@@ -181,7 +181,15 @@ host.stat = (path, follow = true) =>
   statResult((follow ? rawOS.stat : rawOS.lstat)(path), follow ? 'stat' : 'lstat', path);
 // Node's resolver may probe existence without granting access to file contents.
 const moduleStat = osNamespace.stat;
-host.moduleStat = path => statResult(moduleStat(path), 'stat', path);
+// null for a path that is not there: the resolver asks about many of those.
+host.moduleStat = path => {
+  const result = moduleStat(path);
+  if (result[1] !== 0) {
+    const code = errnoNames.get(Math.abs(result[1]));
+    if (code === 'ENOENT' || code === 'ENOTDIR') return null;
+  }
+  return statResult(result, 'stat', path);
+};
 // Built-ins read the environment where it lives: nothing of it is kept here.
 const environmentHandler = {
   get(target, key) { return typeof key === 'string' ? rawStd.getenv(key) : undefined; },
@@ -348,20 +356,31 @@ globalThis.Buffer = Buffer;
 globalThis.global = globalThis;
 globalThis.atob = internalRequire('buffer').atob;
 globalThis.btoa = internalRequire('buffer').btoa;
-host.readFile = path => {
+// Most files fit in one read into this buffer, which is then copied or decoded at
+// the size read; larger files collect copies of it.
+let readBuffer;
+function readInto(path, finish) {
   const options = {}, file = rawStd.open(path, 'rb', options);
   if (!file) throw systemError(options.errno || 2, 'open', path);
-  const chunks = []; let size = 0;
+  if (readBuffer === undefined) readBuffer = new Uint8Array(65536);
+  let chunks = null, size = 0, held = 0;
   try {
     while (true) {
-      const chunk = new Uint8Array(65536), count = file.read(chunk.buffer, 0, chunk.length);
+      if (held !== 0) { chunks = [readBuffer.slice(0, held)]; held = 0; }
+      const count = file.read(readBuffer.buffer, 0, readBuffer.length);
       if (count < 0 || file.error()) throw systemError(file.error() || 5, 'read', path);
       if (count === 0) break;
-      chunks.push(chunk.subarray(0, count)); size += count;
+      if (chunks !== null) chunks.push(readBuffer.slice(0, count));
+      else held = count;
+      size += count;
     }
   } finally { file.close(); }
-  return Buffer.concat(chunks, size);
-};
+  return finish(chunks === null ? Buffer.from(readBuffer.buffer, 0, held) : Buffer.concat(chunks, size));
+}
+const copyBytes = bytes => bytes.buffer === readBuffer.buffer ? Buffer.from(bytes) : bytes;
+const decodeBytes = bytes => bytes.toString('utf8');
+host.readFile = path => readInto(path, copyBytes);
+host.readText = path => readInto(path, decodeBytes);
 function output(fd) {
   return { fd, isTTY: !!rawOS.isatty(fd), writable: true, write(chunk, encoding, callback) {
     if (typeof encoding === 'function') { callback = encoding; encoding = undefined; }
@@ -564,6 +583,15 @@ function publicBuiltin(name) {
 const publicBuiltins = {
   has: publicBuiltin,
   get: name => internalRequire(name),
+  // Whether names() lists name, without building the list.
+  listed(name) {
+    if (typeof name !== 'string') return false;
+    if (stringStartsWith(name, 'node:')) {
+      const bare = stringSlice(name, 5);
+      return prefixOnlyBuiltinHas(bare) && publicBuiltin(bare);
+    }
+    return !prefixOnlyBuiltinHas(name) && publicBuiltin(name);
+  },
   names() {
     const names = [];
     for (let index = 0; index < publicBuiltinNames.length; index++) {
