@@ -360,22 +360,26 @@ globalThis.btoa = internalRequire('buffer').btoa;
 // Most files fit in one read into this buffer, which is then copied or decoded at
 // the size read; larger files collect copies of it.
 let readBuffer;
+// Plain descriptor calls: open, reads until one returns 0, close.
 function readInto(path, finish) {
-  const options = {}, file = rawStd.open(path, 'rb', options);
-  if (!file) throw systemError(options.errno || 2, 'open', path);
+  const fd = rawOS.open(path, rawOS.O_RDONLY);
+  if (fd < 0) throw systemError(-fd, 'open', path);
   if (readBuffer === undefined) readBuffer = new Uint8Array(65536);
   let chunks = null, size = 0, held = 0;
   try {
     while (true) {
       if (held !== 0) { chunks = [readBuffer.slice(0, held)]; held = 0; }
-      const count = file.read(readBuffer.buffer, 0, readBuffer.length);
-      if (count < 0 || file.error()) throw systemError(file.error() || 5, 'read', path);
+      const count = rawOS.read(fd, readBuffer.buffer, 0, readBuffer.length);
+      if (count < 0) {
+        if (count === -4) continue; // EINTR
+        throw systemError(-count, 'read', path);
+      }
       if (count === 0) break;
       if (chunks !== null) chunks.push(readBuffer.slice(0, count));
       else held = count;
       size += count;
     }
-  } finally { file.close(); }
+  } finally { rawOS.close(fd); }
   return finish(chunks === null ? Buffer.from(readBuffer.buffer, 0, held) : Buffer.concat(chunks, size));
 }
 const copyBytes = bytes => bytes.buffer === readBuffer.buffer ? Buffer.from(bytes) : bytes;
