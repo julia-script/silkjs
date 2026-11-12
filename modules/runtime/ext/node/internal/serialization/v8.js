@@ -51,7 +51,7 @@ const UNRESOLVED = Symbol('unresolved wire object');
 
 function isHostObject(value) {
   if (types.isKeyObject(value) || types.isCryptoKey(value) || host.types.isX509Certificate?.(value)) return true;
-  if (host.types.isStorage?.(value) || host.types.isEventSource?.(value)) return true;
+  if (host.types.isStorage?.(value) || host.types.isEventSource?.(value) || host.types.isStreamBindingObject?.(value)) return true;
   try { apply(blobSize, value, []); return true; } catch { return false; }
 }
 
@@ -542,7 +542,8 @@ class Deserializer {
 class DefaultSerializer extends Serializer {
   constructor() { super(); this._setTreatArrayBufferViewsAsHostObjects(true); }
   _writeHostObject(value) {
-    if (!ArrayBuffer.isView(value)) this._fail(value);
+    // lib/v8.js: a host object that is not an ArrayBufferView.
+    if (!ArrayBuffer.isView(value)) throw new this._getDataCloneError(`Unserializable host object: ${require('internal/util/inspect').inspect(value)}`);
     host.getArrayBufferViewFlags(value);
     const info = viewInfo(value);
     // Buffer is a Uint8Array subclass in Silk; require the true view brand first.

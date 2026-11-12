@@ -232,13 +232,16 @@ function optionFlag({ name, type, value, negated, raw }) {
   return name + '=' + value;
 }
 
-// The --env-file and --env-file-if-exists files, in order.
+// The --env-file and --env-file-if-exists files, in order. A --watch supervisor loads
+// none, as in Node: the child it restarts loads them, so a changed file takes effect.
 function environmentFiles(args) {
   const files = [];
-  for (const { name, value } of parseArguments(args, false).entries) {
+  let watch = false;
+  for (const { name, value, negated } of parseArguments(args, false).entries) {
     if (name === '--env-file' || name === '--env-file-if-exists') files.push({ path: value, optional: name === '--env-file-if-exists' });
+    else if (name === '--watch') watch = !negated && value !== false;
   }
-  return files;
+  return watch ? [] : files;
 }
 
 const loaderWorkerExcluded = new Set(['--inspect', '--inspect-brk', '--inspect-wait', '--inspect-port',
@@ -262,12 +265,79 @@ function loaderWorkerArguments(args) {
   return result;
 }
 
+// Node's per-option defaults (src/node_options.h) where they differ from the type's.
+// Boolean options that default to true are marked in the table instead.
+const kOptionDefaults = {
+  __proto__: null,
+  '--cpu-prof-interval': 1000,
+  '--heap-prof-interval': 512 * 1024,
+  '--inspect-publish-uid': 'stderr,http',
+  '--report-signal': 'SIGUSR2',
+  '--stack-trace-limit': 10,
+  '--test-isolation': 'process',
+  '--trace-event-file-pattern': 'node_trace.${rotation}.log',
+  '--use-largepages': 'off',
+  '--v8-pool-size': 4,
+  '--watch-kill-signal': 'SIGTERM',
+};
+
+// The value of a table option nothing above answers for, as node_options.cc keeps it:
+// the CLI and NODE_OPTIONS entries the bootstrap parsed, NODE_OPTIONS first.
+function parsedOptionValue(name) {
+  const info = table.options.get(name);
+  if (info === undefined) return undefined;
+  const type = info[0];
+  let value = name in kOptionDefaults ? kOptionDefaults[name] :
+    type === 'Boolean' ? info[2] : type === 'StringList' ? [] :
+    type === 'Integer' || type === 'UInteger' ? 0 : type === 'String' ? '' : undefined;
+  if (type === 'StringList') value = value.slice();
+  const entries = host.cliOptionEntries || [];
+  // A bracketed name is an internal field that the options implying it set
+  // (Implies in node_options.cc); the parser keeps no entry for it.
+  const implying = name[0] === '[' ? [] : undefined;
+  if (implying !== undefined) for (const [from, to] of table.implications) if (to === name) implying.push(from);
+  for (let index = 0; index < entries.length; index++) {
+    const entry = entries[index];
+    if (implying !== undefined && implying.includes(entry.name)) {
+      if (!entry.negated) value = true;
+      continue;
+    }
+    if (entry.name !== name) continue;
+    if (type === 'StringList') value.push(entry.value);
+    else if (type === 'Boolean') value = !entry.negated && entry.value !== false;
+    else if (type === 'Integer' || type === 'UInteger') value = Number(entry.value);
+    else value = entry.value;
+  }
+  return value;
+}
+
+// node_options.cc GetOptionsAsFlags: the options this process was given, one flag per
+// value, in the form the CLI takes them. V8 options are not node options.
+let optionsFlags;
+function getOptionsAsFlagsFromBinding() {
+  if (optionsFlags !== undefined) return optionsFlags;
+  const seen = new Set();
+  const result = [];
+  const entries = host.cliOptionEntries || [];
+  for (let index = entries.length - 1; index >= 0; index--) {
+    const entry = entries[index];
+    if (entry.implied || entry.type === undefined || entry.type === 'V8Option' || entry.type === 'NoOp') continue;
+    if (entry.type !== 'StringList') {
+      if (seen.has(entry.name)) continue;
+      seen.add(entry.name);
+    }
+    result.push(optionFlag(entry));
+  }
+  return optionsFlags = result.reverse();
+}
+
 function getOptionValue(name) {
   switch (name) {
     case '--enable-source-maps': return !!host.enableSourceMaps;
     case '--trace-sigint': return !!host.traceSigint;
     case '--experimental-stream-iter': return !!host.experimentalStreamIter;
     case '--experimental-vm-modules': return !!host.experimentalVmModules;
+    case '--experimental-shadow-realm': return !!host.experimentalShadowRealm;
     case '--experimental-eventsource': return !!host.experimentalEventSource;
     case '--experimental-webstorage': return !!host.experimentalWebStorage;
     case '--experimental-websocket': return host.experimentalWebSocket !== false;
@@ -290,29 +360,10 @@ function getOptionValue(name) {
     // Addons load through require only; import() of a .node file is unsupported.
     case '--experimental-addon-modules': return false;
     case '--experimental-package-map': return host.packageMap ?? '';
-    default: {
-      const info = table.options.get(name);
-      if (info?.[4] === 'test') return testOptionValue(name, info);
-      return startupControls.getOptionValue(name) ?? require('internal/tls/options').getOptionValue(name);
-    }
+    default: return startupControls.getOptionValue(name) ?? require('internal/tls/options').getOptionValue(name) ?? parsedOptionValue(name);
   }
 }
 
-// A test runner option as given, or EnvironmentOptions' default (node_options.h):
-// the type's zero value, but test_isolation = "process".
-function testOptionValue(name, [type, , defaultIsTrue]) {
-  if (host.testOptionValues.has(name)) {
-    const value = host.testOptionValues.get(name);
-    return type === 'UInteger' || type === 'Integer' ? Number(value) : value;
-  }
-  if (name === '--test-isolation') return 'process';
-  switch (type) {
-    case 'Boolean': return defaultIsTrue;
-    case 'StringList': return [];
-    case 'String': return '';
-    default: return 0;
-  }
-}
 // Node's process.allowedNodeEnvironmentFlags (lib/internal/process/per_thread.js).
 function buildAllowedFlags() {
   const array = [];
@@ -363,4 +414,4 @@ function buildAllowedFlags() {
   return Object.freeze(new NodeEnvironmentFlagsSet());
 }
 
-module.exports = { optionTypes, envVarSettings, getCLIOptionsInfo, parseArguments, optionFlag, parseEnvironment, validateEnvironment, invalidWorkerArguments, processOption, getOptionValue, environmentFiles, loaderWorkerArguments, buildAllowedFlags, applyInspectorOption, isInspectorValueOption };
+module.exports = { optionTypes, envVarSettings, getCLIOptionsInfo, parseArguments, optionFlag, parseEnvironment, validateEnvironment, invalidWorkerArguments, processOption, getOptionValue, getOptionsAsFlagsFromBinding, environmentFiles, loaderWorkerArguments, buildAllowedFlags, applyInspectorOption, isInspectorValueOption };

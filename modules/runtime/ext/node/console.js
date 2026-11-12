@@ -513,6 +513,11 @@ for (const prop of Reflect.ownKeys(Console.prototype)) {
 }
 globalConsole[kBindProperties](true, 'auto');
 globalConsole[kBindStreamsLazy](host);
+// Node binds the global console to the process streams again in every pre-execution
+// (initializeGlobalConsole), so a start from a startup snapshot writes to its own.
+if (host.startupSnapshot.isBuildingSnapshotBuffer[0]) {
+  require('internal/v8/startup_snapshot').namespace.addSerializeCallback(() => globalConsole[kBindStreamsLazy](host));
+}
 // Legacy: the Console constructor on the global console.
 globalConsole.Console = Console;
 module.exports = globalConsole;

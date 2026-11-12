@@ -14,8 +14,9 @@ const booleanOptions = new Map([
 const valueOptions = new Set(['--disable-warning', '--redirect-warnings', '--unhandled-rejections', '--stack-trace-limit',
   '--network-family-autoselection-attempt-timeout']);
 const rejectionModes = new Set(['throw', 'strict', 'warn', 'warn-with-error-code', 'none']);
-const state = { warnings: true, deprecation: true, unhandledRejections: 'throw',
-  networkFamilyAutoselection: true, networkFamilyAutoselectionAttemptTimeout: 250 };
+const defaults = () => ({ warnings: true, deprecation: true, unhandledRejections: 'throw',
+  networkFamilyAutoselection: true, networkFamilyAutoselectionAttemptTimeout: 250 });
+let state = defaults();
 const disabledWarnings = new Set();
 let traceHelperShown = false;
 let warningFd;
@@ -56,6 +57,19 @@ function initialize() {
   state.redirectWarnings ||= process.env.NODE_REDIRECT_WARNINGS;
   if (state.warnings && process.env.NODE_NO_WARNINGS !== '1') process.on('warning', onWarning);
   if (state.abortOnUncaughtException) host.abortOnUncaughtException = abortOnUncaughtException;
+  if (host.startupSnapshot.isBuildingSnapshotBuffer[0])
+    require('internal/v8/startup_snapshot').namespace.addSerializeCallback(resetForSerialization);
+}
+function closeWarningFile() { try { require('fs').closeSync(warningFd); } catch {} }
+// The options belong to the process that gave them, as Node's do: a start from a startup
+// snapshot reads its own (pre_execution.js setupWarningHandler, warning.js resetForSerialization).
+function resetForSerialization() {
+  process.removeListener('warning', onWarning);
+  if (warningFd !== undefined) { process.removeListener('exit', closeWarningFile); closeWarningFile(); }
+  warningFd = undefined;
+  traceHelperShown = false;
+  state = defaults();
+  disabledWarnings.clear();
 }
 function writeStderr(text) { try { require('fs').writeSync(2, text); } catch {} }
 // V8 aborts when an exception reaches the top of the stack with no capture callback. Here the
@@ -135,7 +149,7 @@ function onWarning(warning) {
     try {
       if (warningFd === undefined) {
         warningFd = fs.openSync(state.redirectWarnings, 'a');
-        process.on('exit', () => { try { fs.closeSync(warningFd); } catch {} });
+        process.on('exit', closeWarningFile);
       }
       fs.appendFile(warningFd, message + '\n', error => { if (error) process.stderr.write(message + '\n'); });
       return;

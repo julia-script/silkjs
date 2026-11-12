@@ -123,28 +123,21 @@ function isStringOneByteRepresentation(content) {
   string(content, 'content');
   return host.isOneByteString(content);
 }
+// Node's v8.takeCoverage and v8.stopCoverage are the profiler binding's: they act on the
+// coverage NODE_V8_COVERAGE started and do nothing without it.
 function takeCoverage() {
-  unsupported('takeCoverage', 'NODE_V8_COVERAGE collection is not implemented; native test coverage is a separate facility');
+  require('internal/profiler_binding').takeCoverage();
 }
 function stopCoverage() {
-  unsupported('stopCoverage', 'NODE_V8_COVERAGE collection is not implemented; native test coverage is a separate facility');
+  require('internal/profiler_binding').stopCoverage();
 }
 class GCProfiler {
   start() { unsupported('GCProfiler.start', 'native GC events do not capture the before/after heap statistics required by this profile'); }
   stop() { unsupported('GCProfiler.stop', 'native GC events do not capture the before/after heap statistics required by this profile'); }
   [Symbol.dispose]() { this.stop(); }
 }
-// lib/internal/v8/startup_snapshot.js: outside --build-snapshot (which this runtime does not
-// take) the process is never building one, so every callback API reports that.
-function snapshotCallback(callback) {
-  throw new (require('internal/errors').codes.ERR_NOT_BUILDING_SNAPSHOT)();
-}
-const startupSnapshot = {
-  isBuildingSnapshot() { return false; },
-  addSerializeCallback: snapshotCallback,
-  addDeserializeCallback: snapshotCallback,
-  setDeserializeMainFunction: snapshotCallback,
-};
+// lib/v8.js: startupSnapshot is internal/v8/startup_snapshot's namespace.
+const { namespace: startupSnapshot } = require('internal/v8/startup_snapshot');
 const promiseHooks = require('internal/promise_hooks');
 
 module.exports = {

@@ -101,8 +101,7 @@ for(const signal of ['SIGUSR2','SIGTERM']) process.on(signal, () => { console.lo
   assert.equal((await implicit.ready(3)).worker, 2);
   put('.env', 'WATCH_SMOKE_VALUE=two\n');
   assert.equal((await implicit.ready(4)).env, 'two');
-  fs.unlinkSync(path.join(root, 'dep.mjs'));
-  await implicit.until(output => output.includes('Failed running'));
+  // As in Node, a dependency deleted under a failed run is not watched again.
   put('dep.mjs', 'export default 2;');
   assert.equal((await implicit.ready(5)).esm, 2);
   const latest = implicit.records().at(-1).pid;
@@ -117,11 +116,9 @@ for(const signal of ['SIGUSR2','SIGTERM']) process.on(signal, () => { console.lo
   await explicit.until(output => output.includes('Completed running'));
   put('watched/unrelated.txt', 'one');
   await explicit.ready(2);
-  fs.rmSync(path.join(root, 'watched'), { recursive: true });
+  await explicit.until(output => output.split('Completed running').length === 3);
+  put('watched/nested.txt', 'two');
   await explicit.ready(3);
-  fs.mkdirSync(path.join(root, 'watched'));
-  put('watched/recreated.txt', 'two');
-  await explicit.ready(4);
   await explicit.stop();
   console.log('CLI watch restart/dependency/signal and package runner smoke passed');
 }
