@@ -7,6 +7,10 @@ const builtinPrefix = Function.prototype.call.bind(String.prototype.startsWith);
 const builtinSlice = Function.prototype.call.bind(String.prototype.slice);
 // Node's kFirstModuleParent: internal/errors reads it for require stacks.
 const kModuleParent = require('internal/host').kFirstModuleParent;
+// Captured before user code runs: the main module's evaluation promise is
+// observed without a user-replaced Promise.prototype.then.
+const ReflectApply = Reflect.apply;
+const PromisePrototypeThen = Promise.prototype.then;
 
 // Embedding contract: compileFunction evaluates the complete wrapper expression;
 // evaluateModule(source, filename, isEntry) runs a real native ESM graph; the
@@ -307,11 +311,13 @@ function createLoader(host, builtins) {
       return error('ERR_MODULE_NOT_FOUND', packageName ?? specifier, parent, null);
     }
     const stack = [];
-    let current = cache[parent];
+    // The module being resolved for, when the caller passed one the cache does not
+    // hold under this name (the REPL's '<repl>' module has no filename).
+    let current = resolvingModule && parentName(resolvingModule) === parent ? resolvingModule : cache[parent];
     const visited = new Set();
     while (current && !visited.has(current)) {
       visited.add(current);
-      stack.push(current.filename);
+      stack.push(current.filename || current.id);
       current = current[kModuleParent];
     }
     if (!stack.length && parent) stack.push(parent);
@@ -514,6 +520,7 @@ function createLoader(host, builtins) {
     return { name, subpath: separator === -1 ? '.' : '.' + specifier.slice(separator) };
   }
 
+  let resolvingModule = null;
   function resolveInternal(specifier, parent, mode, options, seen, isMain) {
     if (typeof specifier !== 'string') throw invalidArgType('id', 'string', specifier);
     if (specifier.length === 0) throw invalidArgValue('id', specifier, 'must be a non-empty string');
@@ -529,6 +536,8 @@ function createLoader(host, builtins) {
     const recursion = mode + '\0' + parent + '\0' + specifier;
     if (seen.has(recursion)) throw error('ERR_INVALID_MODULE_SPECIFIER', specifier, 'maps back to itself through package "exports" or "imports"', parent || undefined);
     seen.add(recursion);
+    const previousModule = resolvingModule;
+    if (parentObject) resolvingModule = parentObject;
     try {
       // As in Node, a require of '#name' whose package has no "imports" looks in node_modules.
       if (specifier.startsWith('#') && (mode === 'import' || (packageScope(parent)?.data.imports ?? null) !== null)) {
@@ -568,6 +577,15 @@ function createLoader(host, builtins) {
       }
       if (mode === 'import' && /^[A-Za-z][A-Za-z\d+.-]*:/.test(specifier)) throw error('ERR_UNSUPPORTED_ESM_URL_SCHEME', { protocol: /^[^:]*:/.exec(specifier)[0] }, ['file', 'data', 'node']);
       const parsed = packageName(specifier, parent);
+      // --experimental-package-map: the map alone decides where a bare specifier's
+      // package is (Node's packageResolve and tryPackageMapResolveCJS).
+      if (host.packageMap && path.isAbsolute(parent)) {
+        const mapped = require('internal/modules/package_map').packageMapResolve(specifier, parent);
+        if (mapped === undefined) throw missing(specifier, parent, mode, undefined, parsed.name);
+        const found = packageAt(mapped.packagePath, { name: parsed.name, subpath: mapped.subpath }, specifier, parent, mode, seen, isMain);
+        if (found === undefined) throw missing(specifier, parent, mode, undefined, parsed.name);
+        return found;
+      }
       const scope = packageScope(parent);
       if (scope && scope.data.name === parsed.name && scope.data.exports !== undefined && scope.data.exports !== null) {
         return packageMap(scope, scope.data.exports, parsed.subpath, false, parent, mode, seen, isMain);
@@ -590,7 +608,7 @@ function createLoader(host, builtins) {
         if (known !== undefined) return { ...known };
       }
       return remember(key, findPackage(search, parsed, specifier, parent, mode, seen, isMain));
-    } finally { seen.delete(recursion); }
+    } finally { seen.delete(recursion); resolvingModule = previousModule; }
   }
 
   // Whether resolveInternal may keep what it finds in foundPaths: a plain require, as
@@ -608,23 +626,30 @@ function createLoader(host, builtins) {
   function findPackage(search, parsed, specifier, parent, mode, seen, isMain) {
     for (let i8 = 0, a8 = search; i8 < a8.length; i8++) { const directory = a8[i8];
       if (!isDirectory(directory)) continue;
-      const root = path.join(directory, parsed.name);
-      const pkg = readPackage(root);
-      if (pkg && pkg.data.exports !== undefined && pkg.data.exports !== null) return packageMap(pkg, pkg.data.exports, parsed.subpath, false, parent, mode, seen, isMain);
-      const candidate = parsed.subpath === '.' ? root : path.join(root, parsed.subpath.slice(2));
-      if (mode === 'import' && parsed.subpath !== '.') {
-        if (isDirectory(root)) return strictFile(candidate, specifier, parent, mode, undefined, isMain);
-        continue;
-      }
-      if (mode === 'import' && pkg && typeof pkg.data.main === 'string') {
-        const exact = path.resolve(root, pkg.data.main);
-        if (isFile(exact)) return descriptor(exact, mode, undefined, isMain);
-      }
-      const found = legacyFile(candidate, true, /[\\/]$/.test(specifier));
-      if (found) return descriptor(found, mode, undefined, isMain);
-      if (mode === 'import' && isDirectory(root)) throw missing(specifier, parent, mode, undefined, root + path.sep);
+      const found = packageAt(path.join(directory, parsed.name), parsed, specifier, parent, mode, seen, isMain);
+      if (found !== undefined) return found;
     }
     throw missing(specifier, parent, mode, undefined, parsed.name);
+  }
+
+  // The module that parsed.subpath names in the package at root, or undefined when
+  // root holds no such package.
+  function packageAt(root, parsed, specifier, parent, mode, seen, isMain) {
+    const pkg = readPackage(root);
+    if (pkg && pkg.data.exports !== undefined && pkg.data.exports !== null) return packageMap(pkg, pkg.data.exports, parsed.subpath, false, parent, mode, seen, isMain);
+    const candidate = parsed.subpath === '.' ? root : path.join(root, parsed.subpath.slice(2));
+    if (mode === 'import' && parsed.subpath !== '.') {
+      if (isDirectory(root)) return strictFile(candidate, specifier, parent, mode, undefined, isMain);
+      return undefined;
+    }
+    if (mode === 'import' && pkg && typeof pkg.data.main === 'string') {
+      const exact = path.resolve(root, pkg.data.main);
+      if (isFile(exact)) return descriptor(exact, mode, undefined, isMain);
+    }
+    const found = legacyFile(candidate, true, /[\\/]$/.test(specifier));
+    if (found) return descriptor(found, mode, undefined, isMain);
+    if (mode === 'import' && isDirectory(root)) throw missing(specifier, parent, mode, undefined, root + path.sep);
+    return undefined;
   }
 
   function conditions(mode) {
@@ -1209,6 +1234,12 @@ function createLoader(host, builtins) {
     return cause;
   }
 
+  // Node's ModuleJob.run: an import() or main entry whose evaluation threw a
+  // ReferenceError for a CommonJS name gets the ES module scope hint.
+  function moduleEvaluationError(key, cause) {
+    decorateModuleError(cause, keyName(key));
+  }
+
   function requireModuleEnabled() {
     return typeof host.requireModule === 'function' && !host.requireModuleDisabled;
   }
@@ -1294,7 +1325,13 @@ function createLoader(host, builtins) {
       }
       if (typeof host.evaluateModule !== 'function') throw error('ERR_METHOD_NOT_IMPLEMENTED', 'evaluateModule');
       const loaded = loadESM(resolved.filename);
-      return host.evaluateModule(loaded.source, loaded.filename, true);
+      let result;
+      try { result = host.evaluateModule(loaded.source, loaded.filename, true); }
+      catch (cause) { throw decorateModuleError(cause, resolved.filename); }
+      if (result !== null && typeof result === 'object' && typeof result.then === 'function') {
+        return ReflectApply(PromisePrototypeThen, result, [undefined, (cause) => { throw decorateModuleError(cause, resolved.filename); }]);
+      }
+      return result;
     }
     return loadResolved(resolved, null, true, hooks.hasAsync());
   }
@@ -1606,7 +1643,7 @@ function createLoader(host, builtins) {
     return { source, format: resolved.format, filename: resolved.filename };
   }
 
-  return { decorateModuleError, resolveImport, importKey, moduleSource, requireFor, runMain, defaultRunMain, warmMain, resolve, resolveMain, loadESM, cleanSource, prepareSource, bridge, Module, mockModule };
+  return { decorateModuleError, moduleEvaluationError, resolveImport, importKey, moduleSource, requireFor, runMain, defaultRunMain, warmMain, resolve, resolveMain, loadESM, cleanSource, prepareSource, bridge, Module, mockModule };
 }
 
 module.exports = { createLoader };

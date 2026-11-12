@@ -878,4 +878,4 @@ class Glob {
 }
 
 
-module.exports = { Glob, matchGlobPattern };
+module.exports = { Glob, createMatcher, matchGlobPattern };

@@ -27,7 +27,7 @@
 const c = require('internal/crypto_core');
 const { Buffer, call, submit, packed, bytes, binary, integer, callback, error, invalid, output, attach, handle, release, name } = c;
 const { Transform, Writable } = require('stream');
-const constants = Object.freeze({ RSA_PKCS1_PADDING: 1, RSA_NO_PADDING: 3, RSA_PKCS1_OAEP_PADDING: 4, RSA_X931_PADDING: 5, RSA_PKCS1_PSS_PADDING: 6, RSA_PSS_SALTLEN_DIGEST: -1, RSA_PSS_SALTLEN_MAX_SIGN: -2, RSA_PSS_SALTLEN_AUTO: -2, POINT_CONVERSION_COMPRESSED: 2, POINT_CONVERSION_UNCOMPRESSED: 4, POINT_CONVERSION_HYBRID: 6, DH_CHECK_P_NOT_PRIME: 1, DH_CHECK_P_NOT_SAFE_PRIME: 2, DH_UNABLE_TO_CHECK_GENERATOR: 4, DH_NOT_SUITABLE_GENERATOR: 8, ENGINE_METHOD_RSA: 1, ENGINE_METHOD_DSA: 2, ENGINE_METHOD_DH: 4, ENGINE_METHOD_RAND: 8, ENGINE_METHOD_CIPHERS: 64, ENGINE_METHOD_DIGESTS: 128, ENGINE_METHOD_PKEY_METHS: 512, ENGINE_METHOD_PKEY_ASN1_METHS: 1024, ENGINE_METHOD_EC: 2048, ENGINE_METHOD_ALL: 65535, ENGINE_METHOD_NONE: 0, defaultCoreCipherList: require('internal/tls/options').DEFAULT_CIPHER_LIST, defaultCipherList: require('internal/tls/options').getOptionValue('--tls-cipher-list') });
+const constants = Object.freeze({ SSL_OP_ALL: 2147485776, SSL_OP_ALLOW_NO_DHE_KEX: 1024, SSL_OP_ALLOW_UNSAFE_LEGACY_RENEGOTIATION: 262144, SSL_OP_CIPHER_SERVER_PREFERENCE: 4194304, SSL_OP_CISCO_ANYCONNECT: 32768, SSL_OP_COOKIE_EXCHANGE: 8192, SSL_OP_CRYPTOPRO_TLSEXT_BUG: 2147483648, SSL_OP_DONT_INSERT_EMPTY_FRAGMENTS: 2048, SSL_OP_LEGACY_SERVER_CONNECT: 4, SSL_OP_NO_COMPRESSION: 131072, SSL_OP_NO_ENCRYPT_THEN_MAC: 524288, SSL_OP_NO_QUERY_MTU: 4096, SSL_OP_NO_RENEGOTIATION: 1073741824, SSL_OP_NO_SESSION_RESUMPTION_ON_RENEGOTIATION: 65536, SSL_OP_NO_SSLv2: 0, SSL_OP_NO_SSLv3: 33554432, SSL_OP_NO_TICKET: 16384, SSL_OP_NO_TLSv1: 67108864, SSL_OP_NO_TLSv1_1: 268435456, SSL_OP_NO_TLSv1_2: 134217728, SSL_OP_NO_TLSv1_3: 536870912, SSL_OP_PRIORITIZE_CHACHA: 2097152, SSL_OP_TLS_ROLLBACK_BUG: 8388608, RSA_PKCS1_PADDING: 1, RSA_NO_PADDING: 3, RSA_PKCS1_OAEP_PADDING: 4, RSA_X931_PADDING: 5, RSA_PKCS1_PSS_PADDING: 6, RSA_PSS_SALTLEN_DIGEST: -1, RSA_PSS_SALTLEN_MAX_SIGN: -2, RSA_PSS_SALTLEN_AUTO: -2, POINT_CONVERSION_COMPRESSED: 2, POINT_CONVERSION_UNCOMPRESSED: 4, POINT_CONVERSION_HYBRID: 6, DH_CHECK_P_NOT_PRIME: 1, DH_CHECK_P_NOT_SAFE_PRIME: 2, DH_UNABLE_TO_CHECK_GENERATOR: 4, DH_NOT_SUITABLE_GENERATOR: 8, ENGINE_METHOD_RSA: 1, ENGINE_METHOD_DSA: 2, ENGINE_METHOD_DH: 4, ENGINE_METHOD_RAND: 8, ENGINE_METHOD_CIPHERS: 64, ENGINE_METHOD_DIGESTS: 128, ENGINE_METHOD_PKEY_METHS: 512, ENGINE_METHOD_PKEY_ASN1_METHS: 1024, ENGINE_METHOD_EC: 2048, ENGINE_METHOD_ALL: 65535, ENGINE_METHOD_NONE: 0, defaultCoreCipherList: require('internal/tls/options').DEFAULT_CIPHER_LIST, defaultCipherList: require('internal/tls/options').getOptionValue('--tls-cipher-list') });
 const { codes, validate, isAnyArrayBuffer, normalize } = c;
 // lib/internal/crypto/random.js
 const kMaxPossibleLength = Math.min(require('buffer').kMaxLength, 2 ** 31 - 1);
@@ -809,6 +809,8 @@ function prepareAsymmetricKey(key, ctx, name = 'key') {
   const isPrivateKeyInput = ctx === kConsumePrivate || ctx === kCreatePrivate;
   if (isKeyObject(key)) { validateAsymmetricKeyType(keySlotsOf(key).type, ctx, key); return { keyObject: key }; }
   if (isCryptoKey(key)) { emitDEP0203(); const object = cryptoKeyObject(key); validateAsymmetricKeyType(keySlotsOf(object).type, ctx, key); return { keyObject: object }; }
+  // A private key referenced by a URI for an OpenSSL STORE loader.
+  if (isPrivateKeyInput && webURL().isURLInstance(key)) return prepareStorePrivateKey(key, name);
   if (isAnyArrayBuffer(key)) return { format: 'pem', data: key };
   if (typeof key === 'object' && key !== null) return prepareAsymmetricKeyOptions(key, ctx, name, isPrivateKeyInput);
   throw codes.ERR_INVALID_ARG_TYPE(name, keyTypes(ctx !== kCreatePrivate, isPrivateKeyInput), key);
@@ -819,6 +821,8 @@ function prepareAsymmetricKeyOptions(key, ctx, name, isPrivateKeyInput) {
   if (!isData && isKeyObject(data)) { validateAsymmetricKeyType(keySlotsOf(data).type, ctx, data); return { keyObject: data }; }
   if (!isData && isCryptoKey(data)) { emitDEP0203(); const object = cryptoKeyObject(data); validateAsymmetricKeyType(keySlotsOf(object).type, ctx, data); return { keyObject: object }; }
   isData ||= isAnyArrayBuffer(data);
+  // A STORE URI, with an optional passphrase or PIN.
+  if (!isData && isPrivateKeyInput && webURL().isURLInstance(data)) return prepareStorePrivateKey(data, name, key.passphrase, encoding, key.properties);
   if (format === 'jwk') { validate.object(data, `${name}.key`); return { data, format: 'jwk' }; }
   if (format === 'raw-public' || format === 'raw-private' || format === 'raw-seed') {
     if (isPrivateKeyInput && format === 'raw-public') throw codes.ERR_INVALID_ARG_VALUE(`${name}.format`, format);
@@ -832,6 +836,35 @@ function prepareAsymmetricKeyOptions(key, ctx, name, isPrivateKeyInput) {
   const parsed = parseKeyEncoding(key, undefined, isPrivateKeyInput ? false : undefined, name);
   return { data: keyData, format: parsed.format, type: parsed.type, passphrase: parsed.passphrase };
 }
+function webURL() { return require('internal/web/url'); }
+// lib/internal/crypto/keys.js prepareStorePrivateKey: the URI comes from the
+// URL's private state, file: URLs become paths, and NUL bytes are refused
+// because OpenSSL reads both strings as C strings.
+function prepareStorePrivateKey(url, name, passphrase, encoding, properties) {
+  let uri = webURL().getURLHref(url);
+  if (uri.startsWith('file:')) uri = webURL().fileURLToPath(uri);
+  validate.string(uri, name);
+  if (uri.includes('\u0000')) throw codes.ERR_INVALID_ARG_VALUE(name, url, 'must be a URL without null bytes');
+  if (passphrase !== undefined) {
+    if (!isStringOrBuffer(passphrase)) throw codes.ERR_INVALID_ARG_VALUE(option('passphrase', name), passphrase);
+    if (typeof passphrase === 'string') passphrase = encodeKeyString(passphrase, encoding);
+  }
+  if (properties !== undefined) {
+    validate.string(properties, option('properties', name));
+    if (properties.includes('\u0000')) throw codes.ERR_INVALID_ARG_VALUE(option('properties', name), properties, 'must be a string without null bytes');
+  }
+  return { format: 'store', data: { uri, properties: properties ?? null }, passphrase };
+}
+// The passphrase block the native STORE callback reads: has a passphrase,
+// asked without one, length (u32 LE), bytes.
+function storePassphraseBlock(passphrase) {
+  const bytes = passphrase === undefined ? Buffer.alloc(0) : c.bytes(passphrase);
+  const block = Buffer.alloc(6 + bytes.length);
+  block[0] = passphrase === undefined ? 0 : 1;
+  block.writeUInt32LE(bytes.length, 2);
+  bytes.copy(block, 6);
+  return block;
+}
 function newKeyObject(type, value) { return keyObjectFromHandle(type, binding.createHandle(type, value)); }
 // Turns prepared key input into a KeyObject of the given type.
 function keyFromPrepared(prepared, type) {
@@ -841,6 +874,10 @@ function keyFromPrepared(prepared, type) {
     return object;
   }
   if (prepared.format === 'jwk') return require('internal/crypto_keys').importJwk(prepared.data, type);
+  if (prepared.format === 'store') {
+    const { uri, properties } = prepared.data;
+    return newKeyObject('private', call('storeLoad', [uri, properties ?? '', packed(storePassphraseBlock(prepared.passphrase)), 0]));
+  }
   if (prepared.raw !== undefined) return c.providerRawImport(prepared.raw, type);
   const { format, passphrase } = prepared;
   let data = bytes(prepared.data);
@@ -902,7 +939,7 @@ function preparedKeyObject(key, ctx, name, before, anyType = false) {
   const prepared = prepareAsymmetricKey(key, ctx, name);
   if (before !== undefined) before();
   if (prepared.keyObject !== undefined) return { key: prepared.keyObject, owned: false };
-  if (ctx === kConsumePrivate && !anyType) return { key: keyFromPrepared(prepared, 'private'), owned: true };
+  if (prepared.format === 'store' || ctx === kConsumePrivate && !anyType) return { key: keyFromPrepared(prepared, 'private'), owned: true };
   if (anyType) { try { return { key: keyFromPrepared(prepared, 'private'), owned: true }; } catch (e) { try { return { key: keyFromPrepared(prepared, 'public'), owned: true }; } catch { throw e; } } }
   try { return { key: keyFromPrepared(prepared, 'public'), owned: true }; } catch (e) { try { return { key: keyFromPrepared(prepared, 'private'), owned: true }; } catch { throw e; } }
 }
@@ -1400,7 +1437,17 @@ module.exports.getHashes = () => names('hashes');
 module.exports.getCiphers = () => names('ciphers');
 module.exports.getCurves = () => names('curves');
 module.exports.getFips = () => call('getFips', []);
-module.exports.setFips = enabled => { call('setFips', [enabled ? 1 : 0]); binding.noteFipsChange(); };
+// lib/crypto.js setFips: forced FIPS mode stays on, and workers do not own the process state.
+module.exports.setFips = enabled => {
+  if (require('internal/options').getOptionValue('--force-fips')) {
+    if (enabled) return;
+    throw new (require('internal/errors').codes.ERR_CRYPTO_FIPS_FORCED)();
+  }
+  if (!require('worker_threads').isMainThread) {
+    throw new (require('internal/errors').codes.ERR_WORKER_UNSUPPORTED_OPERATION)('Calling crypto.setFips()');
+  }
+  call('setFips', [enabled ? 1 : 0]); binding.noteFipsChange();
+};
 c.keyFromHandle = (type, id) => newKeyObject(type, id);
 c.keyObjectFromHandle = keyObjectFromHandle;
 c.keyObjectHandle = key => keySlotsOf(key).handle;

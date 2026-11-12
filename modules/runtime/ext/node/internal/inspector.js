@@ -4,21 +4,21 @@ const host = require('internal/host');
 const native = host.inspectorNative;
 const permission = require('internal/permission');
 const contexts = require('internal/inspector_contexts');
-const { RemoteValues, inspect, format, protocolError, unsupported } = require('internal/inspector_values');
+const { RemoteValues, inspect, protocolError, unsupported } = require('internal/inspector_values');
 const debuggerAgent = require('internal/inspector_debugger');
 const profiles = require('internal/inspector_profiles');
 const network = require('internal/inspector_network');
 const sessions = new Map();
 const routed = new Map();
 const workers = require('internal/inspector_workers').create(connectRemote);
-const previews = new Map();
 let nextSession = 1;
 let nextException = 1;
-let nextPreview = 1;
 let waiting = false;
 let workerWaitConsumed = false;
-function error(code, message, Type = Error) { return Object.assign(new Type(message), { code }); }
-function invalid(name, expected) { return error('ERR_INVALID_ARG_TYPE', `The "${name}" argument must be of type ${expected}`, TypeError); }
+const {
+  ERR_INSPECTOR_ALREADY_ACTIVATED, ERR_INSPECTOR_CLOSED, ERR_INSPECTOR_NOT_ACTIVE, ERR_INSPECTOR_NOT_AVAILABLE, ERR_INSPECTOR_NOT_WORKER,
+} = require('internal/errors').codes;
+const { isUint32, validateInt32 } = require('internal/validators');
 function check() { permission.check('inspector'); }
 function protocolParams(params, name, type) {
   if (typeof params[name] !== type) throw protocolError(-32602, `Invalid parameters: ${name}`);
@@ -33,9 +33,28 @@ function evaluation(session, result, params) {
     if (params.awaitPromise) return Promise.resolve(result.value).then(value => ({ result: session.values.remote(value, params.objectGroup, !!params.returnByValue, !!params.generatePreview, params._context) }), value => evaluation(session, { status: 'exception', value }, { ...params, awaitPromise: false }));
     return { result: session.values.remote(result.value, params.objectGroup, !!params.returnByValue, !!params.generatePreview, params._context) };
   }
-  const exception = result.status === 'sideEffect' ? new EvalError('Possible side-effect in debug-evaluate') : result.status === 'terminated' || result.status === 'timeout' ? new Error('Execution was terminated') : result.value;
-  const remote = session.values.remote(exception, params.objectGroup);
-  return { result: remote, exceptionDetails: { exceptionId: nextException++, text: 'Uncaught', lineNumber: 0, columnNumber: 0, exception: remote } };
+  // V8 answers a terminated evaluation with an error response, not an exception.
+  if (result.status === 'terminated' || result.status === 'timeout') throw protocolError(-32000, 'Execution was terminated');
+  const exception = result.status === 'sideEffect' ? new EvalError('Possible side-effect in debug-evaluate') : result.value;
+  // The exception belongs to the context that threw it, as the value of a success would.
+  const remote = session.values.remote(exception, params.objectGroup, false, !!params.generatePreview, params._context);
+  return { result: remote, exceptionDetails: exceptionDetails(exception, remote) };
+}
+// V8's exceptionDetails: the throw site and stack come from the frames the error captured.
+function exceptionDetails(exception, remote) {
+  const details = { exceptionId: nextException++, text: 'Uncaught', lineNumber: 0, columnNumber: 0 };
+  const frames = require('internal/error_stack').framesOf(exception);
+  if (frames && frames.length) {
+    const trace = stackTrace(frames);
+    const top = trace.callFrames[0];
+    details.lineNumber = top.lineNumber;
+    details.columnNumber = top.columnNumber;
+    details.scriptId = top.scriptId;
+    if (top.url) details.url = top.url;
+    details.stackTrace = trace;
+  }
+  details.exception = remote;
+  return details;
 }
 function validateEvaluation(params, method) {
   if (params.serializationOptions || params.replMode || params.allowUnsafeEvalBlockedByCSP === false || params.includeCommandLineAPI) unsupported(method);
@@ -114,6 +133,8 @@ function nodeRuntime(session, method, params) {
 function announceWaiting() {
   for (const session of sessions.values()) if (session.nodeRuntime) session.emit('NodeRuntime.waitingForDebugger', {});
 }
+// NodeTracing loads on its first command.
+let tracing;
 function dispatch(session, method, params) {
   if (method.startsWith('Runtime.')) return runtime(session, method, params);
   if (method.startsWith('Debugger.')) return debuggerAgent.dispatch(session, method, params);
@@ -121,7 +142,9 @@ function dispatch(session, method, params) {
   if (method.startsWith('Network.') || method.startsWith('IO.')) return network.dispatch(session, method, params);
   if (method.startsWith('NodeWorker.')) return workers.dispatch(session, method, params);
   if (method.startsWith('NodeRuntime.')) return nodeRuntime(session, method, params);
-  if (method === 'Schema.getDomains') return { domains: ['Runtime', 'Debugger', 'Profiler', 'HeapProfiler', 'Network', 'IO', 'NodeWorker', 'NodeRuntime', 'Schema'].map(name => ({ name, version: '1.3' })) };
+  if (method.startsWith('DOMStorage.') || method.startsWith('Storage.')) return require('internal/inspector_dom_storage').dispatch(session, method, params);
+  if (method.startsWith('NodeTracing.')) return (tracing ??= require('internal/inspector_tracing')).dispatch(session, method, params);
+  if (method === 'Schema.getDomains') return { domains: ['Runtime', 'Debugger', 'Profiler', 'HeapProfiler', 'Network', 'IO', 'NodeWorker', 'NodeRuntime', 'NodeTracing', 'Schema'].map(name => ({ name, version: '1.3' })) };
   unsupported(method);
 }
 function createSession(key, send) {
@@ -142,6 +165,7 @@ function closeSession(key) {
   profiles.close(session);
   network.close(session);
   workers.close(session);
+  if (tracing) tracing.close(session);
   session.contexts.clear();
   session.values.clear();
   if (sessions.size === 0) native(7, false);
@@ -169,16 +193,16 @@ function connectRemote(target, onMessage, defer = true, greeting = '') {
   const id = nextSession++;
   const route = { receive: onMessage, defer, target };
   routed.set(id, route);
-  try { if (!native(6, target, id, 1, greeting)) throw error('ERR_INSPECTOR_CLOSED', 'Session was closed'); }
+  try { if (!native(6, target, id, 1, greeting)) throw new ERR_INSPECTOR_CLOSED(); }
   catch (cause) { routed.delete(id); throw cause; }
   return { dispatch(message) {
-    if (!native(6, target, id, 2, message)) throw error('ERR_INSPECTOR_CLOSED', 'Session was closed');
+    if (!native(6, target, id, 2, message)) throw new ERR_INSPECTOR_CLOSED();
   }, disconnect() { routed.delete(id); native(6, target, id, 3, ''); } };
 }
 function connect(onMessage, mainThread = false) {
   check();
   if (mainThread) {
-    if (native(10) === 0) throw error('ERR_INSPECTOR_NOT_WORKER', 'Current thread is not a worker');
+    if (native(10) === 0) throw new ERR_INSPECTOR_NOT_WORKER();
     return connectRemote(0, onMessage);
   }
   const key = `local:${nextSession}`;
@@ -243,12 +267,13 @@ function close() {
 }
 function open(port = 9229, hostname = '127.0.0.1', wait = false) {
   check();
-  if (url()) throw error('ERR_INSPECTOR_ALREADY_ACTIVATED', 'Inspector is already activated. Close it with inspector.close() before activating it again.');
-  if (Number.isInteger(port) && port >= 0 && port <= 0xffffffff && port > 65535) throw error('ERR_OUT_OF_RANGE', 'The value of "port" is out of range. It must be >= 0 && <= 65535.', RangeError);
+  if (url()) throw new ERR_INSPECTOR_ALREADY_ACTIVATED();
+  // As Node: no type checks, but a 32-bit port must fit in 16 bits.
+  if (isUint32(port)) validateInt32(port, 'port', 0, 65535);
   if (typeof port !== 'number' || !Number.isInteger(port) || port < 0 || port > 65535) port = 9229;
   if (typeof hostname !== 'string' || !hostname) hostname = '127.0.0.1';
   if (!['127.0.0.1', 'localhost', '::1'].includes(hostname)) process.emitWarning('Binding the inspector to a public IP with an open port is insecure, as it allows external hosts to connect to the inspector and perform a remote code execution attack. Documentation can be found at https://nodejs.org/api/cli.html#--inspecthostport', 'SecurityWarning');
-  if (!native(1, hostname, port)) throw error('ERR_INSPECTOR_NOT_AVAILABLE', 'Inspector is not available');
+  if (!native(1, hostname, port, `node.js/${process.version}`)) throw new ERR_INSPECTOR_NOT_AVAILABLE();
   const endpoint = url();
   process.debugPort = Number(new URL(endpoint).port);
   // Startup can park immediately below; publish without queued stdio work.
@@ -257,7 +282,7 @@ function open(port = 9229, hostname = '127.0.0.1', wait = false) {
   return { __proto__: null, [Symbol.dispose]() { close(); } };
 }
 function waitForDebugger() {
-  if (!url()) throw error('ERR_INSPECTOR_NOT_ACTIVE', 'Inspector is not active');
+  if (!url()) throw new ERR_INSPECTOR_NOT_ACTIVE();
   waiting = true;
   announceWaiting();
   while (waiting && url()) native(4, 10);
@@ -295,7 +320,8 @@ function installProcess(process, hostname, activateOnSignal) {
   process._debugEnd = () => close();
   process._debugProcess = pid => { process.kill(pid, 'SIGUSR1'); };
   if (!activateOnSignal) return;
-  host.processNative('signalStart', [host.platform === 'darwin' ? 30 : 10, () => {
+  // A descriptor in the loop's reactor, not a libuv signal handle: a start pays no signal setup.
+  host.processNative('debugSignalStart', [() => {
     if (!url()) start(process.debugPort, hostname, false, false);
   }]);
 }
@@ -305,30 +331,58 @@ function armStartup() {
   if (native(10) === 0 && !url()) return;
   debuggerAgent.armStartup();
 }
-function evaluatePreview(expression, sandbox, timeout = 333) {
-  if (typeof expression !== 'string') return null;
-  const context = contexts.get(sandbox);
-  if (!context) return null;
-  let token;
-  try {
-    const result = native(12, expression, context.handle, true, timeout);
-    if (result.status !== 'success') return null;
-    token = nextPreview++;
-    previews.set(token, result.value);
-    return { token, text: format(result.value) };
-  } catch { if (token !== undefined) previews.delete(token); return null; }
-}
-function releasePreview(token) { previews.delete(token); }
 function broadcast(method, params) {
-  for (const session of sessions.values()) {
-    if (method.startsWith('Network.') && !session.networkEnabled) continue;
-    session.emit(method, params);
+  // Node's agents check an event only where a session has its domain enabled.
+  const isNetwork = method.startsWith('Network.');
+  if (![...sessions.values()].some(session => isNetwork ? session.networkEnabled : method.startsWith('DOMStorage.') ? session.domStorageEnabled : true)) return;
+  const items = require('internal/inspector_events').validate(method, params);
+  if (method.startsWith('DOMStorage.')) {
+    const domStorage = require('internal/inspector_dom_storage');
+    for (const session of sessions.values()) {
+      domStorage.observe(session, method, params, items);
+      // Not a protocol event: DOMStorageAgent::registerStorage in Node.
+      if (session.domStorageEnabled && method !== 'DOMStorage.registerStorage') session.emit(method, params);
+    }
+    return;
   }
+  if (isNetwork) {
+    // As NetworkAgent: a request names the user code that started it, and says
+    // whether it has a body.
+    if (method === 'Network.requestWillBeSent') {
+      params = { ...params, request: { ...params.request, hasPostData: params.request.hasPostData === true } };
+      if (params.initiator === undefined) params.initiator = { type: 'script', stack: callerStack(broadcast) };
+    }
+    for (const session of sessions.values()) if (session.networkEnabled) {
+      const event = network.observe(session, method, params);
+      if (event !== undefined) session.emit(method, event);
+    }
+    return;
+  }
+  for (const session of sessions.values()) session.emit(method, params);
 }
+// A V8 StackTrace (Runtime.StackTrace) of call sites. Unlike scriptParsed, V8
+// names a frame's script by its resource name as given, not as a URL.
+function stackTrace(frames) {
+  return { callFrames: frames.map(frame => ({
+    functionName: frame.functionName || '', scriptId: String(frame.scriptId ?? 0), url: frame.scriptName || '',
+    lineNumber: Math.max(0, (frame.lineNumber ?? 1) - 1), columnNumber: Math.max(0, (frame.columnNumber ?? 1) - 1),
+  })) };
+}
+// The stack of a call from user code, from its caller down, at most 200 frames
+// (console calls, and the initiator of a Network request).
+function callerStack(skip) {
+  const frames = host.captureCallSites(200, skip);
+  let first = 0;
+  while (first < frames.length && /^(?:node|silk):/.test(frames[first].scriptName)) first++;
+  return stackTrace(frames.slice(first));
+}
+function consoleStack() { return callerStack(consoleStack); }
 const consoleBridge = require('internal/inspector_console').create((type, args) => {
+  let stackTrace;
   for (const session of sessions.values()) if (session.runtime) {
     if (type === 'clear') session.values.releaseGroup('console');
-    session.emit('Runtime.consoleAPICalled', { type, args: args.map(value => session.values.remote(value, 'console', false, true)), executionContextId: 1, timestamp: Date.now() });
+    stackTrace ??= consoleStack();
+    session.emit('Runtime.consoleAPICalled', { type, args: args.map(value => session.values.remote(value, 'console', false, true)), executionContextId: 1, timestamp: Date.now(), stackTrace });
   }
 });
 consoleBridge.console.profile = function profile(title) {
@@ -347,4 +401,4 @@ if (native(10) === 0) {
   // Native state does not come with a heap image: a start from one registers again.
   host.onHydrate(() => { native(0, onNative); });
 }
-module.exports = { connect, open, close, url, waitForDebugger, _start: start, _atExit: atExit, _installProcess: installProcess, _waitForWorker: waitForWorkerStart, _armStartup: armStartup, evaluatePreview, releasePreview, broadcast, error, invalid, console: consoleBridge.console, emitConsole: consoleBridge.emitConsole, putNetworkResource: network.put };
+module.exports = { connect, open, close, url, waitForDebugger, _start: start, _atExit: atExit, _installProcess: installProcess, _waitForWorker: waitForWorkerStart, _armStartup: armStartup, broadcast, console: consoleBridge.console, emitConsole: consoleBridge.emitConsole, putNetworkResource: network.put };

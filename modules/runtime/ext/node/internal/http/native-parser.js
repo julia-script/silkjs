@@ -28,15 +28,19 @@ const call1 = (fn, self, a) => fn.call(self, a);
 const call2 = (fn, self, a) => fn.call(self, a[0], a[1]);
 const callHead = (fn, self, a) => fn.call(self, a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7], a[8]);
 // Parser callbacks run in the parser's async scope, with fixed arguments.
-// When the parser consumes its socket, each callback is a top-level call (Node's
-// MakeCallback), so the nextTick and microtask queues drain after it.
+// When the parser consumes its socket, Node calls kOnHeaders, kOnBody and kOnExecute
+// with MakeCallback, so the nextTick and microtask queues drain after them. Message
+// begin, headers complete and message complete run with kSkipTaskQueues: the rest of
+// the input (a pipelined request, a parse error) is parsed before any tick runs.
 function callback(parser, state, index, call, value) {
   const fn = parser[index];
   if (typeof fn !== 'function') return undefined;
   const result = state.resource ? invoke(state.resource, call, fn, parser, value) : call(fn, parser, value);
-  if (state.topLevel) host.checkpoint();
+  if (state.topLevel && drainsTicks[index]) host.checkpoint();
   return result;
 }
+// Indexed by callback slot (kOnHeaders 1, kOnBody 3, kOnExecute 5).
+const drainsTicks = [false, true, false, true, false, true, false];
 function resetMessage(state) {
   state.headersComplete = false;
   state.upgrade = false;
@@ -154,12 +158,15 @@ class HTTPParser {
   }
   execute(buffer) {
     const state = live(this);
-    if (state.executing) throw error('ERR_INVALID_STATE', 'HTTP parser is already executing');
     if (!isArrayBufferView(buffer)) throw error('ERR_INVALID_ARG_TYPE', 'buffer must be an ArrayBuffer view');
+    // Like Node, a callback may execute the parser again (a socket that pushes its next data
+    // synchronously from 'information'); the outer execute then goes on with its own input.
+    const executing = state.executing;
+    const remaining = state.remaining;
     state.remaining = 0;
     state.executing = true;
     try { return normalize(state, native(3, state.id, buffer)); }
-    finally { state.executing = false; state.remaining = 0; }
+    finally { state.executing = executing; state.remaining = executing ? remaining : 0; }
   }
   finish() {
     const state = live(this);
@@ -186,8 +193,8 @@ class HTTPParser {
   }
   consume(handle) {
     const state = live(this);
-    const socket = handle?.owner;
-    if (!socket || socket._transport !== handle || typeof handle.readStop !== 'function')
+    const binding = require('internal/net/binding');
+    if (!binding.isStreamHandle(handle))
       throw error('ERR_INVALID_ARG_TYPE', 'stream must be a native socket handle');
     HTTPParser.prototype.unconsume.call(this);
     const consumer = { parser: this, read: (status, payload) => {
@@ -202,16 +209,16 @@ class HTTPParser {
       finally { state.currentRead = null; state.topLevel = false; }
       return true;
     } };
-    (socket._streamConsumers ||= []).push(consumer);
-    state.consuming = { socket, consumer };
+    (handle._consumers ||= []).push(consumer);
+    state.consuming = { handle, consumer };
     this._consumed = true;
   }
   unconsume() {
     const state = stateOf(this);
     if (state.consuming) {
-      const { socket, consumer } = state.consuming;
-      const at = socket._streamConsumers.indexOf(consumer);
-      if (at !== -1) socket._streamConsumers.splice(at, 1);
+      const { handle, consumer } = state.consuming;
+      const at = handle._consumers.indexOf(consumer);
+      if (at !== -1) handle._consumers.splice(at, 1);
       state.consuming = null;
     }
     this._consumed = false;

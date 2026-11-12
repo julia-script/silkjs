@@ -9,7 +9,15 @@ const { textBody } = body;
 // Requests and Responses keep their records in a private field; the module reads them through
 // these, set by each class's static block. `internal` makes an instance around a given record.
 const internal = Symbol('internal');
-let readRequest, readResponse;
+let readRequest, readResponse, takeResponseText;
+// A Response made from text alone keeps just the text until something needs its record, and a
+// server request keeps just the parser's field list: most of them are sent or dropped unread.
+// `takenText` marks a text response whose body a server already sent.
+const takenText = Symbol('taken');
+function textRecord(text, used) {
+  const payload = textBody(text); payload.used = used;
+  return new ResponseRecord(200, '', null, payload, 'text/plain;charset=UTF-8');
+}
 const nullBodyStatus = new Set([101, 204, 205, 304]);
 const redirectStatus = new Set([301, 302, 303, 307, 308]);
 const normalizedMethods = new Set(['DELETE', 'GET', 'HEAD', 'OPTIONS', 'POST', 'PUT']);
@@ -47,7 +55,13 @@ function signalGetter() { return this.followed ??= followSignal(this.signalSourc
 function lazySignal(record) { Object.defineProperty(record, 'signal', { get: signalGetter, enumerable: true, configurable: true }); }
 class Request {
   #state;
-  static { readRequest = value => typeof value === 'object' && value !== null && #state in value ? value.#state : undefined; }
+  static {
+    readRequest = value => {
+      if (typeof value !== 'object' || value === null || !(#state in value)) return undefined;
+      const state = value.#state;
+      return Array.isArray(state) ? (value.#state = new ServerRequestRecord(state, '', null)) : state;
+    };
+  }
   constructor(input, init = {}) {
     if (input === internal) { this.#state = init; return; }
     if (!arguments.length) throw new TypeError('Request requires an argument');
@@ -137,8 +151,8 @@ class Request {
 // A Response made with no headers gets its Headers object only when something asks for it: until
 // then `fields` is null and `contentType` holds the one field the body gave it.
 class ResponseRecord {
-  constructor(status, statusText, fields, payload) {
-    this.status = status; this.statusText = statusText; this.fields = fields; this.body = payload;
+  constructor(status, statusText, fields, payload, contentType = null) {
+    this.status = status; this.statusText = statusText; this.fields = fields; this.body = payload; this.contentType = contentType;
   }
   get headers() {
     let headers = this.fields;
@@ -151,12 +165,28 @@ class ResponseRecord {
   set headers(value) { this.fields = value; }
 }
 // What most responses share; a response that differs gets its own field.
-Object.assign(ResponseRecord.prototype, { contentType: null, type: 'default', url: '', redirected: false, immutable: false });
+Object.assign(ResponseRecord.prototype, { type: 'default', url: '', redirected: false, immutable: false });
 
 class Response {
   #state;
-  static { readResponse = value => typeof value === 'object' && value !== null && #state in value ? value.#state : undefined; }
+  static {
+    readResponse = value => {
+      if (typeof value !== 'object' || value === null || !(#state in value)) return undefined;
+      const state = value.#state;
+      if (typeof state === 'string') return (value.#state = textRecord(state, false));
+      return state === takenText ? (value.#state = textRecord('', true)) : state;
+    };
+    // The text of a Response made from text alone, which the caller now sends; else undefined.
+    takeResponseText = value => {
+      if (typeof value !== 'object' || value === null || !(#state in value)) return undefined;
+      const state = value.#state;
+      if (typeof state !== 'string') return undefined;
+      value.#state = takenText;
+      return state;
+    };
+  }
   constructor(value = null, init = undefined) {
+    if (typeof value === 'string' && init === undefined) { this.#state = value; return; }
     if (value === internal) { this.#state = init; return; }
     let status = 200, statusText = '', headers = null;
     if (init !== undefined) {
@@ -173,13 +203,10 @@ class Response {
       if (init.headers !== undefined) headers = new Headers(init.headers);
     }
     const payload = typeof value === 'string' ? textBody(value) : body.extract(value);
-    if (payload && nullBodyStatus.has(status)) throw new TypeError('Invalid response status code for a body: ' + status);
-    const record = new ResponseRecord(status, statusText, headers, payload);
-    if (payload?.type) {
-      if (headers === null) record.contentType = payload.type;
-      else if (!headers.has('content-type')) headers.set('content-type', payload.type);
-    }
-    this.#state = record;
+    if (payload !== null && status !== 200 && nullBodyStatus.has(status)) throw new TypeError('Invalid response status code for a body: ' + status);
+    const type = payload === null ? null : payload.type;
+    if (type && headers !== null && !headers.has('content-type')) headers.set('content-type', type);
+    this.#state = new ResponseRecord(status, statusText, headers, payload, headers === null && type ? type : null);
   }
   clone() {
     const record = responseState(this), headers = new Headers(record.headers);
@@ -246,9 +273,10 @@ Object.assign(ServerRequestRecord.prototype, {
 // A Request for the server: `fields` as above, `authority` the host for a request without one, and
 // `bytes` the body or undefined.
 function serverRequest(fields, authority, bytes) {
+  if (bytes === undefined && fields[2] !== '') return new Request(internal, fields);
   const payload = bytes === undefined ? null : body.bytesBody(Buffer.from(bytes));
   return new Request(internal, new ServerRequestRecord(fields, authority, payload));
 }
 body.readStates(value => readRequest(value) ?? readResponse(value));
 body.installBody(Request.prototype); body.installBody(Response.prototype);
-module.exports = { Request, Response, copyRequestRecord, requestState, responseState, makeResponse, serverRequest, nullBodyStatus, redirectStatus };
+module.exports = { Request, Response, copyRequestRecord, readResponse, takeResponseText, requestState, responseState, makeResponse, serverRequest, nullBodyStatus, redirectStatus };

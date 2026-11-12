@@ -143,6 +143,7 @@ const methods = {
     const s = state(this);
     try { statement(s, 'clear', 'DELETE FROM nodejs_webstorage').run(); }
     catch (cause) { sqliteError(cause); }
+    if (s.inspected) inspected(s, 'domStorageItemsCleared', {});
   },
   getItem() {
     const s = state(this);
@@ -162,12 +163,21 @@ const methods = {
   removeItem() {
     const s = state(this);
     if (arguments.length < 1) missing('removeItem', 1);
-    remove(s, string(arguments[0]));
+    const key = string(arguments[0]);
+    remove(s, key);
+    if (s.inspected) inspected(s, 'domStorageItemRemoved', { key });
   },
   setItem() {
     const s = state(this);
     if (arguments.length < 2) missing('setItem', 2);
-    store(s, string(arguments[0]), arguments[1]);
+    const key = string(arguments[0]);
+    if (!s.inspected) return store(s, key, arguments[1]);
+    // As Node's InspectorLocalStorage: the method calls, not property writes, report.
+    const value = string(arguments[1]);
+    const oldValue = load(s, key);
+    store(s, key, value);
+    if (oldValue === null) inspected(s, 'domStorageItemAdded', { key, newValue: value });
+    else inspected(s, 'domStorageItemUpdated', { key, oldValue, newValue: value });
   },
 };
 Object.defineProperty(Storage.prototype, 'length', {
@@ -188,9 +198,15 @@ function inherited(target, key) {
   const prototype = Object.getPrototypeOf(target);
   return prototype !== null && Reflect.has(prototype, key);
 }
-function create(path) {
+// --experimental-storage-inspection (lib/internal/inspector/webstorage.js): the
+// storage methods report to the inspector's DOMStorage domain.
+function inspected(s, event, params) {
+  const { storageId } = require('internal/inspector_dom_storage');
+  require('inspector').DOMStorage[event]({ ...params, storageId: storageId(s.isLocalStorage) });
+}
+function create(path, isLocalStorage, inspect) {
   const target = Object.create(Storage.prototype);
-  const s = { path, db: undefined, statements: new Map(), symbols: new Map() };
+  const s = { path, db: undefined, statements: new Map(), symbols: new Map(), isLocalStorage, inspected: inspect };
   // A native exotic is necessary: Storage accepts non-configurable descriptors
   // but continues reporting configurable properties, unlike an ECMAScript Proxy.
   const result = host.createStorage(target, {
@@ -225,7 +241,7 @@ function create(path) {
   return result;
 }
 
-function install(global, { localStorageFile } = {}) {
+function install(global, { localStorageFile, inspect = false } = {}) {
   let warned = false;
   function warn() {
     if (warned) return;
@@ -247,7 +263,7 @@ function install(global, { localStorageFile } = {}) {
             if (typeof path !== 'string') throw error('ERR_INVALID_ARG_TYPE', 'The "path" argument must be of type string or an instance of Buffer or URL.', TypeError);
             if (path.includes('\0')) throw error('ERR_INVALID_ARG_VALUE', 'The argument \'path\' must be a string, Uint8Array, or URL without null bytes.', TypeError);
           }
-          value = create(path);
+          value = create(path, name === 'localStorage', inspect);
           initialized = true;
         }
         return value;

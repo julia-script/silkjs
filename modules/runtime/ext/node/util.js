@@ -45,6 +45,7 @@ const {
 } = require('internal/per_context/primordials');
 
 const host = require('internal/host');
+const { debuglog } = require('internal/util/debuglog');
 const types = require('util/types');
 const {
   ErrnoException,
@@ -450,29 +451,6 @@ function deprecate(fn, msg, code, { modifyPrototype } = {}) {
 }
 
 
-function debuglog(section, callback) {
-  section = String(section).toUpperCase();
-  let enabled;
-  // NODE_DEBUG is read on first use, not when a module asks for its logger.
-  const initialize = () => { enabled = String(host.env.NODE_DEBUG || '').split(/[\s,]+/).filter(Boolean).some(pattern => new RegExp('^' + pattern.replace(/[|\\{}()[\]^$+?.]/g, '\\$&').replace(/\*/g, '.*') + '$', 'i').test(section)); };
-  const write = (...args) => { if (enabled) host.stderr.write(section + ' ' + (globalThis.process ? process.pid : 0) + ': ' + format(...args) + '\n'); };
-  Object.defineProperty(write, 'enabled', { enumerable: true, configurable: true, get: () => enabled });
-  const quiet = function debug() {};
-  Object.defineProperty(quiet, 'enabled', { enumerable: true, configurable: true, get: () => enabled });
-  let initialized = false;
-  // Disabled loggers run on every stream chunk: no rest array before the check.
-  const logger = function() {
-    if (enabled === false) return;
-    if (!initialized) {
-      initialize(); initialized = true;
-      // Like Node, a disabled section hands the caller a no-op to call from then on.
-      if (typeof callback === 'function') callback(enabled ? write : quiet);
-    }
-    return write(...arguments);
-  };
-  Object.defineProperty(logger, 'enabled', { enumerable: true, configurable: true, get() { if (enabled === undefined) initialize(); return enabled; } });
-  return logger;
-}
 let traceSigintStarted = false;
 let traceSigintEffective = false;
 function traceSigintNative(enable) {
@@ -596,8 +574,8 @@ for (const [name, load] of [
   ['convertProcessSignalToExitCode', () => require('internal/util_public/system').convertProcessSignalToExitCode],
   ['debounce', () => require('internal/util_public/debounce')],
   ['throttle', () => require('internal/util_public/throttle')],
-  ['TextEncoder', () => require('internal/web/encoding').TextEncoder],
-  ['TextDecoder', () => require('internal/web/encoding').TextDecoder],
+  ['TextEncoder', () => require('internal/encoding').TextEncoder],
+  ['TextDecoder', () => require('internal/encoding').TextDecoder],
 ]) {
   const settle = value => Object.defineProperty(module.exports, name, { value, writable: true, enumerable: true, configurable: true });
   Object.defineProperty(module.exports, name, {

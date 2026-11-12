@@ -3,6 +3,7 @@
 // FileHandle with its reference count, close promise and lock, and readFile/writeFile on
 // a handle. The work goes to the native submitIO operations as Promise requests.
 const fs = require('fs');
+const { ArrayPrototypeConcat, ReflectApply } = require('internal/per_context/primordials');
 const c = require('internal/fs/utils');
 const p = require('path');
 const { EventEmitter } = require('events');
@@ -156,7 +157,8 @@ async function fsCall(fn, handle, ...args) {
     err.code = 'EBADF'; err.syscall = fn.name;
     throw err;
   }
-  try { handle[kRef](); return await fn(handle, ...args); }
+  // Not spread: user code may have replaced the array iterator.
+  try { handle[kRef](); return await ReflectApply(fn, undefined, ArrayPrototypeConcat([handle], args)); }
   finally { handle[kUnref](); }
 }
 async function handleFdClose(fileOpPromise, closeFunc) {

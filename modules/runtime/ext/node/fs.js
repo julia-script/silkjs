@@ -288,7 +288,12 @@ function removeSync(path, options) {
       try { info = fs.lstatSync(path); } catch (e) { if (options.force && e.code === 'ENOENT') return; throw e; }
       if (info.isDirectory()) {
         if (!options.recursive) throw isDirectoryError(path);
-        for (const name of c.native('scandir', [path])) if (name !== '.' && name !== '..') removeSync(p.join(path, name), { ...options, maxRetries: 0 });
+        // Index loops over scandir: user code may have replaced the array iterator.
+        const names = c.native('scandir', [path]);
+        for (let index = 0; index < names.length; index++) {
+          const name = names[index];
+          if (name !== '.' && name !== '..') removeSync(p.join(path, name), { ...options, maxRetries: 0 });
+        }
         c.native('rmdir', [path]);
       } else c.native('unlink', [path]);
       return;
@@ -378,7 +383,9 @@ function readdirEntries(dir, o, recursive) {
   const queue = [dir];
   for (let i = 0; i < queue.length; i++) {
     const current = queue[i];
-    for (const name of c.native('scandir', [current])) {
+    const names = c.native('scandir', [current]);
+    for (let index = 0; index < names.length; index++) {
+      const name = names[index];
       if (name === '.' || name === '..') continue;
       const full = p.join(current, name);
       const info = o.withFileTypes || recursive ? fs.lstatSync(full) : null;

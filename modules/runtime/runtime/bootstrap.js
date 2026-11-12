@@ -6,6 +6,10 @@ const rawOS = { ...osNamespace };
 
 const native = globalThis.__silkNative;
 delete globalThis.__silkNative;
+// Every exit path ends here. Node's exit handler stops and joins every worker
+// before exit(): libc exit handlers (OpenSSL's cleanup among them) must not tear
+// down shared native state while a worker thread still runs.
+rawStd.exit = code => { native.workerNative('stopThreads', []); stdNamespace.exit(code); };
 const factories = new Map();
 const modules = new Map();
 const realmSources = new Map();
@@ -89,7 +93,8 @@ const dotSegment = /\/\.\.?(?:\/|$)/;
 const fileHref = path => host.platform !== 'win32' && plainPath.test(path) && !dotSegment.test(path)
   ? 'file://' + path : internalRequire('url').pathToFileURL(path).href;
 const inspectorNativeOperations = Array.from({ length: 32 }, (_, index) => native['inspectorNative' + index]);
-host.inspectorNative = (operation, ...args) => inspectorNativeOperations[operation](...args);
+const reflectApply = Reflect.apply;
+host.inspectorNative = (operation, ...args) => reflectApply(inspectorNativeOperations[operation], undefined, args);
 host.inspectorEntry = wrapper => host.inspectorNative(15, wrapper);
 host.typeScriptMode = 'strip';
 host.testCoverageStart = () => native.testCoverageNative(0);
@@ -302,24 +307,27 @@ host.queueMicrotask = callback => {
   catch (error) { scope.emitDestroy(); throw error; }
 };
 globalThis.queueMicrotask = host.queueMicrotask;
-let nextTimer = 1;
-const timers = new Map();
-const immediates = new Map();
-const executingTimers = [];
 function checkCallback(callback) {
   if (typeof callback !== 'function') throw new (internalRequire('internal/errors').codes.ERR_INVALID_ARG_TYPE)('callback', 'function', callback);
 }
 function invoke(callback, receiver, args) {
   try { return Reflect.apply(callback, receiver, args); }
-  catch (error) {
-    try {
-      if (process.domain && internalRequire('domain')._handleException(error)) return;
-      internalRequire('internal/startup_controls').handleUncaught(error, 'uncaughtException');
-    } catch (next) {
-      if (next === error || !workerThreads.isMainThread) throw next;
-      exceptionInFatalHandler(next);
-    }
+  catch (error) { reportUncaught(error); }
+}
+function reportUncaught(error) {
+  try {
+    if (process.domain && internalRequire('domain')._handleException(error)) return;
+    internalRequire('internal/startup_controls').handleUncaught(error, 'uncaughtException');
+  } catch (next) {
+    if (next === error || !workerThreads.isMainThread) throw next;
+    exceptionInFatalHandler(next);
   }
+}
+host.triggerUncaughtException = reportUncaught;
+// Runs a timer or immediate callback; true when it threw (and was reported).
+function invokeReporting(callback, receiver, args) {
+  try { Reflect.apply(callback, receiver, args); return false; }
+  catch (error) { reportUncaught(error); return true; }
 }
 // A domain error handler or uncaughtException listener that throws ends the process
 // with Node's kExceptionInFatalExceptionHandler status, without 'exit' listeners.
@@ -367,9 +375,11 @@ function checkpoint() {
       completion();
     }
     while (rejections.size) {
-      const pending = [...rejections];
-      for (const [promise, info] of pending) {
+      const pending = Array.from(rejections.keys());
+      for (let index = 0; index < pending.length; index++) {
+        const promise = pending[index];
         if (!rejections.has(promise)) continue;
+        const info = rejections.get(promise);
         const { context } = info;
         rejections.delete(promise);
         reportedRejections.set(promise, info);
@@ -387,109 +397,18 @@ function checkpoint() {
   } while (ticksPending() || rejections.size || completionsPending());
 }
 host.checkpoint = checkpoint;
-// Timeout and Immediate keep Node's public fields (_idleTimeout, _onTimeout,
-// _timerArgs, _repeat, _destroyed; _onImmediate, _argv), which code reads and
-// writes: a callback that sets _repeat turns a timeout into an interval, and
-// _onTimeout = null or _idleTimeout = -1 stops one. The schedule itself is in
-// symbol-keyed fields and the timers / immediates maps.
-const kTimerId = Symbol('timerId'), kDue = Symbol('due'), kRefed = Symbol('refed'), kTimerResource = Symbol('resource');
-const TIMEOUT_MAX = 2147483647;
-let warnedNegativeNumber = false, warnedNotNumber = false;
-function timeoutDuration(after) {
-  if (after === undefined) return 1;
-  after *= 1;
-  if (!(after >= 1 && after <= TIMEOUT_MAX)) {
-    if (after > TIMEOUT_MAX) {
-      process.emitWarning(`${after} does not fit into a 32-bit signed integer.\nTimeout duration was set to 1.`, 'TimeoutOverflowWarning');
-    } else if (after < 0 && !warnedNegativeNumber) {
-      warnedNegativeNumber = true;
-      process.emitWarning(`${after} is a negative number.\nTimeout duration was set to 1.`, 'TimeoutNegativeWarning');
-    } else if (Number.isNaN(after) && !warnedNotNumber) {
-      warnedNotNumber = true;
-      process.emitWarning(`${after} is not a number.\nTimeout duration was set to 1.`, 'TimeoutNaNWarning');
-    }
-    after = 1;
-  }
-  return after;
+// Node's lib/timers.js and lib/internal/timers.js run the timers; the loop
+// drives them through internal/timers_binding as Node's Environment does.
+// Named, as Node's timer frames are: the REPL trims an error's frames below the
+// last one without a function name.
+host.invokeTimer = function invokeTimer(scope, callback, receiver, args) { return invokeScoped(scope, invokeReporting, callback, receiver, args); };
+const timerAPI = internalRequire('timers');
+{
+  const { processImmediate, processTimers } = internalRequire('internal/timers').getTimerCallbacks(checkpoint);
+  internalRequire('internal/timers_binding').setupTimers(processImmediate, processTimers);
 }
-function schedule(timer, start) {
-  timer._idleStart = start;
-  timer[kDue] = start + Math.trunc(timer._idleTimeout);
-  timers.set(timer[kTimerId], timer);
-}
-class Timeout {
-  constructor(callback, after, args, isRepeat) {
-    after = timeoutDuration(after);
-    this._idleTimeout = after; this._idlePrev = null; this._idleNext = null; this._idleStart = null;
-    this._onTimeout = callback; this._timerArgs = args; this._repeat = isRepeat ? after : null; this._destroyed = false;
-    this[kRefed] = true; this[kTimerId] = nextTimer++;
-    this[kTimerResource] = resource('Timeout', this);
-    schedule(this, native.now());
-  }
-  ref() { this[kRefed] = true; return this; }
-  unref() { this[kRefed] = false; return this; }
-  hasRef() { return this[kRefed]; }
-  refresh() {
-    if (this._destroyed) { this[kTimerResource] = resource('Timeout', this); this._destroyed = false; }
-    schedule(this, native.now());
-    return this;
-  }
-  close() { clearTimeout(this); return this; }
-  [Symbol.toPrimitive]() { return this[kTimerId]; }
-  [Symbol.dispose]() { clearTimeout(this); }
-}
-class Immediate {
-  constructor(callback, args) {
-    this._idleNext = null; this._idlePrev = null; this._onImmediate = callback; this._argv = args; this._destroyed = false;
-    this[kRefed] = true; this[kTimerId] = nextTimer++;
-    this[kTimerResource] = resource('Immediate', this);
-    immediates.set(this[kTimerId], this);
-  }
-  ref() { this[kRefed] = true; return this; }
-  unref() { this[kRefed] = false; return this; }
-  hasRef() { return !!this[kRefed]; }
-  [Symbol.dispose]() { clearImmediate(this); }
-}
-function unenroll(timer) {
-  timers.delete(timer[kTimerId]);
-  if (!timer._destroyed) { timer._destroyed = true; timer[kTimerResource].emitDestroy(); }
-  timer._idleTimeout = -1;
-}
-function clearTimeout(timer) {
-  if (timer?._onTimeout) { timer._onTimeout = null; unenroll(timer); return; }
-  if (typeof timer === 'number' || typeof timer === 'string') {
-    const instance = timers.get(Number(timer));
-    if (instance !== undefined) { instance._onTimeout = null; unenroll(instance); }
-  }
-}
-function clearImmediate(immediate) {
-  if (!(immediate instanceof Immediate) || immediate._destroyed) return;
-  immediate._destroyed = true; immediate._onImmediate = null;
-  immediates.delete(immediate[kTimerId]);
-  immediate[kTimerResource].emitDestroy();
-}
-function validateCallback(callback) {
-  if (typeof callback !== 'function') throw new (internalRequire('internal/errors').codes.ERR_INVALID_ARG_TYPE)('callback', 'function', callback);
-}
-const timerAPI = {
-  setTimeout(callback, after, ...args) { validateCallback(callback); return new Timeout(callback, after, args.length ? args : undefined, false); },
-  clearTimeout,
-  setImmediate(callback, ...args) { validateCallback(callback); return new Immediate(callback, args.length ? args : undefined); },
-  clearImmediate,
-  setInterval(callback, repeat, ...args) { validateCallback(callback); return new Timeout(callback, repeat, args.length ? args : undefined, true); },
-  // Intervals are Timeouts: either clear function clears either.
-  clearInterval(timer) { clearTimeout(timer); },
-};
-Object.defineProperty(timerAPI, 'promises', {
-  get() { return internalRequire('timers/promises'); }, enumerable: true, configurable: true,
-});
+const timerLoop = host.timerLoop;
 for (const name of ['setTimeout', 'clearTimeout', 'setImmediate', 'clearImmediate', 'setInterval', 'clearInterval']) globalThis[name] = timerAPI[name];
-define('timers', module => { module.exports = timerAPI; });
-for (const name of ['setTimeout', 'setImmediate']) {
-  Object.defineProperty(timerAPI[name], Symbol.for('nodejs.util.promisify.custom'), {
-    enumerable: true, get() { return internalRequire('timers/promises')[name]; }
-  });
-}
 const Buffer = internalRequire('buffer').Buffer;
 host.Buffer = Buffer;
 // process and Buffer are accessors on Node's global object (the hook for an
@@ -720,15 +639,9 @@ host.activeResources = () => {
   const names = [];
   for (const row of native.resourceSnapshot())
     if ((row[7] ?? row[2]) && row[6] !== null) names.push(row[6]);
-  const seen = new Set();
-  for (const collection of [timers.values(), immediates.values(), executingTimers]) {
-    for (const timer of collection) {
-      if (!timer._destroyed && timer[kRefed] && !seen.has(timer)) {
-        seen.add(timer);
-        names.push(timer instanceof Immediate ? 'Immediate' : 'Timeout');
-      }
-    }
-  }
+  // As node_process_methods.cc does: the referenced Timeouts, then the referenced Immediates.
+  for (let count = timerLoop.timeoutInfo[0]; count > 0; count--) names.push('Timeout');
+  for (let count = timerLoop.immediateInfo[1]; count > 0; count--) names.push('Immediate');
   names.push(...native.workerNative('activeResources', []));
   return names;
 };
@@ -755,7 +668,7 @@ for (const name of ['Event', 'CustomEvent', 'EventTarget', 'AbortController', 'A
 const asyncFS = internalRequire('internal/fs_async')(native);
 host.submitIO = (operation, args, callback, requestKind) => {
   const scope = resource(requestKind === 1 ? 'FSREQPROMISE' : requestKind === 2 ? 'FILEHANDLECLOSEREQ' : 'FSREQCALLBACK');
-  try { return asyncFS.submitIO(operation, args, (...values) => invokeResource(scope, callback, undefined, values), requestKind); }
+  try { return asyncFS.submitIO(operation, args, function oncomplete(...values) { return invokeResource(scope, callback, undefined, values); }, requestKind); }
   catch (error) { scope.emitDestroy(); throw error; }
 };
 host.watch = (filename, options, callback) => {
@@ -821,7 +734,8 @@ for (const name of ['Crypto', 'SubtleCrypto', 'CryptoKey']) {
     webGlobals.defineLazy(globalThis, name, loadPerformance, name === 'performance');
 }
 host.path = internalRequire('path');
-const publicBuiltinNames = [...factories.keys()].filter(name => !name.startsWith('internal/'));
+// Sorted, as Node lists builtinModules.
+const publicBuiltinNames = [...factories.keys()].filter(name => !name.startsWith('internal/')).sort();
 const publicBuiltinHas = Set.prototype.has.bind(new Set(publicBuiltinNames));
 const prefixOnlyBuiltinHas = Set.prototype.has.bind(new Set(['test', 'test/reporters', 'sqlite', 'sea']));
 const defineBuiltinName = Object.defineProperty;
@@ -851,13 +765,16 @@ const publicBuiltins = {
     }
     return !prefixOnlyBuiltinHas(name) && publicBuiltin(name);
   },
+  // The modules with a bare name first, then the node:-only ones, as Node lists them.
   names() {
     const names = [];
-    for (let index = 0; index < publicBuiltinNames.length; index++) {
-      const name = publicBuiltinNames[index];
-      if (publicBuiltin(name)) defineBuiltinName(names, names.length, {
-        value: prefixOnlyBuiltinHas(name) ? 'node:' + name : name, enumerable: true, writable: true, configurable: true,
-      });
+    for (let pass = 0; pass < 2; pass++) {
+      for (let index = 0; index < publicBuiltinNames.length; index++) {
+        const name = publicBuiltinNames[index];
+        if (publicBuiltin(name) && prefixOnlyBuiltinHas(name) === (pass === 1)) defineBuiltinName(names, names.length, {
+          value: pass === 1 ? 'node:' + name : name, enumerable: true, writable: true, configurable: true,
+        });
+      }
     }
     return names;
   }
@@ -894,7 +811,12 @@ process.getBuiltinModule = function getBuiltinModule(id) {
   return builtinRequire(id);
 };
 process.loadEnvFile = function loadEnvFile(path = undefined) { return internalRequire('internal/dotenv').loadEnvFile(path); };
-if (workerThreads.isMainThread && process.env.NODE_UNIQUE_ID !== undefined) internalRequire('cluster');
+// Like Node's initializeClusterWorker: a cluster worker joins its primary, then the variable is gone.
+function setupClusterWorker() {
+  internalRequire('cluster')._setupWorker();
+  delete process.env.NODE_UNIQUE_ID;
+}
+if (workerThreads.isMainThread && process.env.NODE_UNIQUE_ID !== undefined) setupClusterWorker();
 Object.defineProperty(globalThis, '__silkModuleBridge', { value: loader.bridge });
 let mainModuleName;
 let inspectorStartupArmed = false;
@@ -946,6 +868,9 @@ function runtimeFlag(arg) {
   }
   if (arg === '--trace-sigint' || arg === '--no-trace-sigint') {
     host.traceSigint = arg === '--trace-sigint'; return true;
+  }
+  if (arg === '--experimental-repl-await' || arg === '--no-experimental-repl-await') {
+    host.replAwait = arg === '--experimental-repl-await'; return true;
   }
   if ((arg.startsWith('--report-') || arg.startsWith('--no-report-') || arg === '--experimental-report') &&
       internalRequire('internal/process_report').applyOption(arg)) return true;
@@ -1027,6 +952,7 @@ function runtimeFlag(arg) {
   if (arg === '--experimental-import-meta-resolve') { host.importMetaResolveParent = true; return true; }
   if (arg === '--experimental-print-required-tla') { host.printRequiredTLA = true; return true; }
   if (arg === '--experimental-import-text') { host.importText = true; return true; }
+  if (arg.startsWith('--experimental-package-map=')) { host.packageMap = arg.slice(27); return true; }
   if (arg.startsWith('--experimental-loader=') || arg.startsWith('--loader=')) {
     loaderPreloads.push(arg.slice(arg.indexOf('=') + 1)); return true;
   }
@@ -1035,6 +961,12 @@ function runtimeFlag(arg) {
   }
   if (arg === '--experimental-test-module-mocks' || arg === '--no-experimental-test-module-mocks') {
     host.experimentalTestModuleMocks = arg === '--experimental-test-module-mocks'; return true;
+  }
+  if (arg === '--experimental-storage-inspection' || arg === '--no-experimental-storage-inspection') {
+    host.experimentalStorageInspection = arg === '--experimental-storage-inspection'; return true;
+  }
+  if (arg === '--experimental-network-inspection' || arg === '--no-experimental-network-inspection') {
+    host.experimentalNetworkInspection = arg === '--experimental-network-inspection'; return true;
   }
   if (arg === '--experimental-inspector-network-resource' || arg === '--no-experimental-inspector-network-resource') {
     host.experimentalInspectorNetworkResource = arg === '--experimental-inspector-network-resource'; return true;
@@ -1077,8 +1009,13 @@ function installRuntimeOptions(args, entrypoints = [], preloadEntrypoints = true
     delete globalThis.WebSocket;
     delete globalThis.CloseEvent;
   }
-  if (host.experimentalWebStorage) internalRequire('internal/web/storage').install(globalThis, { localStorageFile: host.localStorageFile });
+  if (host.experimentalWebStorage) internalRequire('internal/web/storage').install(globalThis, { localStorageFile: host.localStorageFile, inspect: !!host.experimentalStorageInspection });
   if (host.experimentalStreamIter) { internalRequire('fs/promises'); internalRequire('internal/fs/iter').install(); }
+  // http is in the heap image, whose global agent was made without this process's options.
+  if (internalRequire('internal/options').getOptionValue('--use-env-proxy')) {
+    const agent = internalRequire('_http_agent');
+    agent.globalAgent = internalRequire('internal/http').getGlobalAgent(process.env, agent.Agent);
+  }
   if (workerThreads.isMainThread) internalRequire('internal/trace_events').initialize(host.traceOptions);
   if (workerThreads.isMainThread && host.traceSigint) internalRequire('util').setTraceSigInt(true);
   if (process.env.NODE_COMPILE_CACHE) internalRequire('internal/compile_cache').initialize();
@@ -1335,9 +1272,17 @@ function run() {
     const separator = native.argv.indexOf('--', 1);
     return internalRequire('internal/main/run').runPackageScript(runName, separator < 0 ? [] : native.argv.slice(separator + 1));
   }
-  // Only a TLS flag loads internal/tls/options, so a plain start skips the check.
-  const tlsErrors = moduleHas('internal/tls/options') ? internalRequire('internal/tls/options').validate() : [];
+  // http loads internal/tls/options into the heap image, so being loaded says nothing:
+  // given() is whether this process had a TLS or OpenSSL option.
+  const tlsOptions = moduleHas('internal/tls/options') && internalRequire('internal/tls/options').given();
+  const tlsErrors = tlsOptions ? internalRequire('internal/tls/options').validate() : [];
   if (tlsErrors.length) return cliError(tlsErrors);
+  // Only an OpenSSL option or OPENSSL_CONF initializes OpenSSL at startup.
+  const opensslError = tlsOptions || process.env.OPENSSL_CONF ? internalRequire('internal/tls/options').processOpenSSLOptions() : undefined;
+  if (opensslError !== undefined) {
+    host.writeStartupDiagnostic(process.execPath + ': ' + opensslError + '\n');
+    return process.exit(1);
+  }
   if (watchMode && expression !== undefined) return cliError('either --watch or --eval can be used, not both');
   if (watchMode && check) return cliError('either --watch or --check can be used, not both');
   if (watchMode && interactive) return cliError('either --watch or --interactive can be used, not both');
@@ -1392,7 +1337,9 @@ function run() {
   if (testMode) {
     return internalRequire('internal/main/test_runner').runTestRunner(testOptions, args.slice(index), reporterNames, destinations);
   }
-  if (expression === undefined && filename === undefined && (interactive || process.stdin.isTTY)) {
+  // As node.cc, ask whether descriptor 0 is a terminal without making process.stdin:
+  // that stream would make the descriptor nonblocking before a piped script is read.
+  if (expression === undefined && filename === undefined && (interactive || internalRequire('tty').isatty(0))) {
     if (inputTypeSet) {
       console.error('Cannot specify --input-type for REPL');
       process.exitCode = 9;
@@ -1403,7 +1350,7 @@ function run() {
   if (expression !== undefined) {
     const name = host.path.join(host.cwd(), '[eval]');
     expression = prepareInput(expression, name, inputType, inputTypeSet);
-    internalRequire('internal/loader/builtin_globals')(globalThis, '<eval>');
+    internalRequire('internal/modules/helpers').addBuiltinLibsToObject(globalThis, '<eval>');
     const code = !inputType.startsWith('module') && /\bcrypto\b/.test(expression) ?
       (print ? 'let crypto=require("node:crypto");{' + expression + '}' : '(crypto=>{{' + expression + '}})(require("node:crypto"))') : expression;
     if (inputType.startsWith('module') || (!inputTypeSet && native.detectModuleSyntax(code))) {
@@ -1413,9 +1360,7 @@ function run() {
     installCommonJSInputGlobals(name, '[eval]');
     armInspectorEntry();
     // As in Node, the script is named [eval] while module.filename is under the cwd.
-    const result = native.compileFunction(code, '[eval]', undefined, undefined, undefined, true);
-    if (print) console.log(result);
-    return afterMain(result);
+    return afterMain(internalRequire('internal/process/execution').evalScript('[eval]', code, print));
   }
   if (filename === undefined || filename === '-') {
     let source = rawStd.in.readAsString();
@@ -1428,9 +1373,7 @@ function run() {
     }
     installCommonJSInputGlobals(name, '[stdin]');
     armInspectorEntry();
-    const result = native.compileFunction(source, '[stdin]', undefined, undefined, undefined, true);
-    if (print) console.log(result);
-    return afterMain(result);
+    return afterMain(internalRequire('internal/process/execution').evalScript('[stdin]', source, print));
   }
   const path = host.path.resolve(filename);
   process.argv[1] = path;
@@ -1449,43 +1392,7 @@ function run() {
   });
 }
 function referencedWork() {
-  if (native.hasPendingIO()) return true;
-  // Most I/O-bound turns have no timers: skip creating the iterators.
-  if (timers.size !== 0) for (const timer of timers.values()) if (timer[kRefed] && !timer._destroyed) return true;
-  if (immediates.size !== 0) for (const timer of immediates.values()) if (timer[kRefed] && !timer._destroyed) return true;
-  return false;
-}
-function fireTimeout(timer, start) {
-  const id = timer[kTimerId];
-  timers.delete(id);
-  if (!timer._onTimeout) { unenroll(timer); return; }
-  executingTimers.push(timer);
-  try { invokeResource(timer[kTimerResource], timer._onTimeout, timer, timer._timerArgs || [], false); }
-  finally {
-    executingTimers.pop();
-    if (timer._repeat && timer._idleTimeout !== -1 && !timer._destroyed) {
-      timer._idleTimeout = timer._repeat;
-      schedule(timer, start);
-    } else if (!timers.has(id) && !timer._destroyed) {
-      // Not refreshed by its callback: done.
-      timer._destroyed = true;
-      timer[kTimerResource].emitDestroy();
-    }
-  }
-  checkpoint();
-}
-function fireImmediate(immediate) {
-  immediates.delete(immediate[kTimerId]);
-  immediate._destroyed = true;
-  const callback = immediate._onImmediate;
-  executingTimers.push(immediate);
-  try { invokeResource(immediate[kTimerResource], callback, immediate, immediate._argv || [], false); }
-  finally {
-    executingTimers.pop();
-    immediate._onImmediate = null;
-    immediate[kTimerResource].emitDestroy();
-  }
-  checkpoint();
+  return native.hasPendingIO() || timerLoop.hasRef();
 }
 function pollWorkers() {
   // Replenished queues must yield to timers and native I/O. Rearm the wake
@@ -1499,37 +1406,26 @@ function pollWorkers() {
 // Milliseconds the native poll may wait: 0 when JavaScript work is ready, the
 // delay to the next timer, or -1 to wait for native completions alone.
 function pollTimeout(pendingPromise) {
-  if (ticksPending() || immediates.size) return 0;
+  if (ticksPending()) return 0;
   if (pendingPromise !== undefined && native.promiseState(pendingPromise) !== 0) return 0;
   const referenced = referencedWork();
   if (!referenced && pendingPromise === undefined) return 0;
-  let due = Infinity;
-  if (timers.size !== 0) for (const timer of timers.values()) if (!timer._destroyed && timer[kDue] < due) due = timer[kDue];
+  const delay = timerLoop.pollDelay();
   // A hook may await an unreferenced timer or an externally settled promise.
   // Keep nested waits interruptible without emitting main-loop lifecycle events.
-  if (!referenced && due === Infinity) return 1;
-  if (due === Infinity) return native.hasPendingIO() ? -1 : 0;
+  if (!referenced && delay === -1) return 1;
+  if (delay === -1) return native.hasPendingIO() ? -1 : 0;
   // To the fraction of a millisecond: rounding up would wait up to one more.
-  return Math.max(0, due - native.now());
+  return delay;
 }
+// One turn in libuv's order: timers, poll for I/O, then the check phase (immediates).
 function loopTurn(pendingPromise) {
-  const now = native.now();
-  // Only the due timers are ordered; most turns have none.
-  let due;
-  if (timers.size !== 0) for (const timer of timers.values()) if (!timer._destroyed && timer[kDue] <= now) (due ||= []).push(timer);
-  if (due !== undefined) {
-    if (due.length > 1) due.sort((a, b) => a[kDue] - b[kDue] || a[kTimerId] - b[kTimerId]);
-    for (const timer of due) if (!timer._destroyed && timer[kDue] <= now && timers.has(timer[kTimerId])) fireTimeout(timer, now);
-  }
+  if (timerLoop.runTimers()) checkpoint();
   native.pollIO(pollTimeout(pendingPromise));
   pollWorkers();
   checkpoint();
   if (loopListeners.size !== 0) for (const listener of loopListeners) listener();
-  if (immediates.size !== 0) {
-    for (const immediate of [...immediates.values()]) {
-      if (!immediate._destroyed) fireImmediate(immediate);
-    }
-  }
+  if (timerLoop.checkImmediate()) checkpoint();
 }
 // An exception in a 'beforeExit' or 'exit' listener is uncaught like any other.
 function emitProcessEvent(name) { process.emit(name, Number(process.exitCode) || 0); }
@@ -1556,12 +1452,14 @@ function loop() {
   return Number(process.exitCode) || 0;
 }
 const imageModules = ['fs', 'fs/promises', 'internal/fs/streams', 'internal/streams/fast-utf8-stream', 'path', 'os',
-  'events', 'stream', 'stream/promises', 'string_decoder', 'util', 'assert', 'console', 'net', 'tty',
-  'internal/tty/write', 'url', 'internal/web/url', 'internal/web/encoding', 'internal/abort_controller'];
+  'events', 'stream', 'stream/promises', 'string_decoder', 'util', 'assert', 'console', 'net', 'tty', 'http',
+  'internal/tty/write', 'url', 'internal/web/url', 'internal/encoding', 'internal/abort_controller',
+  'internal/process/execution'];
 globalThis.__silkRuntime = {
   normalize(name, parent, attributes) { return loader.importKey(name, parent, attributes); },
   load(name, attributes) { return loader.loadESM(name, attributes).source; },
   moduleSource(name, parent, attributes) { return loader.moduleSource(name, parent, attributes); },
+  moduleError(name, error) { loader.moduleEvaluationError(name, error); },
   registerSource(filename, source, metadata) {
     host.registerSource(filename, source, { ...metadata, owner: metadata });
     if (!metadata.generated && typeof filename === 'string') {
@@ -1651,7 +1549,7 @@ globalThis.__silkRuntime = {
     loader.Module._initPaths();
     internalRequire('internal/child_process/ipc').installChild(process);
     internalRequire('internal/watch_mode/dependencies').initialize();
-    if (process.env.NODE_UNIQUE_ID !== undefined) internalRequire('cluster');
+    if (process.env.NODE_UNIQUE_ID !== undefined) setupClusterWorker();
     for (const refresh of hydrations) refresh();
     performanceMilestones.bootstrapComplete = native.now() - startTime;
   }

@@ -18,6 +18,8 @@ function op(...args) {
 // (onhandshakedone) and _onTLSError (onerror).
 class TLSTransport {
   constructor(socket, carrier, context, options, owned) {
+    // As TLSWrap's constructor, a handle made without a socket wraps no session.
+    if (socket === undefined) { this.id = 0; this.closed = true; this.closing = true; return; }
     this.socket = socket; this.carrier = carrier; this.options = options;
     this.kind = carrier._transport?.kind || 1; this.closed = false; this.closing = false;
     this.reading = true; this.ready = false; this.selecting = false; this.pumping = false;
@@ -26,6 +28,11 @@ class TLSTransport {
     // A server answers the peer's ClientHello; a client waits for TLSSocket#_start.
     this.initiated = !!options.isServer;
     this.handshakeStarts = 0; this.handshakeCompletions = 0;
+    this.keylog = false; this.sessionCallbacks = false; this.helloWaiting = false;
+    this.awaitingSession = false; this.flushWaiters = []; this.currentSession = null;
+    // TLSWrap::DoShutdown inside an OpenSSL callback waits for the handshake
+    // and any 'newSession' answer (FlushPendingShutdown).
+    this.holdShutdown = false;
     this.id = native('create', context.context._id, !!options.isServer);
     try {
       if (options.ALPNProtocols?.length) native(options.isServer ? 'serverALPN' : 'setALPN', this.id, options.ALPNProtocols);
@@ -38,7 +45,9 @@ class TLSTransport {
     });
     // A peer that closes without close_notify still ends the stream, as in Node.
     carrier.on('end', () => { if (!this.closing) this.end(); });
-    if (owned) carrier.on('error', err => { if (!this.closing) this.socket.destroy(err); });
+    // An owned carrier is TLSWrap's stream: its write errors once the TLS socket is destroyed
+    // or shutting down (EPIPE on the close_notify) reach nothing, as in afterShutdown.
+    if (owned) carrier.on('error', err => { if (!this.closing && !this.socket.destroyed && !this.shutdownInFlight) this.socket.destroy(err); });
     carrier.once('close', () => this.finish());
     const start = () => {
       if (this.closing || this.started) return;
@@ -64,6 +73,8 @@ class TLSTransport {
     this.socket._onTLSError(err);
   }
   flush(callback) {
+    // TLSWrap::EncOut: nothing leaves while a server waits for 'newSession'.
+    if (this.awaitingSession) { if (callback) this.flushWaiters.push(callback); return; }
     const data = Buffer.from(op('drain', this.id));
     if (data.length) { this.socket._refreshTimeout(); this.carrier.write(data, callback); }
     else if (callback) process.nextTick(callback);
@@ -109,7 +120,60 @@ class TLSTransport {
     if (selected === undefined) op('rejectALPN', this.id);
     else op('serverALPN', this.id, Buffer.concat([Buffer.from([selected.length]), Buffer.from(selected, 'latin1')]));
   }
+  enableKeylog() { this.keylog = true; op('enableKeylog', this.id); }
+  enableSessionCallbacks() { this.sessionCallbacks = true; op('enableSessionCallbacks', this.id); }
+  // Node's EmitClientHello, from a fresh stack as TLSWrap schedules it.
+  awaitClientHello() {
+    if (this.helloWaiting) return;
+    this.helloWaiting = true; this.carrier.pause();
+    const hello = { sessionId: Buffer.from(op('helloSessionId', this.id)), tlsTicket: !!op('helloTicket', this.id) };
+    setImmediate(() => { if (!this.closing && this.id) this.socket._onClientHello(hello); });
+  }
+  clientHelloDone() {
+    if (!this.helloWaiting || this.closing || !this.id) return;
+    op('clientHelloDone', this.id);
+    this.helloWaiting = false; this.carrier.resume(); this.pump();
+  }
+  newSessionDone() {
+    if (!this.id) return;
+    op('newSessionDone', this.id);
+    this.awaitingSession = false;
+    const waiters = this.flushWaiters.splice(0);
+    this.flush(waiters.length ? err => { for (const waiter of waiters) waiter(err); } : undefined);
+    this.pump();
+  }
+  // Keylog lines and new sessions OpenSSL reported during the last operation.
+  libraryEvents() {
+    if (this.keylog) {
+      const lines = Buffer.from(op('keylogLines', this.id));
+      let start = 0;
+      while (start < lines.length) {
+        const end = lines.indexOf(10, start) + 1;
+        this.socket.emit('keylog', Buffer.from(lines.subarray(start, end)));
+        start = end;
+        if (this.closing || !this.id) return false;
+      }
+    }
+    if (this.sessionCallbacks) {
+      const queue = Buffer.from(op('newSessions', this.id));
+      let offset = 0;
+      while (offset < queue.length) {
+        const idLength = queue.readUInt32LE(offset);
+        const sessionId = Buffer.from(queue.subarray(offset + 4, offset + 4 + idLength));
+        const length = queue.readUInt32LE(offset + 4 + idLength);
+        const start = offset + 8 + idLength;
+        const session = Buffer.from(queue.subarray(start, start + length));
+        offset = start + length;
+        if (this.options.isServer) this.awaitingSession = true;
+        this.currentSession = this.options.isServer ? null : session;
+        try { this.socket._onNewSession(sessionId, session); } finally { this.currentSession = null; }
+        if (this.closing || !this.id) return false;
+      }
+    }
+    return true;
+  }
   handshakeEvents() {
+    if (!this.libraryEvents()) return false;
     const starts = op('handshakeStarts', this.id);
     while (this.handshakeStarts < starts) {
       this.handshakeStarts++;
@@ -120,13 +184,13 @@ class TLSTransport {
     const completions = op('handshakeCompletions', this.id);
     while (this.handshakeCompletions < completions) {
       this.handshakeCompletions++;
-      this.socket._finishInit();
+      this.socket._onHandshakeDone();
       if (this.closing) return false;
     }
     return true;
   }
   pump() {
-    if (this.pumping || this.closing || !this.started || this.selecting || !this.id) return;
+    if (this.pumping || this.closing || !this.started || this.selecting || this.helloWaiting || !this.id) return;
     this.pumping = true;
     try {
       if (!this.ready) {
@@ -137,13 +201,13 @@ class TLSTransport {
         if (status !== 1) this.flush();
         if (!this.handshakeEvents()) return;
         if (status === 4) { this.chooseCertificate(); return; }
+        if (status === 11) { this.awaitClientHello(); return; }
         if (status !== 1) { this.shutdown_(); return; }
         this.ready = true;
         this.handshakeCompletions = op('handshakeCompletions', this.id);
-        this.socket._finishInit();
+        this.socket._onHandshakeDone();
         if (this.closing) return;
         this.flush();
-        this.socket._emitSession();
       }
       if (this.renegotiating) {
         this.renegotiating = false;
@@ -161,7 +225,6 @@ class TLSTransport {
       if (this.closing) return;
       if (op('receivedShutdown', this.id) & 2) this.end();
       if (this.closing) return;
-      this.socket._emitSession();
       const item = this.writes[0];
       if (item && !item.inflight) {
         if (!item.data.length) { this.writes.shift(); process.nextTick(() => { item.callback(); this.pump(); }); }
@@ -189,6 +252,7 @@ class TLSTransport {
   // carrier. The result never fails the shutdown (afterShutdown ignores it).
   shutdown_() {
     if (!this.pendingShutdown || this.shutdownInFlight || this.writes.length) return;
+    if (this.holdShutdown && (!this.ready || this.awaitingSession)) return;
     this.shutdownInFlight = true;
     try { op('shutdown', this.id); } catch {}
     let data;
@@ -197,6 +261,9 @@ class TLSTransport {
       const done = this.pendingShutdown; this.pendingShutdown = null;
       if (done) done(null);
     };
+    // A carrier its peer already ended takes no more writes; as with TLSWrap's
+    // StreamBase write, that failure stays out of the socket's errors.
+    if (this.carrier.writable === false) { process.nextTick(finish); return; }
     if (data.length) this.carrier.write(data);
     this.carrier.end(finish);
   }
@@ -216,7 +283,11 @@ class TLSTransport {
     if (!pending) { process.nextTick(callback); return; }
     for (const entry of chunks) this.write(entry.chunk, err => { failure ||= err; if (--pending === 0) callback(failure); });
   }
-  shutdown(callback) { this.pendingShutdown = callback; this.pump(); }
+  shutdown(callback) {
+    this.pendingShutdown = callback;
+    if (this.pumping || this.selecting || this.helloWaiting) this.holdShutdown = true;
+    this.pump();
+  }
   readStart() { this.reading = true; this.carrier.resume(); this.pump(); return 0; }
   readStop() { this.reading = false; if (this.ready) this.carrier.pause(); return 0; }
   // The TLS handle is closed: release the session and report the close once.

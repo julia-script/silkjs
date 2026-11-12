@@ -11,9 +11,14 @@ let hook;
 let asyncEnabled = false;
 let initialized = false;
 let nextId = 1;
+// In-memory collectors (the inspector's NodeTracing domain), each with its own categories.
+const sinks = new Set();
 const stringify = JSON.stringify;
 // Modules that switch a fast path on and off with a category group: [group, callback, state].
 const watchers = [];
+// getCategoryEnabledBuffer: one byte per category group, kept current by sync().
+const enabledBuffers = new Map();
+let stateUpdateHandler;
 function native(operation, value, timestamp) {
   const errno = host.traceNative(operation, value, timestamp);
   if (errno) throw Object.assign(new Error(`Trace file ${operation} failed (errno ${errno})`), { code: 'ERR_TRACE_EVENTS_WRITE', errno: -errno });
@@ -25,7 +30,9 @@ function enabled(group) {
 }
 function ensureOpen() {
   if (opened) return;
-  const path = filePattern.replace(/\$\{(pid|rotation)\}/g, (_, key) => key === 'pid' ? String(process.pid) : '1');
+  const path = require('path').resolve(filePattern.replace(/\$\{(pid|rotation)\}/g, (_, key) => key === 'pid' ? String(process.pid) : '1'));
+  // The trace file is written natively, so the permission model checks it here.
+  if (host.builtinLoaded('internal/permission')) require('internal/permission').check('fs.write', path);
   native('open', path);
   opened = true;
   writeMetadata();
@@ -55,16 +62,24 @@ function emit(category, name, phase, args = {}, id, timestamp, duration) {
     if (id !== undefined) event.id = `0x${id.toString(16)}`;
     if (phase === 'i') event.s = 't';
     if (duration !== undefined) event.dur = duration;
-    const json = stringify(event);
-    native('record', json.slice(0, -1), timestamp);
+    if (sinks.size) {
+      const ts = timestamp === undefined ? Number(process.hrtime.bigint() / 1000n) : Math.trunc(timestamp);
+      for (const sink of sinks) if (sink.matches(category)) sink.events.push({ pid: process.pid, tid: process.pid, ts, ...event });
+    }
+    if (opened) native('record', stringify(event).slice(0, -1), timestamp);
   } finally { writing = false; }
 }
+function categoryPattern(category) {
+  return new RegExp(`^${category.split('*').map(part => part.replace(/[\\^$+?.()|[\]{}]/g, '\\$&')).join('.*')}$`);
+}
 function sync() {
-  patterns = [...counts.keys()].map(category => new RegExp(`^${category.split('*').map(part => part.replace(/[\\^$+?.()|[\]{}]/g, '\\$&')).join('.*')}$`));
+  patterns = [...counts.keys()].map(categoryPattern);
   // Every publish is traced under this category, built-in publishers included.
   if (enabled('node.diagnostics_channel')) require('diagnostics_channel');
   const track = enabled('node,node.async_hooks');
   native('gc', enabled('v8,gc'));
+  for (const [group, buffer] of enabledBuffers) buffer[0] = enabled(group) ? 1 : 0;
+  if (typeof stateUpdateHandler === 'function') stateUpdateHandler(track);
   for (const watcher of watchers) {
     const on = enabled(watcher[0]);
     if (on !== watcher[2]) { watcher[2] = on; watcher[1](on); }
@@ -93,8 +108,8 @@ function sync() {
     resources.clear();
   }
 }
-function add(categories) {
-  ensureOpen();
+function add(categories, file = true) {
+  if (file) ensureOpen();
   for (const category of categories) counts.set(category, (counts.get(category) || 0) + 1);
   sync();
 }
@@ -105,7 +120,27 @@ function remove(categories) {
     else if (count !== undefined) counts.set(category, count - 1);
   }
   sync();
-  native('flush');
+  if (opened) native('flush');
+}
+// Collects the events of `categories` in memory until finish(), which returns
+// them after Node's two metadata events, as Node's inspector trace writer does.
+function collect(categories) {
+  const own = [...categories].map(categoryPattern);
+  const sink = {
+    events: [
+      { pid: process.pid, tid: process.pid, ts: 0, ph: 'M', cat: '__metadata', name: 'process_name', args: { name: processName() } },
+      { pid: process.pid, tid: process.pid, ts: 0, ph: 'M', cat: '__metadata', name: 'thread_name', args: { name: 'JavaScriptMainThread' } },
+    ],
+    matches(group) { return group.split(',').some(category => own.some(pattern => pattern.test(category))); },
+    finish() {
+      if (!sinks.delete(sink)) return sink.events;
+      remove(categories);
+      return sink.events;
+    },
+  };
+  sinks.add(sink);
+  add(categories, false);
+  return sink;
 }
 function getEnabledCategories() { return [...counts.keys()].sort().join(',') || undefined; }
 function initialize(options = {}) {
@@ -141,6 +176,22 @@ function watch(group, callback) {
   watchers.push([group, callback, on]);
   if (on) callback(true);
 }
+// As Node's binding: a Uint8Array whose byte is nonzero while the category group is enabled.
+function getCategoryEnabledBuffer(group) {
+  group = `${group}`;
+  let buffer = enabledBuffers.get(group);
+  if (buffer === undefined) { buffer = new Uint8Array(1); buffer[0] = enabled(group) ? 1 : 0; enabledBuffers.set(group, buffer); }
+  return buffer;
+}
+// Called with whether node.async_hooks tracing is on, each time the enabled categories change.
+function setTraceCategoryStateUpdateHandler(handler) { stateUpdateHandler = handler; }
+// Node's CategorySet: a set of categories that is enabled or disabled as a whole.
+class CategorySet {
+  #categories; #enabled = false;
+  constructor(categories) { this.#categories = new Set(categories); }
+  enable() { if (!this.#enabled) { add(this.#categories); this.#enabled = true; } }
+  disable() { if (this.#enabled) { remove(this.#categories); this.#enabled = false; } }
+}
 // internalBinding('trace_events').trace: the phase is a character code, and data, when
 // given, is the event's args.data.
 function trace(phase, category, name, id, data) {
@@ -148,4 +199,5 @@ function trace(phase, category, name, id, data) {
   emit(category, `${name}`, String.fromCharCode(phase), data === undefined ? {} : { data }, id);
 }
 function flush() { if (opened) native('flush'); }
-module.exports = { available, enabled, isTraceCategoryEnabled: enabled, watch, trace, processTitleChanged, add, remove, getEnabledCategories, initialize, emit, begin, end, performanceEntry, diagnostic, flush };
+module.exports = { available, enabled, isTraceCategoryEnabled: enabled, watch, trace, processTitleChanged,
+  getCategoryEnabledBuffer, setTraceCategoryStateUpdateHandler, CategorySet, add, remove, collect, getEnabledCategories, initialize, emit, begin, end, performanceEntry, diagnostic, flush };

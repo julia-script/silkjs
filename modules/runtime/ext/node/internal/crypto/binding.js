@@ -10,27 +10,39 @@
 const {
   ArrayBufferPrototypeSlice,
   ArrayIsArray,
+  ArrayPrototypePush,
+  ArrayPrototypeUnshift,
+  FunctionPrototypeApply,
+  FunctionPrototypeBind,
   MathCeil,
   MathFloor,
   ObjectDefineProperty,
+  ObjectKeys,
   ObjectPrototypeHasOwnProperty,
   Promise,
+  PromisePrototypeThen,
+  PromiseResolve,
   SafeSet,
   SafeWeakMap,
   StringPrototypeToLowerCase,
   StringPrototypeSplit,
   Symbol,
   TypeError,
+  uncurryThis,
 } = require('internal/per_context/primordials');
 
 const c = require('internal/crypto_core');
 const { Buffer, call, packed } = c;
+// Captured at load: job inputs never reach a user-replaced Buffer.from.
+const bufferFrom = FunctionPrototypeBind(Buffer.from, Buffer);
 const host = require('internal/host');
+const { isPromise } = require('util/types');
 
 const kCryptoJobAsync = 0;
 const kCryptoJobSync = 1;
 const kCryptoJobWebCrypto = 2;
 
+const kDetailNames = ['modulusLength', 'publicExponent', 'hashAlgorithm', 'mgf1HashAlgorithm', 'saltLength', 'divisorLength', 'namedCurve'];
 const kKeyTypeSecret = 0;
 const kKeyTypePublic = 1;
 const kKeyTypePrivate = 2;
@@ -117,7 +129,7 @@ function typeName(type) {
 
 function secretBytes(value) {
   if (value instanceof KeyObjectHandle) return own(stateOf(value).secret);
-  return Buffer.from(c.bytes(value, undefined, 'key'));
+  return bufferFrom(c.bytes(value, undefined, 'key'));
 }
 
 const kEncodingNames = ['pkcs1', 'pkcs8', 'spki', 'sec1'];
@@ -136,7 +148,7 @@ class KeyObjectHandle {
       if (format === kKeyFormatJWK) {
         if (data === null || typeof data !== 'object' || data.kty !== 'oct' || typeof data.k !== 'string')
           throw c.error('ERR_CRYPTO_INVALID_JWK', 'Invalid JWK secret key format', TypeError);
-        state.secret = own(Buffer.from(data.k, 'base64url'));
+        state.secret = own(bufferFrom(data.k, 'base64url'));
       } else {
         state.secret = secretBytes(data);
       }
@@ -188,10 +200,11 @@ class KeyObjectHandle {
   // KeyObjectHandle::GetKeyDetail: fills `target` with the key's details.
   keyDetail(target) {
     const details = c.keyObjectDetails(view(this));
-    for (const key of ['modulusLength', 'publicExponent', 'hashAlgorithm', 'mgf1HashAlgorithm', 'saltLength', 'divisorLength', 'namedCurve']) {
-      if (details[key] === undefined) continue;
+    for (let i = 0; i < kDetailNames.length; i++) {
+      const key = kDetailNames[i];
+      if (!ObjectPrototypeHasOwnProperty(details, key) || details[key] === undefined) continue;
       // The public exponent is its big-endian bytes, as GetRsaKeyDetail returns it.
-      target[key] = key === 'publicExponent' ? bigEndian(details[key]) : details[key];
+      createDataProperty(target, key, key === 'publicExponent' ? bigEndian(details[key]) : details[key]);
     }
     return target;
   }
@@ -227,7 +240,8 @@ class KeyObjectHandle {
         throw c.error('ERR_CRYPTO_JWK_UNSUPPORTED_KEY_TYPE', 'Unsupported JWK Key Type.');
       jwk = object.export({ format: 'jwk' });
     }
-    for (const key of Object.keys(jwk)) target[key] = jwk[key];
+    const keys = ObjectKeys(jwk);
+    for (let i = 0; i < keys.length; i++) createDataProperty(target, keys[i], jwk[keys[i]]);
     return target;
   }
 
@@ -262,7 +276,7 @@ function rawExport(object, format, message) {
 
 function bigEndian(value) {
   const hex = value.toString(16);
-  return copy(Buffer.from(hex.length % 2 ? `0${hex}` : hex, 'hex')).buffer;
+  return copy(bufferFrom(hex.length % 2 ? `0${hex}` : hex, 'hex')).buffer;
 }
 
 function copy(value) {
@@ -273,7 +287,7 @@ function copy(value) {
 // A Buffer that owns its whole ArrayBuffer (never a pool slab), since
 // Node's callers hand TypedArrayPrototypeGetBuffer(result) to the page.
 function own(value) {
-  return Buffer.from(copy(value).buffer);
+  return bufferFrom(copy(value).buffer);
 }
 
 // A KeyObject over a handle, for the runtime's KeyObject helpers.
@@ -346,16 +360,49 @@ function resolveWebCrypto(resolve, value) {
 }
 
 // The operations the native side runs on the thread pool; the rest are cheap
-// and run in place.
-const kWorkerOperations = new SafeSet(['random', 'pbkdf2', 'scrypt', 'hkdf', 'digest', 'cipherOnce', 'hmac',
-  'keyImport', 'keyExport', 'keyGenerate', 'sign', 'verify', 'derive', 'keyType', 'keyBits', 'encrypt', 'decrypt',
-  'argon2', 'encapsulate', 'decapsulate', 'kmac', 'turboshake']);
+// and run in place. This module can first load while user code has replaced
+// Array.prototype[Symbol.iterator], so its top level never iterates arrays.
+const kWorkerOperations = new SafeSet();
+{
+  const names = ['random', 'pbkdf2', 'scrypt', 'hkdf', 'digest', 'cipherOnce', 'hmac',
+    'keyImport', 'keyExport', 'keyGenerate', 'sign', 'verify', 'derive', 'keyType', 'keyBits', 'encrypt', 'decrypt',
+    'argon2', 'encapsulate', 'decapsulate', 'kmac', 'turboshake'];
+  for (let i = 0; i < names.length; i++) kWorkerOperations.add(names[i]);
+}
+
+// Job internals must not reach user-mutated Promise state (Node's jobs run in
+// C++). Await reads promise.constructor, so a promise that is awaited gets an
+// own constructor of %Promise%; one observed with PromisePrototypeThen gets an
+// own undefined constructor, so SpeciesConstructor never reads @@species.
+// CreateDataProperty, as the C++ bindings fill result objects: no inherited setters run.
+function createDataProperty(target, key, value) {
+  ObjectDefineProperty(target, key, { __proto__: null, value, writable: true, enumerable: true, configurable: true });
+}
+// An async work function that returns an object boxes it: resolving the
+// function's promise with the bare object would read its inherited `then`.
+const kBoxed = Symbol('kBoxed');
+function boxed(value) { return { __proto__: null, [kBoxed]: value }; }
+function unboxed(value) {
+  return value !== null && typeof value === 'object' && ObjectPrototypeHasOwnProperty(value, kBoxed) ? value[kBoxed] : value;
+}
+function awaitable(value) {
+  if (isPromise(value)) {
+    ObjectDefineProperty(value, 'constructor', { __proto__: null, value: Promise, configurable: true, writable: true });
+  }
+  return value;
+}
+function settle(value, onFulfilled, onRejected) {
+  const promise = isPromise(value) ? value : PromiseResolve(undefined);
+  ObjectDefineProperty(promise, 'constructor', { __proto__: null, value: undefined, configurable: true, writable: true });
+  if (promise === value) PromisePrototypeThen(promise, onFulfilled, onRejected);
+  else PromisePrototypeThen(promise, () => onFulfilled(value));
+}
 
 function exec(op, args) {
   if (!kWorkerOperations.has(op)) return call(op, args);
-  return new Promise((resolve, reject) => {
-    c.submit(op, args, (err, value) => { if (err) reject(err); else resolve(value); });
-  });
+  return awaitable(new Promise((resolve, reject) => {
+    c.submit(op, args, (err, value) => { if (err) reject(err); else resolveWebCrypto(resolve, value); });
+  }));
 }
 
 const kWork = Symbol('kWork');
@@ -375,23 +422,28 @@ class CryptoJob {
     if (this.mode === kCryptoJobSync) {
       let result;
       try {
-        result = work((op, args) => call(op, args), true);
+        result = unboxed(work((op, args) => call(op, args), true));
       } catch (err) {
         return [err, undefined];
       }
       return [undefined, result];
     }
-    const promise = (async () => work(exec, false))();
+    let pending, failed = false;
+    try { pending = work(exec, false); } catch (err) { pending = err; failed = true; }
     if (this.mode === kCryptoJobAsync) {
-      promise.then((result) => this.ondone(undefined, result), (err) => this.ondone(c.normalize(err)));
+      const onRejected = (err) => this.ondone(c.normalize(err));
+      if (failed) settle(undefined, () => onRejected(pending));
+      else settle(pending, (result) => this.ondone(undefined, unboxed(result)), onRejected);
       return;
     }
     return new Promise((resolve, reject) => {
-      promise.then((result) => {
+      const onRejected = (err) => reject(operationError(c.normalize(err)));
+      if (failed) { onRejected(pending); return; }
+      settle(pending, (result) => {
         let value;
-        try { value = webCryptoResult(result); } catch (err) { reject(operationError(err)); return; }
+        try { value = webCryptoResult(unboxed(result)); } catch (err) { reject(operationError(err)); return; }
         resolveWebCrypto(resolve, value);
-      }, (err) => reject(operationError(c.normalize(err))));
+      }, onRejected);
     });
   }
 }
@@ -399,8 +451,8 @@ class CryptoJob {
 function defineJob(name, prepare) {
   const Job = {
     [name]: class extends CryptoJob {
-      constructor(mode, ...args) {
-        super(mode, prepare(mode, ...args));
+      constructor(mode) {
+        super(mode, FunctionPrototypeApply(prepare, undefined, arguments));
       }
     },
   }[name];
@@ -412,7 +464,7 @@ function bytesOf(value) {
   if (value instanceof KeyObjectHandle) return own(stateOf(value).secret);
   // ArrayBufferOrViewContents reads a detached backing store as empty.
   if ((ArrayBuffer.isView(value) ? value.buffer : value)?.detached === true) return Buffer.alloc(0);
-  return Buffer.from(c.bytes(value, undefined, 'data'));
+  return bufferFrom(c.bytes(value, undefined, 'data'));
 }
 function keyId(handle) { return c.handle(handle); }
 function truncateBits(data, bits) {
@@ -421,7 +473,7 @@ function truncateBits(data, bits) {
   return result;
 }
 function timingSafe(a, b) {
-  a = Buffer.from(a); b = Buffer.from(b);
+  a = bufferFrom(a); b = bufferFrom(b);
   return a.length === b.length && !!call('equal', [packed(a), packed(b)]);
 }
 
@@ -440,7 +492,7 @@ const AESCipherJob = defineJob('AESCipherJob', (mode, cipherMode, key, data, var
   if (invalidIv) throw c.error('ERR_CRYPTO_INVALID_IV', 'Invalid initialization vector', TypeError);
   if (kind === 'ctr') {
     return async (run) => {
-      const counter = Buffer.from(iv.subarray(0, 16));
+      const counter = bufferFrom(iv.subarray(0, 16));
       const bits = lengthOrTag;
       const blocks = BigInt(MathCeil(input.length / 16));
       const modulus = 1n << BigInt(bits);
@@ -454,7 +506,7 @@ const AESCipherJob = defineJob('AESCipherJob', (mode, cipherMode, key, data, var
       value &= ~(modulus - 1n);
       for (let i = 15; i >= 0; i--) { counter[i] = Number(value & 255n); value >>= 8n; }
       const second = await run('cipherOnce', [cipher, keyBytes, packed(counter), packed(input.subarray(firstLength)), encrypt]);
-      return Buffer.concat([Buffer.from(first), Buffer.from(second)]);
+      return Buffer.concat([bufferFrom(first), bufferFrom(second)]);
     };
   }
   if (kind === 'gcm' || kind === 'ocb') {
@@ -512,7 +564,7 @@ const SignJob = defineJob('SignJob', (mode, signMode, key, keyData, keyFormat, k
   const args = (sig) => [keyId(key), digest ?? '', input, sig, padding ?? 0, saltLength ?? -2147483648, contextBytes, 0];
   if (signMode === kSignJobModeSign) {
     return async (run) => {
-      const result = Buffer.from(await run('sign', args(undefined)));
+      const result = bufferFrom(await run('sign', args(undefined)));
       return size ? require('internal/crypto_keys').signature(result, size, false) : result;
     };
   }
@@ -557,9 +609,9 @@ function hasSmallOrderEdDsaPoint(handle, signature) {
   if (points === undefined) return false;
   const size = type === 'ed25519' ? 32 : 57;
   if (signature.length !== size * 2) return false;
-  const hex = (bytes) => Buffer.from(bytes.buffer, bytes.byteOffset, size).toString('hex');
+  const hex = (bytes) => bufferFrom(bytes.buffer, bytes.byteOffset, size).toString('hex');
   if (points.includes(hex(signature))) return true;
-  const publicKey = Buffer.from(handle.rawPublicKey());
+  const publicKey = bufferFrom(handle.rawPublicKey());
   return publicKey.length === size && points.includes(hex(publicKey));
 }
 
@@ -585,14 +637,14 @@ const KmacJob = defineJob('KmacJob', (mode, signMode, key, algorithm, customizat
   } else if (outputLength % 8 || keyLength % 8 || keyBytes.length < 4) {
     if (keyBytes.length < MathCeil(keyLength / 8)) return () => { throw c.error('ERR_CRYPTO_OPERATION_FAILED', 'Deriving bits failed'); };
     const keyString = { bytes: keyBytes.subarray(0, MathCeil(keyLength / 8)), bits: keyLength };
-    mac = cShake(strength, Buffer.from('KMAC'), custom, keyString, input, outputLength, true);
+    mac = cShake(strength, bufferFrom('KMAC'), custom, keyString, input, outputLength, true);
   } else {
     const args = [`KMAC-${strength}`, packed(keyBytes), packed(input), packed(custom), outputLength / 8];
     mac = (run) => run('kmac', args);
   }
   if (signMode === kSignJobModeSign) return mac;
   const expected = bytesOf(signature);
-  return async (run) => timingSafe(await mac(run), expected);
+  return async (run) => timingSafe(await awaitable(mac(run)), expected);
 });
 
 const HKDFJob = defineJob('HKDFJob', (mode, hash, key, salt, info, length) => {
@@ -619,8 +671,8 @@ const DHBitsJob = defineJob('DHBitsJob', (mode, publicKey, publicData, publicFor
 });
 
 function encapsulated(value) {
-  const bytes = Buffer.from(value), length = bytes.readUInt32LE(0);
-  return { sharedKey: copy(bytes.subarray(4, 4 + length)).buffer, ciphertext: copy(bytes.subarray(4 + length)).buffer };
+  const bytes = bufferFrom(value), length = bytes.readUInt32LE(0);
+  return boxed({ sharedKey: copy(bytes.subarray(4, 4 + length)).buffer, ciphertext: copy(bytes.subarray(4 + length)).buffer });
 }
 
 const KEMEncapsulateJob = defineJob('KEMEncapsulateJob', (mode, key) => {
@@ -645,12 +697,17 @@ const HashJob = defineJob('HashJob', (mode, algorithm, data, outputLength) => {
 // the bytes (KMAC keys of any bit length).
 function encodeLength(value, left) {
   const bytes = [];
-  do { bytes.unshift(value % 256); value = Math.floor(value / 256); } while (value);
-  return Buffer.from(left ? [bytes.length, ...bytes] : [...bytes, bytes.length]);
+  do { ArrayPrototypeUnshift(bytes, value % 256); value = MathFloor(value / 256); } while (value);
+  if (left) ArrayPrototypeUnshift(bytes, bytes.length);
+  else ArrayPrototypePush(bytes, bytes.length);
+  return bufferFrom(bytes);
 }
-function bytepad(rate, ...strings) {
+function bytepad(rate) {
   const parts = [encodeLength(rate, true)];
-  for (const { bytes, bits } of strings) parts.push(encodeLength(bits, true), bytes);
+  for (let i = 1; i < arguments.length; i++) {
+    const { bytes, bits } = arguments[i];
+    ArrayPrototypePush(parts, encodeLength(bits, true), bytes);
+  }
   const prefix = Buffer.concat(parts);
   return Buffer.concat([prefix, Buffer.alloc((rate - prefix.length % rate) % rate)]);
 }
@@ -684,8 +741,9 @@ const TurboShakeJob = defineJob('TurboShakeJob', (mode, algorithm, domainSeparat
 });
 function lengthEncode(value) {
   const bytes = [];
-  while (value > 0) { bytes.unshift(value % 256); value = Math.floor(value / 256); }
-  return Buffer.from([...bytes, bytes.length]);
+  while (value > 0) { ArrayPrototypeUnshift(bytes, value % 256); value = MathFloor(value / 256); }
+  ArrayPrototypePush(bytes, bytes.length);
+  return bufferFrom(bytes);
 }
 const kKangarooChunk = 8192;
 const KangarooTwelveJob = defineJob('KangarooTwelveJob', (mode, algorithm, customization, outputLength, data) => {
@@ -697,12 +755,12 @@ const KangarooTwelveJob = defineJob('KangarooTwelveJob', (mode, algorithm, custo
     const args = turboShakeArgs(strength, s, 0x07, outputLength);
     return (run) => run('turboshake', args);
   }
-  const parts = [s.subarray(0, kKangarooChunk), Buffer.from([0x03, 0, 0, 0, 0, 0, 0, 0])];
+  const parts = [s.subarray(0, kKangarooChunk), bufferFrom([0x03, 0, 0, 0, 0, 0, 0, 0])];
   let blocks = 0;
   for (let offset = kKangarooChunk; offset < s.length; offset += kKangarooChunk, blocks++) {
-    parts.push(Buffer.from(call('turboshake', turboShakeArgs(strength, s.subarray(offset, offset + kKangarooChunk), 0x0B, cvLength))));
+    parts.push(bufferFrom(call('turboshake', turboShakeArgs(strength, s.subarray(offset, offset + kKangarooChunk), 0x0B, cvLength))));
   }
-  parts.push(lengthEncode(blocks), Buffer.from([0xff, 0xff]));
+  parts.push(lengthEncode(blocks), bufferFrom([0xff, 0xff]));
   const args = turboShakeArgs(strength, Buffer.concat(parts), 0x06, outputLength);
   return (run) => run('turboshake', args);
 });
@@ -719,22 +777,24 @@ const SecretKeyGenJob = defineJob('SecretKeyGenJob', (mode, bits, algorithm, usa
     const data = truncateBits(await run('random', [length]), bits);
     const handle = createHandle('secret', data);
     if (mode !== kCryptoJobWebCrypto) return handle;
-    return cryptoKey(handle, algorithm, usagesMask, extractable);
+    return boxed(cryptoKey(handle, algorithm, usagesMask, extractable));
   };
 });
 
 function keyPairJob(name, args) {
-  return defineJob(name, (mode, ...rest) => {
-    const { type, options, algorithm, publicMask, privateMask, extractable } = args(...rest);
+  return defineJob(name, function(mode) {
+    const rest = [];
+    for (let i = 1; i < arguments.length; i++) ArrayPrototypePush(rest, arguments[i]);
+    const { type, options, algorithm, publicMask, privateMask, extractable } = FunctionPrototypeApply(args, undefined, rest);
     const keygen = c.keygenArgs(type, options);
     return async (run) => {
       const id = await run('keyGenerate', keygen);
       const privateHandle = createHandle('private', id);
       const publicHandle = createHandle('public', await run('keyPublic', [keyId(privateHandle)]));
-      return {
+      return boxed({
         publicKey: cryptoKey(publicHandle, algorithm, publicMask, true),
         privateKey: cryptoKey(privateHandle, algorithm, privateMask, extractable),
-      };
+      });
     };
   });
 }
@@ -761,8 +821,9 @@ function aliases(list) {
 
 function getPqcKeyTypes() {
   const result = [];
-  for (const name of ['ML-DSA-44', 'ML-DSA-65', 'ML-DSA-87', 'ML-KEM-512', 'ML-KEM-768', 'ML-KEM-1024']) {
-    if (call('providerAvailable', ['key', name])) result.push(name);
+  const names = ['ML-DSA-44', 'ML-DSA-65', 'ML-DSA-87', 'ML-KEM-512', 'ML-KEM-768', 'ML-KEM-1024'];
+  for (let i = 0; i < names.length; i++) {
+    if (call('providerAvailable', ['key', names[i]])) ArrayPrototypePush(result, names[i]);
   }
   return result;
 }
@@ -770,14 +831,20 @@ function getPqcKeyTypes() {
 // internalBinding('encoding_binding') decodeUTF8(buffer, ignoreBOM, fatal)
 // and encodeUtf8String(string).
 const encodingBinding = {
-  decodeUTF8(data, ignoreBOM, fatal) {
+  // Captured when the binding loads, like encodeUtf8String below.
+  decodeUTF8: (() => {
     const { TextDecoder } = require('util');
-    return new TextDecoder('utf-8', { ignoreBOM, fatal }).decode(data);
-  },
-  encodeUtf8String(string) {
+    const decode = uncurryThis(TextDecoder.prototype.decode);
+    return (data, ignoreBOM, fatal) => decode(new TextDecoder('utf-8', { __proto__: null, ignoreBOM, fatal }), data);
+  })(),
+  // wrapKey('jwk') must not reach a
+  // user-replaced TextEncoder.prototype.encode.
+  encodeUtf8String: (() => {
     const { TextEncoder } = require('util');
-    return new TextEncoder().encode(string);
-  },
+    const encoder = new TextEncoder();
+    const encode = uncurryThis(TextEncoder.prototype.encode);
+    return (string) => encode(encoder, string);
+  })(),
 };
 
 module.exports = {
@@ -857,13 +924,15 @@ module.exports = {
   getCachedAliases: () => aliases(names('hashes')),
   getCachedMacAliases: () => aliases(names('macs')),
   getFipsCrypto: () => call('getFips', []),
-  testFipsCrypto: () => call('fipsAvailable', []) === 1,
+  testFipsCrypto: () => (call('fipsAvailable', []) === 1 ? 1 : 0),
   getFipsCryptoGeneration: () => fipsGeneration,
   getOpenSSLSecLevelCrypto: () => call('secLevel', []),
   getPqcKeyTypes,
   secureHeapUsed: () => call('secureHeapUsed', []),
   setEngine: (id, flags) => call('setEngine', [id, flags]),
   timingSafeEqual: (a, b) => timingSafe(a, b),
+  addBlockedSPKIForTesting: hash => require('internal/tls/context').addBlockedSPKIForTesting(hash),
+  clearBlockedSPKIsForTesting: () => require('internal/tls/context').clearBlockedSPKIsForTesting(),
 
   // Runtime internals for internal/crypto/keys and crypto.js.
   createHandle,

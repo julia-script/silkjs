@@ -95,8 +95,12 @@ class CloneSerializer extends Serializer {
   }
   _isHostObject(value) {
     if (this.transferred.has(value)) return true;
-    if (jsTransferable.getTransferMode(value) !== undefined)
+    const mode = jsTransferable.getTransferMode(value);
+    if (mode !== undefined) {
+      // A JS cloneable (Node's BaseObject::kCloneable) is written from its [kClone]().
+      if (mode & jsTransferable.kCloneable) return true;
       throw cloneError('Object that needs transfer was found in message but not listed in transferList');
+    }
     if (isDOMException(value)) return true;
     if (host.types.isSlidingWindowHistogram?.(value)) throw cloneError();
     if (abort.isTransferable(value)) return true;
@@ -124,10 +128,11 @@ class CloneSerializer extends Serializer {
     return id;
   }
   _writeHostObject(value) {
-    if (this.transferred.has(value)) {
-      // A JS transferable (for example a web stream) describes itself when
-      // the serializer reaches it, outer objects before the ones they hold.
-      const transferred = value[jsTransferable.kTransfer]();
+    const transfer = this.transferred.has(value);
+    if (transfer || (jsTransferable.getTransferMode(value) & jsTransferable.kCloneable)) {
+      // A JS transferable (for example a web stream) or cloneable describes itself
+      // when the serializer reaches it, outer objects before the ones they hold.
+      const transferred = transfer ? value[jsTransferable.kTransfer]() : value[jsTransferable.kClone]();
       this.writeUint32(12);
       this.writeValue(transferred.deserializeInfo);
       this.writeValue(transferred.data);

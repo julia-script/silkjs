@@ -18,11 +18,45 @@ const { ConnResetException } = require('internal/errors');
 const { checkServerIdentity } = require('internal/tls/identity');
 const { TLSTransport } = require('internal/tls/transport');
 const { kTLSServer } = require('internal/tls/server');
+const { kReinitializeHandle } = require('internal/net');
 
 const kConnectOptions = Symbol('connect-options');
 const kErrorEmitted = Symbol('error-emitted');
 const kIsVerified = Symbol('verified');
 const kPendingSession = Symbol('pendingSession');
+// Node's session state: a client session is bound to the identity it was verified for.
+const kTLSSessionStatePrefix = Buffer.from('\0nodejs:tls:session:1\0');
+function getSessionServerIdentity(options) {
+  return options?.servername || options?.host || options?.socket?._host || 'localhost';
+}
+function wrapSessionState(session, options) {
+  if (!Buffer.isBuffer(session) || options?.isServer) return session;
+  const servername = Buffer.from(getSessionServerIdentity(options), 'utf8');
+  const servernameLength = Buffer.allocUnsafe(2);
+  servernameLength.writeUInt16BE(servername.length, 0);
+  return Buffer.concat([kTLSSessionStatePrefix, servernameLength, servername, session]);
+}
+function unwrapSessionState(session) {
+  if (!Buffer.isBuffer(session) || session.length < kTLSSessionStatePrefix.length + 2 ||
+      Buffer.compare(session.subarray(0, kTLSSessionStatePrefix.length), kTLSSessionStatePrefix) !== 0) return;
+  const start = kTLSSessionStatePrefix.length;
+  const servernameLength = session.readUInt16BE(start);
+  const servernameStart = start + 2;
+  const servernameEnd = servernameStart + servernameLength;
+  if (session.length < servernameEnd) return;
+  return { servername: session.toString('utf8', servernameStart, servernameEnd), session: session.subarray(servernameEnd) };
+}
+function getSessionForReuse(session, options) {
+  if (typeof session === 'string') session = Buffer.from(session, 'latin1');
+  if (options?.isServer) return session;
+  const wrappedSession = unwrapSessionState(session);
+  if (wrappedSession !== undefined) {
+    if (wrappedSession.servername !== getSessionServerIdentity(options)) return;
+    return wrappedSession.session;
+  }
+  if (Buffer.isBuffer(session) && options?.rejectUnauthorized !== false) return;
+  return session;
+}
 const kHandshakeTimeout = Symbol('handshake-timeout');
 const kSNICallback = Symbol('snicallback');
 const kEnableTrace = Symbol('enableTrace');
@@ -92,7 +126,18 @@ function TLSSocket(socket, opts) {
 Object.setPrototypeOf(TLSSocket.prototype, net.Socket.prototype);
 Object.setPrototypeOf(TLSSocket, net.Socket);
 
-TLSSocket.prototype._init = function(socket) {
+// Node's _wrapHandle and reinitializeHandle: a TLS socket can be moved onto a new
+// carrier, given a handle or a fresh unconnected one, keeping its servername and session.
+TLSSocket.prototype[kReinitializeHandle] = function reinitializeHandle(handle) {
+  const id = this._tls?.id;
+  const servername = id ? native('servername', id) : null;
+  const session = id ? this.getSession() : null;
+  this._init(null, handle, true);
+  if (this._tlsOptions.enableTrace) this.enableTrace();
+  if (session) this.setSession(session);
+  if (servername) this.setServername(servername);
+};
+TLSSocket.prototype._init = function(socket, handle, reinitializing = false) {
   const options = this._tlsOptions;
   this.server = options.server;
   this._requestCert = !!options.requestCert || !options.isServer;
@@ -100,16 +145,27 @@ TLSSocket.prototype._init = function(socket) {
   this._secureContext = options.secureContext || options.credentials || tlsExports.createSecureContext(options);
   if (!(this._secureContext instanceof SecureContext) || !this._secureContext.context)
     throw new codes.ERR_TLS_INVALID_CONTEXT('context');
-  this._parent = socket || new net.Socket({ allowHalfOpen: true });
+  this._parent = socket || new net.Socket(handle ? { handle, allowHalfOpen: true } : { allowHalfOpen: true });
   this._tls = new TLSTransport(this, this._parent, this._secureContext, options, !socket);
+  // As net's reinitializeHandle: the old handle closes before the new one takes over.
+  if (reinitializing) this._handle?.close();
   this._attachTransport(this._tls);
   if (this._requestCert || this._rejectUnauthorized) native('verifyMode', this._tls.id, this._requestCert, this._rejectUnauthorized);
+  // Only report keylog lines once there is a 'keylog' listener.
+  if (this.listenerCount('newListener', keylogNewListener) === 0) this.on('newListener', keylogNewListener);
+  if (options.isServer) {
+    if (this.server && (this.server.listenerCount('resumeSession') > 0 || this.server.listenerCount('newSession') > 0))
+      this._tls.enableSessionCallbacks();
+  } else if (this.listenerCount('newListener', newListener) === 0) {
+    // Only report new sessions once there is a 'session' listener.
+    this.on('newListener', newListener);
+  }
   if (options.isServer && options.ALPNCallback) {
     validateFunction(options.ALPNCallback, 'options.ALPNCallback');
     this[kALPNCallback] = options.ALPNCallback;
   }
   const keylog = tlsOptions.getOptionValue('--tls-keylog');
-  if (keylog) {
+  if (keylog && !reinitializing) {
     if (warnOnTlsKeylog) {
       warnOnTlsKeylog = false;
       process.emitWarning('Using --tls-keylog makes TLS connections insecure by writing secret key material to file ' + keylog);
@@ -131,16 +187,18 @@ TLSSocket.prototype._init = function(socket) {
   if (options.handshakeTimeout > 0) this.setTimeout(options.handshakeTimeout, this._handleTimeout);
   if (socket instanceof net.Socket) {
     this.connecting = socket.connecting || socket._connected === false;
-    socket.once('connect', () => { this.connecting = false; });
+    // Like Node's _tls_wrap: the TLS socket connects when the socket it wraps does.
+    socket.once('connect', () => { this.connecting = false; this.emit('connect'); });
   }
   if (socket) socket.on('error', err => this._emitTLSError(err));
-  else this.connecting = true;
+  else if (!reinitializing) this.connecting = true;
 };
 TLSSocket.prototype.connect = function(...args) {
   const [options, cb] = net._normalizeArgs(args);
   if (cb) this.once('connect', cb);
   this.connecting = true;
-  try { this._parent.connect({ ...options, allowHalfOpen: true }); } catch (err) { this.destroy(); throw err; }
+  // The TLS socket listens to options.signal itself; aborting it destroys the parent too.
+  try { this._parent.connect({ ...options, allowHalfOpen: true, signal: undefined }); } catch (err) { this.destroy(); throw err; }
   return this;
 };
 // A client sends its ClientHello only when told to (tls.connect does).
@@ -207,6 +265,67 @@ TLSSocket.prototype._onHandshakeStart = function(now) {
   }
   if (this[kDisableRenegotiation]) this._emitTLSError(new codes.ERR_TLS_RENEGOTIATION_DISABLED());
 };
+function keylogNewListener(event) {
+  if (event !== 'keylog') return;
+  if (!this._tls?.id) return;
+  this._tls.enableKeylog();
+  this.removeListener('newListener', keylogNewListener);
+}
+function newListener(event) {
+  if (event !== 'session') return;
+  if (!this._tls?.id) return;
+  this._tls.enableSessionCallbacks();
+  this.removeListener('newListener', newListener);
+}
+// Node's onhandshakedone: a server waits for its 'newSession' listener to finish first.
+TLSSocket.prototype._onHandshakeDone = function() {
+  if (this._tlsOptions.isServer && this._newSessionPending) { this._securePending = true; return; }
+  this._finishInit();
+};
+// Node's loadSession (onclienthello): a 'resumeSession' listener may supply the session.
+TLSSocket.prototype._onClientHello = function(hello) {
+  let once = false;
+  const onSession = (err, session) => {
+    if (once) return this.destroy(new codes.ERR_MULTIPLE_CALLBACK());
+    once = true;
+    if (err) return this.destroy(err);
+    if (!this._tls?.id) return this.destroy(new codes.ERR_SOCKET_CLOSED());
+    if (ArrayBuffer.isView(session)) native('loadSession', this._tls.id, session);
+    this._tls.clientHelloDone();
+  };
+  if (hello.sessionId.length <= 0 || hello.tlsTicket ||
+      (this.server && !(() => {
+        try { return this.server.emit('resumeSession', hello.sessionId, onSession); }
+        catch (err) { onSession(err); return true; }
+      })())) {
+    this._tls.clientHelloDone();
+  }
+};
+// Node's onnewsession (server) and onnewsessionclient.
+TLSSocket.prototype._onNewSession = function(sessionId, session) {
+  if (!this._tlsOptions.isServer) {
+    const wrappedSession = wrapSessionState(session, this[kConnectOptions]);
+    if (this[kIsVerified]) this.emit('session', wrappedSession);
+    else this[kPendingSession] = wrappedSession;
+    return;
+  }
+  if (!this.server) return;
+  let once = false;
+  const done = () => {
+    if (once) return;
+    once = true;
+    if (!this._tls?.id) return this.destroy(new codes.ERR_SOCKET_CLOSED());
+    this._tls.newSessionDone();
+    this._newSessionPending = false;
+    if (this._securePending) this._finishInit();
+    this._securePending = false;
+  };
+  this._newSessionPending = true;
+  let hasEmitted = false;
+  try { hasEmitted = this.server.emit('newSession', sessionId, session, done); }
+  catch (err) { this.server.emit('error', err); }
+  if (!hasEmitted) done();
+};
 TLSSocket.prototype._finishInit = function() {
   if (!this._tls?.id) return;
   this.alpnProtocol = native('alpn', this._tls.id) || false;
@@ -256,17 +375,21 @@ TLSSocket.prototype.setServername = function(name) {
   if (this._tls?.id) native('setServername', this._tls.id, name);
 };
 TLSSocket.prototype.setSession = function(session) {
-  if (typeof session === 'string') session = Buffer.from(session, 'latin1');
+  session = getSessionForReuse(session, this[kConnectOptions] || this._tlsOptions);
   if (session !== undefined && this._tls?.id) native('setSession', this._tls.id, bytes(session, 'session'));
 };
 TLSSocket.prototype.getSession = function() {
   if (!this._tls?.id) return null;
-  const session = Buffer.from(native('session', this._tls.id));
-  return session.length ? session : undefined;
+  // While 'session' is emitted, the session OpenSSL reported (as SSL_get_session
+  // inside Node's NewSessionCallback).
+  const current = this._tls.currentSession;
+  const session = current || Buffer.from(native('session', this._tls.id));
+  return wrapSessionState(session.length ? session : undefined, this[kConnectOptions] || this._tlsOptions);
 };
 TLSSocket.prototype.getTLSTicket = function() {
   if (!this._tls?.id) return null;
-  const ticket = Buffer.from(native('ticket', this._tls.id));
+  const current = this._tls.currentSession;
+  const ticket = Buffer.from(current ? native('sessionTicket', this._tls.id, current) : native('ticket', this._tls.id));
   return ticket.length ? ticket : undefined;
 };
 TLSSocket.prototype.isSessionReused = function() { return this._tls?.id ? !!native('sessionReused', this._tls.id) : null; };
@@ -354,21 +477,17 @@ TLSSocket.prototype.getPeerFinished = function() {
   const finished = Buffer.from(native('peerFinished', this._tls.id));
   return finished.length ? finished : undefined;
 };
-// Client sessions surface after verification (Node's onnewsessionclient).
-TLSSocket.prototype._emitSession = function() {
-  if (this._tlsOptions.isServer || !this._secureEstablished || !this.listenerCount('session')) return;
-  const session = this.getSession();
-  if (!session?.length || (this._lastSession && session.equals(this._lastSession))) return;
-  this._lastSession = session;
-  if (this[kIsVerified]) this.emit('session', session);
-  else this[kPendingSession] = session;
-};
 
 function onServerSocketSecure() {
   if (this._requestCert) {
     const verifyError = this._verifyError();
     if (verifyError) {
       this.authorizationError = verifyError.code;
+      if (this._rejectUnauthorized) this.destroy();
+    } else if (!this._tls?.id || !Buffer.from(native('peerCertificate', this._tls.id)).length) {
+      // A resumed TLS 1.3 session verifies with X509_V_OK without a peer
+      // certificate; as in Node, only a presented certificate authorizes.
+      this.authorizationError = 'UNABLE_TO_GET_ISSUER_CERT';
       if (this._rejectUnauthorized) this.destroy();
     } else this.authorized = true;
   }
@@ -560,6 +679,7 @@ function connect(...args) {
   validateFunction(options.checkServerIdentity, 'options.checkServerIdentity');
   validateNumber(options.minDHSize, 'options.minDHSize', 1);
   const context = options.secureContext || tlsExports.createSecureContext(options);
+  options.session = getSessionForReuse(options.session, options);
   const tlssock = new TLSSocket(options.socket, {
     allowHalfOpen: options.allowHalfOpen, pipe: !!options.path, secureContext: context, isServer: false,
     requestCert: true, rejectUnauthorized: options.rejectUnauthorized !== false, session: options.session,
@@ -630,8 +750,9 @@ function convertALPNProtocols(protocols, out) {
   }
 }
 let ciphers;
+// Like Node's cachedResult: callers get a copy of the cached list.
 function getCiphers() {
-  if (ciphers) return ciphers;
+  if (ciphers) return ciphers.slice();
   const context = native('context');
   // Node's GetCiphers also lists the TLSv1.3 suites a default context leaves
   // disabled (the CCM ones); lib/tls.js lowercases, dedupes and sorts.
@@ -640,7 +761,7 @@ function getCiphers() {
     ciphers = require('internal/util').filterDuplicateStrings(names, true);
   }
   finally { native('release', context); }
-  return ciphers;
+  return ciphers.slice();
 }
 
 const tlsExports = module.exports = {

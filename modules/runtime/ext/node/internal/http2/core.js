@@ -169,8 +169,12 @@ const {
   updateSettingsBuffer,
 } = require('internal/http2/util');
 const {
-  async_id_symbol,
-  owner_symbol,
+  symbols: {
+    async_id_symbol,
+    owner_symbol,
+  },
+} = require('internal/async_hooks');
+const {
   writeGeneric,
   writevGeneric,
   onStreamRead,
@@ -180,10 +184,12 @@ const {
   kHandle,
   kSession,
   kBoundSession,
-  kTimeout,
   setStreamTimeout,
+} = require('internal/stream_base_commons');
+const { kTimeout } = require('internal/timers');
+const {
   ShutdownWrap,
-} = require('internal/http2/stream_base');
+} = require('internal/net/binding').stream_wrap;
 const isArrayBufferView = ArrayBuffer.isView;
 
 const binding = require('internal/http2/binding');

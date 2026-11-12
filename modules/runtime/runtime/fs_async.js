@@ -10,7 +10,9 @@ module.exports = function createAsyncFS(native) {
   const uvSyscalls = { __proto__: null, copyFile: 'copyfile', utimes: 'utime', lutimes: 'lutime', futimes: 'futime' };
   function primitive(requestKind, operation, args) {
     return new Promise((resolve, reject) => {
-      native.submit(operation, args, (status, value, code) => {
+      // Completion callbacks are named, as Node's oncomplete is: the REPL trims an
+      // error's frames below the last one without a function name.
+      native.submit(operation, args, function oncomplete(status, value, code) {
         if (status < 0) reject(c().error(code || 'UNKNOWN', uvSyscalls[operation] ?? operation,
           typeof args[0] === 'string' ? args[0] : undefined,
           ['rename', 'link', 'symlink', 'copyFile'].includes(operation) ? args[1] : undefined, status));
@@ -255,8 +257,8 @@ module.exports = function createAsyncFS(native) {
     // Dispatch outside the Promise queue: callback exceptions are uncaught
     // exceptions, and each completion gets its own nextTick/microtask boundary.
     execute(requestKind, operation, args).then(
-      value => host.enqueueIOCompletion(() => callback(null, value)),
-      error => host.enqueueIOCompletion(() => callback(error)));
+      value => host.enqueueIOCompletion(function oncomplete() { callback(null, value); }),
+      error => host.enqueueIOCompletion(function oncomplete() { callback(error); }));
   }
   function watch(filename, options, callback) {
     const id = native.watch(filename, !!options.stat, options.stat ? options.interval : options.recursive ? 4 : 0, !!options.bigint,

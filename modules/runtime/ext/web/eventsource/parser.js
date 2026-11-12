@@ -1,6 +1,6 @@
 'use strict';
 
-const { TextDecoder } = require('internal/web/encoding');
+const { TextDecoder } = require('internal/encoding');
 const { kStringMaxLength } = require('buffer');
 function tooLarge() {
   const error = new Error('EventSource message size exceeded');
