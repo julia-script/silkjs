@@ -29,9 +29,23 @@ function inspectorAddress(value) {
   if (port > 65535 || (port !== 0 && port < 1024)) throw new Error('must be 0 or in range 1024 to 65535.');
   return { host: hostname, port };
 }
+// node_options.cc DebugOptions::CheckOptions: where the target id is published.
+function inspectPublishUid(value) {
+  const publish = { stderr: false, http: false };
+  for (const destination of value.split(',')) {
+    if (destination === 'stderr') publish.stderr = true;
+    else if (destination === 'http') publish.http = true;
+    else throw new Error('--inspect-publish-uid destination can be stderr or http');
+  }
+  return publish;
+}
 function applyInspectorOption(arg) {
   const separator = arg.indexOf('=');
   const name = separator < 0 ? arg : arg.slice(0, separator);
+  if (name === '--inspect-publish-uid' && separator >= 0) {
+    (host.inspectorOptions ||= { enabled: false, host: '127.0.0.1', port: 9229, wait: false, breakFirst: false }).publishUid = inspectPublishUid(arg.slice(separator + 1));
+    return true;
+  }
   const positive = name.replace(/^--no-/, '--');
   if (!inspectorEnableOptions.has(positive) && !isInspectorValueOption(name)) return false;
   if (isInspectorValueOption(name) && separator < 0) return false;
@@ -350,6 +364,10 @@ function getOptionValue(name) {
     case '--inspect': return !!host.inspectorOptions?.enabled;
     case '--inspect-brk': return !!host.inspectorOptions?.breakFirst;
     case '--inspect-wait': return !!host.inspectorOptions?.wait;
+    case '--inspect-publish-uid': {
+      const publish = host.inspectorOptions?.publishUid ?? { stderr: true, http: true };
+      return [publish.stderr && 'stderr', publish.http && 'http'].filter(Boolean).join(',');
+    }
     case '--inspect-port': return { host: host.inspectorOptions?.host ?? '127.0.0.1', port: host.inspectorOptions?.port ?? 9229 };
     case '--localstorage-file': return host.localStorageFile;
     case '--experimental-print-required-tla': return !!host.printRequiredTLA;

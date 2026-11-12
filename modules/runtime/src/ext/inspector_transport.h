@@ -19,7 +19,7 @@ enum { SILK_INSPECTOR_ROUTE_RESPONSE = 4, SILK_INSPECTOR_OWNER_ATTACHED = 5,
 /* Defined by the runtime: ends the current or next wait of the loop that owns wake. */
 void silk_runtime_wake(void *wake);
 silk_inspector *silk_inspector_create(void *wake);
-int silk_inspector_start(silk_inspector *, const unsigned char *host, size_t length, uint16_t port, const unsigned char *browser, size_t browser_length);
+int silk_inspector_start(silk_inspector *, const unsigned char *host, size_t length, uint16_t port, const unsigned char *browser, size_t browser_length, int publish_http);
 void silk_inspector_stop(silk_inspector *);
 void silk_inspector_destroy(silk_inspector *);
 /* Copies at most capacity bytes, without terminator; returns full URL length.
