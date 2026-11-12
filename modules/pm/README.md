@@ -12,7 +12,13 @@ silk run -- install                 # install the package.json of the working di
 
 `pm install` resolves the dependencies against the registry, downloads what the store at
 `$SILKJS_STORE` (or `~/.silkjs/store`) does not have, and links an isolated `node_modules`: each
-package once under `node_modules/.sjs`, with its dependencies as sibling links.
+package once under `node_modules/.sjs`, with its dependencies as sibling links. Tarballs are
+unpacked on a thread pool while later ones still download.
+
+The resolved graph is written to `sjs.lock`, one line per package. The next install reads it and
+asks the registry nothing when it still matches `package.json`. The graph holds the packages of
+every platform, so the file is the same on every machine; the install skips what the host cannot
+run. `pm install --frozen-lockfile` fails when the lockfile is missing or out of date.
 
 ## Layout
 
