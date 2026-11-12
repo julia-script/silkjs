@@ -23,9 +23,9 @@ function site(error, fromPromise) {
   }
   if (error === null || typeof error !== 'object') return undefined;
   // A script that did not compile: V8's message points at the bad token.
-  const own = Object.prototype.hasOwnProperty;
-  if (!fromPromise && error instanceof SyntaxError && own.call(error, 'fileName') && own.call(error, 'lineNumber')) {
-    const { fileName, lineNumber, columnNumber } = error;
+  if (!fromPromise && error instanceof SyntaxError) {
+    const { file, line, column } = host.syntaxOrigin;
+    const fileName = error[file], lineNumber = error[line], columnNumber = error[column];
     if (typeof fileName === 'string' && Number.isInteger(lineNumber)) {
       return { name: fileName, line: lineNumber, column: columnNumber, text: undefined };
     }

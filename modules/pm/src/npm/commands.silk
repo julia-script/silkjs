@@ -1,0 +1,425 @@
+//! The commands that change what a project has installed: install, update, add and remove.
+//!
+//! Each one is given the directory of a package and works on the workspace that package is in,
+//! which is the package alone when nothing above it names it in `workspaces`. It reads every
+//! `package.json` of the workspace and the lockfile at its root, settles the graph, writes back
+//! what changed, and installs. `add` and `remove` edit the `package.json` of the package itself. A command line gives
+//! them a store, a thread pool and the host, and provides the [`Registry`].
+//!
+//! `package.json` is edited in its text, so its formatting and the order of its keys stay as
+//! they are.
+
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.collections.bytes { Bytes }
+import silk.collections.list { List }
+import silk.collections.slice { Slice }
+import silk.concurrency.thread_pool { Pool }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.platform.native.file { NativeFileError }
+import npm.install { Downloader, InstallError, Summary, install }
+import npm.lock { LOCKFILE, Lock, write }
+import npm.manifest { DEVELOPMENT, Manifest, OPTIONAL }
+import npm.registry { Registry }
+import npm.resolve { Graph, Host, ResolveError, Tarballs, resolve }
+import npm.workspace { Located, MANIFEST, Workspace, WorkspaceError }
+import pkg.files { readOptional, writeFile }
+import pkg.json_edit { removeMember, setMember }
+import pkg.names { Names }
+import pkg.store { Store }
+import pkg.text { same }
+
+/// Why a command stopped, apart from a failed resolution or install.
+pub struct CommandError {
+  /// A short description for people.
+  pub message: string<'static>,
+  /// What it is about, or empty.
+  pub subject: Bytes,
+}
+
+/// What a command did.
+pub struct Outcome {
+  pub summary: Summary,
+  /// Whether the lockfile was written.
+  pub lockfile: bool,
+  /// The dependencies that `package.json` gained or lost, a line each: `+ name range` or
+  /// `- name`.
+  pub changes: Bytes,
+}
+
+// The tables of `package.json` a dependency can be in.
+const TABLES: [&'static [u8]; 4] = [b"dependencies", b"devDependencies", b"optionalDependencies", b"peerDependencies"]
+
+effect fn stop(message: string<'static>, subject: &[u8]) -> never ! CommandError | OutOfMemoryError ? &mut Allocator {
+  fail CommandError { message: message, subject: run Bytes.copy(subject) }
+}
+
+// The path of the file `name` in the project directory.
+effect fn inProject(project: &[u8], name: &[u8]) -> Bytes ! OutOfMemoryError ? &mut Allocator {
+  let mut path = run Bytes.copy(project)
+  run path.append(b"/")
+  run path.append(name)
+  return move path
+}
+
+effect fn manifestText(project: &[u8]) -> Bytes ! CommandError | OutOfMemoryError ? &mut Allocator {
+  let path = run inProject(project, MANIFEST)
+  return match move run readOptional(Bytes.asSlice(&path)) {
+    Option.Some { value } => move value
+    Option.None => { run stop("there is no package.json in", project) }
+  }
+}
+
+// The workspace of the package in `project`.
+effect fn located(project: &[u8]) -> Located ! CommandError | OutOfMemoryError ? &mut Allocator {
+  return match move run Effect.result(Workspace.locate(project)) {
+    Result.Success { value } => move value
+    Result.Failure { error } => match move error {
+      WorkspaceError failed => { fail CommandError { message: failed.message, subject: move failed.subject } }
+      OutOfMemoryError exhausted => { fail move exhausted }
+    }
+  }
+}
+
+/// The directory of the package named `name` in the workspace of the package in `project`.
+///
+/// # Errors
+///
+/// - [`CommandError`] when the workspace cannot be read or has no package of that name.
+pub effect fn packageDirectory(project: &[u8], name: &[u8]) -> Bytes ! CommandError | OutOfMemoryError ? &mut Allocator {
+  let Located { workspace, .. } = run located(project)
+  return match Workspace.named(&workspace, name) {
+    Option.Some { value: member } => run Workspace.directory(&workspace, member)
+    Option.None => { run stop("no package of the workspace has the name", name) }
+  }
+}
+
+/// The directory of the root project of the workspace of the package in `project`.
+///
+/// # Errors
+///
+/// - [`CommandError`] when the workspace cannot be read.
+pub effect fn rootDirectory(project: &[u8]) -> Bytes ! CommandError | OutOfMemoryError ? &mut Allocator {
+  let Located { workspace, .. } = run located(project)
+  return run Bytes.copy(Workspace.root(&workspace))
+}
+
+effect fn parsed(text: &[u8]) -> Manifest ! CommandError | OutOfMemoryError ? &mut Allocator {
+  return match move run Manifest.parse(text) {
+    Option.Some { value } => move value
+    Option.None => { run stop("package.json is not valid", b"") }
+  }
+}
+
+effect fn save(path: &[u8], content: &[u8]) -> () ! CommandError | OutOfMemoryError ? &mut Allocator {
+  match move run Effect.result(writeFile(path, content)) {
+    Result.Success {..} => {}
+    Result.Failure { error } => match move error {
+      NativeFileError _ => { run stop("could not write", path) }
+      OutOfMemoryError exhausted => { fail move exhausted }
+    }
+  }
+}
+
+// How a command treats the versions of the lockfile.
+enum Pins {
+  // The lockfile must match `package.json`; nothing is resolved.
+  Frozen,
+  // The lockfile is used as it is when it matches, and else its versions are kept where the
+  // ranges allow.
+  Kept,
+  // Every package gets the newest version its ranges allow.
+  Dropped,
+}
+
+// A settled graph, and whether it came from a resolution and not from the lockfile as it is.
+struct Plan {
+  graph: Graph,
+  resolved: bool,
+}
+
+// The graph for `workspace`. `fresh` names packages that leave their pins.
+effect fn plan(workspace: &Workspace, pins: Pins, fresh: &[Bytes]) -> Plan
+  ! CommandError | ResolveError | OutOfMemoryError ? &mut Registry | &mut Tarballs | &mut Allocator {
+  let lockfile = run inProject(Workspace.root(workspace), LOCKFILE)
+  let existing = run readOptional(Bytes.asSlice(&lockfile))
+  let earlier = match &existing {
+    Option.Some { value: text } => run Lock.read(Bytes.asSlice(&text))
+    Option.None => Option<Lock>.none()
+  }
+  let current = match &earlier {
+    Option.Some { value: lock } => Lock.matches(&lock, workspace)
+    Option.None => false
+  }
+  let mut keep = true
+  match pins {
+    Pins.Frozen => {
+      if current == false {
+        run stop("the lockfile does not match package.json", b"")
+      }
+    }
+    Pins.Kept => {}
+    Pins.Dropped => { keep = false }
+  }
+  let previous = match move earlier {
+    Option.Some { value: lock } => {
+      let graph = Lock.intoGraph(move lock)
+      if current && keep && fresh.length == 0 {
+        return Plan { graph: move graph, resolved: false }
+      }
+      if keep {
+        Option<Graph>.some(move graph)
+      } else {
+        Option<Graph>.none()
+      }
+    }
+    Option.None => Option<Graph>.none()
+  }
+  let graph = match &previous {
+    Option.Some { value: pinned } => run resolve(workspace, Option<&Graph>.some(&pinned), fresh)
+    Option.None => run resolve(workspace, Option<&Graph>.none(), fresh)
+  }
+  return Plan { graph: move graph, resolved: true }
+}
+
+// Writes the lockfile of a resolved plan when it differs from the one on disk, and installs.
+effect fn finish(workspace: &Workspace, settled: Plan, downloader: Downloader<'_>, changes: Bytes) -> Outcome
+  ! CommandError | InstallError | OutOfMemoryError ? &mut Registry | &mut Allocator {
+  let Plan { graph, resolved } = move settled
+  let mut written = false
+  if resolved {
+    let text = run write(workspace, &graph)
+    let lockfile = run inProject(Workspace.root(workspace), LOCKFILE)
+    let unchanged = match move run readOptional(Bytes.asSlice(&lockfile)) {
+      Option.Some { value: old } => same(Bytes.asSlice(&old), Bytes.asSlice(&text))
+      Option.None => false
+    }
+    if unchanged == false {
+      run save(Bytes.asSlice(&lockfile), Bytes.asSlice(&text))
+      written = true
+    }
+  }
+  let summary = run install(workspace, &graph, move downloader)
+  return Outcome { summary: move summary, lockfile: written, changes: move changes }
+}
+
+/// Installs the dependencies of every package of the workspace that the package in `project`
+/// belongs to. The lockfile decides the versions when it matches the `package.json` files; when
+/// it does not, the graph is resolved again, keeping the versions of the lockfile where the
+/// ranges allow, and the lockfile is written. With `frozen`, a lockfile that is missing or does
+/// not match is an error, which is what a build server wants.
+///
+/// # Errors
+///
+/// - [`CommandError`] when a `package.json` or the lockfile is not as needed.
+/// - [`ResolveError`] and [`InstallError`] from the resolution and the install.
+pub effect fn installProject(project: &[u8], store: &Store, pool: &Pool, host: Host, frozen: bool) -> Outcome
+  ! CommandError | ResolveError | InstallError | OutOfMemoryError ? &mut Registry | &mut Allocator {
+  let Located { workspace, .. } = run located(project)
+  // The downloads of a resolution start while it still asks for metadata.
+  let mut downloader = Downloader.make(store, pool, host)
+  let pins = if frozen { Pins.Frozen } else { Pins.Kept }
+  let settled = run plan(&workspace, pins, &[]) |> Effect.provideMut<Tarballs>(&mut downloader)
+  return run finish(&workspace, move settled, move downloader, Bytes.make())
+}
+
+/// Moves packages to the newest versions the ranges of the workspace allow, writes the
+/// lockfile and installs. `names` are the packages to move, wherever they are in the graph;
+/// with no names, every package moves.
+///
+/// # Errors
+///
+/// - [`CommandError`], [`ResolveError`] and [`InstallError`] as for [`installProject`].
+pub effect fn updateProject(project: &[u8], store: &Store, pool: &Pool, host: Host, names: &[Bytes]) -> Outcome
+  ! CommandError | ResolveError | InstallError | OutOfMemoryError ? &mut Registry | &mut Allocator {
+  let Located { workspace, .. } = run located(project)
+  let mut downloader = Downloader.make(store, pool, host)
+  let pins = if names.length == 0 { Pins.Dropped } else { Pins.Kept }
+  let settled = run plan(&workspace, pins, names) |> Effect.provideMut<Tarballs>(&mut downloader)
+  return run finish(&workspace, move settled, move downloader, Bytes.make())
+}
+
+// Where the name ends in `name@spec`: the first `@` that is not the one of a scope, or the
+// length when there is no spec.
+fn nameEnd(wanted: &[u8]) -> usize {
+  let mut index: usize = 1
+  while index < wanted.length {
+    if wanted[index] == 64 {
+      return index
+    }
+    index = index + 1
+  }
+  return wanted.length
+}
+
+// Whether a spec names a tag such as `latest` or `next`, and not a range, a protocol or a path.
+fn isTag(spec: &[u8]) -> bool {
+  if spec.length == 0 {
+    return false
+  }
+  let first = spec[0]
+  if (first >= 48 && first <= 57) || first == 94 || first == 126 || first == 60 || first == 62 || first == 61 || first == 42 {
+    return false
+  }
+  if same(spec, b"x") || same(spec, b"X") {
+    return false
+  }
+  let mut index: usize = 0
+  while index < spec.length {
+    if spec[index] == 58 || spec[index] == 47 || spec[index] == 32 || spec[index] == 124 {
+      return false
+    }
+    index = index + 1
+  }
+  return true
+}
+
+// The version the dependency `alias` of the importer in the directory `path` resolved to.
+fn resolvedVersion<'g>(graph: &'g Graph, path: &[u8], alias: &[u8]) -> Option<&'g [u8]> {
+  let importer = match Graph.importerAt(graph, path) {
+    Option.Some { value } => value
+    Option.None => { return Option<&'g [u8]>.none() }
+  }
+  let edges = Graph.importerEdges(graph, importer)
+  let mut index: usize = 0
+  while index < edges.length {
+    if same(Names.bytes(&graph.names, edges[index].alias), alias) {
+      return Option<&'g [u8]>.some(Graph.version(graph, edges[index].target))
+    }
+    index = index + 1
+  }
+  return Option<&'g [u8]>.none()
+}
+
+effect fn edited(result: Option<Bytes>) -> Bytes ! CommandError | OutOfMemoryError ? &mut Allocator {
+  return match move result {
+    Option.Some { value } => move value
+    Option.None => { run stop("package.json cannot be edited: it is not a JSON object with dependency tables", b"") }
+  }
+}
+
+/// Adds dependencies to the `package.json` in `project` and installs them. Each of `wanted` is a name, or a name
+/// and what to take: `left-pad`, `left-pad@^1.3.0`, `left-pad@next`, `pad@npm:left-pad@1`. A
+/// name alone means the `latest` tag. A range is written as given; a tag is written as the
+/// version it resolved to, with `^` before it unless `exact`. `kind` is the table, as the
+/// dependency kinds of [`Manifest`]: production, development or optional. A dependency that is
+/// in another table moves.
+///
+/// # Errors
+///
+/// - [`CommandError`] when `package.json` cannot be read or edited.
+/// - [`ResolveError`] when one of `wanted` cannot be resolved; `package.json` is then untouched.
+/// - [`InstallError`] from the install.
+pub effect fn addDependencies(project: &[u8], store: &Store, pool: &Pool, host: Host, wanted: &[Bytes], kind: u8, exact: bool) -> Outcome
+  ! CommandError | ResolveError | InstallError | OutOfMemoryError ? &mut Registry | &mut Allocator {
+  let table: &[u8] = if kind == DEVELOPMENT { TABLES[1] } else if kind == OPTIONAL { TABLES[2] } else { TABLES[0] }
+  let Located { workspace: loaded, member } = run located(project)
+  let mut workspace = move loaded
+  let place = run Bytes.copy(Bytes.asSlice(&Workspace.all(&workspace)[member].path))
+  let original = run manifestText(project)
+  // First with the specs as asked for, to learn what the tags resolve to.
+  let mut text = run Bytes.copy(Bytes.asSlice(&original))
+  let mut names = List<Bytes>.make()
+  let mut index: usize = 0
+  while index < wanted.length {
+    let asked = Bytes.asSlice(&wanted[index])
+    let end = nameEnd(asked)
+    let name = Slice.view<u8>(asked, 0, end)
+    if name.length == 0 {
+      run stop("this is not a package name", asked)
+    }
+    let spec: &[u8] = if end + 1 < asked.length { Slice.view<u8>(asked, end + 1, asked.length - end - 1) } else { b"latest" }
+    let mut other: usize = 0
+    while other < 3 {
+      if same(TABLES[other], table) == false {
+        text = run edited(run removeMember(Bytes.asSlice(&text), TABLES[other], name))
+      }
+      other = other + 1
+    }
+    text = run edited(run setMember(Bytes.asSlice(&text), table, name, spec))
+    run names.append(run Bytes.copy(name))
+    index = index + 1
+  }
+  Workspace.replace(&mut workspace, member, run parsed(Bytes.asSlice(&text)))
+  let mut downloader = Downloader.make(store, pool, host)
+  let settled = run plan(&workspace, Pins.Kept, List<Bytes>.asSlice(&names)) |> Effect.provideMut<Tarballs>(&mut downloader)
+
+  // Then with each tag replaced by the range for the version it gave.
+  let mut changes = Bytes.make()
+  index = 0
+  while index < wanted.length {
+    let asked = Bytes.asSlice(&wanted[index])
+    let end = nameEnd(asked)
+    let name = Slice.view<u8>(asked, 0, end)
+    let spec: &[u8] = if end + 1 < asked.length { Slice.view<u8>(asked, end + 1, asked.length - end - 1) } else { b"latest" }
+    let mut range = Bytes.make()
+    if isTag(spec) {
+      let version = match resolvedVersion(&settled.graph, Bytes.asSlice(&place), name) {
+        Option.Some { value } => value
+        Option.None => { run stop("this package could not be resolved", asked) }
+      }
+      if exact == false {
+        run range.append(b"^")
+      }
+      run range.append(version)
+      text = run edited(run setMember(Bytes.asSlice(&text), table, name, Bytes.asSlice(&range)))
+    } else {
+      run range.append(spec)
+    }
+    run changes.append(b"+ ")
+    run changes.append(name)
+    run changes.append(b" ")
+    run changes.append(Bytes.asSlice(&range))
+    run changes.append(b"\n")
+    index = index + 1
+  }
+  Workspace.replace(&mut workspace, member, run parsed(Bytes.asSlice(&text)))
+  if same(Bytes.asSlice(&text), Bytes.asSlice(&original)) == false {
+    let path = run inProject(project, MANIFEST)
+    run save(Bytes.asSlice(&path), Bytes.asSlice(&text))
+  }
+  let Plan { graph, .. } = move settled
+  // The lockfile records the ranges of package.json, which are the final ones only now.
+  return run finish(&workspace, Plan { graph: move graph, resolved: true }, move downloader, move changes)
+}
+
+/// Takes dependencies out of the `package.json` in `project`, whatever table they are in, and installs, which
+/// removes what nothing needs any more.
+///
+/// # Errors
+///
+/// - [`CommandError`] when one of `names` is not a dependency of the project; nothing is
+///   changed then.
+/// - [`ResolveError`] and [`InstallError`] from the resolution and the install.
+pub effect fn removeDependencies(project: &[u8], store: &Store, pool: &Pool, host: Host, names: &[Bytes]) -> Outcome
+  ! CommandError | ResolveError | InstallError | OutOfMemoryError ? &mut Registry | &mut Allocator {
+  let Located { workspace: loaded, member } = run located(project)
+  let mut workspace = move loaded
+  let original = run manifestText(project)
+  let mut text = run Bytes.copy(Bytes.asSlice(&original))
+  let mut changes = Bytes.make()
+  let mut index: usize = 0
+  while index < names.length {
+    let name = Bytes.asSlice(&names[index])
+    let before = Bytes.length(&text)
+    let mut table: usize = 0
+    while table < TABLES.length {
+      text = run edited(run removeMember(Bytes.asSlice(&text), TABLES[table], name))
+      table = table + 1
+    }
+    if Bytes.length(&text) == before {
+      run stop("this is not a dependency of the project", name)
+    }
+    run changes.append(b"- ")
+    run changes.append(name)
+    run changes.append(b"\n")
+    index = index + 1
+  }
+  Workspace.replace(&mut workspace, member, run parsed(Bytes.asSlice(&text)))
+  let path = run inProject(project, MANIFEST)
+  run save(Bytes.asSlice(&path), Bytes.asSlice(&text))
+  let mut downloader = Downloader.make(store, pool, host)
+  let settled = run plan(&workspace, Pins.Kept, &[]) |> Effect.provideMut<Tarballs>(&mut downloader)
+  return run finish(&workspace, move settled, move downloader, move changes)
+}

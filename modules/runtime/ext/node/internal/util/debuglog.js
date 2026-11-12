@@ -9,12 +9,16 @@ const { format } = require('internal/util/inspect');
 const ReflectApply = Reflect.apply;
 
 const debugWarned = new Set();
+// Whether NODE_DEBUG names the (upper case) section.
+function testEnabled(section) {
+  return String(host.env.NODE_DEBUG || '').split(/[\s,]+/).filter(Boolean).some(pattern => new RegExp('^' + pattern.replace(/[|\\{}()[\]^$+?.]/g, '\\$&').replace(/\*/g, '.*') + '$', 'i').test(section));
+}
 function debuglog(section, callback) {
   section = String(section).toUpperCase();
   let enabled;
   // NODE_DEBUG is read on first use, not when a module asks for its logger.
   const initialize = () => {
-    enabled = String(host.env.NODE_DEBUG || '').split(/[\s,]+/).filter(Boolean).some(pattern => new RegExp('^' + pattern.replace(/[|\\{}()[\]^$+?.]/g, '\\$&').replace(/\*/g, '.*') + '$', 'i').test(section));
+    enabled = testEnabled(section);
     // Like Node's debuglogImpl, the first enabled logger of http or http2 warns once.
     if (enabled && (section === 'HTTP' || section === 'HTTP2') && !debugWarned.has(section)) {
       debugWarned.add(section);
@@ -66,4 +70,56 @@ function formatTime(ms) {
   return `${Number(ms.toFixed(3))}ms`;
 }
 
-module.exports = { debuglog, formatTime };
+// debugWithTimer(set): timers that print to stderr when NODE_DEBUG names the set and
+// emit begin and end trace events while the node.<set> trace category is on.
+// The trace category can only be on once internal/trace_events is loaded, so it is
+// not loaded before. active() says whether a timer would do anything.
+const kTraceBegin = 98, kTraceEnd = 101;
+function debugWithTimer(set) {
+  set = String(set).toUpperCase();
+  const traceCategory = `node,node.${set.toLowerCase()}`;
+  const times = new Map();
+  let logEnabled;
+  let categoryBuffer;
+  function traceEnabled() {
+    if (categoryBuffer === undefined) {
+      if (!host.builtinLoaded('internal/trace_events')) return false;
+      categoryBuffer = require('internal/trace_events').getCategoryEnabledBuffer(traceCategory);
+    }
+    return categoryBuffer[0] !== 0;
+  }
+  function logging() {
+    logEnabled ??= testEnabled(set);
+    return logEnabled;
+  }
+  function log(label, formatted) {
+    const colors = { colors: require('internal/util/colors').shouldColorize(process.stderr) };
+    process.stderr.write(format('%s %s %s: %s\n', set, require('internal/util/inspect').inspect(process.pid, colors), label, formatted));
+  }
+  function active() { return logging() || traceEnabled(); }
+  function start(logLabel, traceLabel = logLabel) {
+    logLabel = `${logLabel}`;
+    if (times.has(logLabel)) {
+      process.emitWarning(`Label '${logLabel}' already exists for debuglog.time`);
+      return;
+    }
+    if (traceEnabled()) require('internal/trace_events').trace(kTraceBegin, traceCategory, `${traceLabel}`, 0);
+    times.set(logLabel, process.hrtime());
+  }
+  function end(logLabel, traceLabel = logLabel) {
+    logLabel = `${logLabel}`;
+    if (logging()) {
+      const time = times.get(logLabel);
+      if (time === undefined) process.emitWarning(`No such label '${logLabel}' for debuglog.timeEnd`);
+      else {
+        const duration = process.hrtime(time);
+        log(logLabel, formatTime(duration[0] * 1000 + duration[1] / 1e6));
+      }
+    }
+    if (traceEnabled()) require('internal/trace_events').trace(kTraceEnd, traceCategory, `${traceLabel}`, 0);
+    times.delete(logLabel);
+  }
+  return { active, start, end };
+}
+
+module.exports = { debuglog, debugWithTimer, formatTime };
