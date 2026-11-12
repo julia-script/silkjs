@@ -183,7 +183,7 @@ class KeyObjectHandle {
       case kKeyFormatRawPublic:
       case kKeyFormatRawPrivate:
       case kKeyFormatRawSeed:
-        prepared = { raw: { key: data, format: kRawFormats[format], asymmetricKeyType: encoding, namedCurve: namedCurve ?? undefined } };
+        prepared = { data, format: kRawFormats[format], type: encoding, namedCurve: namedCurve ?? null };
         break;
       default:
         throw c.error('ERR_INVALID_ARG_VALUE', 'Invalid key format', TypeError);

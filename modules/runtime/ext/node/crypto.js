@@ -25,7 +25,7 @@
 
 'use strict';
 const c = require('internal/crypto_core');
-const { Buffer, call, submit, packed, bytes, binary, integer, callback, error, invalid, output, attach, handle, release, name } = c;
+const { Buffer, call, submit, packed, bytes, binary, integer, callback, error, invalid, output, attach, handle, release, name, kHandle } = c;
 const { Transform, Writable } = require('stream');
 const constants = Object.freeze({ SSL_OP_ALL: 2147485776, SSL_OP_ALLOW_NO_DHE_KEX: 1024, SSL_OP_ALLOW_UNSAFE_LEGACY_RENEGOTIATION: 262144, SSL_OP_CIPHER_SERVER_PREFERENCE: 4194304, SSL_OP_CISCO_ANYCONNECT: 32768, SSL_OP_COOKIE_EXCHANGE: 8192, SSL_OP_CRYPTOPRO_TLSEXT_BUG: 2147483648, SSL_OP_DONT_INSERT_EMPTY_FRAGMENTS: 2048, SSL_OP_LEGACY_SERVER_CONNECT: 4, SSL_OP_NO_COMPRESSION: 131072, SSL_OP_NO_ENCRYPT_THEN_MAC: 524288, SSL_OP_NO_QUERY_MTU: 4096, SSL_OP_NO_RENEGOTIATION: 1073741824, SSL_OP_NO_SESSION_RESUMPTION_ON_RENEGOTIATION: 65536, SSL_OP_NO_SSLv2: 0, SSL_OP_NO_SSLv3: 33554432, SSL_OP_NO_TICKET: 16384, SSL_OP_NO_TLSv1: 67108864, SSL_OP_NO_TLSv1_1: 268435456, SSL_OP_NO_TLSv1_2: 134217728, SSL_OP_NO_TLSv1_3: 536870912, SSL_OP_PRIORITIZE_CHACHA: 2097152, SSL_OP_TLS_ROLLBACK_BUG: 8388608, RSA_PKCS1_PADDING: 1, RSA_NO_PADDING: 3, RSA_PKCS1_OAEP_PADDING: 4, RSA_X931_PADDING: 5, RSA_PKCS1_PSS_PADDING: 6, RSA_PSS_SALTLEN_DIGEST: -1, RSA_PSS_SALTLEN_MAX_SIGN: -2, RSA_PSS_SALTLEN_AUTO: -2, POINT_CONVERSION_COMPRESSED: 2, POINT_CONVERSION_UNCOMPRESSED: 4, POINT_CONVERSION_HYBRID: 6, DH_CHECK_P_NOT_PRIME: 1, DH_CHECK_P_NOT_SAFE_PRIME: 2, DH_UNABLE_TO_CHECK_GENERATOR: 4, DH_NOT_SUITABLE_GENERATOR: 8, ENGINE_METHOD_RSA: 1, ENGINE_METHOD_DSA: 2, ENGINE_METHOD_DH: 4, ENGINE_METHOD_RAND: 8, ENGINE_METHOD_CIPHERS: 64, ENGINE_METHOD_DIGESTS: 128, ENGINE_METHOD_PKEY_METHS: 512, ENGINE_METHOD_PKEY_ASN1_METHS: 1024, ENGINE_METHOD_EC: 2048, ENGINE_METHOD_ALL: 65535, ENGINE_METHOD_NONE: 0, defaultCoreCipherList: require('internal/tls/options').DEFAULT_CIPHER_LIST, defaultCipherList: require('internal/tls/options').getOptionValue('--tls-cipher-list') });
 const { codes, validate, isAnyArrayBuffer, normalize } = c;
@@ -232,19 +232,32 @@ function hashState(algorithm, xofLen, existing) {
   if (xofLen !== undefined && !xof && xofLen !== size) throw error('ERR_OSSL_EVP_NOT_XOF_OR_INVALID_LENGTH', 'Invalid XOF digest length');
   return { algorithm, length: xof ? xofLen ?? (/128$/.test(algorithm) ? 16 : 32) : -1, [kFinalized]: false, existing };
 }
+// The native half of Node's Hash (crypto::Hash): update() reports an OpenSSL
+// failure as false, and digest() keeps the first digest so _flush() can read it
+// without finalizing.
+class HashHandle {
+  constructor(algorithm, length, source) {
+    this.algorithm = algorithm; this.length = length;
+    attach(this, source === undefined ? call('hashCreate', [algorithm]) : call('hashCopy', [handle(source)]));
+  }
+  update(data, encoding) {
+    try { call('hashUpdate', [handle(this), packed(typeof data === 'string' ? Buffer.from(data, encoding) : data)]); } catch { return false; }
+    return true;
+  }
+  digest(outputEncoding) { return hashDigest(this, 'hashFinal', () => [handle(this), this.length], outputEncoding); }
+}
 function Hash(algorithm, options) {
   if (!new.target) return new Hash(algorithm, options);
-  const isCopy = algorithm instanceof Hash;
+  const isCopy = algorithm instanceof HashHandle;
   if (!isCopy) validate.string(algorithm, 'algorithm');
   let xofLen = typeof options === 'object' && options !== null ? options.outputLength : undefined;
   if (xofLen !== undefined) { validate.uint32(xofLen, 'options.outputLength'); xofLen += 0; }
-  const source = isCopy ? algorithm[kState] : undefined, name = isCopy ? source.algorithm : algorithm;
+  const name = isCopy ? algorithm.algorithm : algorithm;
   if (!isCopy && digestSize(name) === undefined) throw new Error('Digest method not supported');
   const state = hashState(name, xofLen);
-  let id;
-  try { id = isCopy ? call('hashCopy', [handle(algorithm)]) : call('hashCreate', [algorithm]); }
+  try { this[kHandle] = new HashHandle(name, state.length, isCopy ? algorithm : undefined); }
   catch (e) { if (!isCopy && e.code === 'ERR_OSSL_CRYPTO_OPERATION_FAILED' && digestSize(algorithm) === undefined) throw new Error('Digest method not supported'); throw e; }
-  attach(this, id); this[kState] = state;
+  this[kState] = { [kFinalized]: false };
   if (!isCopy && xofLen === undefined) warnShake(algorithm);
   LazyTransform.call(this, options);
 }
@@ -264,18 +277,19 @@ function hashDigest(object, op, args, outputEncoding) {
   outputEncoding = outputEncoding && `${outputEncoding}`;
   return outputEncoding && outputEncoding !== 'buffer' ? result.toString(outputEncoding) : Buffer.from(result);
 }
-Hash.prototype.copy = function copy(options) { if (this[kState][kFinalized]) throw codes.ERR_CRYPTO_HASH_FINALIZED(); return new Hash(this, options); };
-Hash.prototype._transform = function _transform(chunk, encoding, cb) { call('hashUpdate', [handle(this), packed(typeof chunk === 'string' ? Buffer.from(chunk, encoding) : chunk)]); cb(); };
-Hash.prototype._flush = function _flush(cb) { this.push(hashDigest(this, 'hashFinal', () => [handle(this), this[kState].length])); cb(); };
+Hash.prototype.copy = function copy(options) { if (this[kState][kFinalized]) throw codes.ERR_CRYPTO_HASH_FINALIZED(); return new Hash(this[kHandle], options); };
+Hash.prototype._transform = function _transform(chunk, encoding, cb) { if (!this[kHandle].update(chunk, encoding)) return cb(codes.ERR_CRYPTO_HASH_UPDATE_FAILED()); cb(); };
+Hash.prototype._flush = function _flush(cb) { this.push(this[kHandle].digest()); cb(); };
 Hash.prototype.update = function update(data, encoding) {
   if (this[kState][kFinalized]) throw codes.ERR_CRYPTO_HASH_FINALIZED();
-  call('hashUpdate', [handle(this), packed(hashData(data, encoding))]); return this;
+  if (!this[kHandle].update(hashData(data, encoding))) throw codes.ERR_CRYPTO_HASH_UPDATE_FAILED();
+  return this;
 };
 Hash.prototype.digest = function digest(outputEncoding) {
   const state = this[kState]; if (state[kFinalized]) throw codes.ERR_CRYPTO_HASH_FINALIZED();
-  const result = hashDigest(this, 'hashFinal', () => [handle(this), state.length], outputEncoding); state[kFinalized] = true; return result;
+  const result = this[kHandle].digest(outputEncoding); state[kFinalized] = true; return result;
 };
-Hash.prototype._destroy = function _destroy(e, cb) { release(this); cb(e); };
+Hash.prototype._destroy = function _destroy(e, cb) { release(this[kHandle]); cb(e); };
 function Hmac(hmac, key, options) {
   if (!(this instanceof Hmac)) return new Hmac(hmac, key, options);
   validate.string(hmac, 'hmac');
@@ -300,7 +314,7 @@ Hmac.prototype.digest = function digest(outputEncoding) {
 };
 Hmac.prototype._transform = function _transform(chunk, encoding, cb) { call('hmacUpdate', [handle(this), packed(typeof chunk === 'string' ? Buffer.from(chunk, encoding) : chunk)]); cb(); };
 Hmac.prototype._flush = function _flush(cb) { this.push(hashDigest(this, 'hmacFinal', () => [handle(this)])); this[kState][kFinalized] = true; cb(); };
-Hmac.prototype._destroy = Hash.prototype._destroy;
+Hmac.prototype._destroy = function _destroy(e, cb) { release(this); cb(e); };
 function createHash(algorithm, options) { return new Hash(algorithm, options); }
 function createHmac(hmac, key, options) { return new Hmac(hmac, key, options); }
 function hash(algorithm, input, options) {
@@ -807,8 +821,8 @@ function prepareAsymmetricKey(key, ctx, name = 'key') {
   if (typeof key === 'string') return { format: 'pem', data: encodeKeyString(key) };
   if (ArrayBuffer.isView(key)) return { format: 'pem', data: key };
   const isPrivateKeyInput = ctx === kConsumePrivate || ctx === kCreatePrivate;
-  if (isKeyObject(key)) { validateAsymmetricKeyType(keySlotsOf(key).type, ctx, key); return { keyObject: key }; }
-  if (isCryptoKey(key)) { emitDEP0203(); const object = cryptoKeyObject(key); validateAsymmetricKeyType(keySlotsOf(object).type, ctx, key); return { keyObject: object }; }
+  if (isKeyObject(key)) { const slots = keySlotsOf(key); validateAsymmetricKeyType(slots.type, ctx, key); return { data: slots.handle, keyObject: key }; }
+  if (isCryptoKey(key)) { emitDEP0203(); const object = cryptoKeyObject(key), slots = keySlotsOf(object); validateAsymmetricKeyType(slots.type, ctx, key); return { data: slots.handle, keyObject: object }; }
   // A private key referenced by a URI for an OpenSSL STORE loader.
   if (isPrivateKeyInput && webURL().isURLInstance(key)) return prepareStorePrivateKey(key, name);
   if (isAnyArrayBuffer(key)) return { format: 'pem', data: key };
@@ -816,20 +830,20 @@ function prepareAsymmetricKey(key, ctx, name = 'key') {
   throw codes.ERR_INVALID_ARG_TYPE(name, keyTypes(ctx !== kCreatePrivate, isPrivateKeyInput), key);
 }
 function prepareAsymmetricKeyOptions(key, ctx, name, isPrivateKeyInput) {
-  const { key: data, encoding, format } = key;
+  const { key: data, encoding, format, properties } = key;
   let isData = typeof data === 'string' || ArrayBuffer.isView(data);
-  if (!isData && isKeyObject(data)) { validateAsymmetricKeyType(keySlotsOf(data).type, ctx, data); return { keyObject: data }; }
-  if (!isData && isCryptoKey(data)) { emitDEP0203(); const object = cryptoKeyObject(data); validateAsymmetricKeyType(keySlotsOf(object).type, ctx, data); return { keyObject: object }; }
+  if (!isData && isKeyObject(data)) { const slots = keySlotsOf(data); validateAsymmetricKeyType(slots.type, ctx, data); return { data: slots.handle, keyObject: data }; }
+  if (!isData && isCryptoKey(data)) { emitDEP0203(); const object = cryptoKeyObject(data), slots = keySlotsOf(object); validateAsymmetricKeyType(slots.type, ctx, data); return { data: slots.handle, keyObject: object }; }
   isData ||= isAnyArrayBuffer(data);
   // A STORE URI, with an optional passphrase or PIN.
-  if (!isData && isPrivateKeyInput && webURL().isURLInstance(data)) return prepareStorePrivateKey(data, name, key.passphrase, encoding, key.properties);
+  if (!isData && isPrivateKeyInput && webURL().isURLInstance(data)) return prepareStorePrivateKey(data, name, key.passphrase, encoding, properties);
   if (format === 'jwk') { validate.object(data, `${name}.key`); return { data, format: 'jwk' }; }
   if (format === 'raw-public' || format === 'raw-private' || format === 'raw-seed') {
     if (isPrivateKeyInput && format === 'raw-public') throw codes.ERR_INVALID_ARG_VALUE(`${name}.format`, format);
     if (!isData || typeof data === 'string') throw codes.ERR_INVALID_ARG_TYPE(`${name}.key`, ['ArrayBuffer', 'Buffer', 'TypedArray', 'DataView'], data);
     validate.string(key.asymmetricKeyType, `${name}.asymmetricKeyType`);
     if (key.asymmetricKeyType === 'ec') validate.string(key.namedCurve, `${name}.namedCurve`);
-    return { data, format, raw: key };
+    return { data, format, type: key.asymmetricKeyType, namedCurve: key.namedCurve ?? null };
   }
   if (!isData) throw codes.ERR_INVALID_ARG_TYPE(`${name}.key`, keyTypes(ctx !== kCreatePrivate, isPrivateKeyInput), data);
   const keyData = typeof data === 'string' ? encodeKeyString(data, encoding) : data;
@@ -878,7 +892,7 @@ function keyFromPrepared(prepared, type) {
     const { uri, properties } = prepared.data;
     return newKeyObject('private', call('storeLoad', [uri, properties ?? '', packed(storePassphraseBlock(prepared.passphrase)), 0]));
   }
-  if (prepared.raw !== undefined) return c.providerRawImport(prepared.raw, type);
+  if (prepared.format === 'raw-public' || prepared.format === 'raw-private' || prepared.format === 'raw-seed') return c.providerRawImport({ key: prepared.data, format: prepared.format, asymmetricKeyType: prepared.type, namedCurve: prepared.namedCurve ?? undefined }, type);
   const { format, passphrase } = prepared;
   let data = bytes(prepared.data);
   // PEM_read_bio_PrivateKey and friends skip blocks that hold no key, such
@@ -1008,7 +1022,7 @@ function keygenArgs(type, options) {
       else if (paramEncoding === 'explicit') explicit = true;
       else throw codes.ERR_INVALID_ARG_VALUE('options.paramEncoding', paramEncoding);
       if (!kNistCurves.includes(namedCurve) && !names('curves').includes(namedCurve)) throw codes.ERR_CRYPTO_INVALID_CURVE();
-      return ['EC', -1, namedCurve, packed(Buffer.alloc(0)), '', '', -1, explicit ? 3 : 0];
+      return ['EC', -1, namedCurve, packed(Buffer.alloc(0)), '', '', -1, explicit ? 3 : 4];
     }
     case 'dh': {
       validate.object(options, 'options');
@@ -1446,7 +1460,10 @@ module.exports.setFips = enabled => {
   if (!require('worker_threads').isMainThread) {
     throw new (require('internal/errors').codes.ERR_WORKER_UNSUPPORTED_OPERATION)('Calling crypto.setFips()');
   }
-  call('setFips', [enabled ? 1 : 0]); binding.noteFipsChange();
+  // ncrypto::setFipsEnabled: the generation moves only when the FIPS state does.
+  const before = call('getFips', []);
+  call('setFips', [enabled ? 1 : 0]);
+  if (call('getFips', []) !== before) binding.noteFipsChange();
 };
 c.keyFromHandle = (type, id) => newKeyObject(type, id);
 c.keyObjectFromHandle = keyObjectFromHandle;
@@ -1461,6 +1478,10 @@ c.keyObjectAsymmetricType = key => asymmetricKeyTypeOf(key);
 c.keyObjectDetails = key => asymmetricKeyDetailsOf(key);
 c.keyObjectDer = key => exportAsymmetric(key, { format: 'der', type: keySlotsOf(key).type === 'private' ? 'pkcs8' : 'spki' });
 c.keygenArgs = keygenArgs;
+// lib/internal/crypto/keys.js internals that tests reach with --expose-internals.
+c.prepareAsymmetricKey = prepareAsymmetricKey;
+c.getKeyObjectHandle = key => keySlotsOf(key).handle;
+c.keyContexts = { kCreatePrivate, kCreatePublic, kConsumePrivate, kConsumePublic };
 c.serializeKeyObject = key => {
   if (!isKeyObject(key)) return undefined;
   const type = keySlotsOf(key).type;
