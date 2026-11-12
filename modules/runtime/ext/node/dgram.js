@@ -883,6 +883,11 @@ Socket.prototype._stopReceiving = deprecate(function() {
 
 
 module.exports = {
+  _createSocketHandle: deprecate(
+    require('internal/dgram')._createSocketHandle,
+    'dgram._createSocketHandle() is deprecated',
+    'DEP0112',
+  ),
   createSocket,
   Socket,
 };
