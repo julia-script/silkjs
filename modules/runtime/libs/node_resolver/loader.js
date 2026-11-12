@@ -355,7 +355,9 @@ function createLoader(host, builtins) {
     return null;
   }
 
-  function legacyFile(filename, directoryAllowed, directoryOnly) {
+  // warnMain: a require() lookup, which warns as Node's tryPackage (DEP0128) when an
+  // index file stands in for a "main" that names nothing.
+  function legacyFile(filename, directoryAllowed, directoryOnly, warnMain = true) {
     const exact = directoryOnly ? null : tryFile(filename) || tryExtensions(filename);
     if (exact || !directoryAllowed || !isDirectory(filename)) return exact;
     const pkg = readPackage(filename);
@@ -365,7 +367,13 @@ function createLoader(host, builtins) {
       if (found) return found;
     }
     const index = tryExtensions(path.join(filename, 'index'));
-    if (index) return index;
+    if (index) {
+      if (warnMain && pkg && typeof pkg.data.main === 'string' && pkg.data.main) {
+        process.emitWarning(`Invalid 'main' field in '${pkg.filename}' of '${pkg.data.main}'. ` +
+          'Please either fix that or report it to the module author', 'DeprecationWarning', 'DEP0128');
+      }
+      return index;
+    }
     if (pkg && typeof pkg.data.main === 'string' && pkg.data.main) {
       throw notFound(`Cannot find module '${path.resolve(filename, pkg.data.main)}'. Please verify that the package.json has a valid "main" entry`, { path: pkg.filename, requestPath: filename });
     }
@@ -408,7 +416,20 @@ function createLoader(host, builtins) {
       `${packagePath(pkg)}package.json${parent ? ` imported from ${parent}` : ''}.`, 'DeprecationWarning', 'DEP0166');
   }
 
-  function packageTarget(pkg, target, replacement, key, pattern, internal, parent, mode, seen) {
+  // pathMap: an "exports" pattern matched a request ending in "/" (Node's isPathMap),
+  // which has its own deprecation (DEP0155) in place of the segment one.
+  // emitTrailingSlashPatternDeprecation, once for each package and request.
+  const trailingSlashWarnings = new Set();
+  function trailingSlashPatternDeprecation(request, pkg, parent) {
+    if (process.noDeprecation) return;
+    const pjsonPath = packagePath(pkg) + 'package.json';
+    if (trailingSlashWarnings.has(pjsonPath + '|' + request)) return;
+    trailingSlashWarnings.add(pjsonPath + '|' + request);
+    process.emitWarning(`Use of deprecated trailing slash pattern mapping "${request}" in the "exports" field module resolution of the package at ` +
+      `${pjsonPath}${parent ? ` imported from ${parent}` : ''}. Mapping specifiers ending in "/" is no longer supported.`, 'DeprecationWarning', 'DEP0155');
+  }
+
+  function packageTarget(pkg, target, replacement, key, pattern, internal, parent, mode, seen, pathMap = false) {
     if (typeof target === 'string') {
       if (!target.startsWith('./')) {
         if (internal && !target.startsWith('../') && !target.startsWith('/') && !/^[A-Za-z][A-Za-z\d+.-]*:/.test(target) && !target.startsWith('#')) {
@@ -422,14 +443,14 @@ function createLoader(host, builtins) {
       const expandedTarget = pattern ? target.split('*').join(subpath) : target;
       if (invalidSegmentRegEx.test(target.slice(2))) {
         if (deprecatedInvalidSegmentRegEx.test(target.slice(2))) throw invalidTarget(pkg, key, target, internal, parent);
-        segmentDeprecation(expandedTarget, request, key, pkg, internal, parent, true);
+        if (!pathMap) segmentDeprecation(expandedTarget, request, key, pkg, internal, parent, true);
       }
       if (subpath !== '' && invalidSegmentRegEx.test(subpath)) {
         if (deprecatedInvalidSegmentRegEx.test(subpath)) {
           throw error('ERR_INVALID_MODULE_SPECIFIER', request, `request is not a valid match in pattern "${key}" for the ` +
             `"${internal ? 'imports' : 'exports'}" resolution of ${packagePath(pkg)}package.json`, parent || undefined);
         }
-        segmentDeprecation(expandedTarget, request, key, pkg, internal, parent, false);
+        if (!pathMap) segmentDeprecation(expandedTarget, request, key, pkg, internal, parent, false);
       }
       const expanded = pattern ? target.split('*').join(replacement) : target;
       const url = fromFileURL(fileURL(pkg.directory) + '/' + expanded.slice(2));
@@ -442,7 +463,7 @@ function createLoader(host, builtins) {
       let last;
       for (let i1 = 0, a1 = target; i1 < a1.length; i1++) { const item = a1[i1];
         let result;
-        try { result = packageTarget(pkg, item, replacement, key, pattern, internal, parent, mode, seen); }
+        try { result = packageTarget(pkg, item, replacement, key, pattern, internal, parent, mode, seen, pathMap); }
         catch (cause) {
           if (cause.code !== 'ERR_INVALID_PACKAGE_TARGET') throw cause;
           last = cause;
@@ -464,7 +485,7 @@ function createLoader(host, builtins) {
       }
       for (let i3 = 0, a3 = keys; i3 < a3.length; i3++) { const condition = a3[i3];
         if (condition === 'default' || (activeConditions ? activeConditions.includes(condition) : condition === 'node' || (condition === 'node-addons' && !host.noAddons) || condition === mode || (condition === 'module-sync' && requireModuleEnabled()) || (host.moduleConditions && host.moduleConditions.includes(condition)))) {
-          const result = packageTarget(pkg, target[condition], replacement, key, pattern, internal, parent, mode, seen);
+          const result = packageTarget(pkg, target[condition], replacement, key, pattern, internal, parent, mode, seen, pathMap);
           if (result !== undefined) return result;
         }
       }
@@ -498,6 +519,7 @@ function createLoader(host, builtins) {
           const star = key.indexOf('*');
           if (star === -1 || key.indexOf('*', star + 1) !== -1) continue;
           const prefix = key.slice(0, star);
+          if (!internal && request.startsWith(prefix) && request.endsWith('/')) trailingSlashPatternDeprecation(request, pkg, parent);
           const suffix = key.slice(star + 1);
           if (!request.startsWith(prefix) || !request.endsWith(suffix) || request.length < key.length) continue;
           if (match === undefined || star > match.indexOf('*') || (star === match.indexOf('*') && key.length > match.length)) {
@@ -510,7 +532,7 @@ function createLoader(host, builtins) {
       }
     }
     if (match !== undefined) {
-      const targetResult = packageTarget(pkg, target, replacement, match, pattern, internal, parent, mode, seen);
+      const targetResult = packageTarget(pkg, target, replacement, match, pattern, internal, parent, mode, seen, pattern && !internal && request.endsWith('/'));
       if (targetResult !== null && targetResult !== undefined) {
         if (targetResult.external) return resolveInternal(targetResult.external, targetResult.parent, mode, undefined, seen, isMain);
         return strictFile(targetResult.filename, request, parent, mode, targetResult.suffix, isMain, pkg);
@@ -648,6 +670,25 @@ function createLoader(host, builtins) {
     throw missing(specifier, parent, mode, undefined, parsed.name);
   }
 
+  // emitLegacyIndexDeprecation (DEP0151): an ES module found as a package's main by
+  // a default index or by extension resolution of its "main" field.
+  function legacyIndexDeprecation(found, root, pkg, parent) {
+    if (process.noDeprecation) return;
+    try { if (format(found, 'import') !== 'module') return; } catch (_) { return; }
+    const pkgPath = root + path.sep;
+    const main = pkg && typeof pkg.data.main === 'string' ? pkg.data.main : undefined;
+    const base = typeof parent === 'string' && parent.startsWith('file:') ? filesystemName(parent) : parent;
+    if (!main) {
+      process.emitWarning(`No "main" or "exports" field defined in the package.json for ${pkgPath} resolving the main entry point ` +
+        `"${found.slice(pkgPath.length)}", imported from ${base}.\nDefault "index" lookups for the main are deprecated for ES modules.`,
+        'DeprecationWarning', 'DEP0151');
+    } else if (path.resolve(pkgPath, main) !== found) {
+      process.emitWarning(`Package ${pkgPath} has a "main" field set to "${main}", excluding the full filename and extension to the ` +
+        `resolved file at "${found.slice(pkgPath.length)}", imported from ${base}.\n Automatic extension resolution of the "main" field is ` +
+        'deprecated for ES modules.', 'DeprecationWarning', 'DEP0151');
+    }
+  }
+
   // The module that parsed.subpath names in the package at root, or undefined when
   // root holds no such package.
   function packageAt(root, parsed, specifier, parent, mode, seen, isMain) {
@@ -663,8 +704,11 @@ function createLoader(host, builtins) {
       const exact = path.resolve(root, pkg.data.main);
       if (isFile(exact)) return descriptor(exact, mode, undefined, isMain);
     }
-    const found = legacyFile(candidate, true, /[\\/]$/.test(specifier));
-    if (found) return descriptor(found, mode, undefined, isMain);
+    const found = legacyFile(candidate, true, /[\\/]$/.test(specifier), mode !== 'import');
+    if (found) {
+      if (mode === 'import' && parsed.subpath === '.') legacyIndexDeprecation(found, root, pkg, parent);
+      return descriptor(found, mode, undefined, isMain);
+    }
     if (mode === 'import' && isDirectory(root)) throw missing(specifier, parent, mode, undefined, root + path.sep);
     return undefined;
   }
@@ -1312,17 +1356,46 @@ function createLoader(host, builtins) {
   // Node's ERR_REQUIRE_ESM, for require() of an ES module under --no-experimental-require-module.
   function requireESMError(filename, parent) {
     const pkg = filename.endsWith('.mjs') ? null : packageScope(filename);
-    return error('ERR_REQUIRE_ESM', filename, false, (parent && parent.filename) || null, pkg ? pkg.filename : null);
+    // Whether the file has module syntax (containsModuleSyntax) picks the hint.
+    let usesEsm = false;
+    if (pkg) { try { usesEsm = host.detectModuleSyntax(cleanSource(text(filename)), filename); } catch (_) {} }
+    return error('ERR_REQUIRE_ESM', filename, usesEsm, (parent && parent.filename) || null, pkg ? pkg.filename : null);
+  }
+
+  // --trace-require-module (Node's loadESMFromCJS): an ExperimentalWarning for a
+  // require() of an ES module; under no-node-modules, not for one a module in
+  // node_modules makes. After one warning, Node warns for every later one.
+  let requireModuleTrace;
+  function traceRequireModule(module) {
+    requireModuleTrace ??= host.traceRequireModule;
+    if (!requireModuleTrace) return;
+    const parent = module[kModuleParent];
+    if (requireModuleTrace === 'no-node-modules' &&
+        !(parent && !path.normalize(path.resolve(parent.filename)).split(path.sep).includes('node_modules'))) return;
+    let prefix;
+    if (parent) {
+      let from = parent.filename || parent.id;
+      const to = module.id || module.filename;
+      if (from === 'internal/preload') from = '--require';
+      else if (from === '<repl>') from = 'The REPL';
+      else if (from === '.') from = 'The entry point';
+      else from &&= `CommonJS module ${from}`;
+      if (from && to) prefix = `${from} is loading ES Module ${to} using require().\n`;
+    }
+    require('internal/util').emitExperimentalWarning('Support for loading ES Module in require()', prefix, undefined, parent?.require);
+    requireModuleTrace = true;
   }
 
   function requireNamespace(module, filename) {
     if (!requireModuleEnabled()) throw requireESMError(filename, module[kModuleParent]);
+    traceRequireModule(module);
     let namespace;
     try { namespace = host.requireModule(filename); }
     catch (cause) {
       if (cause !== null && typeof cause === 'object' && cause.code === 'ERR_REQUIRE_ASYNC_MODULE') throw asyncModuleError(filename, module[kModuleParent]);
       if (cause !== null && typeof cause === 'object' && cause.code === 'ERR_REQUIRE_CYCLE_MODULE') throw cycleError(filename, module[kModuleParent]);
-      throw decorateModuleError(cause, filename);
+      // As Node's C++ ReThrow, which keeps the message of where it was thrown.
+      host.rethrow(decorateModuleError(cause, filename));
     }
     if (own(namespace, 'module.exports')) module.exports = namespace['module.exports'];
     else if (own(namespace, 'default') && !own(namespace, '__esModule')) {
@@ -1399,7 +1472,7 @@ function createLoader(host, builtins) {
       const loaded = loadESM(resolved.filename);
       let result;
       try { result = host.evaluateModule(loaded.source, loaded.filename, true); }
-      catch (cause) { throw decorateModuleError(cause, resolved.filename); }
+      catch (cause) { host.rethrow(decorateModuleError(cause, resolved.filename)); }
       if (result !== null && typeof result === 'object' && typeof result.then === 'function') {
         return ReflectApply(PromisePrototypeThen, result, [undefined, (cause) => { throw decorateModuleError(cause, resolved.filename); }]);
       }
