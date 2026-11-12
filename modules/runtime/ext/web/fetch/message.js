@@ -97,6 +97,9 @@ class Request {
       signalSource: init.signal === undefined ? original?.signal : init.signal,
       followed: null,
       body: null,
+      // The URL parsed above, so that fetching this request does not parse record.url again.
+      // Only the fetch of a request made for that fetch takes it (see performFetch).
+      parsedURL: url,
     };
     lazySignal(record);
     if (record.signalSource != null && !(record.signalSource instanceof AbortSignal)) throw new TypeError('signal must be an AbortSignal');

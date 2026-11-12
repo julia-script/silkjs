@@ -26,6 +26,8 @@ class FSEvent {
   start(filename, persistent = true, recursive = false, encoding = 'utf8') {
     if (this[kInitialized]) return 0;
     if (typeof c.host.watch !== 'function') return uvCode('ENOSYS');
+    // FSEvent::Start: THROW_IF_INSUFFICIENT_PERMISSIONS(env, kFileSystemRead, path).
+    if (c.host.builtinLoaded('internal/permission')) require('internal/permission').check('fs.read', String(filename));
     try {
       this[kWatch] = c.host.watch(filename, { persistent, recursive, encoding }, (err, eventType, name) => {
         if (typeof this.onchange !== 'function') return;
