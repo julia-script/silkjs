@@ -24,10 +24,12 @@ class WeakRefMap extends Map {
   decRef(key) { return super.get(key)?.decRef(); }
 }
 
+const host = require('internal/host');
 function markActive(channel) {
   Object.setPrototypeOf(channel, ActiveChannel.prototype);
   channel._subscribers = [];
   channel._stores = new Map();
+  host.diagnostics.status(channel.name, true);
 }
 
 function maybeMarkInactive(channel) {
@@ -35,6 +37,7 @@ function maybeMarkInactive(channel) {
     Object.setPrototypeOf(channel, Channel.prototype);
     channel._subscribers = undefined;
     channel._stores = undefined;
+    host.diagnostics.status(channel.name, false);
   }
 }
 
