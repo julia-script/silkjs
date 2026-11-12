@@ -125,7 +125,11 @@ async function snapshots(root) {
     assert.equal(Object.hasOwn(heap, 'total_available_size'), false);
     assert.equal(Object.hasOwn(heap, 'heap_size_limit'), false);
     assert.throws(() => v8.getHeapSnapshot({ exposeNumericValues: true }), { code: 'ERR_NOT_SUPPORTED' });
-    for (const name of ['getHeapSpaceStatistics', 'getHeapCodeStatistics', 'getCppHeapStatistics'])
+    const spaces = v8.getHeapSpaceStatistics();
+    assert.deepEqual(spaces.map(space => space.space_name), ['new_space', 'old_space', 'code_space']);
+    for (const space of spaces) assert.ok(space.space_used_size >= 0 && space.space_size === space.space_used_size && !Object.hasOwn(space, 'space_available_size'));
+    assert.equal(spaces[2].space_used_size, 0);
+    for (const name of ['getHeapCodeStatistics', 'getCppHeapStatistics'])
       assert.throws(() => v8[name](), { code: 'ERR_NOT_SUPPORTED' });
     // Without NODE_V8_COVERAGE there is no coverage to take or stop, as in Node.
     assert.equal(v8.takeCoverage(), undefined);

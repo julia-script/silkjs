@@ -11,6 +11,7 @@ import silk.core.ownership { Copy }
 import silk.core.result { Result }
 import silk.collections.slice { Slice }
 import silk.num.u32
+import silk.num.u8
 import silk.num.usize
 import js_heap { HeapCell, HeapHeader }
 import js_value { ValueBits }
@@ -28,6 +29,7 @@ import js_array_storage as arrays
 import js_array_storage { StorageOutcome }
 import js_shapes as shapes
 import js_lexer { Lexer, LexicalContext }
+import js_lexer_chars { decode }
 import js_tokens { Token, TokenPayload, LexError }
 import js_tokens as tok
 import js_atom_data as atoms
@@ -222,7 +224,10 @@ struct JsonParser<'src, 'r> {
   lexer: Lexer<'src>, token: Token, runtime: *mut HeapHeader,
   realm: Realm<'r>, filename: StringOwner, records: JsonParseRecords<'src>,
   // Set by advanceKey when the key token was read as an atom.
-  key: OwnedAtom
+  key: OwnedAtom,
+  // A lexical failure waits in a TOK_ERROR token until the grammar reads it,
+  // as V8 decides by the token's first character before scanning it.
+  lexError: LexError
 }
 /// A lexer failure caught without wrapping each token in a Result (see js_caught).
 struct LexFailed { error: LexError | BigIntError | OutOfMemoryError | StringLengthError }
@@ -239,11 +244,76 @@ impl<'src, 'r> JsonParser<'src, 'r> {
     let location = self.lexer.location(offset)
     fail run message.error(self.filename.get(), offset, location)
   }
-  effect fn syntax<T>(self: &mut Self, text: &[u8]) -> T
+  // Messages follow V8's JsonParser::ReportUnexpectedToken (json-parser.cc):
+  // positions and columns count UTF-16 units, lines end at \r, \n and \r\n.
+  effect fn positioned<T>(self: &mut Self, text: &[u8], offset: usize, inJson: bool) -> T
     ! SyntaxError | OutOfMemoryError | StringLengthError ? &mut Allocator {
-    let mut message = DiagnosticMessage.make() message.append(text)
-    let offset = self.token.start
+    let source = self.lexer.sourceBytes()
+    let mut bounded = offset
+    if bounded > source.length { bounded = source.length }
+    let mut position: usize = 0
+    let mut line: usize = 1
+    let mut lineStart: usize = 0
+    let mut i: usize = 0
+    while i < bounded {
+      let mut b = source[i]
+      if b == 13 && i + 1 < bounded && source[i + 1] == 10 { i = i + 1 position = position + 1 b = 10 }
+      position = position + utf16Units(b)
+      i = i + 1
+      if b == 13 || b == 10 { line = line + 1 lineStart = position }
+    }
+    let mut message = DiagnosticMessage.make()
+    message.append(text)
+    if inJson { message.append(b" in JSON") }
+    message.append(b" at position ") appendDecimal(&mut message, position)
+    message.append(b" (line ") appendDecimal(&mut message, line)
+    message.append(b" column ") appendDecimal(&mut message, position - lineStart + 1) message.append(b")")
     return run self.diagnostic<T>(move message, offset)
+  }
+  effect fn endOfInput<T>(self: &mut Self) -> T
+    ! SyntaxError | OutOfMemoryError | StringLengthError ? &mut Allocator {
+    let mut message = DiagnosticMessage.make() message.append(b"Unexpected end of JSON input")
+    let offset = self.lexer.sourceBytes().length
+    return run self.diagnostic<T>(move message, offset)
+  }
+  // The character at offset, quoted with up to ten units of source on each side.
+  effect fn unexpectedToken<T>(self: &mut Self, offset: usize) -> T
+    ! SyntaxError | OutOfMemoryError | StringLengthError ? &mut Allocator {
+    let source = self.lexer.sourceBytes()
+    if offset >= source.length { return run self.endOfInput<T>() }
+    let mut message = DiagnosticMessage.make()
+    if isSpecialSource(source) {
+      message.append(b"\"") message.append(source) message.append(b"\" is not valid JSON")
+      return run self.diagnostic<T>(move message, offset)
+    }
+    let end = decode(source, offset).end
+    message.append(b"Unexpected token '") message.append(Slice.view(source, offset, end - offset)) message.append(b"', ")
+    let total = unitsBefore(source, source.length)
+    let position = unitsBefore(source, offset)
+    if total < 2 * JSON_CONTEXT_UNITS + 1 {
+      message.append(b"\"") message.append(source) message.append(b"\"")
+    } else if position < JSON_CONTEXT_UNITS {
+      let last = byteAtUnit(source, position + JSON_CONTEXT_UNITS)
+      message.append(b"\"") message.append(Slice.view(source, 0, last)) message.append(b"\"...")
+    } else if position < total - JSON_CONTEXT_UNITS {
+      let first = byteAtUnit(source, position - JSON_CONTEXT_UNITS)
+      let last = byteAtUnit(source, position + JSON_CONTEXT_UNITS)
+      message.append(b"...\"") message.append(Slice.view(source, first, last - first)) message.append(b"\"...")
+    } else {
+      let first = byteAtUnit(source, position - JSON_CONTEXT_UNITS)
+      message.append(b"...\"") message.append(Slice.view(source, first, source.length - first)) message.append(b"\"")
+    }
+    message.append(b" is not valid JSON")
+    return run self.diagnostic<T>(move message, offset)
+  }
+  effect fn lexFailure<T>(self: &mut Self) -> T
+    ! SyntaxError | OutOfMemoryError | StringLengthError ? &mut Allocator {
+    let e = self.lexError
+    if e.message == "Unexpected end of JSON input" { return run self.endOfInput<T>() }
+    if e.message == "Unexpected token '%c'" || e.message == "Invalid or unexpected token" {
+      return run self.unexpectedToken<T>(e.offset)
+    }
+    return run self.positioned<T>(Intrinsic.stringUtf8Bytes(e.message), e.offset, true)
   }
   // Punctuators are most tokens: they rewrite the current token in place, and only
   // a token with a payload releases the lexer's strings. Everything else is out of line.
@@ -288,11 +358,17 @@ impl<'src, 'r> JsonParser<'src, 'r> {
       LexFailed { error } => {
         match move error {
           LexError e => {
-            let mut message = DiagnosticMessage.make()
-            if e.message == "Unexpected token '%c'" {
-              message.append(b"Unexpected token '") message.appendCharacter(u32.toI32(e.detail)) message.append(b"'")
-            } else { message.append(Intrinsic.stringUtf8Bytes(e.message)) }
-            return run self.diagnostic<()>(move message, e.offset)
+            let empty = match &self.token.payload { TokenPayload.Empty => true _ => false }
+            if !empty { self.token.payload = TokenPayload.Empty self.lexer.releaseStrings() }
+            // The failed token starts after the JSON whitespace past the last one.
+            let source = self.lexer.sourceBytes()
+            let mut start = self.token.end
+            while start < e.offset && isJsonSpace(source[start]) { start = start + 1 }
+            self.token.kind = tok.TOK_ERROR
+            self.token.start = start
+            self.token.end = e.offset
+            self.lexError = e
+            return ()
           }
           BigIntError e => { fail move e }
           OutOfMemoryError e => { fail move e }
@@ -318,17 +394,15 @@ impl<'src, 'r> JsonParser<'src, 'r> {
     self.token.gotLineFeed = false
     self.key = unsafe OwnedAtom.adopt(self.runtime, key.atom)
   }
-  effect fn expect(self: &mut Self, kind: i32) -> ()
+  effect fn expect(self: &mut Self, kind: i32, text: &[u8]) -> ()
     ! OutOfMemoryError | StringLengthError | BigIntError | SyntaxError | ParserStackOverflow ? &mut Allocator {
     if self.token.kind != kind {
-      let mut message = DiagnosticMessage.make()
-      message.append(b"expecting '") message.appendCharacter(kind) message.append(b"'")
       let offset = self.token.start
-      return run self.diagnostic<()>(move message, offset)
+      return run self.positioned<()>(text, offset, true)
     }
     run self.advance()
   }
-  effect fn propertyName(self: &mut Self) -> OwnedAtom
+  effect fn propertyName(self: &mut Self, first: bool) -> OwnedAtom
     ! OutOfMemoryError | StringLengthError | SyntaxError ? &mut Allocator {
     if self.key.get() != 0 { return unsafe OwnedAtom.adopt(self.runtime, self.key.take()) }
     match &self.token.payload {
@@ -344,7 +418,13 @@ impl<'src, 'r> JsonParser<'src, 'r> {
     if self.lexer.context.extendedJson && self.token.kind == tok.TOK_IDENT {
       return unsafe OwnedAtom.duplicate(self.runtime, self.token.atom())
     }
-    return run self.syntax<OwnedAtom>(b"expecting property name")
+    let offset = self.token.start
+    if self.token.kind == tok.TOK_ERROR {
+      let c = self.lexer.sourceBytes()[offset]
+      if c == 34 || (c == 39 && self.lexer.context.extendedJson) { return run self.lexFailure<OwnedAtom>() }
+    }
+    if first { return run self.positioned<OwnedAtom>(b"Expected property name or '}'", offset, true) }
+    return run self.positioned<OwnedAtom>(b"Expected double-quoted property name", offset, true)
   }
 }
 
@@ -384,6 +464,70 @@ effect fn defineProperty<'v, H: HeapHooks>(s: &JsonParser<'_, '_>, hooks: &mut H
   }
 }
 
+// V8's kMaxContextCharacters: source shown on each side of an unexpected token.
+const JSON_CONTEXT_UNITS: usize = 10
+fn isJsonSpace(b: u8) -> bool { return b == 32 || b == 9 || b == 10 || b == 13 }
+fn utf16Units(b: u8) -> usize {
+  if (b & 0xc0) == 0x80 { return 0 }
+  if b >= 0xf0 { return 2 }
+  return 1
+}
+fn unitsBefore(source: &[u8], end: usize) -> usize {
+  let mut units: usize = 0
+  let mut i: usize = 0
+  while i < end { units = units + utf16Units(source[i]) i = i + 1 }
+  return units
+}
+// The first character boundary at or after UTF-16 unit index units.
+fn byteAtUnit(source: &[u8], units: usize) -> usize {
+  let mut counted: usize = 0
+  let mut i: usize = 0
+  while i < source.length {
+    if utf16Units(source[i]) != 0 {
+      if counted >= units { return i }
+      counted = counted + utf16Units(source[i])
+    }
+    i = i + 1
+  }
+  return source.length
+}
+// V8 IsSpecialString: what JSON.parse sees for undefined, NaN, Infinity and {}.
+fn isSpecialSource(source: &[u8]) -> bool {
+  return sameBytes(source, b"undefined") || sameBytes(source, b"NaN") || sameBytes(source, b"Infinity")
+    || sameBytes(source, b"[object Object]")
+}
+fn sameBytes(a: &[u8], b: &[u8]) -> bool {
+  if a.length != b.length { return false }
+  let mut i: usize = 0
+  while i < a.length { if a[i] != b[i] { return false } i = i + 1 }
+  return true
+}
+// V8 scans true, false and null by comparing characters: an identifier that
+// starts like one fails where it stops matching.
+fn literalMismatch(source: &[u8], start: usize) -> usize {
+  let c = source[start]
+  let mut literal: &[u8] = b""
+  if c == 116 { literal = b"true" } else if c == 102 { literal = b"false" } else if c == 110 { literal = b"null" }
+  let mut i: usize = 0
+  while i < literal.length {
+    if start + i >= source.length || source[start + i] != literal[i] { return start + i }
+    i = i + 1
+  }
+  return start + literal.length
+}
+fn appendDecimal(message: &mut DiagnosticMessage, value: usize) -> () {
+  let mut digits: [u8; 20] = [0; 20]
+  let mut count: usize = 0
+  let mut rest = value
+  while true {
+    digits[count] = usize.toU8(rest % 10) + 48
+    count = count + 1
+    rest = rest / 10
+    if rest == 0 { break }
+  }
+  while count > 0 { count = count - 1 message.appendCharacter(u8.toI32(digits[count])) }
+}
+
 struct FailedValue { error: OutOfMemoryError | StringLengthError | BigIntError | SyntaxError | ParserStackOverflow }
 effect fn failedValue(error: OutOfMemoryError | StringLengthError | BigIntError | SyntaxError | ParserStackOverflow) -> FailedValue {
   return FailedValue { error: move error }
@@ -411,10 +555,12 @@ effect fn parseValueInto<H: HeapHooks>(s: &mut JsonParser<'_, '_>, hooks: &mut H
     value.* = run objects.object(&mut hooks, memory, s.realm)
     s.records.initialize(record, unsafe lendBits(&value, value.*), JsonRecordKind.Object, 0, 0)
     if s.token.kind != 125 {
+      let mut first = true
       while true {
-        let name = run s.propertyName()
+        let name = run s.propertyName(first)
+        first = false
         run s.advance()
-        run s.expect(58)
+        run s.expect(58, b"Expected ':' after property name")
         let child = run s.records.add(record, name.get())
         let property = run parseValue(&mut s, &mut hooks, memory, child)
         run defineProperty(&s.*, &mut hooks, unsafe lendBits(&value, value.*), name.get(), property)
@@ -423,7 +569,7 @@ effect fn parseValueInto<H: HeapHooks>(s: &mut JsonParser<'_, '_>, hooks: &mut H
         if s.lexer.context.extendedJson && s.token.kind == 125 { break }
       }
     }
-    run s.expect(125)
+    run s.expect(125, b"Expected ',' or '}' after property value")
     return ()
   }
   if s.token.kind == 91 {
@@ -442,7 +588,7 @@ effect fn parseValueInto<H: HeapHooks>(s: &mut JsonParser<'_, '_>, hooks: &mut H
         if s.lexer.context.extendedJson && s.token.kind == 93 { break }
       }
     }
-    run s.expect(93)
+    run s.expect(93, b"Expected ',' or ']' after array element")
     return ()
   }
   let mut primitive = false
@@ -465,13 +611,11 @@ effect fn parseValueInto<H: HeapHooks>(s: &mut JsonParser<'_, '_>, hooks: &mut H
     }
   }
   if !accepted {
-    if s.token.kind == tok.TOK_EOF { return run s.syntax<()>(b"Unexpected end of JSON input") }
-    let mut message = DiagnosticMessage.make()
-    let offset = s.token.start
-    message.append(b"unexpected token: '")
-    message.append(Slice.view(s.lexer.sourceBytes(), offset, s.lexer.offset - offset))
-    message.append(b"'")
-    return run s.diagnostic<()>(move message, offset)
+    if s.token.kind == tok.TOK_EOF { return run s.endOfInput<()>() }
+    if s.token.kind == tok.TOK_ERROR { return run s.lexFailure<()>() }
+    let mut offset = s.token.start
+    if s.token.kind == tok.TOK_IDENT { offset = literalMismatch(s.lexer.sourceBytes(), offset) }
+    return run s.unexpectedToken<()>(offset)
   }
   // As in the pinned source, bare extended NaN/Infinity identifiers leave the
   // record Empty/Undefined. Signed numeric forms have ordinary primitive spans.
@@ -488,7 +632,10 @@ effect fn parseDocument<H: HeapHooks>(s: &mut JsonParser<'_, '_>, hooks: &mut H,
   let mut record = NO_RECORD
   if captureRecords { run s.records.nodes.append(ParseRecord.empty()) record = 0 }
   value.* = run parseValue(&mut s, &mut hooks, memory, record)
-  if s.token.kind != tok.TOK_EOF { return run s.syntax<()>(b"unexpected data at the end") }
+  if s.token.kind != tok.TOK_EOF {
+    let offset = s.token.start
+    return run s.positioned<()>(b"Unexpected non-whitespace character after JSON", offset, false)
+  }
 }
 
 // JS_ParseJSON3: filename is a borrowed string ValueBits, source is borrowed UTF-8.
@@ -502,7 +649,7 @@ pub effect fn parse<'a, 'b, 'src, H: HeapHooks>(hooks: &mut H, memory: &Allocati
   let mut s = JsonParser { lexer: Lexer.make(source, LexicalContext.jsonSource(extended)),
     token: Token.empty(32, 0, 0), runtime: runtime, realm: realm,
     filename: StringOwner.borrowed(filename.view()), records: JsonParseRecords.make(runtime, source),
-    key: OwnedAtom.none() }
+    key: OwnedAtom.none(), lexError: LexError.at(0, "") }
   let mut value = ValueBits.Undefined
   let result = run Effect.result(parseDocument(&mut s, &mut hooks, memory, captureRecords, &mut value))
   match move result {

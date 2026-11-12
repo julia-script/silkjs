@@ -350,6 +350,7 @@ function getOptionValue(name) {
     case '--enable-source-maps': return !!host.enableSourceMaps;
     case '--trace-sigint': return !!host.traceSigint;
     case '--experimental-stream-iter': return !!host.experimentalStreamIter;
+    case '--experimental-sqlite': return host.sqliteDisabled !== true;
     case '--experimental-vm-modules': return !!host.experimentalVmModules;
     case '--experimental-shadow-realm': return !!host.experimentalShadowRealm;
     case '--experimental-eventsource': return !!host.experimentalEventSource;

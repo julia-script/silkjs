@@ -43,8 +43,9 @@ function createLoader(host, builtins) {
   const parentNames = new Map();
   // What a require of a relative or bare specifier found, by the specifier and its
   // directory or lookup paths, as with Node's Module._pathCache: a module found once is
-  // not looked for again. Callers get a copy.
-  const foundPaths = new Map();
+  // not looked for again. Callers get a copy. It is Module._pathCache, so code that
+  // replaces that object starts the lookups over, as in Node.
+  let foundPaths = { __proto__: null };
   // The source format() read to tell a module from a script, for the load that follows.
   let probed = null;
   const cache = Object.create(null);
@@ -144,7 +145,9 @@ function createLoader(host, builtins) {
     return name;
   }
 
-  function readPackage(directory) {
+  // importing names what an ES module resolution was importing, for Node's
+  // "while importing" part of ERR_INVALID_PACKAGE_CONFIG.
+  function readPackage(directory, importing) {
     const filename = path.join(directory, 'package.json');
     if (typeof host.checkModuleRead === 'function') host.checkModuleRead(filename);
     const known = packages.get(directory);
@@ -154,7 +157,7 @@ function createLoader(host, builtins) {
     try { data = JSON.parse(text(filename).replace(/^\uFEFF/, '')); }
     catch (cause) {
       if (!(cause instanceof SyntaxError)) throw cause;
-      throw Object.assign(error('ERR_INVALID_PACKAGE_CONFIG', filename, undefined, cause.message), { cause });
+      throw Object.assign(error('ERR_INVALID_PACKAGE_CONFIG', filename, importing, cause.message), { cause });
     }
     // Like Node, keep only the fields resolution reads, on a null-prototype object, so
     // a getter on Object.prototype never stands in for a missing field.
@@ -352,7 +355,9 @@ function createLoader(host, builtins) {
     return null;
   }
 
-  function legacyFile(filename, directoryAllowed, directoryOnly) {
+  // warnMain: a require() lookup, which warns as Node's tryPackage (DEP0128) when an
+  // index file stands in for a "main" that names nothing.
+  function legacyFile(filename, directoryAllowed, directoryOnly, warnMain = true) {
     const exact = directoryOnly ? null : tryFile(filename) || tryExtensions(filename);
     if (exact || !directoryAllowed || !isDirectory(filename)) return exact;
     const pkg = readPackage(filename);
@@ -362,7 +367,13 @@ function createLoader(host, builtins) {
       if (found) return found;
     }
     const index = tryExtensions(path.join(filename, 'index'));
-    if (index) return index;
+    if (index) {
+      if (warnMain && pkg && typeof pkg.data.main === 'string' && pkg.data.main) {
+        process.emitWarning(`Invalid 'main' field in '${pkg.filename}' of '${pkg.data.main}'. ` +
+          'Please either fix that or report it to the module author', 'DeprecationWarning', 'DEP0128');
+      }
+      return index;
+    }
     if (pkg && typeof pkg.data.main === 'string' && pkg.data.main) {
       throw notFound(`Cannot find module '${path.resolve(filename, pkg.data.main)}'. Please verify that the package.json has a valid "main" entry`, { path: pkg.filename, requestPath: filename });
     }
@@ -405,7 +416,20 @@ function createLoader(host, builtins) {
       `${packagePath(pkg)}package.json${parent ? ` imported from ${parent}` : ''}.`, 'DeprecationWarning', 'DEP0166');
   }
 
-  function packageTarget(pkg, target, replacement, key, pattern, internal, parent, mode, seen) {
+  // pathMap: an "exports" pattern matched a request ending in "/" (Node's isPathMap),
+  // which has its own deprecation (DEP0155) in place of the segment one.
+  // emitTrailingSlashPatternDeprecation, once for each package and request.
+  const trailingSlashWarnings = new Set();
+  function trailingSlashPatternDeprecation(request, pkg, parent) {
+    if (process.noDeprecation) return;
+    const pjsonPath = packagePath(pkg) + 'package.json';
+    if (trailingSlashWarnings.has(pjsonPath + '|' + request)) return;
+    trailingSlashWarnings.add(pjsonPath + '|' + request);
+    process.emitWarning(`Use of deprecated trailing slash pattern mapping "${request}" in the "exports" field module resolution of the package at ` +
+      `${pjsonPath}${parent ? ` imported from ${parent}` : ''}. Mapping specifiers ending in "/" is no longer supported.`, 'DeprecationWarning', 'DEP0155');
+  }
+
+  function packageTarget(pkg, target, replacement, key, pattern, internal, parent, mode, seen, pathMap = false) {
     if (typeof target === 'string') {
       if (!target.startsWith('./')) {
         if (internal && !target.startsWith('../') && !target.startsWith('/') && !/^[A-Za-z][A-Za-z\d+.-]*:/.test(target) && !target.startsWith('#')) {
@@ -419,14 +443,14 @@ function createLoader(host, builtins) {
       const expandedTarget = pattern ? target.split('*').join(subpath) : target;
       if (invalidSegmentRegEx.test(target.slice(2))) {
         if (deprecatedInvalidSegmentRegEx.test(target.slice(2))) throw invalidTarget(pkg, key, target, internal, parent);
-        segmentDeprecation(expandedTarget, request, key, pkg, internal, parent, true);
+        if (!pathMap) segmentDeprecation(expandedTarget, request, key, pkg, internal, parent, true);
       }
       if (subpath !== '' && invalidSegmentRegEx.test(subpath)) {
         if (deprecatedInvalidSegmentRegEx.test(subpath)) {
           throw error('ERR_INVALID_MODULE_SPECIFIER', request, `request is not a valid match in pattern "${key}" for the ` +
             `"${internal ? 'imports' : 'exports'}" resolution of ${packagePath(pkg)}package.json`, parent || undefined);
         }
-        segmentDeprecation(expandedTarget, request, key, pkg, internal, parent, false);
+        if (!pathMap) segmentDeprecation(expandedTarget, request, key, pkg, internal, parent, false);
       }
       const expanded = pattern ? target.split('*').join(replacement) : target;
       const url = fromFileURL(fileURL(pkg.directory) + '/' + expanded.slice(2));
@@ -439,7 +463,7 @@ function createLoader(host, builtins) {
       let last;
       for (let i1 = 0, a1 = target; i1 < a1.length; i1++) { const item = a1[i1];
         let result;
-        try { result = packageTarget(pkg, item, replacement, key, pattern, internal, parent, mode, seen); }
+        try { result = packageTarget(pkg, item, replacement, key, pattern, internal, parent, mode, seen, pathMap); }
         catch (cause) {
           if (cause.code !== 'ERR_INVALID_PACKAGE_TARGET') throw cause;
           last = cause;
@@ -461,7 +485,7 @@ function createLoader(host, builtins) {
       }
       for (let i3 = 0, a3 = keys; i3 < a3.length; i3++) { const condition = a3[i3];
         if (condition === 'default' || (activeConditions ? activeConditions.includes(condition) : condition === 'node' || (condition === 'node-addons' && !host.noAddons) || condition === mode || (condition === 'module-sync' && requireModuleEnabled()) || (host.moduleConditions && host.moduleConditions.includes(condition)))) {
-          const result = packageTarget(pkg, target[condition], replacement, key, pattern, internal, parent, mode, seen);
+          const result = packageTarget(pkg, target[condition], replacement, key, pattern, internal, parent, mode, seen, pathMap);
           if (result !== undefined) return result;
         }
       }
@@ -495,6 +519,7 @@ function createLoader(host, builtins) {
           const star = key.indexOf('*');
           if (star === -1 || key.indexOf('*', star + 1) !== -1) continue;
           const prefix = key.slice(0, star);
+          if (!internal && request.startsWith(prefix) && request.endsWith('/')) trailingSlashPatternDeprecation(request, pkg, parent);
           const suffix = key.slice(star + 1);
           if (!request.startsWith(prefix) || !request.endsWith(suffix) || request.length < key.length) continue;
           if (match === undefined || star > match.indexOf('*') || (star === match.indexOf('*') && key.length > match.length)) {
@@ -507,7 +532,7 @@ function createLoader(host, builtins) {
       }
     }
     if (match !== undefined) {
-      const targetResult = packageTarget(pkg, target, replacement, match, pattern, internal, parent, mode, seen);
+      const targetResult = packageTarget(pkg, target, replacement, match, pattern, internal, parent, mode, seen, pattern && !internal && request.endsWith('/'));
       if (targetResult !== null && targetResult !== undefined) {
         if (targetResult.external) return resolveInternal(targetResult.external, targetResult.parent, mode, undefined, seen, isMain);
         return strictFile(targetResult.filename, request, parent, mode, targetResult.suffix, isMain, pkg);
@@ -576,13 +601,14 @@ function createLoader(host, builtins) {
         const bases = options && Array.isArray(options.paths) ? options.paths : [path.dirname(parent)];
         const key = cacheable(mode, options, isMain) ? specifier + '\0' + bases[0] : null;
         if (key !== null) {
-          const known = foundPaths.get(key);
+          const known = foundPaths[key];
           if (known !== undefined) return { ...known };
         }
         for (let i5 = 0, a5 = bases; i5 < a5.length; i5++) { const base = a5[i5];
           const candidate = path.resolve(base, requested);
           if (mode === 'import') return strictFile(candidate, specifier, parent, mode, suffix, isMain);
-          const found = legacyFile(candidate, true, /[\\/]$/.test(specifier) || specifier === '.' || specifier === '..');
+          // Node's _findPath: a trailing slash or a last "." or ".." segment names a directory.
+          const found = legacyFile(candidate, true, /[\\/]$/.test(specifier) || /(?:^|[\\/])\.?\.$/.test(specifier));
           if (found) return remember(key, descriptor(found, mode, undefined, isMain));
         }
         throw missing(specifier, parent, mode);
@@ -616,7 +642,7 @@ function createLoader(host, builtins) {
       }
       const key = cacheable(mode, options, isMain) ? specifier + '\0' + search.join('\0') : null;
       if (key !== null) {
-        const known = foundPaths.get(key);
+        const known = foundPaths[key];
         if (known !== undefined) return { ...known };
       }
       return remember(key, findPackage(search, parsed, specifier, parent, mode, seen, isMain));
@@ -631,7 +657,7 @@ function createLoader(host, builtins) {
 
   function remember(key, result) {
     if (key === null) return result;
-    foundPaths.set(key, result);
+    foundPaths[key] = result;
     return { ...result };
   }
 
@@ -644,10 +670,30 @@ function createLoader(host, builtins) {
     throw missing(specifier, parent, mode, undefined, parsed.name);
   }
 
+  // emitLegacyIndexDeprecation (DEP0151): an ES module found as a package's main by
+  // a default index or by extension resolution of its "main" field.
+  function legacyIndexDeprecation(found, root, pkg, parent) {
+    if (process.noDeprecation) return;
+    try { if (format(found, 'import') !== 'module') return; } catch (_) { return; }
+    const pkgPath = root + path.sep;
+    const main = pkg && typeof pkg.data.main === 'string' ? pkg.data.main : undefined;
+    const base = typeof parent === 'string' && parent.startsWith('file:') ? filesystemName(parent) : parent;
+    if (!main) {
+      process.emitWarning(`No "main" or "exports" field defined in the package.json for ${pkgPath} resolving the main entry point ` +
+        `"${found.slice(pkgPath.length)}", imported from ${base}.\nDefault "index" lookups for the main are deprecated for ES modules.`,
+        'DeprecationWarning', 'DEP0151');
+    } else if (path.resolve(pkgPath, main) !== found) {
+      process.emitWarning(`Package ${pkgPath} has a "main" field set to "${main}", excluding the full filename and extension to the ` +
+        `resolved file at "${found.slice(pkgPath.length)}", imported from ${base}.\n Automatic extension resolution of the "main" field is ` +
+        'deprecated for ES modules.', 'DeprecationWarning', 'DEP0151');
+    }
+  }
+
   // The module that parsed.subpath names in the package at root, or undefined when
   // root holds no such package.
   function packageAt(root, parsed, specifier, parent, mode, seen, isMain) {
-    const pkg = readPackage(root);
+    const base = typeof parent === 'string' && parent.startsWith('file:') ? filesystemName(parent) : parent;
+    const pkg = readPackage(root, mode === 'import' && base ? `"${specifier}" from ${base}` : undefined);
     if (pkg && pkg.data.exports !== undefined && pkg.data.exports !== null) return packageMap(pkg, pkg.data.exports, parsed.subpath, false, parent, mode, seen, isMain);
     const candidate = parsed.subpath === '.' ? root : path.join(root, parsed.subpath.slice(2));
     if (mode === 'import' && parsed.subpath !== '.') {
@@ -658,8 +704,11 @@ function createLoader(host, builtins) {
       const exact = path.resolve(root, pkg.data.main);
       if (isFile(exact)) return descriptor(exact, mode, undefined, isMain);
     }
-    const found = legacyFile(candidate, true, /[\\/]$/.test(specifier));
-    if (found) return descriptor(found, mode, undefined, isMain);
+    const found = legacyFile(candidate, true, /[\\/]$/.test(specifier), mode !== 'import');
+    if (found) {
+      if (mode === 'import' && parsed.subpath === '.') legacyIndexDeprecation(found, root, pkg, parent);
+      return descriptor(found, mode, undefined, isMain);
+    }
     if (mode === 'import' && isDirectory(root)) throw missing(specifier, parent, mode, undefined, root + path.sep);
     return undefined;
   }
@@ -832,7 +881,13 @@ function createLoader(host, builtins) {
   }
   function dataSource(url) {
     const match = /^data:([^/]+\/[^;,]+)(?:[^,]*?)(;base64)?,([\s\S]*)$/.exec(url);
-    if (!match) throw error('ERR_INVALID_URL', url);
+    if (!match) {
+      // A MIME type the pattern does not take still has a body (fetch's data:
+      // URL processor reads it as text/plain): only its format is unknown.
+      const result = require('internal/data_url').dataURLProcessor(new URL(url));
+      if (result === 'failure') throw error('ERR_INVALID_URL', url);
+      return { format: null, source: host.Buffer.from(result.body).toString('utf8') };
+    }
     // Percent escapes are bytes, decoded as UTF-8 with replacement characters, as Node does.
     const bytes = match[2] ? host.Buffer.from(match[3], 'base64') : host.Buffer.concat(match[3].split(/(%[0-9A-Fa-f]{2})/)
       .map(part => /^%[0-9A-Fa-f]{2}$/.test(part) ? host.Buffer.from([parseInt(part.slice(1), 16)]) : host.Buffer.from(part, 'utf8')));
@@ -889,7 +944,8 @@ function createLoader(host, builtins) {
     sourceLoadActive = true;
     strippedSource = undefined;
     try {
-      const url = resolved.url || asURL(resolved.filename);
+      // Own properties only: user code may have put a url accessor on Object.prototype.
+      const url = (own(resolved, 'url') && resolved.url) || asURL(resolved.filename);
       const loaded = hooks.run('load', url, { format: resolved.format,
         importAttributes: attributes || resolved.importAttributes || {}, conditions: conditions(mode) }, allowAsync);
       let source = loaded.source == null || loaded.format === 'wasm' ? loaded.source : sourceText(loaded.source);
@@ -966,7 +1022,8 @@ function createLoader(host, builtins) {
       this.id = id;
       this.filename = null;
       this.path = path.dirname(id);
-      this.exports = {};
+      // Node's setOwnProperty: no setter on Object.prototype runs.
+      Object.defineProperty(this, 'exports', { value: {}, writable: true, enumerable: true, configurable: true });
       this[kModuleParent] = parent;
       this.children = [];
       // As Node, paths come with load() (or from whoever made the module).
@@ -1026,6 +1083,11 @@ function createLoader(host, builtins) {
   Module.Module = Module;
   Module._cache = cache;
   Module._extensions = extensions;
+  Object.defineProperty(Module, '_pathCache', {
+    get() { return foundPaths; },
+    set(value) { foundPaths = value; },
+    enumerable: true, configurable: true,
+  });
   Module._nodeModulePaths = directory => modulePaths(path.resolve(directory));
   // Node's internalModuleStat: 0 for a file, 1 for a directory, negative otherwise.
   Module._stat = filename => {
@@ -1255,7 +1317,18 @@ function createLoader(host, builtins) {
       throw cause;
     }
   }
+  // Node's ModuleWrap compile failure (AppendExceptionLine): a module that did
+  // not parse reports the line of the bad token in its own file, by URL.
+  function moduleSyntaxArrow(cause) {
+    if (!(cause instanceof SyntaxError) || typeof cause.fileName !== 'string' || host.errorArrows.has(cause)) return;
+    const url = asURL(cause.fileName);
+    if (!url.startsWith('file:')) return;
+    let source;
+    try { source = text(filesystemName(url)); } catch (_) { return; }
+    host.attachArrow(cause, url, cleanSource(source), 0);
+  }
   function decorateModuleError(cause, filename) {
+    moduleSyntaxArrow(cause);
     if (cause === null || typeof cause !== 'object' || cause.name !== 'ReferenceError') return cause;
     const match = /^(require|module|exports|__filename|__dirname) is not defined$/.exec(cause.message);
     if (!match) return cause;
@@ -1283,17 +1356,46 @@ function createLoader(host, builtins) {
   // Node's ERR_REQUIRE_ESM, for require() of an ES module under --no-experimental-require-module.
   function requireESMError(filename, parent) {
     const pkg = filename.endsWith('.mjs') ? null : packageScope(filename);
-    return error('ERR_REQUIRE_ESM', filename, false, (parent && parent.filename) || null, pkg ? pkg.filename : null);
+    // Whether the file has module syntax (containsModuleSyntax) picks the hint.
+    let usesEsm = false;
+    if (pkg) { try { usesEsm = host.detectModuleSyntax(cleanSource(text(filename)), filename); } catch (_) {} }
+    return error('ERR_REQUIRE_ESM', filename, usesEsm, (parent && parent.filename) || null, pkg ? pkg.filename : null);
+  }
+
+  // --trace-require-module (Node's loadESMFromCJS): an ExperimentalWarning for a
+  // require() of an ES module; under no-node-modules, not for one a module in
+  // node_modules makes. After one warning, Node warns for every later one.
+  let requireModuleTrace;
+  function traceRequireModule(module) {
+    requireModuleTrace ??= host.traceRequireModule;
+    if (!requireModuleTrace) return;
+    const parent = module[kModuleParent];
+    if (requireModuleTrace === 'no-node-modules' &&
+        !(parent && !path.normalize(path.resolve(parent.filename)).split(path.sep).includes('node_modules'))) return;
+    let prefix;
+    if (parent) {
+      let from = parent.filename || parent.id;
+      const to = module.id || module.filename;
+      if (from === 'internal/preload') from = '--require';
+      else if (from === '<repl>') from = 'The REPL';
+      else if (from === '.') from = 'The entry point';
+      else from &&= `CommonJS module ${from}`;
+      if (from && to) prefix = `${from} is loading ES Module ${to} using require().\n`;
+    }
+    require('internal/util').emitExperimentalWarning('Support for loading ES Module in require()', prefix, undefined, parent?.require);
+    requireModuleTrace = true;
   }
 
   function requireNamespace(module, filename) {
     if (!requireModuleEnabled()) throw requireESMError(filename, module[kModuleParent]);
+    traceRequireModule(module);
     let namespace;
     try { namespace = host.requireModule(filename); }
     catch (cause) {
       if (cause !== null && typeof cause === 'object' && cause.code === 'ERR_REQUIRE_ASYNC_MODULE') throw asyncModuleError(filename, module[kModuleParent]);
       if (cause !== null && typeof cause === 'object' && cause.code === 'ERR_REQUIRE_CYCLE_MODULE') throw cycleError(filename, module[kModuleParent]);
-      throw decorateModuleError(cause, filename);
+      // As Node's C++ ReThrow, which keeps the message of where it was thrown.
+      host.rethrow(decorateModuleError(cause, filename));
     }
     if (own(namespace, 'module.exports')) module.exports = namespace['module.exports'];
     else if (own(namespace, 'default') && !own(namespace, '__esModule')) {
@@ -1328,6 +1430,11 @@ function createLoader(host, builtins) {
     }
     require.resolve = (specifier, options) => {
       if (typeof specifier !== 'string') throw invalidArgType('request', 'string', specifier);
+      // Node's _resolveFilename: a node: name that is no builtin is looked up like any other.
+      if (builtinPrefix(specifier, 'node:')) {
+        try { builtinName(specifier); }
+        catch (cause) { if (cause?.code === 'ERR_UNKNOWN_BUILTIN_MODULE') throw missing(specifier, parentName(parent || filename), 'require'); throw cause; }
+      }
       const result = resolve(specifier, parent || filename, 'require', undefined, options, false, allowAsync);
       return result.format === 'builtin' && !specifier.startsWith('node:') && result.filename.startsWith('node:') ? result.filename.slice(5) : result.filename;
     };
@@ -1365,7 +1472,7 @@ function createLoader(host, builtins) {
       const loaded = loadESM(resolved.filename);
       let result;
       try { result = host.evaluateModule(loaded.source, loaded.filename, true); }
-      catch (cause) { throw decorateModuleError(cause, resolved.filename); }
+      catch (cause) { host.rethrow(decorateModuleError(cause, resolved.filename)); }
       if (result !== null && typeof result === 'object' && typeof result.then === 'function') {
         return ReflectApply(PromisePrototypeThen, result, [undefined, (cause) => { throw decorateModuleError(cause, resolved.filename); }]);
       }
@@ -1381,7 +1488,7 @@ function createLoader(host, builtins) {
     const modules = new Set(Object.keys(cache)), directories = new Set(packages.keys());
     const resolved = new Set(resolutions.keys()), previous = main;
     const scoped = new Set(scopes.keys()), looked = new Set(lookupPaths.keys()), reals = new Set(realPaths.keys());
-    const parents = new Set(parentNames.keys()), founds = new Set(foundPaths.keys());
+    const parents = new Set(parentNames.keys()), founds = new Set(Object.keys(foundPaths));
     try { runMain(filename); }
     finally {
       for (const key of Object.keys(cache)) if (!modules.has(key)) delete cache[key];
@@ -1390,7 +1497,7 @@ function createLoader(host, builtins) {
       for (const key of [...lookupPaths.keys()]) if (!looked.has(key)) lookupPaths.delete(key);
       for (const key of [...realPaths.keys()]) if (!reals.has(key)) realPaths.delete(key);
       for (const key of [...parentNames.keys()]) if (!parents.has(key)) parentNames.delete(key);
-      for (const key of [...foundPaths.keys()]) if (!founds.has(key)) foundPaths.delete(key);
+      for (const key of Object.keys(foundPaths)) if (!founds.has(key)) delete foundPaths[key];
       for (const key of [...resolutions.keys()]) if (!resolved.has(key)) resolutions.delete(key);
       main = previous;
       probed = null;
