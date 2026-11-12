@@ -621,6 +621,16 @@ function reallyExit(code) {
   if (moduleHas('internal/profiler_binding')) internalRequire('internal/profiler_binding').finish();
   rawStd.exit(code);
 }
+// Node's process_methods binding: process.chdir and process.cwd call through
+// it at each call, so a replaced method takes effect as in Node.
+const processMethods = host.processMethods = {
+  cwd: host.cwd,
+  chdir(directory) {
+    const code = rawOS.chdir(directory);
+    // Node reports the directory it was in as the path and the target as dest.
+    if (code < 0) throw systemError(code, 'chdir', host.cwd(), directory);
+  },
+};
 Object.assign(process, {
   argv: native.argv.slice(), argv0: native.argv[0], execArgv: [], execPath: native.osNative('execPath', []),
   version: 'v' + nodeVersion, versions: componentVersions(), config: buildConfig(),
@@ -630,12 +640,10 @@ Object.assign(process, {
     sourceUrl: `https://nodejs.org/download/release/v${nodeVersion}/node-v${nodeVersion}.tar.gz`,
     headersUrl: `https://nodejs.org/download/release/v${nodeVersion}/node-v${nodeVersion}-headers.tar.gz`,
   }, stdout: host.stdout, stderr: host.stderr,
-  cwd: host.cwd,
+  cwd() { return processMethods.cwd(); },
   chdir(directory) {
     internalRequire('internal/validators').validateString(directory, 'directory');
-    const code = rawOS.chdir(directory);
-    // Node reports the directory it was in as the path and the target as dest.
-    if (code < 0) throw systemError(code, 'chdir', host.cwd(), directory);
+    processMethods.chdir(directory);
   },
   nextTick: host.nextTick, uptime: () => (native.now() - startTime) / 1000,
   hrtime(previous) { const nanoseconds = native.nowNanoseconds(); const value = [Number(nanoseconds / 1000000000n), Number(nanoseconds % 1000000000n)]; if (previous !== undefined) { if (!Array.isArray(previous)) throw new (internalRequire('internal/errors').codes.ERR_INVALID_ARG_TYPE)('time', 'Array', previous); if (previous.length !== 2) throw new (internalRequire('internal/errors').codes.ERR_OUT_OF_RANGE)('time', 2, previous.length); value[0] -= previous[0]; value[1] -= previous[1]; if (value[1] < 0) { value[0]--; value[1] += 1000000000; } } return value; },
@@ -795,7 +803,7 @@ host.watch = (filename, options, callback) => {
 Object.defineProperty(globalThis, 'WebAssembly', {
   value: internalRequire('internal/web/wasm').WebAssembly, writable: true, configurable: true,
 });
-const workerThreads = internalRequire('worker_threads');
+const workerThreads = internalRequire('internal/worker');
 const workerBootstrap = workerThreads._bootstrap();
 if (workerThreads.isMainThread) {
   internalRequire('internal/process_signals').install(process);

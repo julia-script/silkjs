@@ -1,0 +1,188 @@
+//! V8's side-effect-free text for a value in an error message
+//! (Object::NoSideEffectsToString): "#<Foo>" for an object whose toString is
+//! Object.prototype.toString, "[object Tag]" for other objects, the source for
+//! functions and "Name: message" for errors. Only data properties are read:
+//! no getter, proxy trap or user toString runs.
+import silk.core.option { Option }
+import silk.mem.pointer { Pointer }
+import silk.num.u8
+import silk.num.u16
+import silk.num.u32
+import silk.num.usize
+import js_heap { HeapCell, HeapHeader }
+import js_value { ValueBits }
+import js_core_types { RuntimeState, ObjectData, ObjectPayload, ShapeData, PropertySlot, FunctionBytecode, FunctionDebugInfo,
+  NativeFunctionId, BuiltinFamily, SourceText, JS_PROP_TMASK, JS_PROP_NORMAL }
+import js_strings { Strings }
+import js_shapes as shapes
+import js_atom_data as atoms
+import js_class_data as classes
+import js_backtrace as backtrace
+import js_parser_diagnostics { DiagnosticMessage }
+import js_invariant { present }
+import js_atoms { AtomTable }
+import js_string_types { AtomKind }
+import js_coercion_host { CoercionHooks }
+import js_realm { Realm }
+import js_owned_value { lendFor }
+
+/// Object.prototype.toString's and Error.prototype.toString's method numbers.
+const OBJECT_TO_STRING: u32 = 24
+const ERROR_TO_STRING: u32 = 1
+
+/// A data property found on object or its prototypes; none past a proxy or
+/// at an accessor (V8's JSReceiver::GetDataProperty).
+unsafe fn dataProperty(object: ValueBits, atom: u32) -> Option<ValueBits> {
+  let mut pointer = match object { ValueBits.Object { reference } => reference _ => { return Option<ValueBits>.none() } }
+  let anchor = ()
+  let mut depth: usize = 0
+  while depth < 64 {
+    let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, pointer)
+    if data.classId() == classes.JS_CLASS_PROXY { return Option<ValueBits>.none() }
+    let shape = unsafe HeapCell.payload<ShapeData, ()>(&anchor, data.shape)
+    match unsafe shapes.lookup(data.shape, atom) {
+      Option<usize>.Some { value: index } => {
+        if (u8.toU32(shape.properties.get(index).flags) & JS_PROP_TMASK) != JS_PROP_NORMAL { return Option<ValueBits>.none() }
+        return match data.slot(index).view(unsafe shapes.slotFlags(data.shape, index)) {
+          PropertySlot.Value { value } => Option<ValueBits>.some(value)
+          _ => Option<ValueBits>.none()
+        }
+      }
+      Option<usize>.None => ()
+    }
+    if Pointer.isNull<HeapHeader>(shape.prototype) { return Option<ValueBits>.none() }
+    pointer = present(shape.prototype)
+    depth = depth + 1
+  }
+  return Option<ValueBits>.none()
+}
+/// The builtin family method a native function is, if any.
+unsafe fn builtin(function: ValueBits, family: BuiltinFamily) -> u32 {
+  let reference = match function { ValueBits.Object { reference } => reference _ => { return u32.MAX } }
+  let anchor = () let object = unsafe HeapCell.payload<ObjectData, ()>(&anchor, reference)
+  if object.classId() != classes.JS_CLASS_C_FUNCTION { return u32.MAX }
+  return match &object.payload {
+    ObjectPayload.NativeFunction { function: native } => if native.magicBits != 0 { u32.MAX } else { match native.function {
+      NativeFunctionId.Builtin { family: found, method } => if found == family { method } else { u32.MAX }
+      _ => u32.MAX
+    } }
+    _ => u32.MAX
+  }
+}
+/// Appends string's code units as UTF-8 (lone surrogates as U+FFFD).
+fn appendString(message: &mut DiagnosticMessage, text: ValueBits) -> () {
+  let length = Strings.length(text)
+  let mut index: usize = 0
+  while index < length {
+    let mut unit = u16.toU32(Strings.codeUnit(text, index))
+    index = index + 1
+    if unit >= 0xd800 && unit < 0xdc00 && index < length {
+      let low = u16.toU32(Strings.codeUnit(text, index))
+      if low >= 0xdc00 && low < 0xe000 { unit = 0x10000 + u32.shiftLeft((unit - 0xd800), 10) + (low - 0xdc00) index = index + 1 }
+    }
+    if unit >= 0xd800 && unit < 0xe000 { unit = 0xfffd }
+    if unit < 0x80 { message.appendCharacter(u32.toI32(unit)) }
+    else if unit < 0x800 {
+      message.appendCharacter(u32.toI32(0xc0 | u32.shiftRight(unit, 6))) message.appendCharacter(u32.toI32(0x80 | (unit & 63)))
+    } else if unit < 0x10000 {
+      message.appendCharacter(u32.toI32(0xe0 | u32.shiftRight(unit, 12))) message.appendCharacter(u32.toI32(0x80 | (u32.shiftRight(unit, 6) & 63)))
+      message.appendCharacter(u32.toI32(0x80 | (unit & 63)))
+    } else {
+      message.appendCharacter(u32.toI32(0xf0 | u32.shiftRight(unit, 18))) message.appendCharacter(u32.toI32(0x80 | (u32.shiftRight(unit, 12) & 63)))
+      message.appendCharacter(u32.toI32(0x80 | (u32.shiftRight(unit, 6) & 63))) message.appendCharacter(u32.toI32(0x80 | (unit & 63)))
+    }
+  }
+}
+/// A function's source text, or V8's native placeholder.
+unsafe fn appendFunction(message: &mut DiagnosticMessage, function: ValueBits) -> () {
+  let anchor = ()
+  match unsafe backtrace.bytecode(function) {
+    Option<*mut HeapHeader>.Some { value: code } => {
+      let record = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, code)
+      match &record.debug {
+        Option<FunctionDebugInfo>.Some { value: debug } => match &debug.source {
+          Option<SourceText>.Some { value: source } => { message.append(source.bytes()) return () }
+          _ => ()
+        }
+        _ => ()
+      }
+    }
+    _ => ()
+  }
+  message.append(b"function ")
+  match unsafe backtrace.propertyString(function, atoms.JS_ATOM_name) {
+    Option<ValueBits>.Some { value: name } => appendString(&mut message, name)
+    _ => ()
+  }
+  message.append(b"() { [native code] }")
+}
+/// Appends V8's side-effect-free text for object (an object value).
+pub unsafe fn appendObject<'a, H: CoercionHooks>(hooks: &mut H, realm: Realm<'a>, message: &mut DiagnosticMessage, object: ValueBits) -> () {
+  let runtime = realm.runtime()
+  let reference = match object { ValueBits.Object { reference } => reference _ => { return () } }
+  let anchor = ()
+  let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, reference)
+  let classId = data.classId()
+  if classId != classes.JS_CLASS_PROXY && hooks.isCallable(realm, unsafe lendFor(object)) {
+    unsafe appendFunction(&mut message, object)
+    return ()
+  }
+  let toString = match unsafe dataProperty(object, atoms.JS_ATOM_toString) { Option<ValueBits>.Some { value } => value _ => ValueBits.Undefined }
+  if classId == classes.JS_CLASS_ERROR || unsafe builtin(toString, BuiltinFamily.Error) == ERROR_TO_STRING {
+    let name = unsafe dataProperty(object, atoms.JS_ATOM_name)
+    let text = unsafe dataProperty(object, atoms.JS_ATOM_message)
+    let named = match name { Option<ValueBits>.Some { value } => if value.isString() { value } else { ValueBits.Undefined } _ => ValueBits.Undefined }
+    if named.isString() { appendString(&mut message, named) } else { message.append(b"Error") }
+    match text {
+      Option<ValueBits>.Some { value } => { if value.isString() && Strings.length(value) != 0 {
+        message.append(b": ") appendString(&mut message, value)
+      } }
+      _ => ()
+    }
+    return ()
+  }
+  if classId == classes.JS_CLASS_PROXY || unsafe builtin(toString, BuiltinFamily.Object) == OBJECT_TO_STRING {
+    if classId == classes.JS_CLASS_PROXY { message.append(b"#<Object>") return () }
+    match unsafe dataProperty(object, atoms.JS_ATOM_constructor) {
+      Option<ValueBits>.Some { value: constructor } => { if hooks.isCallable(realm, unsafe lendFor(constructor)) {
+        match unsafe backtrace.propertyString(constructor, atoms.JS_ATOM_name) {
+          Option<ValueBits>.Some { value: name } => { if Strings.length(name) != 0 {
+            message.append(b"#<") appendString(&mut message, name) message.append(b">")
+            return ()
+          } }
+          _ => ()
+        }
+      } }
+      _ => ()
+    }
+  }
+  message.append(b"[object ")
+  match unsafe dataProperty(object, atoms.JS_ATOM_Symbol_toStringTag) {
+    Option<ValueBits>.Some { value: tag } => { if tag.isString() { appendString(&mut message, tag) message.append(b"]") return () } }
+    _ => ()
+  }
+  let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, runtime)
+  let id = u32.toUsize(classId)
+  let classes = state.classes.asSlice()
+  if id < classes.length && classes[id].classNameAtom != 0 { message.appendAtom(&state.atoms, classes[id].classNameAtom) }
+  else { message.append(b"Object") }
+  message.append(b"]")
+}
+/// appendObject for an object; a primitive shows as its wrapper's tag.
+pub unsafe fn appendReceiver<'a, H: CoercionHooks>(hooks: &mut H, realm: Realm<'a>, message: &mut DiagnosticMessage, value: ValueBits) -> () {
+  if value.isObject() { unsafe appendObject(&mut hooks, realm, &mut message, value) }
+  else if value.isString() { message.append(b"[object String]") }
+  else if value.isNumber() { message.append(b"[object Number]") }
+  else if value.isBigInt() { message.append(b"[object BigInt]") }
+  else if value.tag() == 1 { message.append(b"[object Boolean]") }
+  else if value.tag() == 2 { message.append(b"null") }
+  else if value.tag() == 3 { message.append(b"undefined") }
+  else { message.append(b"[object Symbol]") }
+}
+/// A property key as V8 prints it: a symbol as Symbol(description).
+pub fn appendKey(message: &mut DiagnosticMessage, table: &AtomTable, atom: u32) -> () {
+  let symbol = !AtomTable.isInteger(atom) && atom != 0 && (table.kind(atom) == AtomKind.Symbol || table.kind(atom) == AtomKind.GlobalSymbol)
+  if symbol { message.append(b"Symbol(") }
+  message.appendAtom(&table, atom)
+  if symbol { message.append(b")") }
+}
