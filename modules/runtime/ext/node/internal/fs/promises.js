@@ -441,7 +441,7 @@ async function readlink(path, options) {
 async function symlink(target, path, type) {
   validateOneOf(type, 'type', ['dir', 'file', 'junction', null, undefined]);
   target = c.path(target, 'target'); path = c.path(path);
-  return binding('symlink', [target, path, type]);
+  return binding('symlink', [c.preprocessSymlinkDestination(target, type, path), path, type]);
 }
 async function fstat(handle, options = { bigint: false }) {
   return makeStats(await binding('fstat', [handle.fd, { bigint: !!options.bigint }]), !!options.bigint);

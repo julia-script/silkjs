@@ -14,6 +14,8 @@ const signalState = {
   get(value) { return (typeof value === 'object' && value !== null) || typeof value === 'function' ? value[kSignalState] : undefined; },
   has(value) { return signalState.get(value) !== undefined; },
 };
+// Node's #brand: only constructed signals, not a Proxy of one or an object inheriting from one.
+const signalBrands = new WeakSet();
 const controllerState = new WeakMap();
 const signalToken = {};
 
@@ -175,6 +177,7 @@ class AbortSignal extends EventTarget {
       throw error;
     }
     super();
+    signalBrands.add(this);
     // Signals warn about no listener count (Node: kMaxEventTargetListeners = 0).
     this[require('events').kMaxEventTargetListeners] = 0;
     Object.defineProperty(this, kSignalState, { value: {
@@ -230,11 +233,13 @@ class AbortSignal extends EventTarget {
     }
     const sources = Array.from(signals);
     for (let i = 0; i < sources.length; i++) {
-      if (!signalState.has(sources[i])) throw new ERR_INVALID_ARG_TYPE(`signals[${i}]`, 'AbortSignal', sources[i]);
+      if (!signalBrands.has(sources[i])) throw new ERR_INVALID_ARG_TYPE(`signals[${i}]`, 'AbortSignal', sources[i]);
     }
     const signal = new AbortSignal(signalToken);
     for (const source of sources) {
-      if (source.aborted) return AbortSignal.abort(source.reason);
+      // The internal state, not the getters: a source may have its own aborted or reason.
+      const sourceState = signalData(source);
+      if (sourceState.aborted) return AbortSignal.abort(sourceState.reason);
     }
     const state = signalData(signal);
     state.composite = true;
@@ -279,6 +284,7 @@ module.exports = {
   Event, CustomEvent, EventTarget, AbortController, AbortSignal, DOMException,
   isEventTarget, kEvents, kResistStopPropagation,
   isAbortSignal: value => signalState.has(value),
+  isAbortSignalInstance: value => signalBrands.has(value),
   createAbortSignal: () => {
     const signal = new AbortSignal(signalToken);
     signalData(signal).transferred = true;

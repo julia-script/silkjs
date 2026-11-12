@@ -134,6 +134,8 @@ function setHeapSnapshotNearHeapLimit(limit) {
   if (typeof limit !== 'number') throw error('ERR_INVALID_ARG_TYPE', 'The "limit" argument must be a number', TypeError);
   if (!Number.isInteger(limit) || limit < 1 || limit > 0xffffffff)
     throw error('ERR_OUT_OF_RANGE', 'The "limit" argument must be a positive uint32', RangeError);
+  // Node's binding checks fs.write (no resource) before it installs the callback.
+  if (host.builtinLoaded('internal/permission')) require('internal/permission').check('fs.write', '');
   unsupported('setHeapSnapshotNearHeapLimit', 'the runtime has no V8 heap-limit callback or reserved heap arena');
 }
 function isStringOneByteRepresentation(content) {

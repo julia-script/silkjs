@@ -73,7 +73,8 @@ fs.existsSync = function existsSync(path) {
     }
     return false;
   }
-  try { c.native('access', [path, constants.F_OK]); return true; } catch { return false; }
+  // Node's binding checks fs.read before it looks at the file, so a denial throws.
+  try { c.native('access', [path, constants.F_OK]); return true; } catch (err) { if (err?.code === 'ERR_ACCESS_DENIED') throw err; return false; }
 };
 
 function defaultCloseCallback(err) { if (err != null) throw err; }
@@ -461,12 +462,12 @@ fs.symlink = function symlink(target, path, type, callback) {
   if (callback === undefined) { callback = makeCallback(type); type = undefined; }
   else validateOneOf(type, 'type', ['dir', 'file', 'junction', null, undefined]);
   target = c.path(target, 'target'); path = c.path(path);
-  c.submit('symlink', [target, path, type], callback);
+  c.submit('symlink', [c.preprocessSymlinkDestination(target, type, path), path, type], callback);
 };
 fs.symlinkSync = function symlinkSync(target, path, type) {
   validateOneOf(type, 'type', ['dir', 'file', 'junction', null, undefined]);
   target = c.path(target, 'target'); path = c.path(path);
-  c.fail(os.symlink(target, path), 'symlink', target, path);
+  c.fail(os.symlink(c.preprocessSymlinkDestination(target, type, path), path), 'symlink', target, path);
 };
 fs.link = function link(existingPath, newPath, callback) {
   callback = makeCallback(callback);

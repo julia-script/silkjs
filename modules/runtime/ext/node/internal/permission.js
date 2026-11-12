@@ -252,6 +252,8 @@ function checkCallbackFile(op, args) {
   if (initialized && state.enforce && !state.audit && callbackChecked[op] === true) checkFile(op, args);
 }
 function checkNative(id, op, args, third) {
+  // fs_async has already appended XXXXXX to the template it submits.
+  if (id === 2001 && op === 'mkdtemp') return check('fs.write', args[0]);
   if (id === 2000 || id === 2001) return checkFile(op, args);
   if (id === 2002) return check('fs.read', op);
   if (id === 2700 && (op === 'spawn' || op === 'spawnSync')) return check('child', args[0]);

@@ -995,6 +995,8 @@ function createLoader(host, builtins) {
           : host.compileFunction(wrapperPrefix + compiledSource + wrapperSuffix, filename, compiledSource, wrapperPrefix.length);
       } catch (error) {
         host.attachArrow(error, filename, compiledSource, wrapperPatched ? Module.wrap(compiledSource).indexOf(compiledSource) : wrapperPrefix.length);
+        // CompileFunctionForCJSLoader decorates the stack of a compile error.
+        host.decorateErrorStack(error);
         throw error;
       }
       const metadata = host.getScriptMetadata(wrapper);
