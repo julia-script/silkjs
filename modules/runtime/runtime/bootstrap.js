@@ -597,6 +597,13 @@ Object.assign(process, {
     return true;
   },
   _fatalException: internalRequire('internal/startup_controls').fatalException,
+  // node_binding.cc GetLinkedBinding: the addon permission names the module, then the embedder's
+  // linked modules are searched. This runtime links none.
+  _linkedBinding(module) {
+    module = `${module}`;
+    internalRequire('internal/permission').check('addon', module);
+    throw Object.assign(new Error(`No such binding was linked: ${module}`), { code: 'ERR_INVALID_MODULE' });
+  },
   // Formats like console.log and writes to fd 2 at once: no streams, ticks or console.
   _rawDebug(...args) { host.writeText(2, internalRequire('util').format(...args) + '\n'); },
 });
@@ -974,6 +981,7 @@ function runtimeFlag(arg) {
   if (arg.startsWith('--localstorage-file=')) { host.localStorageFile = arg.slice(20); return true; }
   if (arg.startsWith('--require=')) { requirePreloads.push(arg.slice(10)); return true; }
   if (arg.startsWith('--import=')) { importPreloads.push(arg.slice(9)); return true; }
+  if (arg === '--addons' || arg === '--no-addons') { host.noAddons = arg === '--no-addons'; return true; }
   if (arg.startsWith('--conditions=')) { (host.moduleConditions ||= []).push(arg.slice(13)); return true; }
   if (arg === '--preserve-symlinks' || arg === '--no-preserve-symlinks') {
     host.preserveSymlinks = arg === '--preserve-symlinks'; return true;
@@ -1290,6 +1298,8 @@ function run() {
   process._print_eval = print;
   filename = args[index];
   process.argv = [process.execPath, ...args.slice(index)];
+  // As lib/internal/main: an empty script name is no script, so the input is stdin (or the REPL).
+  if (filename === '') filename = undefined;
   // `node inspect ...`: the debugger client (lib/internal/main/inspect.js).
   if (filename === 'inspect' && expression === undefined && !testMode && !check && !watchMode && !interactive) {
     installRuntimeOptions(environment.concat(process.execArgv));

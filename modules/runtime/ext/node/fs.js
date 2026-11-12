@@ -759,8 +759,9 @@ fs.cpSync = function cpSync(src, dest, options) {
   cp().cpSyncFn(src, dest, options);
 };
 
-const { Dir, DirHandle, openDirHandle, FSWatcher, StatWatcher, watch, watchFile, unwatchFile } = require('internal/fs/dir');
-Object.assign(fs, { Dir, FSWatcher, StatWatcher, watch, watchFile, unwatchFile });
+const { Dir, DirHandle, openDirHandle, watch, watchFile, unwatchFile } = require('internal/fs/dir');
+// Node's fs does not export FSWatcher or StatWatcher (they live in internal/fs/watchers).
+Object.assign(fs, { Dir, watch, watchFile, unwatchFile });
 fs.opendirSync = function opendirSync(path, options) {
   path = c.path(path); options = c.options(options, { encoding: 'utf8' });
   return new Dir(openDirHandle(path, options.encoding), path, options);

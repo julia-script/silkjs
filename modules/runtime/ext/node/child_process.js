@@ -262,6 +262,44 @@ class ChildProcess extends EventEmitter {
 }
 
 let emittedDEP0190Already = false;
+// Node's lib/child_process.js: a child of a process under the permission model gets the
+// parent's permission flags through NODE_OPTIONS, unless it is given its own.
+function permissionEnabled() {
+  return require('internal/host').builtinLoaded('internal/permission') && require('internal/permission').enabled();
+}
+let permissionModelFlagsToCopy;
+function getPermissionModelFlagsToCopy() {
+  if (permissionModelFlagsToCopy === undefined) {
+    permissionModelFlagsToCopy = ['--allow-fs-read', '--allow-fs-write', '--allow-addons', '--allow-child-process',
+      '--allow-inspector', '--allow-wasi', '--allow-worker', '--allow-openssl-store', '--permission'];
+  }
+  return permissionModelFlagsToCopy;
+}
+function hasPermissionFlagInEnv(nodeOptions) {
+  if (!nodeOptions) return false;
+  const tokens = nodeOptions.split(/\s+/);
+  return tokens.some((token) =>
+    token === '--permission' ||
+    token.startsWith('--permission=') ||
+    token === '--permission-audit' ||
+    token.startsWith('--permission-audit='),
+  );
+}
+function copyPermissionModelFlagsToEnv(env, key, args) {
+  if (args.includes('--permission') || args.includes('--permission-audit') ||
+      hasPermissionFlagInEnv(env[key])) {
+    return;
+  }
+  const flagsToCopy = getPermissionModelFlagsToCopy();
+  for (const arg of process.execArgv) {
+    for (const flag of flagsToCopy) {
+      if (arg.startsWith(flag)) {
+        env[key] = `${env[key] ? env[key] + ' ' + arg : arg}`;
+      }
+    }
+  }
+}
+
 function normalizeSpawnArguments(file, args, options) {
   validateString(file, 'file');
   validateArgumentNullCheck(file, 'file');
@@ -302,10 +340,14 @@ function normalizeSpawnArguments(file, args, options) {
   }
   args.unshift(typeof options.argv0 === 'string' ? options.argv0 : file);
   let envPairs;
-  const inherit = !options.env || options.env === process.env;
+  let env = options.env;
+  if (permissionEnabled()) {
+    env = env || { ...process.env };
+    copyPermissionModelFlagsToEnv(env, 'NODE_OPTIONS', args);
+  }
+  const inherit = !env || env === process.env;
   if (!inherit) {
     envPairs = [];
-    const env = options.env;
     // Prototype values are intentionally included.
     for (const key in env) {
       const value = env[key];

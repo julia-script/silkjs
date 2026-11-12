@@ -190,6 +190,8 @@ function install(host, process) {
     if (module === null || typeof module !== 'object') throw Object.assign(new TypeError('The "module" argument must be an object'), { code: 'ERR_INVALID_ARG_TYPE' });
     if (typeof filename !== 'string') throw Object.assign(new TypeError('The "filename" argument must be a string'), { code: 'ERR_INVALID_ARG_TYPE' });
     if (!Number.isInteger(flags) || flags < -0x80000000 || flags > 0x7fffffff) throw Object.assign(new TypeError('The "flags" argument must be a 32-bit integer'), { code: 'ERR_INVALID_ARG_TYPE' });
+    // node_binding.cc DLOpen with --no-addons (or the permission model without --allow-addons).
+    if (host.noAddons) throw Object.assign(new Error('Cannot load native addon because loading addons is disabled.'), { code: 'ERR_DLOPEN_DISABLED' });
     module.exports = host.napiNative(1, [filename, module, flags]);
   };
   host.loadAddon = (filename, module) => process.dlopen(module, filename);

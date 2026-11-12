@@ -43,6 +43,8 @@ function writeHeapSnapshot(filename, options) {
     if (filename.includes('\0')) throw error('ERR_INVALID_ARG_VALUE', 'The "filename" argument must not contain null bytes', TypeError);
   }
   snapshotOptions(options);
+  // heap_utils.cc TriggerHeapSnapshot: fs.write on the name as given, or on the cwd for a generated name.
+  if (host.builtinLoaded('internal/permission')) require('internal/permission').check('fs.write', filename === undefined ? process.cwd() : filename);
   if (filename === undefined) {
     const date = new Date();
     const pad = value => String(value).padStart(2, '0');
