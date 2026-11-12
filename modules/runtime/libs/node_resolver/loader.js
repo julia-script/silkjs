@@ -775,8 +775,12 @@ function createLoader(host, builtins) {
     const builtin = builtinName(specifier);
     if (builtin !== null) return { url: builtinFile(builtin), format: 'builtin' };
     if (context.parentURL && urlParent(context.parentURL)) {
-      const href = urlParentResolve(specifier, context.parentURL);
-      if (href !== undefined) return { url: href, format: undefined };
+      if (mode === 'import') {
+        const href = urlParentResolve(specifier, context.parentURL);
+        if (href !== undefined) return { url: href, format: undefined };
+      } else if (!/^[A-Za-z][A-Za-z\d+.-]*:/.test(specifier) && !path.isAbsolute(specifier)) {
+        throw error('ERR_UNSUPPORTED_RESOLVE_REQUEST', specifier, context.parentURL);
+      }
     }
     const previous = activeConditions;
     activeConditions = context.conditions;
