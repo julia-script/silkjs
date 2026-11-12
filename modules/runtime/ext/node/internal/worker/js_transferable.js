@@ -47,10 +47,12 @@ function getTransferMode(obj) {
 }
 
 // The deserializer-side constructor lookup Node registers with
-// setDeserializerCreateObjectFunction().
+// setDeserializerCreateObjectFunction(): only built-in modules, through the
+// internal require, which knows no other module.
 function createDeserializedObject(deserializeInfo) {
-  const index = typeof deserializeInfo === 'string' ? deserializeInfo.indexOf(':') : -1;
-  const Ctor = index > 0 ? require(deserializeInfo.slice(0, index))[deserializeInfo.slice(index + 1)] : undefined;
+  const { 0: module, 1: ctor } = String(deserializeInfo).split(':');
+  if (!require('internal/host').builtinExists(module)) throw new TypeError(`Missing internal module '${module}'`);
+  const Ctor = require(module)[ctor];
   if (typeof Ctor !== 'function' ||
       typeof Ctor.prototype[kDeserialize] !== 'function') {
     throw new Error(`Unknown deserialize spec ${deserializeInfo}`);
