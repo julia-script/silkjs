@@ -1659,7 +1659,9 @@ function loop() {
     pollWorkers();
     if (workerThreads._exitRequested) break;
     if (!referencedWork()) {
+      const beforeExit = host.traceEnvironment ? internalRequire('internal/trace_events').now() : undefined;
       invoke(emitProcessEvent, undefined, ['beforeExit']);
+      if (beforeExit !== undefined) internalRequire('internal/trace_events').phase('BeforeExit', beforeExit);
       checkpoint();
       // embed_helpers.cc SpinEventLoopInternal: a snapshot builder serializes here.
       if (snapshotState.serialize !== undefined) { invoke(snapshotState.serialize, undefined, []); checkpoint(); }
@@ -1670,10 +1672,18 @@ function loop() {
   performanceMilestones.loopExit = native.now() - startTime;
   process._exiting = true;
   invoke(emitProcessEvent, undefined, ['exit']);
+  // Node's Environment::RunCleanup and RunAtExit: the runtime's cleanup is its exit work below.
+  const trace = host.traceEnvironment ? internalRequire('internal/trace_events') : undefined;
+  const cleanup = trace?.now();
   inspectorBackend._atExit();
   if (moduleHas('internal/heap_prof')) internalRequire('internal/heap_prof').finish();
   if (moduleHas('internal/profiler_binding')) internalRequire('internal/profiler_binding').finish();
   if (moduleHas('internal/compile_cache')) internalRequire('internal/compile_cache').flushAtExit();
+  if (trace !== undefined) {
+    trace.phase('RunCleanup', cleanup);
+    trace.phase('AtExit', trace.now());
+    trace.environmentEnd();
+  }
   if (snapshotState.building) {
     // What is left becomes the blob: no serialize callback, and no garbage.
     snapshotState.serialize = undefined;

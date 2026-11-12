@@ -180,20 +180,24 @@ function scriptCoverages(rows) {
     const length = info.source.length;
     // V8's first function of a script is the script itself, over the whole text. The
     // function a CJS wrapper compiles to spans the whole file too and is that script.
+    // Its block ranges are those of that top-level code.
     let topCount = 0;
     const out = [];
+    const blocks = [];
     for (let at = 0; at < functions.length; at++) {
       const fn = functions[at];
       // '<eval>' is the engine's name for a compile's top-level code.
       if ((fn.start <= 0 && fn.end >= length) || fn.name === '<eval>') {
         if (fn.count > topCount) topCount = fn.count;
+        const { ranges } = fn.coverage;
+        for (let range = 1; range < ranges.length; range++) ArrayPrototypePush(blocks, ranges[range]);
         continue;
       }
       ArrayPrototypePush(out, fn.coverage);
     }
     const script = {
       functionName: '', isBlockCoverage: true,
-      ranges: [{ startOffset: 0, endOffset: length, count: topCount > 0 ? topCount : 1 }],
+      ranges: [{ startOffset: 0, endOffset: length, count: topCount > 0 ? topCount : 1 }, ...blocks],
     };
     result[index] = { scriptId, url, functions: [script, ...out] };
   }
