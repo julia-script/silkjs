@@ -110,6 +110,9 @@ const reflectApply = Reflect.apply;
 host.inspectorNative = (operation, ...args) => reflectApply(inspectorNativeOperations[operation], undefined, args);
 host.inspectorEntry = wrapper => host.inspectorNative(15, wrapper);
 host.typeScriptMode = 'strip';
+// libm lgamma and erfc for the histogram statistics (internal/histogram_native).
+host.lgamma = x => native.mathSpecial(0, x);
+host.erfc = x => native.mathSpecial(1, x);
 host.testCoverageStart = () => native.testCoverageNative(0);
 host.testCoverageTake = () => native.testCoverageNative(1);
 host.testCoverageStop = () => native.testCoverageNative(2);
