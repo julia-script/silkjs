@@ -178,13 +178,11 @@ function install(process) {
   // A method, as Node's C++ function: no prototype, not a constructor.
   process.abort = { abort() { native('abort'); } }.abort;
   process.execve = require('internal/process/per_thread').execve;
-  // node_process_object.cc ProcessTitleGetter/Setter; only the main thread sets it.
+  // node_process_object.cc ProcessTitleGetter/Setter: any thread sets the process's title.
   Object.defineProperty(process, 'title', {
     configurable: true, enumerable: true,
     get() { return require('internal/process/title').get(); },
     set(value) {
-      if (!require('worker_threads').isMainThread)
-        throw Object.assign(new TypeError('Setting process.title is not supported in Workers'), { code: 'ERR_WORKER_UNSUPPORTED_OPERATION' });
       require('internal/process/title').set(`${value}`);
       require('internal/trace_events').processTitleChanged();
     },

@@ -33,7 +33,7 @@ function validate(kind, result, advanced, asynchronous, url) {
     if (typeof result.format !== 'string') throw badProperty('a string', hook, 'format', result.format);
     const source = result.source;
     if (source != null && typeof source !== 'string' && !(source instanceof ArrayBuffer) && !(typeof SharedArrayBuffer !== 'undefined' && source instanceof SharedArrayBuffer) && !ArrayBuffer.isView(source)) {
-      throw fail('ERR_INVALID_RETURN_PROPERTY_VALUE', 'Expected a string, ArrayBuffer or typed array for "source" from the load hook');
+      throw badProperty('a string, an ArrayBuffer, or a TypedArray', hook, 'source', source);
     }
   }
   return result;

@@ -12,6 +12,11 @@ const { loaderRequire } = require('internal/modules/helpers');
 // observed without a user-replaced Promise.prototype.then.
 const ReflectApply = Reflect.apply;
 const PromisePrototypeThen = Promise.prototype.then;
+const ObjectPrototype = Object.prototype;
+const ObjectGetPrototypeOf = Object.getPrototypeOf;
+const ObjectSetPrototypeOf = Object.setPrototypeOf;
+const ObjectGetOwnPropertyDescriptor = Object.getOwnPropertyDescriptor;
+const ObjectPrototypeHasOwnProperty = Function.prototype.call.bind(Object.prototype.hasOwnProperty);
 
 // Embedding contract: compileFunction evaluates the complete wrapper expression;
 // evaluateModule(source, filename, isEntry) runs a real native ESM graph; the
@@ -614,7 +619,12 @@ function createLoader(host, builtins) {
         }
         throw missing(specifier, parent, mode);
       }
-      if (mode === 'import' && /^[A-Za-z][A-Za-z\d+.-]*:/.test(specifier)) throw error('ERR_UNSUPPORTED_ESM_URL_SCHEME', { protocol: /^[^:]*:/.exec(specifier)[0] }, ['file', 'data', 'node']);
+      // Node's moduleResolve: an absolute URL resolves to itself, whatever its scheme;
+      // loading it is what fails (unsupportedScheme).
+      if (mode === 'import' && /^[A-Za-z][A-Za-z\d+.-]*:/.test(specifier)) {
+        const parsed = builtins.get('url').URL.parse(specifier);
+        if (parsed !== null) return { filename: parsed.href, format: undefined };
+      }
       const parsed = packageName(specifier, parent);
       // --experimental-package-map: the map alone decides where a bare specifier's
       // package is (Node's packageResolve and tryPackageMapResolveCJS).
@@ -732,6 +742,32 @@ function createLoader(host, builtins) {
     return mode === 'import' && parsed.suffix ? url : parsed.filename;
   }
 
+  // A module whose URL is neither file: nor a builtin's (a data: or http: module).
+  function urlParent(parent) {
+    return /^[A-Za-z][A-Za-z\d+.-]*:/.test(parent) && !parent.startsWith('file:') && !isBuiltinFile(parent);
+  }
+  // Node's moduleResolve for such a parent, after builtins: a relative or absolute path
+  // resolves against the URL, a URL stands for itself (undefined: the caller goes on),
+  // and a bare name has no package to look in.
+  function urlParentResolve(specifier, parent) {
+    if (specifier === '/' || /^(?:\.{1,2}(?:\/|$)|\/)/.test(specifier)) {
+      try { return new (builtins.get('url').URL)(specifier, parent).href; }
+      catch (cause) {
+        const unsupported = error('ERR_UNSUPPORTED_RESOLVE_REQUEST', specifier, parent);
+        unsupported.cause = cause;
+        throw unsupported;
+      }
+    }
+    if (builtins.get('url').URL.canParse(specifier) || builtinName(specifier) !== null) return undefined;
+    if (parent.startsWith('data:')) {
+      const unsupported = error('ERR_UNSUPPORTED_RESOLVE_REQUEST', specifier, parent);
+      unsupported.cause = error('ERR_INVALID_URL', specifier);
+      throw unsupported;
+    }
+    // packageResolve reads package.json files through fileURLToPath, which takes file: only.
+    throw error('ERR_INVALID_URL_SCHEME', 'file');
+  }
+
   function defaultResolve(specifier, context) {
     if (context.conditions !== undefined && !Array.isArray(context.conditions)) throw invalidArgValue('context.conditions', context.conditions, 'expected an array');
     const mode = context.conditions && context.conditions.includes('require') ? 'require' : 'import';
@@ -739,8 +775,13 @@ function createLoader(host, builtins) {
     if (specifier.startsWith('data:')) return { url: specifier, format: textImport ? 'text' : dataFormat(specifier) };
     const builtin = builtinName(specifier);
     if (builtin !== null) return { url: builtinFile(builtin), format: 'builtin' };
-    if (context.parentURL && !context.parentURL.startsWith('file:') && !/^[A-Za-z][A-Za-z\d+.-]*:/.test(specifier) && !path.isAbsolute(specifier)) {
-      throw error('ERR_UNSUPPORTED_RESOLVE_REQUEST', specifier, context.parentURL);
+    if (context.parentURL && urlParent(context.parentURL)) {
+      if (mode === 'import') {
+        const href = urlParentResolve(specifier, context.parentURL);
+        if (href !== undefined) return { url: href, format: undefined };
+      } else if (!/^[A-Za-z][A-Za-z\d+.-]*:/.test(specifier) && !path.isAbsolute(specifier)) {
+        throw error('ERR_UNSUPPORTED_RESOLVE_REQUEST', specifier, context.parentURL);
+      }
     }
     const previous = activeConditions;
     activeConditions = context.conditions;
@@ -776,6 +817,10 @@ function createLoader(host, builtins) {
     regularFile = null;
     mode = mode === 'import' || mode === 'esm' ? 'import' : 'require';
     if (allowAsync === undefined) allowAsync = mode === 'import';
+    if (mode === 'import' && !hooks.active(allowAsync) && typeof parent === 'string' && typeof specifier === 'string' && urlParent(parent)) {
+      const href = urlParentResolve(specifier, parent);
+      if (href !== undefined) return { filename: href, format: undefined };
+    }
     if (!hooks.active(allowAsync) && !String(specifier).startsWith('data:')) {
       return mockResolution(resolveInternal(specifier, parent, mode, options, new Set(), isMain), mode);
     }
@@ -897,7 +942,15 @@ function createLoader(host, builtins) {
     return error('ERR_UNKNOWN_MODULE_FORMAT', format, url);
   }
 
+  // Node's throwIfUnsupportedURLScheme, run before anything reads the URL.
+  function unsupportedScheme(url) {
+    if (url.startsWith('file:') || url.startsWith('data:') || isBuiltinFile(url)) return undefined;
+    return error('ERR_UNSUPPORTED_ESM_URL_SCHEME', { protocol: /^[^:]*:/.exec(url)?.[0] ?? '' }, ['file', 'data', 'node']);
+  }
+
   function defaultLoad(url, context) {
+    const unsupported = /^[A-Za-z][A-Za-z\d+.-]*:/.test(url) ? unsupportedScheme(url) : undefined;
+    if (unsupported) throw unsupported;
     const data = url.startsWith('data:') ? dataSource(url) : undefined;
     const textImport = host.importText && context.importAttributes && context.importAttributes.type === 'text';
     let kind = context.format || (textImport ? 'text' : data ? data.format : format(url, context.conditions && context.conditions.includes('require') ? 'require' : 'import'));
@@ -910,7 +963,6 @@ function createLoader(host, builtins) {
     // Node's async default loader leaves CJS execution to the legacy loader.
     // A hook that supplies source opts hook-thread CJS into hook-aware requires.
     if (kind === 'commonjs' && hooks.inWorker()) return { format: kind, source: null };
-    if (!url.startsWith('file:')) throw error('ERR_UNSUPPORTED_ESM_URL_SCHEME', { protocol: /^[^:]*:/.exec(url)?.[0] ?? '' }, ['file', 'data', 'node']);
     if (kind === 'wasm') return { format: kind, source: builtins.get('fs').readFileSync(filesystemName(url)) };
     const source = text(filesystemName(url));
     if (kind === undefined && host.typeScriptMode && path.extname(filesystemName(url)) === '.ts') {
@@ -1058,6 +1110,7 @@ function createLoader(host, builtins) {
       const ext = path.extname(filename);
       (extensions[ext] || extensions['.js'])(this, filename);
       this.loaded = true;
+      exportsAtLoad.set(this, this.exports);
     }
   }
   Object.defineProperty(Module.prototype, 'isPreloading', { get: () => isPreloading });
@@ -1149,7 +1202,13 @@ function createLoader(host, builtins) {
   Module.createRequire = filename => {
     if (filename && typeof filename === 'object' && filename.href) filename = filename.href;
     if (typeof filename !== 'string' || (!filename.startsWith('file:') && !path.isAbsolute(filename))) throw invalidArgValue('filename', filename, 'must be a file URL object, file URL string, or absolute path string');
-    return requireFor(filename, undefined, false);
+    // Node's createRequire requires for a loaded module at that path: the parent errors
+    // and require stacks name (an ES module has no CommonJS module of its own).
+    const name = parentName(filename);
+    if (own(cache, name) || !path.isAbsolute(name)) return requireFor(filename, undefined, false);
+    const proxy = makeModule(name, null);
+    proxy.loaded = true;
+    return requireFor(filename, proxy, false);
   };
   Module.isBuiltin = name => typeof name === 'string' && (builtins.listed(name) ||
     (builtinPrefix(name, 'node:') && builtins.listed(builtinSlice(name, 5))));
@@ -1231,7 +1290,7 @@ function createLoader(host, builtins) {
         throw cycleError(filename, parent);
       }
       addChild(parent, cache[filename]);
-      return cache[filename].exports;
+      return cache[filename].loaded ? cache[filename].exports : circularExports(cache[filename]);
     }
     // Node's .mts loader: without require(esm), ERR_REQUIRE_ESM before the types are stripped.
     if (resolved.format === 'module-typescript' && !requireModuleEnabled() && !hooks.active(allowAsync)) throw requireESMError(filename, parent);
@@ -1274,6 +1333,14 @@ function createLoader(host, builtins) {
         } else extensions[ext](module, filename);
       }
       module.loaded = true;
+      exportsAtLoad.set(module, module.exports);
+      if (circularModules.has(module)) {
+        circularModules.delete(module);
+        const exports = module.exports;
+        if (exports && !builtins.get('util').types.isProxy(exports) && ObjectGetPrototypeOf(exports) === circularWarningPrototype) {
+          ObjectSetPrototypeOf(exports, ObjectPrototype);
+        }
+      }
       return module.exports;
     } catch (cause) {
       pendingLoads.delete(resolved.filename);
@@ -1285,6 +1352,38 @@ function createLoader(host, builtins) {
       }
       host.rethrow(cause);
     }
+  }
+
+  // Node's cjsCache: an import of a CommonJS module gets module.exports as it was when
+  // the module finished loading, whatever a later assignment put there.
+  const exportsAtLoad = new WeakMap();
+
+  // Node's CircularRequirePrototypeWarningProxy: while a module that a cycle required
+  // is still loading, its plain exports object warns about the names it lacks.
+  const circularWarning = (prop) => process.emitWarning(
+    `Accessing non-existent property '${String(prop)}' of module exports inside circular dependency`);
+  const circularWarningPrototype = new Proxy({}, {
+    __proto__: null,
+    get(target, prop) {
+      // Transpiled code reads __esModule to tell an ES module apart.
+      if (prop in target || prop === '__esModule') return target[prop];
+      circularWarning(prop);
+      return undefined;
+    },
+    getOwnPropertyDescriptor(target, prop) {
+      if (ObjectPrototypeHasOwnProperty(target, prop) || prop === '__esModule') return ObjectGetOwnPropertyDescriptor(target, prop);
+      circularWarning(prop);
+      return undefined;
+    },
+  });
+  const circularModules = new WeakSet();
+  function circularExports(module) {
+    const exports = module.exports;
+    if (exports && !builtins.get('util').types.isProxy(exports) && ObjectGetPrototypeOf(exports) === ObjectPrototype && !exports.__esModule) {
+      ObjectSetPrototypeOf(exports, circularWarningPrototype);
+      circularModules.add(module);
+    }
+    return exports;
   }
 
   // The files that required one another down to parent, nearest first (Node's requireStack).
@@ -1390,17 +1489,29 @@ function createLoader(host, builtins) {
     requireModuleTrace = true;
   }
 
+  // How many require(esm) graphs are loading (Node's importSyncForRequire): while
+  // one is, an ES module there may not import a CommonJS module still executing.
+  let requiringESM = 0;
+  // Import cycles keep their own message through each enclosing require(esm).
+  const importCycles = new WeakSet();
   function requireNamespace(module, filename) {
     if (!requireModuleEnabled()) throw requireESMError(filename, module[kModuleParent]);
     traceRequireModule(module);
     let namespace;
+    requiringESM++;
     try { namespace = host.requireModule(filename); }
     catch (cause) {
       if (cause !== null && typeof cause === 'object' && cause.code === 'ERR_REQUIRE_ASYNC_MODULE') throw asyncModuleError(filename, module[kModuleParent]);
-      if (cause !== null && typeof cause === 'object' && cause.code === 'ERR_REQUIRE_CYCLE_MODULE') throw cycleError(filename, module[kModuleParent]);
+      if (cause !== null && typeof cause === 'object' && cause.code === 'ERR_REQUIRE_CYCLE_MODULE' && !importCycles.has(cause)) {
+        // The engine names a request whose module an enclosing import still evaluates.
+        if (typeof cause.specifier !== 'string') throw cycleError(filename, module[kModuleParent]);
+        const cycle = error('ERR_REQUIRE_CYCLE_MODULE', `Cannot import Module ${cause.specifier} in a cycle. (from ${filesystemName(keyName(cause.referrer))})`);
+        importCycles.add(cycle);
+        throw cycle;
+      }
       // As Node's C++ ReThrow, which keeps the message of where it was thrown.
       host.rethrow(decorateModuleError(cause, filename));
-    }
+    } finally { requiringESM--; }
     if (own(namespace, 'module.exports')) module.exports = namespace['module.exports'];
     else if (own(namespace, 'default') && !own(namespace, '__esModule')) {
       // As in Node, a facade module re-exports the namespace with __esModule added, so
@@ -1480,6 +1591,7 @@ function createLoader(host, builtins) {
       let result;
       try { result = host.evaluateModule(loaded.source, loaded.filename, true); }
       catch (cause) { host.rethrow(decorateModuleError(cause, resolved.filename)); }
+      host.mainModuleEvaluated();
       if (result !== null && typeof result === 'object' && typeof result.then === 'function') {
         return ReflectApply(PromisePrototypeThen, result, [undefined, (cause) => { throw decorateModuleError(cause, resolved.filename); }]);
       }
@@ -1545,7 +1657,9 @@ function createLoader(host, builtins) {
         pendingLoads.delete(resolved.filename);
         return JSON.parse(String(loaded.source).replace(/^\uFEFF/, ''));
       }
-      return loadResolved(resolved, null, false, hooks.hasAsync());
+      const exports = loadResolved(resolved, null, false, hooks.hasAsync());
+      const module = resolved.format === 'commonjs' ? cache[filesystemName(resolved.filename)] : undefined;
+      return module !== undefined && exportsAtLoad.has(module) ? exportsAtLoad.get(module) : exports;
     },
   });
 
@@ -1684,6 +1798,7 @@ function createLoader(host, builtins) {
     if (!resolved) {
       let detected;
       if (filename.startsWith('data:')) detected = dataFormat(filename);
+      else if (/^[A-Za-z][A-Za-z\d+.-]*:/.test(filename) && unsupportedScheme(filename)) detected = undefined;
       else {
         // An unknown extension is reported by the default load step, after the hooks ran.
         try { detected = format(filename, 'import'); }
@@ -1729,7 +1844,9 @@ function createLoader(host, builtins) {
     try {
       if (specifier.startsWith('file://')) specifier = builtins.get('url').fileURLToPath(specifier);
       const from = parent.startsWith('file:') ? builtins.get('url').fileURLToPath(parent) : parent;
-      if (!path.isAbsolute(from)) return;
+      // Node resolves the hint for a module with no filename, which never looks at
+      // the "imports" field.
+      if (!path.isAbsolute(from) || specifier.startsWith('#')) return;
       found = resolve(specifier, from, 'require').filename;
       if (!path.isAbsolute(found)) return;
       if (/^\.\.?(?:\/|$)/.test(specifier)) {
@@ -1762,6 +1879,12 @@ function createLoader(host, builtins) {
     // whatever the file is (Node's isExperimentalTextImport).
     if (host.importText && attributes && attributes.type === 'text') resolved = { ...resolved, format: 'text' };
     if (resolved.format && !hooks.active()) validateAttributes(resolved.format, asURL(resolved.filename), attributes || {});
+    if (requiringESM > 0 && resolved.format === 'commonjs' && own(cache, resolved.filename) && !cache[resolved.filename].loaded) {
+      const from = typeof parent === 'string' ? ` (from ${filesystemName(parent)})` : '';
+      const cycle = error('ERR_REQUIRE_CYCLE_MODULE', `Cannot import CommonJS Module ${specifier} in a cycle.${from}`);
+      importCycles.add(cycle);
+      throw cycle;
+    }
     return resolved;
   }
   // The engine's module name for an import request.

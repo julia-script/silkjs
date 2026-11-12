@@ -426,7 +426,16 @@ function onRejection(promise, reason, handled) {
     rejections.set(promise, { reason, id: ++nextRejectionId, domain: process.domain, context: asyncHooks._captureContext() });
   }
 }
+// Node evaluates an ES main module inside a microtask checkpoint (its loader awaits
+// before evaluating), so the jobs the module queues, such as its import() calls,
+// settle before the next ticks it queued run (test-esm-dynamic-import-commonjs).
+let mainJobsFirst = false;
+host.mainModuleEvaluated = () => { mainJobsFirst = true; };
 function checkpoint() {
+  if (mainJobsFirst) {
+    mainJobsFirst = false;
+    native.drainJobs();
+  }
   do {
     while (true) {
       while (tickHead !== ticks.length) {
@@ -1288,8 +1297,14 @@ function prepareInput(source, filename, inputType, explicit) {
     }
   }
 }
+// Node's HandleEnvOptions: options that environment variables set, read from the
+// environment a Worker was given as from the process environment.
+function applyEnvironmentOptions() {
+  if (process.env.NODE_PRESERVE_SYMLINKS === '1') host.preserveSymlinks = true;
+}
 function runWorker() {
   const { filename, eval: evaluate, argv, runtimeArgs } = workerBootstrap;
+  applyEnvironmentOptions();
   let inputType;
   for (const entry of internalRequire('internal/options').parseArguments(runtimeArgs, false).entries) {
     if (entry.name === '--input-type') inputType = entry.value;
@@ -1518,6 +1533,7 @@ function run(restored = false) {
   // option table has expanded aliases and short forms.
   // getOptionValue reads the options no handler below keeps (internal/options).
   host.cliOptionEntries = environmentEntries.concat(parsed.entries);
+  applyEnvironmentOptions();
   for (const entry of host.cliOptionEntries) {
     const { name, value } = entry;
     switch (name) {
@@ -1840,6 +1856,8 @@ globalThis.__silkRuntime = {
           throw new (internalRequire('internal/errors').codes.ERR_INVALID_ARG_TYPE)('parentURL', ['string', 'URL'], parent);
         from = String(parent);
       }
+      // Node's resolveSync takes `${specifier}`, so a URL object resolves as its href.
+      specifier = `${specifier}`;
       // As in Node, a file that is missing (or a directory) still resolves to its URL.
       try { return asURL(loader.resolve(specifier, from, 'import').filename); }
       catch (error) {

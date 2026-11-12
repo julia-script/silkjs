@@ -191,9 +191,9 @@ class FileHandleNative {
 const handleCloser = new FinalizationRegistry(fd => { try { fs.closeSync(fd); } catch {} });
 c.fileHandles = {
   isNative: value => value instanceof FileHandleNative,
-  // The posted message now owns the descriptor.
-  detach: handle => handleCloser.unregister(handle),
-  create: fd => new FileHandleNative(fd),
+  // The posted message now owns the descriptor, and the receiver's thread tracks it.
+  detach: handle => { handleCloser.unregister(handle); require('internal/host').fsTracking(2, handle.fd); },
+  create: fd => { require('internal/host').fsTracking(1, fd); return new FileHandleNative(fd); },
 };
 require('internal/fs/iter').register(FileHandle, { kFd, kLocked, kRef, kUnref, kClosePromise, kCloseSync, invalidState });
 
