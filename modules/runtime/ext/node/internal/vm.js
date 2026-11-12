@@ -83,6 +83,71 @@ function run(handle, { timeout, breakOnSigint }, afterEvaluate, wrapSignals = tr
 }
 
 
+// The cache envelope: magic, kind, payload length, build identity, then SHA-256
+// digests of the source and the payload. Loaded on first use.
+let envelope;
+function cacheEnvelope() {
+  if (envelope === undefined) {
+    const { Buffer } = require('buffer');
+    envelope = { Buffer, magic: Buffer.from('SILKVM01'), identity: Buffer.from(host.cacheBuildIdentity, 'hex'), createHash: require('crypto').createHash };
+  }
+  return envelope;
+}
+const CACHE_HEADER = 120;
+function digest(value, encoding) { return cacheEnvelope().createHash('sha256').update(value, encoding).digest(); }
+function writeCache(handle, source, kind) {
+  const { Buffer, magic: cacheMagic, identity: cacheIdentity } = cacheEnvelope();
+  const payload = Buffer.from(host.vmWriteCache(handle));
+  const cache = Buffer.allocUnsafe(CACHE_HEADER + payload.byteLength);
+  cacheMagic.copy(cache, 0);
+  cache.writeUInt32LE(kind, 8);
+  cache.writeUInt32LE(0, 12);
+  cache.writeBigUInt64LE(BigInt(payload.byteLength), 16);
+  cacheIdentity.copy(cache, 24);
+  digest(source, 'utf16le').copy(cache, 56);
+  digest(payload).copy(cache, 88);
+  payload.copy(cache, CACHE_HEADER);
+  return cache;
+}
+// kind: 0 a Script, 1 a compileFunction body, 2 a SourceTextModule. read decodes
+// the payload into a handle.
+function readCache(value, source, kind, read) {
+  const { Buffer, magic: cacheMagic, identity: cacheIdentity } = cacheEnvelope();
+  const {
+    DataViewPrototypeGetBuffer, DataViewPrototypeGetByteOffset, DataViewPrototypeGetByteLength, TypedArrayPrototypeGetBuffer,
+    TypedArrayPrototypeGetByteOffset, TypedArrayPrototypeGetByteLength, Uint8Array,
+  } = require('internal/streams/iter/primordials');
+  const { isDataView } = require('util/types');
+  let cache;
+  try {
+    // Snapshot before hashing: a SharedArrayBuffer writer must not race admission.
+    const view = isDataView(value) ?
+      new Uint8Array(DataViewPrototypeGetBuffer(value), DataViewPrototypeGetByteOffset(value), DataViewPrototypeGetByteLength(value)) :
+      new Uint8Array(TypedArrayPrototypeGetBuffer(value), TypedArrayPrototypeGetByteOffset(value), TypedArrayPrototypeGetByteLength(value));
+    cache = Buffer.from(view);
+  } catch (cause) {
+    if (cause instanceof TypeError || cause instanceof RangeError) return undefined;
+    throw cause;
+  }
+  if (cache.byteLength < CACHE_HEADER ||
+      !cache.subarray(0, 8).equals(cacheMagic) ||
+      cache.readUInt32LE(8) !== kind || cache.readUInt32LE(12) !== 0 ||
+      cache.readBigUInt64LE(16) !== BigInt(cache.byteLength - CACHE_HEADER) ||
+      !cache.subarray(24, 56).equals(cacheIdentity) ||
+      !cache.subarray(56, 88).equals(digest(source, 'utf16le')) ||
+      !cache.subarray(88, 120).equals(digest(cache.subarray(CACHE_HEADER)))) return undefined;
+  try {
+    return read(cache.buffer, cache.byteOffset + CACHE_HEADER, cache.byteLength - CACHE_HEADER);
+  } catch (cause) {
+    // Checksums do not make externally supplied bytecode safe. The native reader
+    // independently validates operands, control flow, metadata and ownership.
+    // null: the cache is valid, but a debugger needs code compiled with metadata.
+    if (cause instanceof SyntaxError && cause.message === 'Silk script cache has no debugger metadata') return null;
+    if (cause instanceof SyntaxError || cause instanceof TypeError || cause instanceof RangeError) return undefined;
+    throw cause;
+  }
+}
+
 // makeContextifyScript of Node's lib/internal/vm.js, over the vm module's Script.
 // The runtime has no V8 code cache, so cachedData and produceCachedData are
 // ignored, and each script is its own host-defined option.
@@ -99,5 +164,5 @@ function makeContextifyScript(code, filename, lineOffset, columnOffset, cachedDa
 
 module.exports = {
   contexts, error, invalid, contextData, isContext, syntaxDiagnostic, terminationErrors, terminationError, run,
-  kInternalImportModuleDynamically, makeContextifyScript,
+  kInternalImportModuleDynamically, makeContextifyScript, writeCache, readCache,
 };
