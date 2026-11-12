@@ -1,0 +1,306 @@
+//! Changes members of a JSON document in its text, so that everything else stays as its author
+//! wrote it: the order of keys, the indentation, the line ends.
+//!
+//! The edits are the ones a manifest needs: a table of names to strings one level below the
+//! root, such as `"dependencies": { "left-pad": "^1.3.0" }`. [`setMember`] sets one entry and
+//! [`removeMember`] takes one out. A new entry is written the way the entries beside it are.
+
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.collections.bytes { Bytes }
+import silk.collections.list { List }
+import silk.collections.slice { Slice }
+import silk.core.option { Option }
+import silk.core.ownership { Copy }
+import pkg.json_walk { Extent, Text, Walker }
+import pkg.json_write { appendString }
+import pkg.text { compare, same }
+
+// One member of an object, with offsets into the whole document.
+struct Member<'a> {
+  // The key as written between its quotes.
+  name: &'a [u8],
+  // Whether the key has escapes, so `name` is not its text.
+  escaped: bool,
+  // The offset of the opening quote of the key.
+  key: usize,
+  value: Extent,
+}
+
+impl<'a> Copy for Member<'a> {}
+
+// The members of the object that `text` is, which starts at `base` in the whole document.
+effect fn read<'a>(text: &'a [u8], base: usize) -> Option<List<Member<'a>>> ! OutOfMemoryError ? &mut Allocator {
+  let mut walker = Walker<'a>.make(text)
+  let mut members = List<Member<'a>>.make()
+  if Walker.enterObject(&mut walker) == false {
+    return Option<List<Member<'a>>>.none()
+  }
+  while true {
+    let key: Text<'a> = match Walker.key(&mut walker) {
+      Option.None => { break }
+      Option.Some { value } => value
+    }
+    let value = Walker.extent(&mut walker)
+    run members.append(Member<'a> {
+      name: Text.bytes(&key),
+      escaped: key.escaped,
+      key: base + Text.start(&key) - 1,
+      value: Extent { start: base + value.start, end: base + value.end },
+    })
+  }
+  if Walker.failed(&walker) {
+    return Option<List<Member<'a>>>.none()
+  }
+  return Option<List<Member<'a>>>.some(move members)
+}
+
+fn find(members: &[Member<'_>], name: &[u8]) -> Option<usize> {
+  let mut index: usize = 0
+  while index < members.length {
+    if members[index].escaped == false && same(members[index].name, name) {
+      return Option<usize>.some(index)
+    }
+    index = index + 1
+  }
+  return Option<usize>.none()
+}
+
+// The offset of the first `{` of the document, or its length when there is none.
+fn opening(document: &[u8]) -> usize {
+  let mut index: usize = 0
+  while index < document.length && document[index] != 123 {
+    index = index + 1
+  }
+  return index
+}
+
+// The offset of the last `}` of the document, or 0 when there is none.
+fn closing(document: &[u8]) -> usize {
+  let mut index = document.length
+  while index > 0 {
+    index = index - 1
+    if document[index] == 125 {
+      return index
+    }
+  }
+  return 0
+}
+
+// The spaces and tabs that the line of `at` starts with.
+fn indentOf(document: &[u8], at: usize) -> &[u8] {
+  let mut start = at
+  while start > 0 && document[start - 1] != 10 {
+    start = start - 1
+  }
+  let mut end = start
+  while end < document.length && (document[end] == 32 || document[end] == 9) {
+    end = end + 1
+  }
+  return Slice.view<u8>(document, start, end - start)
+}
+
+// Whether `document` has a line end between `from` and `to`.
+fn spansLines(document: &[u8], from: usize, to: usize) -> bool {
+  let mut index = from
+  while index < to {
+    if document[index] == 10 {
+      return true
+    }
+    index = index + 1
+  }
+  return false
+}
+
+// The line end the document uses.
+fn lineEnd(document: &[u8]) -> &'static [u8] {
+  let mut index: usize = 0
+  while index < document.length {
+    if document[index] == 10 {
+      if index > 0 && document[index - 1] == 13 {
+        return b"\r\n"
+      }
+      return b"\n"
+    }
+    index = index + 1
+  }
+  return b"\n"
+}
+
+// `document` with the bytes from `start` to `end` replaced by `insert`.
+effect fn splice(document: &[u8], start: usize, end: usize, insert: &[u8]) -> Bytes ! OutOfMemoryError ? &mut Allocator {
+  let mut out = run Bytes.copy(Slice.view<u8>(document, 0, start))
+  run out.append(insert)
+  run out.append(Slice.view<u8>(document, end, document.length - end))
+  return move out
+}
+
+effect fn entry(out: &mut Bytes, key: &[u8], value: &[u8]) -> () ! OutOfMemoryError ? &mut Allocator {
+  run appendString(&mut out, key)
+  run out.append(b": ")
+  run appendString(&mut out, value)
+}
+
+// One step of indentation, given the indentation of the first level.
+fn step(first: &[u8]) -> &[u8] {
+  if first.length == 0 {
+    return b"  "
+  }
+  return first
+}
+
+/// Sets the entry `key` of the table `table` to the text `value`, and returns the new document.
+/// A table that is missing is added at the end of the document, and a new entry goes before the
+/// first entry that sorts after it, which keeps a sorted table sorted. Returns none when the
+/// document is not a JSON object or `table` is something else than an object.
+pub effect fn setMember(document: &[u8], table: &[u8], key: &[u8], value: &[u8]) -> Option<Bytes>
+  ! OutOfMemoryError ? &mut Allocator {
+  let root = match move run read(document, 0) {
+    Option.None => { return Option<Bytes>.none() }
+    Option.Some { value: members } => move members
+  }
+  let top = List<Member<'_>>.asSlice(&root)
+  let eol = lineEnd(document)
+  let mut insert = Bytes.make()
+  let section = match find(top, table) {
+    Option.Some { value: index } => top[index]
+    Option.None => {
+      // A new table, after the last member of the document.
+      if top.length == 0 {
+        let open = opening(document)
+        run insert.append(eol)
+        run insert.append(b"  ")
+        run appendString(&mut insert, table)
+        run insert.append(b": {")
+        run insert.append(eol)
+        run insert.append(b"    ")
+        run entry(&mut insert, key, value)
+        run insert.append(eol)
+        run insert.append(b"  }")
+        run insert.append(eol)
+        return Option<Bytes>.some(run splice(document, open + 1, closing(document), Bytes.asSlice(&insert)))
+      }
+      let last = top[top.length - 1]
+      run insert.append(b",")
+      if spansLines(document, opening(document), last.key) {
+        let indent = indentOf(document, last.key)
+        run insert.append(eol)
+        run insert.append(indent)
+        run appendString(&mut insert, table)
+        run insert.append(b": {")
+        run insert.append(eol)
+        run insert.append(indent)
+        run insert.append(step(indent))
+        run entry(&mut insert, key, value)
+        run insert.append(eol)
+        run insert.append(indent)
+        run insert.append(b"}")
+      } else {
+        run insert.append(b" ")
+        run appendString(&mut insert, table)
+        run insert.append(b": { ")
+        run entry(&mut insert, key, value)
+        run insert.append(b" }")
+      }
+      return Option<Bytes>.some(run splice(document, last.value.end, last.value.end, Bytes.asSlice(&insert)))
+    }
+  }
+  if document[section.value.start] != 123 {
+    return Option<Bytes>.none()
+  }
+  let inside = Slice.view<u8>(document, section.value.start, section.value.end - section.value.start)
+  let entries = match move run read(inside, section.value.start) {
+    Option.None => { return Option<Bytes>.none() }
+    Option.Some { value: members } => move members
+  }
+  let all = List<Member<'_>>.asSlice(&entries)
+  match find(all, key) {
+    Option.Some { value: index } => {
+      run appendString(&mut insert, value)
+      return Option<Bytes>.some(run splice(document, all[index].value.start, all[index].value.end, Bytes.asSlice(&insert)))
+    }
+    Option.None => {}
+  }
+  if all.length == 0 {
+    let indent = indentOf(document, section.key)
+    run insert.append(eol)
+    run insert.append(indent)
+    run insert.append(step(indent))
+    run entry(&mut insert, key, value)
+    run insert.append(eol)
+    run insert.append(indent)
+    return Option<Bytes>.some(run splice(document, section.value.start + 1, section.value.end - 1, Bytes.asSlice(&insert)))
+  }
+  let lines = spansLines(document, section.value.start, all[0].key)
+  let mut before: usize = 0
+  while before < all.length && compare(all[before].name, key) < 0 {
+    before = before + 1
+  }
+  if before < all.length {
+    run entry(&mut insert, key, value)
+    run insert.append(b",")
+    if lines {
+      run insert.append(eol)
+      run insert.append(indentOf(document, all[before].key))
+    } else {
+      run insert.append(b" ")
+    }
+    return Option<Bytes>.some(run splice(document, all[before].key, all[before].key, Bytes.asSlice(&insert)))
+  }
+  let last = all[all.length - 1]
+  run insert.append(b",")
+  if lines {
+    run insert.append(eol)
+    run insert.append(indentOf(document, last.key))
+  } else {
+    run insert.append(b" ")
+  }
+  run entry(&mut insert, key, value)
+  return Option<Bytes>.some(run splice(document, last.value.end, last.value.end, Bytes.asSlice(&insert)))
+}
+
+// `document` without member `index` of `members`, which are all the members of the object
+// from `open` to `close`.
+effect fn without(document: &[u8], members: &[Member<'_>], index: usize, open: usize, close: usize) -> Bytes
+  ! OutOfMemoryError ? &mut Allocator {
+  if index + 1 < members.length {
+    return run splice(document, members[index].key, members[index + 1].key, b"")
+  }
+  if index > 0 {
+    return run splice(document, members[index - 1].value.end, members[index].value.end, b"")
+  }
+  return run splice(document, open + 1, close, b"")
+}
+
+/// Takes the entry `key` out of the table `table`, and the table too when that was its last
+/// entry, and returns the new document. The document comes back as it is when it has no such
+/// entry. Returns none when the document is not a JSON object.
+pub effect fn removeMember(document: &[u8], table: &[u8], key: &[u8]) -> Option<Bytes>
+  ! OutOfMemoryError ? &mut Allocator {
+  let root = match move run read(document, 0) {
+    Option.None => { return Option<Bytes>.none() }
+    Option.Some { value: members } => move members
+  }
+  let top = List<Member<'_>>.asSlice(&root)
+  let at = match find(top, table) {
+    Option.Some { value: index } => index
+    Option.None => { return Option<Bytes>.some(run Bytes.copy(document)) }
+  }
+  let section = top[at]
+  if document[section.value.start] != 123 {
+    return Option<Bytes>.some(run Bytes.copy(document))
+  }
+  let inside = Slice.view<u8>(document, section.value.start, section.value.end - section.value.start)
+  let entries = match move run read(inside, section.value.start) {
+    Option.None => { return Option<Bytes>.none() }
+    Option.Some { value: members } => move members
+  }
+  let all = List<Member<'_>>.asSlice(&entries)
+  let index = match find(all, key) {
+    Option.Some { value: found } => found
+    Option.None => { return Option<Bytes>.some(run Bytes.copy(document)) }
+  }
+  if all.length > 1 {
+    return Option<Bytes>.some(run without(document, all, index, section.value.start, section.value.end - 1))
+  }
+  return Option<Bytes>.some(run without(document, top, at, opening(document), closing(document)))
+}
