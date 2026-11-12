@@ -36,6 +36,12 @@ function isJSTransferable(value) {
     typeof value[jsTransferable.kTransfer] === 'function';
 }
 function installPortHooks(hooks) { portHooks = hooks; }
+// The emulated stream and UDP wraps are Node BaseObjects, which neither clone
+// nor transfer. Only a loaded binding can have made one.
+function isNativeWrap(value) {
+  if (host.builtinLoaded('internal/net/binding') && value instanceof require('internal/net/binding').stream_wrap.LibuvStreamWrap) return true;
+  return host.builtinLoaded('internal/dgram') && value instanceof require('internal/dgram').UDP;
+}
 // postMessage(value, transferList) takes an iterable, or an options object whose transfer
 // member is one, with Node's messages for each.
 function iterable(value, name) {
@@ -66,7 +72,6 @@ class CloneSerializer extends Serializer {
     this.signals = signals;
     this.pendingSignals = [];
     this.handles = null;
-    this.handleFds = [];
     this.modules = new WeakMap();
     this.memories = new WeakMap();
   }
@@ -99,14 +104,17 @@ class CloneSerializer extends Serializer {
     if (mode !== undefined) {
       // A JS cloneable (Node's BaseObject::kCloneable) is written from its [kClone]().
       if (mode & jsTransferable.kCloneable) return true;
+      // Node's kDisallowCloneAndTransfer (a URL, for example) is no type the serializer supports.
+      if (mode === jsTransferable.kDisallowCloneAndTransfer) throw cloneError('Cannot clone object of unsupported type.');
       throw cloneError('Object that needs transfer was found in message but not listed in transferList');
     }
+    if (isNativeWrap(value)) throw cloneError('Cannot clone object of unsupported type.');
     if (isDOMException(value)) return true;
     if (abort.isTransferable(value)) return true;
     if (isCryptoKey(value) || isKeyObject(value) || host.types.isX509Certificate?.(value)) return true;
     if (host.types.isStorage?.(value) || host.types.isEventSource?.(value)) return true;
     if (portHooks?.isPort(value)) return true;
-    if (this.handles && fileHandles(false)?.is(value)) return true;
+    if (this.handles && fileHandles(false)?.isNative(value)) return true;
     const memory = host.wasmNative('cloneMemory', value);
     if (memory === false) throw cloneError('A nonshared WebAssembly.Memory cannot be cloned.');
     if (memory !== undefined) { this.memories.set(value, memory); return true; }
@@ -177,11 +185,10 @@ class CloneSerializer extends Serializer {
       this.writeRawBytes(bytes);
       return;
     }
-    if (this.handles && fileHandles(false)?.is(value)) {
-      const index = this.handles.indexOf(value);
-      if (index < 0) throw cloneError('Object that needs transfer was found in message but not listed in transferList');
+    if (this.handles && fileHandles(false)?.isNative(value)) {
+      if (!this.handles.includes(value)) throw cloneError('Object that needs transfer was found in message but not listed in transferList');
       this.writeUint32(11);
-      this.writeUint32(this.handleFds[index]);
+      this.writeUint32(value.fd);
       return;
     }
     if (portHooks?.isPort(value)) {
@@ -312,7 +319,6 @@ function prepare(value, list, source) {
   const signals = new Map();
   const transferred = new Map();
   const handles = [];
-  const handleFds = [];
   // Index loops and Map#forEach: user code may have replaced the iterators (Node's primordials).
   const items = transferList(list);
   for (let position = 0; position < items.length; position++) {
@@ -334,9 +340,6 @@ function prepare(value, list, source) {
       signals.set(item, undefined);
     } else if (isJSTransferable(item)) {
       transferred.set(item, undefined);
-    } else if (fileHandles(false)?.is(item)) {
-      handleFds.push(fileHandles(false).check(item));
-      handles.push(item);
     } else if (jsTransferable.getTransferMode(item) !== undefined) {
       // markTransferMode(object, false, false): neither cloneable nor transferable.
       throw cloneError();
@@ -355,7 +358,9 @@ function prepare(value, list, source) {
       const others = extra || [];
       for (let at = 0; at < others.length; at++) {
         const other = others[at];
-        if (portHooks?.isPort(other)) {
+        if (fileHandles(false)?.isNative(other)) {
+          handles.push(other);
+        } else if (portHooks?.isPort(other)) {
           // Node skips a nested port without a handle; serialization then rejects it if referenced.
           if (portHooks.detached(other)) continue;
           ports.push(other);
@@ -373,7 +378,6 @@ function prepare(value, list, source) {
     });
     const serializer = new CloneSerializer(ports, shared, buffers, signals, transferred);
     serializer.handles = fileHandles(false) ? handles : null;
-    serializer.handleFds = handleFds;
     buffers.forEach((buffer, index) => serializer.transferArrayBuffer(index, buffer));
     serializer.writeHeader();
     serializer.writeValue(value);
@@ -403,7 +407,6 @@ function prepare(value, list, source) {
       if (host.wasmNative('isMemoryBuffer', buffer)) throw cloneError('WebAssembly memory buffers cannot be transferred.');
       try { new Uint8Array(buffer); } catch { throw cloneError('An ArrayBuffer was detached during serialization.'); }
     }
-    for (let at = 0; at < handles.length; at++) fileHandles(false).check(handles[at]);
     return { bytes: serializer.releaseBuffer(), buffers, shared, ports: ids, moved: ports, signals, handles };
   } catch (error) {
     signals.forEach(record => { if (record) abort.rollbackTransfer(record); });

@@ -68,6 +68,7 @@ function queryObjects(ctor, options = {}) {
   const format = options.format || 'count';
   if (format !== 'count' && format !== 'summary')
     throw error('ERR_INVALID_ARG_VALUE', 'The "options.format" argument must be "count" or "summary"', TypeError);
+  require('internal/util').emitExperimentalWarning('v8.queryObjects()');
   const prototype = ctor.prototype;
   // Node's native predicate returns an empty result for a non-object search
   // prototype; being constructable is not a requirement of this API.
