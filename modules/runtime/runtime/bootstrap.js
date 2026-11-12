@@ -416,7 +416,16 @@ function onRejection(promise, reason, handled) {
     rejections.set(promise, { reason, id: ++nextRejectionId, domain: process.domain, context: asyncHooks._captureContext() });
   }
 }
+// Node evaluates an ES main module inside a microtask checkpoint (its loader awaits
+// before evaluating), so the jobs the module queues, such as its import() calls,
+// settle before the next ticks it queued run (test-esm-dynamic-import-commonjs).
+let mainJobsFirst = false;
+host.mainModuleEvaluated = () => { mainJobsFirst = true; };
 function checkpoint() {
+  if (mainJobsFirst) {
+    mainJobsFirst = false;
+    native.drainJobs();
+  }
   do {
     while (true) {
       while (tickHead !== ticks.length) {

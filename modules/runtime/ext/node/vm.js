@@ -209,7 +209,14 @@ function validateImportCallback(callback, module = false) {
   }
 }
 function importCallback(callback, referrer, filename, functionRef = false) {
-  if (callback === USE_MAIN_CONTEXT_DEFAULT_LOADER) return host.vmCreateDefaultImporter(filename);
+  if (callback === USE_MAIN_CONTEXT_DEFAULT_LOADER) {
+    // Node's importModuleDynamicallyCallback warns as each import starts.
+    const load = host.vmCreateDefaultImporter(filename);
+    return (specifier, attributes, source) => {
+      require('internal/util').emitExperimentalWarning('vm.USE_MAIN_CONTEXT_DEFAULT_LOADER');
+      return load(specifier, attributes, source);
+    };
+  }
   // internal/vm registerImportModuleDynamically: the callback answers through
   // importModuleDynamicallyWrap, which unwraps a vm.Module to its namespace or source.
   return async (specifier, attributes, sourcePhase) => {
