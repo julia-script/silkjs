@@ -1,7 +1,7 @@
 'use strict';
 
 const { Buffer } = require('buffer');
-const { URL } = require('internal/web/url');
+const { URL } = require('internal/url');
 const { Blob, resolveObjectURL } = require('internal/web/blob');
 const { TextEncoder } = require('internal/encoding');
 const { Headers, immutable } = require('internal/web/fetch/headers');

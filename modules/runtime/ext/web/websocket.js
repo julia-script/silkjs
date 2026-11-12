@@ -3,7 +3,7 @@
 const { Buffer } = require('buffer');
 const { randomBytes, createHash } = require('crypto');
 const { Event, EventTarget, DOMException } = require('internal/path_events/event_target');
-const { URL } = require('internal/web/url');
+const { URL } = require('internal/url');
 const { Blob } = require('internal/web/blob');
 const { MessageEvent, CloseEvent, ErrorEvent, string } = require('internal/web/websocket/events');
 const { Receiver, frame, failure } = require('internal/web/websocket/framing');

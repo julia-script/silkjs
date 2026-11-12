@@ -52,7 +52,9 @@ function contextOptions(value) {
     if (generation.strings !== undefined) strings = boolean(generation.strings, 'options.codeGeneration.strings');
     if (generation.wasm !== undefined) wasm = boolean(generation.wasm, 'options.codeGeneration.wasm');
   }
-  return { strings, wasm, afterEvaluate: opts.microtaskMode === 'afterEvaluate', name: opts.name, origin: opts.origin };
+  validateImportCallback(opts.importModuleDynamically);
+  return { strings, wasm, afterEvaluate: opts.microtaskMode === 'afterEvaluate', name: opts.name, origin: opts.origin,
+    importModuleDynamically: opts.importModuleDynamically };
 }
 function createContext(sandbox = {}, value) {
   if (sandbox !== DONT_CONTEXTIFY && (sandbox === null || typeof sandbox !== 'object')) throw invalid('contextObject', 'object', sandbox);
@@ -66,23 +68,36 @@ function createContext(sandbox = {}, value) {
     // The sandbox mirror and the realm's binding record have distinct property
     // attributes. A host exotic object preserves both without Proxy invariants.
     const proxy = host.vmContextGlobal(handle, {
-      has(key) { return Reflect.has(sandbox, key) || Reflect.has(global, key); },
+      // Node's query interceptor: the sandbox's own properties, then the global's chain.
+      has(key) { return Object.hasOwn(sandbox, key) || Reflect.has(global, key); },
       get(key) {
-        return Reflect.has(sandbox, key) ? Reflect.get(sandbox, key, sandbox) : Reflect.get(global, key, global);
+        if (!Reflect.has(sandbox, key)) return Reflect.get(global, key, global);
+        // Node's getter interceptor answers the sandbox itself with the global proxy.
+        const value = Reflect.get(sandbox, key, sandbox);
+        return value === sandbox ? proxy : value;
       },
       set(key, value, receiver) {
         if (receiver !== proxy) return Reflect.set(sandbox, key, value, receiver);
         const own = Reflect.getOwnPropertyDescriptor(sandbox, key);
         const backing = Reflect.getOwnPropertyDescriptor(global, key);
         const descriptor = own || backing;
-        if (descriptor && (('writable' in descriptor && !descriptor.writable) || ('set' in descriptor && !descriptor.set))) return false;
+        if (descriptor && (('writable' in descriptor && !descriptor.writable) || ('set' in descriptor && !descriptor.set))) {
+          // Node's setter interceptor leaves a read-only property to V8. When only the
+          // sandbox has it, V8's [[Set]] defines it on the global through the definer
+          // interceptor, and the sandbox refuses that definition (null).
+          return own && !backing && 'writable' in own ? null : false;
+        }
         const mirrored = Reflect.set(sandbox, key, value, sandbox);
         const stored = Reflect.set(global, key, value, global);
         return mirrored || stored;
       },
       defineProperty(key, descriptor, declaration) {
-        if (!Reflect.defineProperty(global, key, descriptor)) return false;
         const own = Reflect.getOwnPropertyDescriptor(sandbox, key);
+        // V8 validates the definition against the descriptor the global reports,
+        // the sandbox's own first: a non-configurable one refuses incompatible changes.
+        if (own && !own.configurable &&
+            !Reflect.defineProperty(Object.defineProperty({}, key, own), key, descriptor)) return false;
+        if (!Reflect.defineProperty(global, key, descriptor)) return false;
         const visible = declaration && (!own || own.configurable) ? { ...descriptor, configurable: true } : descriptor;
         Reflect.defineProperty(sandbox, key, visible);
         return true;
@@ -112,6 +127,10 @@ function createContext(sandbox = {}, value) {
   }
   host.vmSetCodeGeneration(handle, config.strings);
   contexts.set(result, { handle, afterEvaluate: config.afterEvaluate });
+  // Node registers the context's importModuleDynamically for an import() with no
+  // referrer script; without one, such an import() reports the missing callback.
+  host.vmSetImportModuleDynamically(handle, importCallback(config.importModuleDynamically, result,
+    require('path').join(host.tryGetCwd(), 'vm-context')), true);
   require('internal/inspector_contexts').register(result, handle, config);
   return result;
 }

@@ -228,14 +228,14 @@ function hexSlice(bytes, start, end) {
 let internalUrl;
 
 function pathToFileUrlHref(filepath) {
-  internalUrl ??= require('internal/web/url');
+  internalUrl ??= require('internal/url');
   return internalUrl.pathToFileURL(filepath).href;
 }
 
 function isURL(value) {
   // No URL instance can exist before the URL implementation has loaded.
-  if (internalUrl === undefined && !builtinLoaded('internal/web/url')) return false;
-  internalUrl ??= require('internal/web/url');
+  if (internalUrl === undefined && !builtinLoaded('internal/url')) return false;
+  internalUrl ??= require('internal/url');
   return typeof value.href === 'string' && value instanceof internalUrl.URL;
 }
 

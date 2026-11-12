@@ -14,6 +14,15 @@ function socket(fd, reading) {
   return stream;
 }
 
+const kRelease = Symbol('kRelease');
+// Node's is_main_thread.js addCleanup: a startup snapshot keeps no stream of the
+// process that built it (their handles belong to that process); the next use
+// builds them again.
+function addCleanup(fn) {
+  if (host.startupSnapshot.isBuildingSnapshotBuffer[0])
+    require('internal/v8/startup_snapshot').namespace.addSerializeCallback(fn);
+}
+
 function output(fd) {
   const kind = native('guessHandleType', [fd]);
   let stream;
@@ -47,6 +56,8 @@ function output(fd) {
   stream._isStdio = true;
   // Standard output streams survive destroy(), as in Node. The process owns
   // its descriptors; native teardown closes only our duplicated transport fds.
+  const destroy = stream._destroy;
+  stream[kRelease] = () => { stream._destroy = destroy; stream.destroy(); };
   stream._destroy = function(error, callback) {
     callback(error);
     this._undestroy();
@@ -127,14 +138,18 @@ function install(process) {
     stdout() {
       if (!stdout) {
         stdout = output(1);
-        if (stdout.isTTY) process.on('SIGWINCH', () => stdout._refreshSize());
+        const refresh = () => stdout._refreshSize();
+        if (stdout.isTTY) process.on('SIGWINCH', refresh);
+        addCleanup(() => { stdout[kRelease](); process.removeListener('SIGWINCH', refresh); stdout = undefined; });
       }
       return stdout;
     },
     stderr() {
       if (!stderr) {
         stderr = output(2);
-        if (stderr.isTTY) process.on('SIGWINCH', () => stderr._refreshSize());
+        const refresh = () => stderr._refreshSize();
+        if (stderr.isTTY) process.on('SIGWINCH', refresh);
+        addCleanup(() => { stderr[kRelease](); process.removeListener('SIGWINCH', refresh); stderr = undefined; });
       }
       return stderr;
     },
@@ -142,7 +157,16 @@ function install(process) {
   // In particular, do not inspect/open fd 0 here: the CLI may still need to
   // synchronously consume piped program source before application execution.
   Object.defineProperties(process, {
-    stdin: { configurable: true, enumerable: true, get() { return stdin ||= input(); } },
+    stdin: {
+      configurable: true, enumerable: true,
+      get() {
+        if (!stdin) {
+          stdin = input();
+          addCleanup(() => { stdin.destroy(); stdin = undefined; });
+        }
+        return stdin;
+      },
+    },
     stdout: { configurable: true, enumerable: true, get: getters.stdout },
     stderr: { configurable: true, enumerable: true, get: getters.stderr }
   });

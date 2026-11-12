@@ -10,9 +10,13 @@ module.exports = function createAsyncFS(native) {
   const uvSyscalls = { __proto__: null, copyFile: 'copyfile', utimes: 'utime', lutimes: 'lutime', futimes: 'futime' };
   function primitive(requestKind, operation, args) {
     return new Promise((resolve, reject) => {
+      const tracer = host.fsAsyncTracer;
+      const traceName = tracer === undefined ? undefined : uvSyscalls[operation] ?? operation;
+      const traceId = tracer?.begin(traceName);
       // Completion callbacks are named, as Node's oncomplete is: the REPL trims an
       // error's frames below the last one without a function name.
       native.submit(operation, args, function oncomplete(status, value, code) {
+        if (traceId !== undefined) tracer.end(traceName, traceId);
         if (status < 0) reject(c().error(code || 'UNKNOWN', uvSyscalls[operation] ?? operation,
           typeof args[0] === 'string' ? args[0] : undefined,
           ['rename', 'link', 'symlink', 'copyFile'].includes(operation) ? args[1] : undefined, status));
@@ -57,12 +61,13 @@ module.exports = function createAsyncFS(native) {
   async function readdir(requestKind, filename, options = {}) {
     const result = [];
     async function visit(directory, relative) {
-      const entries = await primitive(requestKind, 'scandir', [directory]);
+      const raw = !options.recursive && c().rawNames(options.encoding);
+      const entries = await primitive(requestKind, 'scandir', [directory, raw]);
       for (const entry of entries) {
-        const name = typeof entry === 'string' ? entry : entry.name;
+        const name = typeof entry === 'string' || raw ? entry : entry.name;
         if (name === '.' || name === '..') continue;
-        const full = path().join(directory, name), rel = relative ? path().join(relative, name) : name;
-        let mode = typeof entry === 'string' ? 0 : entry.mode;
+        const full = raw ? c().rawEntryPath(directory, name) : path().join(directory, name), rel = relative ? path().join(relative, name) : name;
+        let mode = typeof entry === 'string' || raw ? 0 : entry.mode;
         if ((options.withFileTypes || options.recursive) && !mode) mode = (await stat(requestKind, 'lstat', full)).mode;
         result.push(options.withFileTypes ? { name, mode, parentPath: directory } : rel);
         if (options.recursive && (Number(mode) & 0o170000) === 0o040000) await visit(full, rel);
@@ -74,13 +79,14 @@ module.exports = function createAsyncFS(native) {
   async function remove(requestKind, filename, options = {}) {
     async function attempt(current) {
       let info;
-      try { info = await stat(requestKind, 'lstat', current); }
+      try { info = await stat(requestKind, 'lstat', c().path(current)); }
       catch (error) { if (options.force && error.code === 'ENOENT') return; throw error; }
       if (kind(info, 0o040000)) {
         if (!options.recursive) { const error = c().error('ERR_FS_EISDIR', 'rm', current); error.info = { code: 'EISDIR', syscall: 'rm', path: current }; throw error; }
-        for (const name of await readdir(requestKind, current)) await remove(requestKind, path().join(current, name), options);
-        await primitive(requestKind, 'rmdir', [current]);
-      } else await primitive(requestKind, 'unlink', [current]);
+        // Raw names: an entry whose name is not valid UTF-8 is removed too.
+        for (const name of await primitive(requestKind, 'scandir', [c().path(current), true])) await remove(requestKind, c().rawEntryPath(current, name), options);
+        await primitive(requestKind, 'rmdir', [c().path(current)]);
+      } else await primitive(requestKind, 'unlink', [c().path(current)]);
     }
     for (let count = 0;; count++) {
       try { return await attempt(filename); }
@@ -194,7 +200,10 @@ module.exports = function createAsyncFS(native) {
       case 'readdir': return readdir(requestKind, ...args);
       case 'opendir': {
         const o = Object.assign({}, args[1], { withFileTypes: true });
-        const entries = await readdir(requestKind, args[0], o);
+        const tracer = host.fsAsyncTracer, traceId = tracer?.begin('opendir', true);
+        let entries;
+        try { entries = await readdir(requestKind, args[0], o); }
+        finally { if (traceId !== undefined) tracer.end('opendir', traceId, true); }
         return entries.map(entry => Object.assign(entry, { name: c().encoded(entry.name, c().encoding(o.encoding, 'utf8', true)) }));
       }
       case 'cp': return copy(requestKind, ...args);
@@ -242,7 +251,10 @@ module.exports = function createAsyncFS(native) {
   // hops, which cost more than the system call for a 64 KiB chunk.
   function transferIO(operation, args, callback, requestKind) {
     const fd = args[0], view = args[1], position = args[4];
+    const tracer = host.fsAsyncTracer;
+    const traceId = tracer?.begin(operation);
     const done = (status, value, code) => {
+      if (traceId !== undefined) tracer.end(operation, traceId);
       // The native request holds view.buffer until it ends.
       const error = status < 0 ? c().error(code || 'UNKNOWN', operation, undefined, undefined, status) : null;
       host.enqueueIOCompletion(error === null ? () => callback(null, value) : () => callback(error));

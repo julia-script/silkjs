@@ -212,20 +212,20 @@ function workerOptions(filename, options) {
     if (explicitEnv && errors.length)
       throw clone().codedError('ERR_WORKER_INVALID_EXEC_ARGV', errors.map(error => error.message).join(', '), Error);
   }
+  let workerArgs;
   if (explicitExecArgv) {
-    result.execArgv = new Array(execArgv.length);
-    for (let index = 0; index < result.execArgv.length; index++) result.execArgv[index] = optionString(execArgv[index]);
+    workerArgs = new Array(execArgv.length);
+    for (let index = 0; index < workerArgs.length; index++) workerArgs[index] = optionString(execArgv[index]);
+    let checked;
+    try { checked = runtimeOptions().invalidWorkerArguments(workerArgs); }
+    catch (error) { throw new (nodeErrors().codes.ERR_WORKER_INVALID_EXEC_ARGV)([error.message]); }
+    if (checked.invalid.length) throw new (nodeErrors().codes.ERR_WORKER_INVALID_EXEC_ARGV)(checked.invalid);
+    result.execArgv = checked.execArgv;
   } else {
     result.execArgv = host.initialExecArgv.slice();
   }
-  if (explicitExecArgv) {
-    let invalid;
-    try { invalid = runtimeOptions().invalidWorkerArguments(result.execArgv); }
-    catch (error) { throw new (nodeErrors().codes.ERR_WORKER_INVALID_EXEC_ARGV)([error.message]); }
-    if (invalid.length) throw new (nodeErrors().codes.ERR_WORKER_INVALID_EXEC_ARGV)(invalid);
-  }
   if (explicitEnv || explicitExecArgv) {
-    result.runtimeArgs = environment.slice(0, accepted).concat(result.execArgv);
+    result.runtimeArgs = environment.slice(0, accepted).concat(workerArgs ?? result.execArgv);
   } else {
     // Native options are snapshots, independent of later mutations to the public
     // execArgv array or NODE_OPTIONS environment string.
@@ -237,6 +237,7 @@ function workerOptions(filename, options) {
   }
   for (const key of ['stdin', 'stdout', 'stderr']) result[key] = !!options[key];
   result.processExposeGC = !!host.exposeGC;
+  result.processClock = { start: host.performanceStartTime, origin: host.performanceTimeOrigin };
   return { metadata: result, options };
 }
 class WorkerHandle {
@@ -246,6 +247,7 @@ class WorkerHandle {
 }
 class Worker extends EventEmitter {
   constructor(filename, options) {
+    require('internal/v8/startup_snapshot').throwIfBuildingSnapshot('Creating workers');
     super();
     const config = workerOptions(filename, options);
     const list = clone().transferList(config.options.transferList);
@@ -400,6 +402,7 @@ function bootstrap() {
   module.exports.parentPort = data.parentPort;
   module.exports.workerData = data.workerData;
   const nativeMetadata = JSON.parse(info.metadata);
+  if (nativeMetadata.processClock) host.adoptProcessClock(nativeMetadata.processClock.start, nativeMetadata.processClock.origin);
   bootstrapResult = { ...nativeMetadata, ...data.options, threadId: info.threadId };
   module.exports.threadName = bootstrapResult.name;
   module.exports.resourceLimits = { ...bootstrapResult.resourceLimits };
@@ -419,10 +422,17 @@ function bootstrap() {
 // are not variables resolve on Object.prototype, values become strings (a
 // Symbol throws), and only plain enumerable, writable, configurable data
 // properties can be defined.
+let environmentWarned = false;
 function workerEnvironment() {
   const lookup = key => host.workerNative('envGet', [key]);
   const store = (key, value) => {
     if (typeof key === 'symbol') throw new TypeError('Cannot convert a Symbol value to a string');
+    // node_env_var.cc EnvSetter: one DEP0104 warning under --pending-deprecation.
+    if (host.pendingDeprecation && !environmentWarned && typeof value !== 'string' && typeof value !== 'number' && typeof value !== 'boolean') {
+      environmentWarned = true;
+      process.emitWarning('Assigning any value other than a string, number, or boolean to a process.env property is deprecated. ' +
+        'Please make sure to convert the value to a string before setting process.env with it.', 'DeprecationWarning', 'DEP0104');
+    }
     host.workerNative('envSet', [key, `${value}`]);
   };
   const invalidDescriptor = message => clone().codedError('ERR_INVALID_OBJECT_DEFINE_PROPERTY', message);
