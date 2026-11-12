@@ -963,9 +963,15 @@ function createLoader(host, builtins) {
     require(specifier) { return makeRequire(this.filename || path.join(host.tryGetCwd(), '__entry__.js'), this, moduleAsyncModes.get(this) === true)(specifier); }
     _compile(source, filename) {
       const compiledSource = cleanSource(source);
-      const wrapper = wrapperPatched
-        ? host.compileFunction(Module.wrap(compiledSource), filename, undefined, undefined, true)
-        : host.compileFunction(wrapperPrefix + compiledSource + wrapperSuffix, filename, compiledSource, wrapperPrefix.length);
+      let wrapper;
+      try {
+        wrapper = wrapperPatched
+          ? host.compileFunction(Module.wrap(compiledSource), filename, undefined, undefined, true)
+          : host.compileFunction(wrapperPrefix + compiledSource + wrapperSuffix, filename, compiledSource, wrapperPrefix.length);
+      } catch (error) {
+        host.attachArrow(error, filename, compiledSource, wrapperPatched ? Module.wrap(compiledSource).indexOf(compiledSource) : wrapperPrefix.length);
+        throw error;
+      }
       const metadata = host.getScriptMetadata(wrapper);
       host.registerSource(filename, compiledSource, {
         owner: this, scriptId: metadata?.scriptId, sourceURL: metadata?.sourceURL ?? null, sourceMapURL: metadata?.sourceMapURL ?? null,

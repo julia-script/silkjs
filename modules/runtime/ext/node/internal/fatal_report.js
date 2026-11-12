@@ -69,7 +69,9 @@ function format(error, fromPromise) {
   const object = error !== null && (typeof error === 'object' || typeof error === 'function');
   const nativeError = object && require('util/types').isNativeError(error);
   let source;
-  try { source = arrow(error, fromPromise); } catch {}
+  try {
+    if (!host.decoratedErrors.has(error)) source = host.errorArrows.get(error) ?? arrow(error, fromPromise);
+  } catch {}
   let text = '';
   // AppendExceptionLine prints the source of anything but an error at once.
   if (source !== undefined && !nativeError) { text += '\n' + source; source = undefined; }

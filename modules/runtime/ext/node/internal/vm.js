@@ -34,6 +34,8 @@ function syntaxDiagnostic(cause, source, filename, line, column, prefix = 0) {
   const caret = text.slice(0, Math.max(0, sourceColumn - 1)).replace(/[^\t]/g, ' ') +
     (cause.columnNumber === 0 ? '' : '^');
   cause.stack = `${filename}:${cause.lineNumber}\n${text}\n${caret}\n\n${cause.name}: ${cause.message}\n${frames}`;
+  // decorateErrorStack: the stack holds the arrow, so the fatal report adds none.
+  host.decoratedErrors.add(cause);
   throw cause;
 }
 const terminationErrors = new WeakSet();
