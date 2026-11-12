@@ -404,6 +404,20 @@ native.workerNative('syntaxOriginKeys', [syntaxOrigin.file, syntaxOrigin.line, s
 const regExpExec = RegExp.prototype.exec;
 const emptyPattern = /(?:)/;
 host.clearRegExpStatics = () => { Reflect.apply(regExpExec, emptyPattern, ['']); };
+// Whether value starts with a URL scheme ("file:", "node:"). A scan, not a RegExp:
+// the loader runs it in the user's realm, where a RegExp would set RegExp.input.
+host.hasURLScheme = value => {
+  if (typeof value !== 'string') value = String(value);
+  const first = value.charCodeAt(0) | 0x20;
+  if (first < 0x61 || first > 0x7a) return false;
+  for (let index = 1; index < value.length; index++) {
+    const code = value.charCodeAt(index);
+    if (code === 0x3a) return true;
+    const lower = code | 0x20;
+    if (!((lower >= 0x61 && lower <= 0x7a) || (code >= 0x30 && code <= 0x39) || code === 0x2b || code === 0x2e || code === 0x2d)) return false;
+  }
+  return false;
+};
 // The carets under a SyntaxError's site, from column (0-based) of text: V8 underlines
 // the token a message names ("Unexpected identifier 'line'"), else one character.
 const namedToken = /^Unexpected (?:identifier|token|reserved word|strict mode reserved word) '(.+)'$/;
@@ -1900,7 +1914,7 @@ function checkUnsettledTopLevelAwait() {
       const sourceLine = sources.get(name)[line - 1] ?? '';
       let caret = '';
       for (let at = 0; at < column - 1 && at < sourceLine.length; at++) caret += sourceLine[at] === '\t' ? '\t' : ' ';
-      const location = /^[A-Za-z][A-Za-z\d+.-]*:/.test(name) ? name : url.pathToFileURL(name).href;
+      const location = host.hasURLScheme(name) ? name : url.pathToFileURL(name).href;
       host.writeText(2, `Warning: Detected unsettled top-level await at ${location}:${line}\n${sourceLine}\n${caret}^\n\n\n\n`);
     }
   }
@@ -1985,7 +1999,7 @@ globalThis.__silkRuntime = {
   importTrace(specifier, referrer, promise) {
     const channels = host.diagnostics.tracing('module.import');
     if (channels === undefined) return promise;
-    const parentURL = typeof referrer === 'string' ? (/^[A-Za-z][A-Za-z\d+.-]*:/.test(referrer) ? referrer : fileHref(referrer)) : undefined;
+    const parentURL = typeof referrer === 'string' ? (host.hasURLScheme(referrer) ? referrer : fileHref(referrer)) : undefined;
     const context = { __proto__: null, parentURL, url: specifier };
     const { end, asyncStart, asyncEnd, error } = channels;
     const resolve = result => {
@@ -2009,11 +2023,11 @@ globalThis.__silkRuntime = {
   registerSource(filename, source, metadata) {
     host.registerSource(filename, source, { ...metadata, owner: metadata });
     if (!metadata.generated && typeof filename === 'string') {
-      return /^[A-Za-z][A-Za-z\d+.-]*:/.test(filename) ? filename : fileHref(filename);
+      return host.hasURLScheme(filename) ? filename : fileHref(filename);
     }
   },
   importMeta(name) {
-    const asURL = value => /^[A-Za-z][A-Za-z\d+.-]*:/.test(value) ? value : fileHref(value);
+    const asURL = value => host.hasURLScheme(value) ? value : fileHref(value);
     const url = asURL(name);
     // As in Node: a null prototype, keys in this order, filename and dirname for file: only.
     const meta = { __proto__: null };
