@@ -383,7 +383,11 @@ host.attachArrow = (error, scriptName, source, prefix) => {
   let caret = '';
   if (column >= 0 && column < text.length) {
     for (let index = 0; index < column; index++) caret += text[index] === '\t' ? '\t' : ' ';
-    caret += '^\n';
+    // V8 underlines the token a message names ("Unexpected identifier 'line'").
+    const token = /^Unexpected (?:identifier|token|reserved word|strict mode reserved word) '(.+)'$/.exec(error.message)?.[1];
+    const width = token !== undefined && stringStartsWith(text, token, column) ? token.length : 1;
+    for (let index = 0; index < width; index++) caret += '^';
+    caret += '\n';
   }
   host.errorArrows.set(error, scriptName + ':' + line + '\n' + text + '\n' + caret);
 };
