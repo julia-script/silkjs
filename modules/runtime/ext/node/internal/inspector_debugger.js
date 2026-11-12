@@ -164,7 +164,9 @@ function paused(payload) {
     session.emit('Debugger.paused', { callFrames: frames(session, source), reason, hitBreakpoints: hits, ...(asyncStackTrace && { asyncStackTrace }) });
     if (!native(31)) break;
   }
-  if (!delivered && !startup && native(31)) { native(27, 0); activePause = undefined; }
+  // V8 schedules the start pause only for sessions whose debugger is enabled
+  // (V8DebuggerAgentImpl::schedulePauseOnNextStatement): without one it runs on.
+  if (!delivered && (!startup || enabled.size === 0) && native(31)) { native(27, 0); activePause = undefined; }
 }
 // V8 records async tasks for the deepest stack any enabled session asked for.
 let asyncModule;
@@ -283,8 +285,15 @@ function dispatch(session, method, params) {
     case 'Debugger.evaluateOnCallFrame':
       if (typeof params.callFrameId !== 'string' || typeof params.expression !== 'string') throw protocolError(-32602, 'Invalid parameters');
       if (params.timeout !== undefined && (typeof params.timeout !== 'number' || !Number.isFinite(params.timeout) || params.timeout < 0)) throw protocolError(-32602, 'Invalid parameters: timeout');
-      if (params.includeCommandLineAPI) unsupported(method);
-      return session.evaluation(native(29, params.callFrameId, params.expression, !!params.throwOnSideEffect, params.timeout || 0), params);
+      {
+        const frame = params.includeCommandLineAPI && activePause ? (activePause.frames || []).find(item => item.callFrameId === params.callFrameId) : undefined;
+        const context = frame && contexts.fromToken(frame.contextToken);
+        const restore = context ? session.commandLineAPI(context) : undefined;
+        let result;
+        try { result = native(29, params.callFrameId, params.expression, !!params.throwOnSideEffect, params.timeout || 0); }
+        finally { if (restore) restore(); }
+        return session.evaluation(result, params);
+      }
     default: unsupported(method);
   }
 }

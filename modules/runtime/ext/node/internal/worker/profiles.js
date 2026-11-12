@@ -22,17 +22,18 @@ function finish(id, error, result) {
 function send(id, request) {
   request.sent = true;
   try {
-    const interval = request.operation === 0 ? 1000 : request.operation === 2 ? 524288 : 0;
+    // A stop names the profile it stops (Node's stopCpuProfile(id)).
+    const interval = request.operation === 0 ? 1000 : request.operation === 2 ? 524288 : request.operation === 1 ? request.profile : 0;
     const capacity = request.operation === 0 ? 16384 : request.operation === 2 ? 2048 : 0;
     const status = host.profileRequest(request.state.id, id, request.operation, interval, capacity);
     if (status !== 0) finish(id, failure(status, request.operation));
   } catch (error) { finish(id, error); }
 }
-function request(state, operation, retain) {
+function request(state, operation, retain, profile) {
   if (!state || state.exited) return Promise.reject(notRunning());
   return new Promise((resolve, reject) => {
     const id = ++sequence;
-    const entry = { state, operation, retain, resolve, reject, sent: false };
+    const entry = { state, operation, retain, resolve, reject, sent: false, profile };
     retain(state.control, 1);
     pending.set(id, entry);
     // The native owner registry is attached before the worker announces online.
@@ -68,10 +69,11 @@ function stopped(result, heap) {
 class CPUProfileHandle {
   #state;
   #retain;
+  #id;
   #promise;
-  constructor(state, retain) { this.#state = state; this.#retain = retain; }
+  constructor(state, retain, id) { this.#state = state; this.#retain = retain; this.#id = id; }
   stop() {
-    if (!this.#promise) this.#promise = request(this.#state, 1, this.#retain).then(result => stopped(result, false));
+    if (!this.#promise) this.#promise = request(this.#state, 1, this.#retain, this.#id).then(result => stopped(result, false));
     return this.#promise;
   }
 }
@@ -89,8 +91,19 @@ if (Symbol.asyncDispose) {
   CPUProfileHandle.prototype[Symbol.asyncDispose] = async function() { await this.stop(); };
   HeapProfileHandle.prototype[Symbol.asyncDispose] = async function() { await this.stop(); };
 }
-function startCpuProfile(state, retain) { return request(state, 0, retain).then(() => new CPUProfileHandle(state, retain)); }
-function startHeapProfile(state, retain) { return request(state, 2, retain).then(() => new HeapProfileHandle(state, retain)); }
+function startCpuProfile(state, retain) {
+  return request(state, 0, retain).then(id => {
+    if (id === -1) throw failure(16, 0);
+    if (typeof id !== 'number') throw codedError('ERR_OPERATION_FAILED', 'The CPU profiler of the worker is in use by its inspector', Error);
+    return new CPUProfileHandle(state, retain, id);
+  });
+}
+function startHeapProfile(state, retain) {
+  return request(state, 2, retain).then(started => {
+    if (!started) throw failure(16, 2);
+    return new HeapProfileHandle(state, retain);
+  });
+}
 function getHeapSnapshot(state, options = {}, retain) {
   const { validateObject, validateBoolean } = require('internal/validators');
   validateObject(options, 'options');

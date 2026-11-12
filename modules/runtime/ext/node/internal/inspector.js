@@ -28,8 +28,17 @@ function contextFor(params) {
   if (!context) throw protocolError(-32000, 'Cannot find context with specified id');
   return context;
 }
+// V8's CommandLineAPIScope over the global of the context an evaluation runs in.
+function withCommandLineAPI(session, context) {
+  const global = native(8, 'this', context.handle, false, 0);
+  if (global.status !== 'success') return () => {};
+  const { commandLineAPI, install } = require('internal/inspector_command_line');
+  return install(global.value, commandLineAPI(session, context.id, consoleBridge));
+}
 function evaluation(session, result, params) {
   if (result.status === 'success') {
+    // InjectedScript::wrapEvaluateResult keeps a console evaluation's value as $_.
+    if (params.objectGroup === 'console' && !params.awaitPromise) session.lastEvaluationResult = result.value;
     if (params.awaitPromise) return Promise.resolve(result.value).then(value => ({ result: session.values.remote(value, params.objectGroup, !!params.returnByValue, !!params.generatePreview, params._context) }), value => evaluation(session, { status: 'exception', value }, { ...params, awaitPromise: false }));
     return { result: session.values.remote(result.value, params.objectGroup, !!params.returnByValue, !!params.generatePreview, params._context) };
   }
@@ -63,7 +72,7 @@ function exceptionDetails(exception, remote) {
   return details;
 }
 function validateEvaluation(params, method) {
-  if (params.serializationOptions || params.replMode || params.allowUnsafeEvalBlockedByCSP === false || params.includeCommandLineAPI) unsupported(method);
+  if (params.serializationOptions || params.replMode || params.allowUnsafeEvalBlockedByCSP === false) unsupported(method);
   if (params.timeout !== undefined && (typeof params.timeout !== 'number' || !Number.isFinite(params.timeout) || params.timeout < 0)) throw protocolError(-32602, 'Invalid parameters: timeout');
 }
 function runtime(session, method, params) {
@@ -71,7 +80,7 @@ function runtime(session, method, params) {
     case 'Runtime.enable':
       if (!session.runtime) {
         session.runtime = true;
-        for (const context of contexts.list()) { session.contexts.set(context.id, context); session.emit('Runtime.executionContextCreated', { context: contexts.description(context) }); }
+        for (const context of contexts.list()) { session.contexts.set(context.id, { id: context.id, uniqueId: context.uniqueId }); session.emit('Runtime.executionContextCreated', { context: contexts.description(context) }); }
       }
       return {};
     case 'Runtime.disable': session.runtime = false; session.contexts.clear(); return {};
@@ -79,7 +88,11 @@ function runtime(session, method, params) {
       protocolParams(params, 'expression', 'string');
       validateEvaluation(params, method);
       const context = contextFor(params);
-      return evaluation(session, native(8, params.expression, context.handle, !!params.throwOnSideEffect, params.timeout || 0), { ...params, _context: context });
+      const restore = params.includeCommandLineAPI ? withCommandLineAPI(session, context) : undefined;
+      let result;
+      try { result = native(8, params.expression, context.handle, !!params.throwOnSideEffect, params.timeout || 0); }
+      finally { if (restore) restore(); }
+      return evaluation(session, result, { ...params, _context: context });
     }
     case 'Runtime.callFunctionOn': {
       protocolParams(params, 'functionDeclaration', 'string');
@@ -157,7 +170,8 @@ function createSession(key, send) {
   const session = { id: nextSession++, runtime: false, contexts: new Map(), values: null,
     send(message) { if (sessions.get(key) === session) send(message); },
     emit(method, params) { if (sessions.get(key) === session) send({ method, params }); },
-    evaluation(result, params) { return evaluation(session, result, params); } };
+    evaluation(result, params) { return evaluation(session, result, params); },
+    commandLineAPI(context) { return withCommandLineAPI(session, context); } };
   session.values = new RemoteValues(`${native(10)}:${session.id}`);
   sessions.set(key, session);
   native(7, true);
@@ -279,11 +293,13 @@ function open(port = 9229, hostname = '127.0.0.1', wait = false) {
   if (typeof port !== 'number' || !Number.isInteger(port) || port < 0 || port > 65535) port = 9229;
   if (typeof hostname !== 'string' || !hostname) hostname = '127.0.0.1';
   if (!['127.0.0.1', 'localhost', '::1'].includes(hostname)) process.emitWarning('Binding the inspector to a public IP with an open port is insecure, as it allows external hosts to connect to the inspector and perform a remote code execution attack. Documentation can be found at https://nodejs.org/api/cli.html#--inspecthostport', 'SecurityWarning');
-  if (!native(1, hostname, port, `node.js/${process.version}`)) throw new ERR_INSPECTOR_NOT_AVAILABLE();
+  // --inspect-publish-uid: the listing over HTTP and the banner on stderr.
+  const publish = host.inspectorOptions?.publishUid ?? { stderr: true, http: true };
+  if (!native(1, hostname, port, `node.js/${process.version}`, publish.http)) throw new ERR_INSPECTOR_NOT_AVAILABLE();
   const endpoint = url();
   process.debugPort = Number(new URL(endpoint).port);
   // Startup can park immediately below; publish without queued stdio work.
-  host.writeStartupDiagnostic(`Debugger listening on ${endpoint}\nFor help, see: https://nodejs.org/en/docs/inspector\n`);
+  if (publish.stderr) host.writeStartupDiagnostic(`Debugger listening on ${endpoint}\nFor help, see: https://nodejs.org/learn/getting-started/debugging\n`);
   if (wait) waitForDebugger();
   return { __proto__: null, [Symbol.dispose]() { close(); } };
 }
@@ -397,8 +413,11 @@ consoleBridge.console.profile = function profile(title) {
 consoleBridge.console.profileEnd = function profileEnd(title) {
   return profiles.consoleProfileEnd(title, profiles.emitConsoleEvent, profileEnd);
 };
+contexts.onDestroyed(context => {
+  for (const session of sessions.values()) if (session.runtime && session.contexts.delete(context.id)) session.emit('Runtime.executionContextDestroyed', { executionContextId: context.id, executionContextUniqueId: context.uniqueId });
+});
 contexts.subscribe(context => {
-  for (const session of sessions.values()) if (session.runtime) { session.contexts.set(context.id, context); session.emit('Runtime.executionContextCreated', { context: contexts.description(context) }); }
+  for (const session of sessions.values()) if (session.runtime) { session.contexts.set(context.id, { id: context.id, uniqueId: context.uniqueId }); session.emit('Runtime.executionContextCreated', { context: contexts.description(context) }); }
 }, true);
 // Worker owners are announced before bootstrap has installed permissions and
 // startup options. Keep incoming routes queued until _start/_waitForWorker.
