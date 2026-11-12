@@ -1073,8 +1073,9 @@ function runtimeFlag(arg) {
   // V8's optimizing tiers (Sparkplug, Maglev, Turbofan) and their switches. The engine
   // is an interpreter with no compiler tiers, so turning one on or off changes nothing,
   // as these V8 flags change nothing under --jitless. Spellings as V8 parses them:
-  // --no-x, --nox, and _ for -.
-  if (/^--(no-?)?(maglev|turbofan|sparkplug|opt|concurrent[-_]recompilation|always[-_]osr|use[-_]osr)$/.test(arg)) return true;
+  // --no-x, --nox, and _ for -. --minor-ms picks V8's non-moving young collector;
+  // the engine's young collections never move cells, so it changes nothing either.
+  if (/^--(no-?)?(maglev|turbofan|sparkplug|opt|concurrent[-_]recompilation|always[-_]osr|use[-_]osr|minor[-_]ms)$/.test(arg)) return true;
   // Node maps its code to large pages on request; this binary does not, which Node
   // reports as its ENOTSUP result (src/large_pages/node_large_page.cc).
   if (arg.startsWith('--use-largepages=')) {
@@ -1169,12 +1170,23 @@ function installRuntimeOptions(args, entrypoints = [], preloadEntrypoints = true
   if (host.exposeGC) {
     // A collection gc() asks for is a forced one to 'gc' performance entries.
     const collect = rawStd.gc;
-    const gc = function gc() {
+    // V8's gc(options): type 'minor' collects only the young generation, and
+    // execution 'async' collects in a later task and returns a promise for it.
+    const run = young => {
       const observer = host.gcObserver;
-      if (observer === undefined) return Reflect.apply(collect, undefined, arguments);
-      observer(false);
-      try { return Reflect.apply(collect, undefined, arguments); }
-      finally { observer(true); }
+      if (observer !== undefined) observer(false);
+      try { if (young) host.collectGarbage(true); else collect(); }
+      finally { if (host.gcObserver !== undefined) host.gcObserver(true); }
+    };
+    const gc = function gc(options) {
+      let young = false;
+      let async = false;
+      if (options !== null && typeof options === 'object') {
+        young = options.type === 'minor';
+        async = options.execution === 'async';
+      }
+      if (!async) return run(young);
+      return new Promise(resolve => setImmediate(() => { run(young); resolve(); }));
     };
     Object.defineProperty(globalThis, 'gc', { value: gc, writable: true, enumerable: true });
   }
