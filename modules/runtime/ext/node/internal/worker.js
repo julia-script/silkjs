@@ -297,7 +297,7 @@ class Worker extends EventEmitter {
       state.user.on('message', value => state.resource.runInAsyncScope(this.emit, this, 'message', value));
       state.user.on('messageerror', error => state.resource.runInAsyncScope(this.emit, this, 'messageerror', error));
       state.user.unref();
-      if (info.isMainThread) cwdCounter ??= new Uint32Array(new SharedArrayBuffer(4));
+      if (info.isMainThread) cwdCounter ??= new Uint32Array(new host.SharedArrayBuffer(4));
       controlChannel.port1.postMessage({ type: messageTypes.LOAD_SCRIPT, cwdCounter: cwdCounter || sharedCwdCounter, workerData: config.options.workerData,
         environmentData: Array.from(environmentData), parentPort: userChannel.port2,
         options: config.metadata }, [userChannel.port2, ...list]);

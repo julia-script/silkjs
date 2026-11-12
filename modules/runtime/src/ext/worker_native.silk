@@ -35,6 +35,7 @@ import libs.core.owners { Scope }
 import libs.core.common as common
 import silkjs.js_proxy_core as core
 import silkjs.js_runtime as runtime
+import ext.os_abi as abi
 import libs.core.host as host
 import runtime.worker as worker
 import ext.worker_transport { Group, Registry, Thread, Endpoint, Message, Shared, Environment, Variable, LockRequest }
@@ -89,15 +90,51 @@ pub unsafe fn domain(pointer: *mut State) -> Domain {
   let anchor = () let state = unsafe Pointer.borrow<(), State>(&anchor, pointer) let guard = state.group.registry.get().lock()
   let entry = unsafe Pointer.borrow<(), Thread>(&anchor, unsafe nonnull(unsafe transport.thread(guard.get(), state.id))) return entry.cancellation.handle()
 }
+/// V8's default --stack-size, in KiB.
+const V8_DEFAULT_STACK_KIB: usize = 984
+/// Native stack the main thread keeps past the JavaScript limit, for host
+/// frames, exception reporting and teardown.
+const MAIN_STACK_RESERVE: usize = 2 * 1024 * 1024
+/// The main thread's JavaScript stack for V8's --stack-size=kib. An engine
+/// frame of a plain call takes about 5.5 times the native stack of a V8
+/// interpreter frame (432 vs 80 bytes), so a limit of 5.5 times V8's gives the
+/// call depth Node gives. It stays inside RLIMIT_STACK minus a reserve.
+unsafe fn mainStackBytes(kib: usize) -> usize {
+  let room = unsafe mainStackRoom()
+  if kib >= room / 1024 { return room }
+  let bytes = kib * 1024 / 2 * 11
+  return if bytes > room { room } else { bytes }
+}
+/// The most JavaScript stack the main thread can take: RLIMIT_STACK less the
+/// reserve, at most 64 MiB (an unlimited stack still has its frame region).
+unsafe fn mainStackRoom() -> usize {
+  let mut room: usize = 64 * 1024 * 1024
+  let mut limit: [u64; 2] = [0; 2]
+  // RLIMIT_STACK is 3 on Darwin and GNU/Linux.
+  if unsafe abi.getrlimit(3, Pointer.fromMutRef<[u64; 2]>(&mut limit)) == 0 && limit[0] < usize.toU64(room) {
+    let soft = u64.toUsize(limit[0])
+    room = if soft > 2 * MAIN_STACK_RESERVE { soft - MAIN_STACK_RESERVE } else { soft / 2 }
+  }
+  return room
+}
 // Called immediately after runtime storage is allocated, before realm/bootstrap.
 // The native thread reserves an additional 8 MiB for runtime/bootstrap frames,
 // exception reporting and teardown beyond this JavaScript stack boundary.
-pub unsafe fn configureRuntime(pointer: *mut State, rt: *mut HeapHeader) -> () {
+// While a heap image is written (building) the frame region stays at its 1 MiB:
+// the image would otherwise carry the whole region, and a start from it reserves.
+pub unsafe effect fn configureRuntime(pointer: *mut State, rt: *mut HeapHeader, building: bool) -> () ! OutOfMemoryError ? &mut Allocator {
   let anchor = () let state = unsafe Pointer.borrow<(), State>(&anchor, pointer)
-  if state.id == 0 { return () }
+  if state.id == 0 {
+    // Room for the largest --stack-size the thread can take, so a later
+    // setStackSize needs no new frame region.
+    if !building { run unsafe runtime.reserveCallFrames(rt, unsafe mainStackRoom()) }
+    unsafe runtime.setMaxStackSize(rt, unsafe mainStackBytes(V8_DEFAULT_STACK_KIB))
+    return ()
+  }
   let guard = state.group.registry.get().lock()
   let entry = unsafe Pointer.borrow<(), Thread>(&anchor, unsafe nonnull(unsafe transport.thread(guard.get(), state.id)))
   let size = entry.stackSize drop entry drop guard
+  if !building { run unsafe runtime.reserveCallFrames(rt, size) }
   unsafe runtime.setMaxStackSize(rt, size)
 }
 /// Connects the isolate to its runtime loop: messages and thread events for it wake `io`.
@@ -924,6 +961,14 @@ unsafe effect fn invoke<'m, S: EngineServices>(engine: &mut Engine<'m, S>, conte
     return ValueBits.Undefined
   }
   // process.exit on the main thread: workers end before the exit handlers run.
+  // V8's --stack-size on the main thread; a Worker keeps its resourceLimits stack.
+  if equal(op, b"setStackSize") {
+    let kib = args.values[0].numericValue()
+    if state.id == 0 && f64.isFinite(kib) && kib >= 1.0 && kib < 1073741824.0 {
+      unsafe runtime.setMaxStackSize(unsafe runtime.contextRuntime(context), unsafe mainStackBytes(f64.toUsize(kib)))
+    }
+    return ValueBits.Undefined
+  }
   if equal(op, b"stopThreads") { unsafe stopChildren(&state) return ValueBits.Undefined }
   if equal(op, b"hasPending") { return ValueBits.Bool { value: unsafe hasPending(pointer) } }
   if equal(op, b"startSigintWatch") { drop state return run unsafe startSignalGuard(&mut engine, context, pointer) }

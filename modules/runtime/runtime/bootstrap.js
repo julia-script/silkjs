@@ -77,6 +77,9 @@ for (const name of ['dispose', 'asyncDispose']) {
   if (Symbol[name] === undefined) Object.defineProperty(Symbol, name, { value: Symbol.for('nodejs.' + name) });
 }
 const host = { ...native, rawOS, rawStd };
+// Node's internals keep SharedArrayBuffer when the global is left out
+// (--enable-sharedarraybuffer-per-context): a Worker still shares its cwd counter.
+host.SharedArrayBuffer = SharedArrayBuffer;
 // Startup snapshots: what Node keeps in internalBinding('mksnapshot') for
 // internal/v8/startup_snapshot. With --build-snapshot (native.snapshotBuild) the
 // heap is saved as the blob when the loop ends; a start from the blob runs
@@ -957,6 +960,7 @@ function runPreloads(entry, loadImports = true, loadRequires = true) {
   if (host.configFile) process.emitWarning('--experimental-config-file is an experimental feature and might change at any time', 'ExperimentalWarning');
   // Before any preload: Node applies it when the context is made.
   if (host.disableProto !== undefined) disableProto(globalThis);
+  if (host.noSharedArrayBuffer) delete globalThis.SharedArrayBuffer;
   if (host.disallowCodeGeneration) native.vmSetCodeGeneration(undefined, false);
   if (host.jitless) delete globalThis.WebAssembly;
   if (host.experimentalShadowRealm) internalRequire('internal/shadow_realm').enable();
@@ -1021,6 +1025,16 @@ function runtimeFlag(arg) {
   if (arg.startsWith('--v8-pool-size=')) return true;
   if (arg === '--async-context-frame' || arg === '--no-async-context-frame') {
     host.asyncContextFrame = arg === '--async-context-frame'; return true;
+  }
+  // V8's --stack-size, in KiB: the main thread's JavaScript stack (worker_native
+  // mainStackBytes). A Worker keeps its resourceLimits stack, as in Node.
+  const stackSize = /^--stack[-_]size=(\d+)$/.exec(arg);
+  if (stackSize) { native.workerNative('setStackSize', [Number(stackSize[1])]); return true; }
+  // V8 with these flags and no embedder callback, as in Node, installs no
+  // SharedArrayBuffer global (runPreloads removes it before user code).
+  if (arg === '--enable-sharedarraybuffer-per-context' || arg === '--no-harmony-sharedarraybuffer' ||
+      arg === '--no-harmony_sharedarraybuffer') {
+    host.noSharedArrayBuffer = true; return true;
   }
   if (arg === '--expose-gc' || arg === '--no-expose-gc') {
     host.exposeGC = arg === '--expose-gc'; return true;

@@ -112,6 +112,10 @@ function getCppHeapStatistics(detailLevel = 'detailed') {
 }
 function setFlagsFromString(flags) {
   string(flags, 'flags');
+  // V8 reads --stack-size when an isolate's thread starts, so a running isolate
+  // keeps its limit and a Worker keeps its resourceLimits stack.
+  const tokens = flags.split(/\s+/).filter(Boolean);
+  if (tokens.length && tokens.every(flag => /^--stack[-_]size=\d+$/.test(flag))) return;
   unsupported('setFlagsFromString', 'V8 execution flags do not control the Silk engine');
 }
 function setHeapSnapshotNearHeapLimit(limit) {
