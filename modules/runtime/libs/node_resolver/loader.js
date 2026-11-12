@@ -130,7 +130,7 @@ function createLoader(host, builtins) {
 
   function parentName(parent) {
     if (parent && typeof parent === 'object') parent = parent.filename;
-    if (!parent) return path.join(host.cwd(), '__silk_entry__.js');
+    if (!parent) return path.join(host.tryGetCwd(), '__silk_entry__.js');
     parent = String(parent);
     let name = parentNames.get(parent);
     if (name !== undefined) return name;
@@ -956,10 +956,10 @@ function createLoader(host, builtins) {
       this.exports = {};
       this[kModuleParent] = parent;
       this.children = [];
-      this.paths = modulePaths(this.path);
+      // As Node, paths come with load() (or from whoever made the module).
       this.loaded = false;
     }
-    require(specifier) { return makeRequire(this.filename || path.join(host.cwd(), '__entry__.js'), this, moduleAsyncModes.get(this) === true)(specifier); }
+    require(specifier) { return makeRequire(this.filename || path.join(host.tryGetCwd(), '__entry__.js'), this, moduleAsyncModes.get(this) === true)(specifier); }
     _compile(source, filename) {
       const compiledSource = cleanSource(source);
       const wrapper = wrapperPatched
@@ -1091,6 +1091,7 @@ function createLoader(host, builtins) {
   function makeModule(filename, parent) {
     const module = new Module(filename, parent || null);
     module.filename = filename;
+    module.paths = modulePaths(module.path);
     return module;
   }
 
