@@ -1,5 +1,5 @@
 'use strict';
-const c = require('internal/fs_core');
+const c = require('internal/fs/utils');
 const { EventEmitter } = require('events');
 const { join } = require('path');
 const v = require('internal/validators');
@@ -121,7 +121,7 @@ class Dir {
   async [Symbol.asyncDispose]() { if (this.#closed) return; await this.#closePromisified(); }
 }
 Object.defineProperty(Dir.prototype, Symbol.asyncIterator, { enumerable: false, writable: true, configurable: true, value: Dir.prototype.entries });
-const { FSWatcher, watch } = require('internal/fs_watch');
+const { FSWatcher, watch } = require('internal/fs/watchers');
 class StatWatcher extends EventEmitter {
   constructor() { super(); this._handle = null; this._closed = false; }
   stop() { if (this._closed) return; this._closed = true; if (this._handle) { this._handle.close(); this._handle = null; } process.nextTick(() => this.emit('stop')); }
