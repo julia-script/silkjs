@@ -1259,8 +1259,14 @@ function prepareInput(source, filename, inputType, explicit) {
     }
   }
 }
+// Node's HandleEnvOptions: options that environment variables set, read from the
+// environment a Worker was given as from the process environment.
+function environmentOptions() {
+  if (process.env.NODE_PRESERVE_SYMLINKS === '1') host.preserveSymlinks = true;
+}
 function runWorker() {
   const { filename, eval: evaluate, argv, runtimeArgs } = workerBootstrap;
+  environmentOptions();
   let inputType;
   for (const entry of internalRequire('internal/options').parseArguments(runtimeArgs, false).entries) {
     if (entry.name === '--input-type') inputType = entry.value;
@@ -1489,6 +1495,7 @@ function run(restored = false) {
   // option table has expanded aliases and short forms.
   // getOptionValue reads the options no handler below keeps (internal/options).
   host.cliOptionEntries = environmentEntries.concat(parsed.entries);
+  environmentOptions();
   for (const entry of host.cliOptionEntries) {
     const { name, value } = entry;
     switch (name) {

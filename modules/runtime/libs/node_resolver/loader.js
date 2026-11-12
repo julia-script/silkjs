@@ -786,6 +786,12 @@ function createLoader(host, builtins) {
     regularFile = null;
     mode = mode === 'import' || mode === 'esm' ? 'import' : 'require';
     if (allowAsync === undefined) allowAsync = mode === 'import';
+    // defaultResolve's check, for the path that skips it: a module with a URL other than
+    // file: (a data: module) can import only URLs and absolute paths.
+    if (mode === 'import' && typeof parent === 'string' && /^[A-Za-z][A-Za-z\d+.-]*:/.test(parent) && !parent.startsWith('file:') &&
+        !isBuiltinFile(parent) && typeof specifier === 'string' && !/^[A-Za-z][A-Za-z\d+.-]*:/.test(specifier) && !path.isAbsolute(specifier) && builtinName(specifier) === null) {
+      throw error('ERR_UNSUPPORTED_RESOLVE_REQUEST', specifier, parent);
+    }
     if (!hooks.active(allowAsync) && !String(specifier).startsWith('data:')) {
       return mockResolution(resolveInternal(specifier, parent, mode, options, new Set(), isMain), mode);
     }
@@ -1165,7 +1171,13 @@ function createLoader(host, builtins) {
   Module.createRequire = filename => {
     if (filename && typeof filename === 'object' && filename.href) filename = filename.href;
     if (typeof filename !== 'string' || (!filename.startsWith('file:') && !path.isAbsolute(filename))) throw invalidArgValue('filename', filename, 'must be a file URL object, file URL string, or absolute path string');
-    return requireFor(filename, undefined, false);
+    // Node's createRequire requires for a loaded module at that path: the parent errors
+    // and require stacks name (an ES module has no CommonJS module of its own).
+    const name = parentName(filename);
+    if (own(cache, name) || !path.isAbsolute(name)) return requireFor(filename, undefined, false);
+    const proxy = makeModule(name, null);
+    proxy.loaded = true;
+    return requireFor(filename, proxy, false);
   };
   Module.isBuiltin = name => typeof name === 'string' && (builtins.listed(name) ||
     (builtinPrefix(name, 'node:') && builtins.listed(builtinSlice(name, 5))));
