@@ -539,6 +539,54 @@ function getConstructorOf(obj) {
   return null;
 }
 
+let getStructuredStackImpl;
+
+function lazyGetStructuredStack() {
+  if (getStructuredStackImpl === undefined) {
+    // Lazy-load to avoid a circular dependency.
+    const { runInNewContext } = require('vm');
+    const { overrideStackTrace } = require('internal/errors');
+    // Use `runInNewContext()` to get something tamper-proof and
+    // side-effect-free. Since this is currently only used for a deprecated API
+    // and module mocking, the perf implications should be okay.
+    getStructuredStackImpl = runInNewContext(`(function() {
+      try { Error.stackTraceLimit = Infinity; } catch {}
+      return function structuredStack() {
+        const e = new Error();
+        overrideStackTrace.set(e, (err, trace) => trace);
+        return e.stack;
+      };
+    })()`, { overrideStackTrace }, { filename: 'structured-stack' });
+  }
+
+  return getStructuredStackImpl;
+}
+
+function getStructuredStack() {
+  const getStructuredStackImpl = lazyGetStructuredStack();
+
+  return getStructuredStackImpl();
+}
+
+function setupCoverageHooks(dir) {
+  const cwd = require('internal/process/execution').tryGetCwd();
+  const { resolve } = require('path');
+  const coverageDirectory = resolve(cwd, dir);
+  const { sourceMapCacheToObject } =
+    require('internal/source_map/source_map_cache');
+
+  if (process.features.inspector) {
+    require('internal/profiler_binding').setCoverageDirectory(coverageDirectory);
+    require('internal/profiler_binding').setSourceMapCacheGetter(sourceMapCacheToObject);
+  } else {
+    process.emitWarning('The inspector is disabled, ' +
+                        'coverage could not be collected',
+                        'Warning');
+    return '';
+  }
+  return coverageDirectory;
+}
+
 class WeakReference {
   #weak = null;
   // eslint-disable-next-line no-unused-private-class-members
@@ -573,6 +621,12 @@ class WeakReference {
 }
 
 let validateUint32;
+// Node keeps convertToValidSignal here; the runtime's lives with the validators that
+// child_process already loads.
+function convertToValidSignal(signal) {
+  return require('internal/validators').convertToValidSignal(signal);
+}
+
 function sleep(msec) {
   // Lazy-load to avoid a circular dependency.
   if (validateUint32 === undefined)
@@ -587,6 +641,7 @@ module.exports = {
   assertCrypto,
   sleep,
   assignFunctionName,
+  convertToValidSignal,
   customInspectSymbol: SymbolFor('nodejs.util.inspect.custom'),
   customPromisifyArgs: kCustomPromisifyArgsSymbol,
   decorateErrorStack,
@@ -599,6 +654,7 @@ module.exports = {
   getConstructorOf,
   getDeprecationWarningEmitter,
   getLazy,
+  getStructuredStack,
   getSystemErrorName,
   isError,
   isMacOS,
@@ -619,4 +675,5 @@ module.exports = {
   promisify,
   removeColors,
   setOwnProperty,
+  setupCoverageHooks,
 };

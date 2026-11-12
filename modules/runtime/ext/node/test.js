@@ -1,23 +1,81 @@
+// Adapted from Node.js v24.22.1 lib/test.js by tools/port_test_runner.py.
 'use strict';
 
-const harness = require('internal/test_runner/harness');
-const { MockTracker } = require('internal/test_runner/mock');
-const test = harness.test;
-Object.assign(test, {
-  test, it: test, suite: harness.suite, describe: harness.suite,
-  before: harness.before, after: harness.after,
-  beforeEach: harness.beforeEach, afterEach: harness.afterEach,
-  getTestContext: harness.getTestContext,
-  run: require('internal/test_runner/runner').run,
-  assert: { register: harness.registerAssertion },
-});
-let mock, snapshot;
-Object.defineProperty(test, 'mock', { configurable: true, enumerable: true, get() { return mock ||= new MockTracker(); } });
-Object.defineProperty(test, 'snapshot', { configurable: true, enumerable: true, get() {
-  if (!snapshot) {
-    const api = require('internal/test_runner/snapshot');
-    snapshot = { setDefaultSnapshotSerializers: api.setDefaultSnapshotSerializers, setResolveSnapshotPath: api.setResolveSnapshotPath };
-  }
-  return snapshot;
-} });
+const {
+  ObjectAssign,
+  ObjectDefineProperty,
+} = require('internal/per_context/primordials');
+
+const { test, suite, before, after, beforeEach, afterEach, getTestContext } = require('internal/test_runner/harness');
+const { run } = require('internal/test_runner/runner');
+
 module.exports = test;
+ObjectAssign(module.exports, {
+  after,
+  afterEach,
+  before,
+  beforeEach,
+  describe: suite,
+  getTestContext,
+  it: test,
+  run,
+  suite,
+  test,
+});
+
+let lazyMock;
+
+ObjectDefineProperty(module.exports, 'mock', {
+  __proto__: null,
+  configurable: true,
+  enumerable: true,
+  get() {
+    if (lazyMock === undefined) {
+      const { MockTracker } = require('internal/test_runner/mock/mock');
+
+      lazyMock = new MockTracker();
+    }
+
+    return lazyMock;
+  },
+});
+
+let lazySnapshot;
+
+ObjectDefineProperty(module.exports, 'snapshot', {
+  __proto__: null,
+  configurable: true,
+  enumerable: true,
+  get() {
+    if (lazySnapshot === undefined) {
+      const {
+        setDefaultSnapshotSerializers,
+        setResolveSnapshotPath,
+      } = require('internal/test_runner/snapshot');
+
+      lazySnapshot = {
+        __proto__: null,
+        setDefaultSnapshotSerializers,
+        setResolveSnapshotPath,
+      };
+    }
+
+    return lazySnapshot;
+  },
+});
+
+let lazyAssert;
+
+ObjectDefineProperty(module.exports, 'assert', {
+  __proto__: null,
+  configurable: true,
+  enumerable: true,
+  get() {
+    if (lazyAssert === undefined) {
+      const { register } = require('internal/test_runner/assert');
+      lazyAssert = { __proto__: null, register };
+    }
+
+    return lazyAssert;
+  },
+});

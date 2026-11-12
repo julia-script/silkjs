@@ -68,6 +68,7 @@ function queryObjects(ctor, options = {}) {
   const format = options.format || 'count';
   if (format !== 'count' && format !== 'summary')
     throw error('ERR_INVALID_ARG_VALUE', 'The "options.format" argument must be "count" or "summary"', TypeError);
+  require('internal/util').emitExperimentalWarning('v8.queryObjects()');
   const prototype = ctor.prototype;
   // Node's native predicate returns an empty result for a non-object search
   // prototype; being constructable is not a requirement of this API.
@@ -123,11 +124,13 @@ function isStringOneByteRepresentation(content) {
   string(content, 'content');
   return host.isOneByteString(content);
 }
+// Node's v8.takeCoverage and v8.stopCoverage are the profiler binding's: they act on the
+// coverage NODE_V8_COVERAGE started and do nothing without it.
 function takeCoverage() {
-  unsupported('takeCoverage', 'NODE_V8_COVERAGE collection is not implemented; native test coverage is a separate facility');
+  require('internal/profiler_binding').takeCoverage();
 }
 function stopCoverage() {
-  unsupported('stopCoverage', 'NODE_V8_COVERAGE collection is not implemented; native test coverage is a separate facility');
+  require('internal/profiler_binding').stopCoverage();
 }
 class GCProfiler {
   start() { unsupported('GCProfiler.start', 'native GC events do not capture the before/after heap statistics required by this profile'); }

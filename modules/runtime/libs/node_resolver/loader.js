@@ -1063,6 +1063,7 @@ function createLoader(host, builtins) {
     const allowAsync = !!parent && moduleAsyncModes.get(parent) === true;
     return loadResolved(resolve(request, parent, 'require', undefined, undefined, !!isMain, allowAsync), parent, !!isMain, allowAsync);
   };
+  const defaultModuleLoad = Module._load;
   Module._initPaths = () => {
     const windows = process.platform === 'win32';
     const home = process.env[windows ? 'USERPROFILE' : 'HOME'];
@@ -1166,6 +1167,8 @@ function createLoader(host, builtins) {
       addChild(parent, cache[filename]);
       return cache[filename].exports;
     }
+    // Node's .mts loader: without require(esm), ERR_REQUIRE_ESM before the types are stripped.
+    if (resolved.format === 'module-typescript' && !requireModuleEnabled() && !hooks.active(allowAsync)) throw requireESMError(filename, parent);
     let loaded = pendingLoads.get(resolved.filename);
     if (loaded) pendingLoads.delete(resolved.filename);
     else if (hooks.active(allowAsync) || !path.isAbsolute(filename) ||
@@ -1185,7 +1188,7 @@ function createLoader(host, builtins) {
         requireNamespace(module, filename);
       } else if (loaded && resolved.format !== 'addon') {
         if (resolved.format === 'json') module.exports = JSON.parse(loaded.source.replace(/^\uFEFF/, ''));
-        else if (resolved.format === 'commonjs') module._compile(loaded.source, filename);
+        else if (resolved.format === 'commonjs') compileCommonJS(module, loaded.source, filename);
         else throw error('ERR_UNKNOWN_MODULE_FORMAT', resolved.format, asURL(resolved.filename));
       } else {
         const basename = path.basename(filename);
@@ -1239,6 +1242,19 @@ function createLoader(host, builtins) {
   }
 
   // Node's hint for a CommonJS global used in an ES module.
+  // Node's CompileFunctionForCJSLoader without module detection: ES module syntax in a
+  // file that must be CommonJS warns once, then its SyntaxError is thrown.
+  let warnedRequireESM = false;
+  function compileCommonJS(module, source, filename) {
+    try { module._compile(source, filename); }
+    catch (cause) {
+      if (!warnedRequireESM && cause instanceof SyntaxError && host.detectModuleSyntax(cleanSource(source), filename)) {
+        warnedRequireESM = true;
+        require('internal/startup_controls').emitWarningSync(`Failed to load the ES module: ${filename}. Make sure to set "type": "module" in the nearest package.json file or use the .mjs extension.`);
+      }
+      throw cause;
+    }
+  }
   function decorateModuleError(cause, filename) {
     if (cause === null || typeof cause !== 'object' || cause.name !== 'ReferenceError') return cause;
     const match = /^(require|module|exports|__filename|__dirname) is not defined$/.exec(cause.message);
@@ -1301,6 +1317,8 @@ function createLoader(host, builtins) {
       return load(specifier);
     }
     function load(specifier) {
+      // Module.prototype.require goes through Module._load, so a replaced one sees every require.
+      if (Module._load !== defaultModuleLoad) return Module._load(specifier, parent || cache[filename], false);
       probed = null;
       // Unlike the node: form, ordinary builtin names can be overridden through
       // require.cache, matching Node's documented builtin cache behavior.
@@ -1391,7 +1409,7 @@ function createLoader(host, builtins) {
       return mock.format === 'builtin' || mock.format === 'commonjs' || mock.format === 'commonjs-typescript'
         ? mockCommonJS(mock, mock.filename, null) : mock.exports;
     },
-    startHookWorker() { return require('./hooks_worker').start(bridge, builtins.get('worker_threads')); },
+    startHookWorker() { return require('./hooks_worker').start(bridge, builtins.get('worker_threads'), builtins.get('internal/worker')); },
     enterHookWorker: hooks.enterWorker,
     addAsyncHooks: hooks.addAsync,
     importConditions: () => conditions('import'),

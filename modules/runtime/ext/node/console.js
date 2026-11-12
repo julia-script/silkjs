@@ -444,19 +444,37 @@ const consoleMethods = {
       return inspect(v, { depth, maxArrayLength: 3, breakLength: Infinity, ...this[kGetInspectOptions](this._stdout) });
     };
     const getIndexArray = (length) => Array.from({ length }, (_, i) => _inspect(i));
+    // A Map or Set iterator shows the entries it has not produced yet, without advancing it.
+    const mapIter = types.isMapIterator(tabularData);
+    let isKeyValue = false;
     let i = 0;
-    if (types.isMap(tabularData)) {
+    if (mapIter) {
+      const res = require('internal/util/binding').previewEntries(tabularData, true);
+      tabularData = res[0];
+      isKeyValue = res[1];
+    }
+    if (isKeyValue || types.isMap(tabularData)) {
       const keys = [];
       const values = [];
       let length = 0;
-      for (const { 0: k, 1: v } of tabularData) {
-        keys.push(_inspect(k));
-        values.push(_inspect(v));
-        length++;
+      if (mapIter) {
+        for (; i < tabularData.length / 2; ++i) {
+          keys.push(_inspect(tabularData[i * 2]));
+          values.push(_inspect(tabularData[i * 2 + 1]));
+          length++;
+        }
+      } else {
+        for (const { 0: k, 1: v } of tabularData) {
+          keys.push(_inspect(k));
+          values.push(_inspect(v));
+          length++;
+        }
       }
       return final([iterKey, keyKey, valuesKey], [getIndexArray(length), keys, values]);
     }
-    if (types.isSet(tabularData)) {
+    const setIter = types.isSetIterator(tabularData);
+    if (setIter) tabularData = require('internal/util/binding').previewEntries(tabularData);
+    if (setIter || mapIter || types.isSet(tabularData)) {
       const values = [];
       let length = 0;
       for (const v of tabularData) {
