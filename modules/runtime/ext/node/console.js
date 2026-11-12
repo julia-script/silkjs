@@ -511,6 +511,12 @@ for (const prop of Reflect.ownKeys(Console.prototype)) {
   if (typeof desc.value === 'function' && typeof prop === 'string') desc.value = bindMethod(desc.value, globalConsole, prop, desc.value.name);
   Reflect.defineProperty(globalConsole, prop, desc);
 }
+// lib/internal/util/inspector.js wrapConsole adds the V8 console methods Node's
+// console lacks; they report to inspector sessions only.
+globalConsole.profile = function profile(label) { return require('internal/inspector').console.profile(label); };
+globalConsole.profileEnd = function profileEnd(label) { return require('internal/inspector').console.profileEnd(label); };
+// V8 hands the label to the embedder (consoleTimeStamp), which Node does not record.
+globalConsole.timeStamp = function timeStamp(label) {};
 globalConsole[kBindProperties](true, 'auto');
 globalConsole[kBindStreamsLazy](host);
 // Node binds the global console to the process streams again in every pre-execution

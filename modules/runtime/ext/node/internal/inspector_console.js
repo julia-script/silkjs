@@ -13,10 +13,9 @@ function call(type, args, receiver, method) {
 function create(publish) {
   const console = Object.create(null);
   const counts = new Map(), timers = new Map();
-  let forwarding = 0;
   let emitting = false;
   function emitConsole(type, args) {
-    if (forwarding || emitting) return;
+    if (emitting) return;
     if (type === 'assert') {
       if (args[0]) return;
       args = ['Assertion failed', ...args.slice(1)];
@@ -40,15 +39,9 @@ function create(publish) {
     try { publish(names[type] || type, args); }
     finally { emitting = false; }
   }
+  // V8's console (inspector.console): it reports to inspector sessions only.
   for (const name of ['log', 'debug', 'info', 'warn', 'error', 'dir', 'dirxml', 'table', 'trace', 'clear', 'assert', 'count', 'countReset', 'time', 'timeLog', 'timeEnd', 'group', 'groupCollapsed', 'groupEnd']) {
-    console[name] = (...args) => {
-      emitConsole(name, args);
-      forwarding++;
-      // The built-in console, loaded on the first forwarded call.
-      const output = require('console');
-      try { return Reflect.apply(output[name], output, args); }
-      finally { forwarding--; }
-    };
+    console[name] = (...args) => { emitConsole(name, args); };
   }
   currentEmitter = emitConsole;
   return { console, emitConsole };

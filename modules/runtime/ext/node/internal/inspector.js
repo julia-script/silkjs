@@ -81,6 +81,7 @@ function runtime(session, method, params) {
       if (!session.runtime) {
         session.runtime = true;
         for (const context of contexts.list()) { session.contexts.set(context.id, { id: context.id, uniqueId: context.uniqueId }); session.emit('Runtime.executionContextCreated', { context: contexts.description(context) }); }
+        for (const message of consoleMessages) consoleMessage(session, message);
       }
       return {};
     case 'Runtime.disable': session.runtime = false; session.contexts.clear(); return {};
@@ -131,6 +132,7 @@ function runtime(session, method, params) {
     case 'Runtime.globalLexicalScopeNames': return { names: native(11, contextFor(params).handle) };
     case 'Runtime.getIsolateId': return { id: `silk:${native(10)}` };
     case 'Runtime.runIfWaitingForDebugger': waiting = false; return {};
+    case 'Runtime.discardConsoleEntries': consoleMessages.length = 0; session.values.releaseGroup('console'); return {};
     default: unsupported(method);
   }
 }
@@ -285,6 +287,8 @@ function close() {
   for (const key of sessions.keys()) if (!key.startsWith('local:') && key.startsWith('-1:')) closeSession(key);
   waiting = false;
 }
+// The errno of the last failed listen, for the CLI's report.
+let startFailure = 0;
 function open(port = 9229, hostname = '127.0.0.1', wait = false) {
   check();
   if (url()) throw new ERR_INSPECTOR_ALREADY_ACTIVATED();
@@ -295,7 +299,8 @@ function open(port = 9229, hostname = '127.0.0.1', wait = false) {
   if (!['127.0.0.1', 'localhost', '::1'].includes(hostname)) process.emitWarning('Binding the inspector to a public IP with an open port is insecure, as it allows external hosts to connect to the inspector and perform a remote code execution attack. Documentation can be found at https://nodejs.org/api/cli.html#--inspecthostport', 'SecurityWarning');
   // --inspect-publish-uid: the listing over HTTP and the banner on stderr.
   const publish = host.inspectorOptions?.publishUid ?? { stderr: true, http: true };
-  if (!native(1, hostname, port, `node.js/${process.version}`, publish.http)) throw new ERR_INSPECTOR_NOT_AVAILABLE();
+  const status = native(1, hostname, port, `node.js/${process.version}`, publish.http);
+  if (status !== 0) { startFailure = status; throw new ERR_INSPECTOR_NOT_AVAILABLE(); }
   const endpoint = url();
   process.debugPort = Number(new URL(endpoint).port);
   // Startup can park immediately below; publish without queued stdio work.
@@ -330,7 +335,9 @@ function start(port, hostname, wait, breakFirst) {
     try { open(port, hostname, false); }
     catch (cause) {
       if (cause.code !== 'ERR_INSPECTOR_NOT_AVAILABLE') throw cause;
-      process.stderr.write(`Starting inspector on ${hostname || '127.0.0.1'}:${port === undefined ? 9229 : port} failed\n`);
+      // As Node's InspectorSocketServer::Start: the libuv reason follows.
+      const reason = startFailure > 0 ? `: ${require('util').getSystemErrorMessage(-startFailure)}` : '';
+      process.stderr.write(`Starting inspector on ${hostname || '127.0.0.1'}:${port === undefined ? 9229 : port} failed${reason}\n`);
       return;
     }
     if (wait || breakFirst) waitForDebugger();
@@ -399,12 +406,23 @@ function callerStack(skip) {
   return stackTrace(frames.slice(first));
 }
 function consoleStack() { return callerStack(consoleStack); }
+// V8ConsoleMessageStorage: a session that enables Runtime later is sent the messages
+// logged before, up to V8's 1000 (maxConsoleMessageCount); console.clear() empties it.
+// Node calls the inspector console only while the inspector is active (a server
+// listens or a session is connected).
+const consoleMessages = [];
+function consoleMessage(session, message) {
+  session.emit('Runtime.consoleAPICalled', { type: message.type, args: message.args.map(value => session.values.remote(value, 'console', false, true)), executionContextId: 1, timestamp: message.timestamp, stackTrace: message.stackTrace });
+}
 const consoleBridge = require('internal/inspector_console').create((type, args) => {
-  let stackTrace;
+  if (!url() && sessions.size === 0) return;
+  const message = { type, args, timestamp: Date.now(), stackTrace: consoleStack() };
+  if (type === 'clear') consoleMessages.length = 0;
+  consoleMessages.push(message);
+  if (consoleMessages.length > 1000) consoleMessages.shift();
   for (const session of sessions.values()) if (session.runtime) {
     if (type === 'clear') session.values.releaseGroup('console');
-    stackTrace ??= consoleStack();
-    session.emit('Runtime.consoleAPICalled', { type, args: args.map(value => session.values.remote(value, 'console', false, true)), executionContextId: 1, timestamp: Date.now(), stackTrace });
+    consoleMessage(session, message);
   }
 });
 consoleBridge.console.profile = function profile(title) {
