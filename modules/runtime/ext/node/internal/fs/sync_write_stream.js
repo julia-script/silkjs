@@ -1,5 +1,8 @@
 'use strict';
 
+// The runtime's builtins take primordials from this module, not a wrapper argument.
+const primordials = require('internal/per_context/primordials');
+
 const {
   FunctionPrototypeCall,
   ObjectSetPrototypeOf,

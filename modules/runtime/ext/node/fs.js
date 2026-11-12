@@ -340,6 +340,8 @@ fs.rm = function rm(path, options, callback) {
 fs.rmSync = function rmSync(path, options) {
   path = c.path(path);
   const o = validateRmOptionsSync(path, options, false);
+  // The rmSync binding checks fs.write on the path before it removes anything.
+  if (c.host.builtinLoaded('internal/permission')) require('internal/permission').check('fs.write', path);
   return removeSync(path, o);
 };
 for (const name of ['fsync', 'fdatasync']) {
@@ -636,6 +638,14 @@ fs.realpathSync = function realpathSync(path, options) {
   if (typeof path !== 'string') path += '';
   path = c.path(path);
   path = p.resolve(path);
+  // Check the resolved input path up front so that the lstat walk below cannot
+  // be used to probe the existence of paths outside the granted set.
+  if (c.host.builtinLoaded('internal/permission')) {
+    const permission = require('internal/permission');
+    if (permission.enabled() && !permission.has('fs.read', path)) {
+      throw permission.accessDenied('Access to this API has been restricted. Use --allow-fs-read to manage permissions.', 'fs.read', path);
+    }
+  }
   const cache = options[realpathCacheKey];
   const cached = cache?.get(path);
   if (cached) return cached;
