@@ -671,6 +671,9 @@ Object.assign(process, {
     }
     const code = rawOS.kill(pid, number);
     if (code < 0) throw new (internalRequire('internal/errors').ErrnoException)(-Math.abs(code), 'kill');
+    // SIGINT listeners hear it through the interrupt broker's thread: wait for it,
+    // so a signal this process sent itself is seen in the next poll as in Node.
+    if (number === 2) host.processNative('signalFlush', []);
     return true;
   },
   _fatalException: internalRequire('internal/startup_controls').fatalException,
@@ -1013,6 +1016,9 @@ function runtimeFlag(arg) {
     if (!/^\d+$/.test(value)) { cliError('--max-http-header-size requires a nonnegative integer'); return true; }
     host.maxHTTPHeaderSize = Number(value); return true;
   }
+  // The size of V8's platform pool for background GC and compile jobs: the engine
+  // runs none, so only getOptionValue reads it.
+  if (arg.startsWith('--v8-pool-size=')) return true;
   if (arg === '--async-context-frame' || arg === '--no-async-context-frame') {
     host.asyncContextFrame = arg === '--async-context-frame'; return true;
   }
