@@ -13,9 +13,10 @@ function site(error, fromPromise) {
     const thrown = host.captureCallSites(-4, error);
     // Its column counts in the script's own text, before any column offset.
     // A script without a name (an eval) is V8's "<anonymous_script>" in the message.
+    // A module link error spans its import name, which V8 underlines whole.
     if (thrown !== undefined) {
       const name = thrown[0] === '' && typeof thrown[3] === 'string' ? '<anonymous_script>' : thrown[0];
-      return { name, line: thrown[1], column: thrown[2], text: thrown[3], textColumn: true };
+      return { name, line: thrown[1], column: thrown[2], text: thrown[3], textColumn: true, length: thrown[4] };
     }
   }
   if (error === null || typeof error !== 'object') return undefined;
@@ -71,7 +72,8 @@ function arrow(error, fromPromise, scriptName, lineOffset = 0, columnOffset = 0,
   if (!(start >= 0) || start >= text.length) return result;
   let underline = '';
   for (let index = 0; index < start; index++) underline += text[index] === '\t' ? '\t' : ' ';
-  return result + underline + '^\n';
+  const span = where.length > 1 ? Math.min(where.length, text.length - start) : 1;
+  return result + underline + '^'.repeat(span) + '\n';
 }
 function stringOf(value) {
   try { return String(value); } catch { return '<toString() threw exception>'; }
