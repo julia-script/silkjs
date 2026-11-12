@@ -200,7 +200,7 @@ host.initializeRealmBuiltins = (handle, global, wasmCodeGeneration, isolated = f
     return module.exports;
   }
   load('internal/error_stack').install(global, isolated);
-  Object.defineProperty(global, 'WebAssembly', {
+  if (!host.jitless) Object.defineProperty(global, 'WebAssembly', {
     value: load('internal/web/wasm').WebAssembly, writable: true, configurable: true,
   });
 };
@@ -938,7 +938,13 @@ function armInspectorEntry() {
 function evaluateMain(source, name) {
   mainModuleName = name;
   armInspectorEntry();
-  return native.evaluateModule(source, name, true);
+  // Node's ModuleJob.run hint for a CommonJS global (an --eval module has no load step
+  // that would add it).
+  let result;
+  try { result = native.evaluateModule(source, name, true); }
+  catch (cause) { throw loader.decorateModuleError(cause, name); }
+  // As loader.runMain does for a file entry.
+  return result instanceof Promise ? promiseThen(result, undefined, cause => { throw loader.decorateModuleError(cause, name); }) : result;
 }
 const requirePreloads = [], importPreloads = [], loaderPreloads = [];
 function runPreloads(entry, loadImports = true, loadRequires = true) {
@@ -946,6 +952,7 @@ function runPreloads(entry, loadImports = true, loadRequires = true) {
   // Before any preload: Node applies it when the context is made.
   if (host.disableProto !== undefined) disableProto(globalThis);
   if (host.disallowCodeGeneration) native.vmSetCodeGeneration(undefined, false);
+  if (host.jitless) delete globalThis.WebAssembly;
   if (host.experimentalShadowRealm) internalRequire('internal/shadow_realm').enable();
   // --experimental-loader: each one is module.register(specifier, cwd) before any preload.
   if (loadImports && loaderPreloads.length) {
@@ -1054,8 +1061,9 @@ function runtimeFlag(arg) {
   // V8 frees ArrayBuffer backing stores on a concurrent thread unless told not to; this
   // engine frees them when they are collected, so the flag already holds.
   if (arg === '--no-concurrent-array-buffer-sweeping') return true;
-  // V8's flag to run without a JIT: this engine is an interpreter, so it always holds.
-  if (arg === '--jitless') return true;
+  // V8's flag to run without a JIT. This engine is an interpreter, so only what V8 leaves
+  // out with it shows: WebAssembly, which V8 cannot run without generated code.
+  if (arg === '--jitless') { host.jitless = true; return true; }
   // V8 flags that turn on source phase imports and import attributes, which this
   // engine always implements.
   if (arg === '--js-source-phase-imports' || arg === '--harmony-import-attributes') return true;
@@ -1169,13 +1177,14 @@ function installRuntimeOptions(args, entrypoints = [], preloadEntrypoints = true
 }
 function prepareInput(source, filename, inputType, explicit) {
   if (!host.typeScriptMode) return source;
+  // Node strips an input under its tag ([eval], [stdin]), which its syntax errors name.
   if (inputType && inputType.endsWith('-typescript'))
-    return host.stripTypeScriptModuleTypes(source, filename);
+    return host.stripTypeScriptModuleTypes(source, host.path.basename(filename));
   if (explicit) return source;
   try { native.checkSyntax(source, filename, native.detectModuleSyntax(source)); return source; }
   catch (error) {
     if (!(error instanceof SyntaxError)) throw error;
-    try { return host.stripTypeScriptModuleTypes(source, filename); }
+    try { return host.stripTypeScriptModuleTypes(source, host.path.basename(filename)); }
     catch (strippingError) {
       if (strippingError.code === 'ERR_INVALID_TYPESCRIPT_SYNTAX' ||
           strippingError.code === 'ERR_UNSUPPORTED_TYPESCRIPT_SYNTAX') {
