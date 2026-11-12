@@ -1,0 +1,580 @@
+//! Versions and version ranges with the rules of node-semver, the scheme npm packages use.
+//!
+//! A [`Version`] is `major.minor.patch` with an optional prerelease, and it borrows the
+//! prerelease text from the bytes it was parsed from. A [`Range`] is one or more comparator sets
+//! joined by `||`; a version satisfies the range when it satisfies every comparator of one set.
+//! Carets, tildes, x-ranges, hyphen ranges and partial versions are rewritten to plain
+//! comparators when the range is parsed, so matching a version does no parsing.
+//!
+//! Nothing here knows about a registry or a manifest: a package manager for another ecosystem
+//! can use the same types with its own range syntax.
+
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.collections.list { List }
+import silk.collections.slice { Slice }
+import silk.core.ownership { Copy }
+import silk.core.option { Option }
+import silk.num.u8
+import silk.num.u64
+import silk.num.usize
+
+/// A parsed version. `pre` is the prerelease text without its leading `-`, or empty.
+pub struct Version<'a> {
+  pub major: u64,
+  pub minor: u64,
+  pub patch: u64,
+  pub pre: &'a [u8],
+}
+
+impl<'a> Copy for Version<'a> {}
+
+/// How a comparator relates a candidate version to its own version.
+pub enum Op {
+  Less,
+  LessOrEqual,
+  Greater,
+  GreaterOrEqual,
+  Equal,
+}
+
+/// One comparator of a range. `last` marks the final comparator of its `||` alternative.
+pub struct Comparator<'a> {
+  pub op: Op,
+  pub version: Version<'a>,
+  pub last: bool,
+}
+
+impl<'a> Copy for Comparator<'a> {}
+
+/// A parsed range: its comparators in order, each `||` alternative ending at a `last` one.
+pub struct Range<'a> {
+  comparators: List<Comparator<'a>>,
+}
+
+struct Number {
+  valid: bool,
+  value: u64,
+  next: usize,
+}
+
+impl Copy for Number {}
+
+// A version with fields that may be missing or wildcards, as ranges write them.
+struct Partial<'a> {
+  valid: bool,
+  parts: usize,
+  major: u64,
+  minor: u64,
+  patch: u64,
+  pre: &'a [u8],
+  next: usize,
+}
+
+impl<'a> Copy for Partial<'a> {}
+
+fn digit(byte: u8) -> bool {
+  return byte >= 48 && byte <= 57
+}
+
+fn space(byte: u8) -> bool {
+  return byte == 32 || byte == 9 || byte == 10 || byte == 13
+}
+
+fn identifierByte(byte: u8) -> bool {
+  return digit(byte) || (byte >= 65 && byte <= 90) || (byte >= 97 && byte <= 122) || byte == 45
+}
+
+fn wildcard(byte: u8) -> bool {
+  return byte == 120 || byte == 88 || byte == 42
+}
+
+fn number(bytes: &[u8], at: usize) -> Number {
+  let mut index = at
+  let mut value: u64 = 0
+  while index < bytes.length && digit(bytes[index]) {
+    // Stop before the value leaves the range JavaScript holds exactly, as node-semver does.
+    if value > 900719925474099 {
+      return Number { valid: false, value: 0, next: index }
+    }
+    value = value * 10 + u8.toU64(bytes[index] - 48)
+    index = index + 1
+  }
+  if index == at {
+    return Number { valid: false, value: 0, next: index }
+  }
+  if index - at > 1 && bytes[at] == 48 {
+    return Number { valid: false, value: 0, next: index }
+  }
+  return Number { valid: true, value: value, next: index }
+}
+
+// The end of the prerelease or build text that starts at `at`: dot-separated, non-empty identifiers.
+fn identifiersEnd(bytes: &[u8], at: usize) -> usize {
+  let mut index = at
+  let mut fieldStart = at
+  while index < bytes.length {
+    let byte = bytes[index]
+    if byte == 46 {
+      if index == fieldStart {
+        return at
+      }
+      fieldStart = index + 1
+    } else if identifierByte(byte) == false {
+      break
+    }
+    index = index + 1
+  }
+  if index == fieldStart {
+    return at
+  }
+  return index
+}
+
+fn trimStart(bytes: &[u8], at: usize) -> usize {
+  let mut index = at
+  while index < bytes.length && space(bytes[index]) {
+    index = index + 1
+  }
+  return index
+}
+
+fn numeric(field: &[u8]) -> bool {
+  let mut index: usize = 0
+  while index < field.length {
+    if digit(field[index]) == false {
+      return false
+    }
+    index = index + 1
+  }
+  return field.length > 0
+}
+
+fn compareNumbers(left: u64, right: u64) -> i32 {
+  if left < right {
+    return -1
+  }
+  if left > right {
+    return 1
+  }
+  return 0
+}
+
+fn compareFields(left: &[u8], right: &[u8]) -> i32 {
+  let leftNumeric = numeric(left)
+  let rightNumeric = numeric(right)
+  if leftNumeric && rightNumeric {
+    if left.length != right.length {
+      return compareNumbers(usize.toU64(left.length), usize.toU64(right.length))
+    }
+  } else if leftNumeric {
+    return -1
+  } else if rightNumeric {
+    return 1
+  }
+  let mut index: usize = 0
+  while index < left.length && index < right.length {
+    if left[index] != right[index] {
+      return compareNumbers(u8.toU64(left[index]), u8.toU64(right[index]))
+    }
+    index = index + 1
+  }
+  return compareNumbers(usize.toU64(left.length), usize.toU64(right.length))
+}
+
+fn fieldEnd(bytes: &[u8], at: usize) -> usize {
+  let mut index = at
+  while index < bytes.length && bytes[index] != 46 {
+    index = index + 1
+  }
+  return index
+}
+
+// Orders two prerelease texts. No prerelease is greater than any prerelease.
+fn comparePre(left: &[u8], right: &[u8]) -> i32 {
+  if left.length == 0 && right.length == 0 {
+    return 0
+  }
+  if left.length == 0 {
+    return 1
+  }
+  if right.length == 0 {
+    return -1
+  }
+  let mut leftAt: usize = 0
+  let mut rightAt: usize = 0
+  while true {
+    if leftAt >= left.length && rightAt >= right.length {
+      return 0
+    }
+    if leftAt >= left.length {
+      return -1
+    }
+    if rightAt >= right.length {
+      return 1
+    }
+    let leftEnd = fieldEnd(left, leftAt)
+    let rightEnd = fieldEnd(right, rightAt)
+    let order = compareFields(Slice.view<u8>(left, leftAt, leftEnd - leftAt), Slice.view<u8>(right, rightAt, rightEnd - rightAt))
+    if order != 0 {
+      return order
+    }
+    leftAt = leftEnd + 1
+    rightAt = rightEnd + 1
+  }
+  return 0
+}
+
+impl<'a> Version<'a> {
+  /// A version with no prerelease.
+  pub fn make(major: u64, minor: u64, patch: u64) -> Version<'a> {
+    return Version<'a> { major: major, minor: minor, patch: patch, pre: b"" }
+  }
+
+  /// Parses a complete version such as `1.2.3`, `v1.2.3-beta.1` or `1.2.3+build`. Surrounding
+  /// spaces and one leading `v` or `=` are ignored. Returns none for anything else.
+  pub fn parse(text: &'a [u8]) -> Option<Version<'a>> {
+    let mut at = trimStart(text, 0)
+    if at < text.length && (text[at] == 118 || text[at] == 86 || text[at] == 61) {
+      at = at + 1
+    }
+    let partial = readPartial<'a>(text, at)
+    if partial.valid == false || partial.parts != 3 {
+      return Option<Version<'a>>.none()
+    }
+    if trimStart(text, partial.next) != text.length {
+      return Option<Version<'a>>.none()
+    }
+    return Option<Version<'a>>.some(
+      Version<'a> { major: partial.major, minor: partial.minor, patch: partial.patch, pre: partial.pre },
+    )
+  }
+
+  /// Orders two versions: negative when `self` is lower, zero when equal, positive when higher.
+  /// Build metadata never takes part.
+  pub fn compare(self: &Self, other: &Version<'_>) -> i32 {
+    if self.major != other.major {
+      return compareNumbers(self.major, other.major)
+    }
+    if self.minor != other.minor {
+      return compareNumbers(self.minor, other.minor)
+    }
+    if self.patch != other.patch {
+      return compareNumbers(self.patch, other.patch)
+    }
+    return comparePre(self.pre, other.pre)
+  }
+
+  /// Whether the version has a prerelease.
+  pub fn isPrerelease(self: &Self) -> bool {
+    return self.pre.length > 0
+  }
+}
+
+// Reads `X[.Y[.Z]][-pre][+build]` at `at`. A wildcard field ends the numeric parts.
+fn readPartial<'a>(bytes: &'a [u8], at: usize) -> Partial<'a> {
+  let mut partial = Partial<'a> { valid: false, parts: 0, major: 0, minor: 0, patch: 0, pre: b"", next: at }
+  let mut index = at
+  let mut field: usize = 0
+  let mut wild = false
+  while field < 3 {
+    if index < bytes.length && wildcard(bytes[index]) {
+      wild = true
+      index = index + 1
+    } else {
+      let parsed = number(bytes, index)
+      if parsed.valid == false {
+        return partial
+      }
+      if wild == false {
+        if field == 0 {
+          partial.major = parsed.value
+        } else if field == 1 {
+          partial.minor = parsed.value
+        } else {
+          partial.patch = parsed.value
+        }
+        partial.parts = field + 1
+      }
+      index = parsed.next
+    }
+    field = field + 1
+    if index < bytes.length && bytes[index] == 46 && field < 3 {
+      index = index + 1
+    } else {
+      break
+    }
+  }
+  if index < bytes.length && bytes[index] == 45 {
+    let end = identifiersEnd(bytes, index + 1)
+    if end == index + 1 {
+      return partial
+    }
+    if partial.parts == 3 {
+      partial.pre = Slice.view<u8>(bytes, index + 1, end - index - 1)
+    }
+    index = end
+  }
+  if index < bytes.length && bytes[index] == 43 {
+    let end = identifiersEnd(bytes, index + 1)
+    if end == index + 1 {
+      return partial
+    }
+    index = end
+  }
+  partial.valid = true
+  partial.next = index
+  return partial
+}
+
+fn lowest<'a>(major: u64, minor: u64, patch: u64) -> Version<'a> {
+  return Version<'a> { major: major, minor: minor, patch: patch, pre: b"0" }
+}
+
+fn test(op: Op, order: i32) -> bool {
+  return match op {
+    Op.Less => order < 0
+    Op.LessOrEqual => order <= 0
+    Op.Greater => order > 0
+    Op.GreaterOrEqual => order >= 0
+    Op.Equal => order == 0
+  }
+}
+
+effect fn push<'a>(list: &mut List<Comparator<'a>>, op: Op, version: Version<'a>) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  run list.append(Comparator<'a> { op: op, version: version, last: false })
+}
+
+// The exclusive upper bound of the versions that share the given leading fields of `partial`.
+fn ceiling<'a>(partial: &Partial<'a>, fields: usize) -> Version<'a> {
+  if fields == 1 {
+    return lowest<'a>(partial.major + 1, 0, 0)
+  }
+  if fields == 2 {
+    return lowest<'a>(partial.major, partial.minor + 1, 0)
+  }
+  return lowest<'a>(partial.major, partial.minor, partial.patch + 1)
+}
+
+fn floor<'a>(partial: &Partial<'a>) -> Version<'a> {
+  return Version<'a> { major: partial.major, minor: partial.minor, patch: partial.patch, pre: partial.pre }
+}
+
+// Appends the comparators one written comparator stands for. `kind` is the operator as written:
+// 0 none or `=`, 1 `<`, 2 `<=`, 3 `>`, 4 `>=`, 5 `^`, 6 `~`.
+effect fn expand<'a>(list: &mut List<Comparator<'a>>, kind: u8, partial: &Partial<'a>) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let parts = partial.parts
+  if parts == 0 {
+    // `*`, `>=*` and `<=*` match everything; `<*` and `>*` match nothing.
+    if kind == 1 || kind == 3 {
+      run push<'a>(&mut list, Op.Less, lowest<'a>(0, 0, 0))
+    } else {
+      run push<'a>(&mut list, Op.GreaterOrEqual, Version<'a>.make(0, 0, 0))
+    }
+    return ()
+  }
+  if kind == 5 {
+    run push<'a>(&mut list, Op.GreaterOrEqual, floor<'a>(partial))
+    let mut fields: usize = 1
+    if partial.major == 0 && parts >= 2 {
+      fields = 2
+      if partial.minor == 0 && parts == 3 {
+        fields = 3
+      }
+    }
+    run push<'a>(&mut list, Op.Less, ceiling<'a>(partial, fields))
+    return ()
+  }
+  if kind == 6 {
+    run push<'a>(&mut list, Op.GreaterOrEqual, floor<'a>(partial))
+    let mut fields: usize = 2
+    if parts == 1 {
+      fields = 1
+    }
+    run push<'a>(&mut list, Op.Less, ceiling<'a>(partial, fields))
+    return ()
+  }
+  if parts == 3 {
+    let mut op = Op.Equal
+    if kind == 1 {
+      op = Op.Less
+    } else if kind == 2 {
+      op = Op.LessOrEqual
+    } else if kind == 3 {
+      op = Op.Greater
+    } else if kind == 4 {
+      op = Op.GreaterOrEqual
+    }
+    run push<'a>(&mut list, op, floor<'a>(partial))
+    return ()
+  }
+  if kind == 0 {
+    run push<'a>(&mut list, Op.GreaterOrEqual, floor<'a>(partial))
+    run push<'a>(&mut list, Op.Less, ceiling<'a>(partial, parts))
+  } else if kind == 1 {
+    run push<'a>(&mut list, Op.Less, Version<'a> { major: partial.major, minor: partial.minor, patch: 0, pre: b"0" })
+  } else if kind == 2 {
+    run push<'a>(&mut list, Op.Less, ceiling<'a>(partial, parts))
+  } else if kind == 3 {
+    run push<'a>(&mut list, Op.GreaterOrEqual, Version<'a> {
+      major: ceiling<'a>(partial, parts).major,
+      minor: ceiling<'a>(partial, parts).minor,
+      patch: 0,
+      pre: b"",
+    })
+  } else {
+    run push<'a>(&mut list, Op.GreaterOrEqual, floor<'a>(partial))
+  }
+  return ()
+}
+
+// Whether ` - ` follows at `at`: the separator of a hyphen range.
+fn hyphenAt(bytes: &[u8], at: usize) -> usize {
+  let start = trimStart(bytes, at)
+  if start == at || start >= bytes.length || bytes[start] != 45 {
+    return at
+  }
+  let after = trimStart(bytes, start + 1)
+  if after == start + 1 {
+    return at
+  }
+  return after
+}
+
+impl<'a> Range<'a> {
+  /// Parses a range such as `^1.2.3`, `>=1.0.0 <2`, `1.x || 2.x` or `1.2.3 - 2`. Returns none
+  /// when the text is not a range, for example a dist-tag or a URL.
+  pub effect fn parse(text: &'a [u8]) -> Option<Range<'a>> ! OutOfMemoryError ? &mut Allocator {
+    let mut list = List<Comparator<'a>>.make()
+    let mut at: usize = 0
+    while true {
+      let setStart = List<Comparator<'a>>.length(&list)
+      at = trimStart(text, at)
+      // One `||` alternative: comparators up to `||` or the end.
+      while at < text.length && bytes2(text, at, 124, 124) == false {
+        let mut kind: u8 = 0
+        let first = text[at]
+        if first == 94 {
+          kind = 5
+          at = at + 1
+        } else if first == 126 {
+          kind = 6
+          at = at + 1
+          if at < text.length && text[at] == 62 {
+            at = at + 1
+          }
+        } else if first == 60 {
+          kind = 1
+          at = at + 1
+          if at < text.length && text[at] == 61 {
+            kind = 2
+            at = at + 1
+          }
+        } else if first == 62 {
+          kind = 3
+          at = at + 1
+          if at < text.length && text[at] == 61 {
+            kind = 4
+            at = at + 1
+          }
+        } else if first == 61 {
+          at = at + 1
+        }
+        at = trimStart(text, at)
+        if at < text.length && (text[at] == 118 || text[at] == 86) {
+          at = at + 1
+        }
+        let partial = readPartial<'a>(text, at)
+        if partial.valid == false {
+          return Option<Range<'a>>.none()
+        }
+        at = partial.next
+        let upperAt = hyphenAt(text, at)
+        if upperAt != at && kind == 0 {
+          let mut upperStart = upperAt
+          if upperStart < text.length && (text[upperStart] == 118 || text[upperStart] == 86) {
+            upperStart = upperStart + 1
+          }
+          let upper = readPartial<'a>(text, upperStart)
+          if upper.valid == false {
+            return Option<Range<'a>>.none()
+          }
+          at = upper.next
+          if partial.parts > 0 {
+            run push<'a>(&mut list, Op.GreaterOrEqual, floor<'a>(&partial))
+          }
+          if upper.parts == 3 {
+            run push<'a>(&mut list, Op.LessOrEqual, floor<'a>(&upper))
+          } else if upper.parts > 0 {
+            run push<'a>(&mut list, Op.Less, ceiling<'a>(&upper, upper.parts))
+          }
+          if partial.parts == 0 && upper.parts == 0 {
+            run push<'a>(&mut list, Op.GreaterOrEqual, Version<'a>.make(0, 0, 0))
+          }
+        } else {
+          run expand<'a>(&mut list, kind, &partial)
+        }
+        if at < text.length && space(text[at]) == false && bytes2(text, at, 124, 124) == false {
+          return Option<Range<'a>>.none()
+        }
+        at = trimStart(text, at)
+      }
+      if List<Comparator<'a>>.length(&list) == setStart {
+        // An empty alternative is `*`.
+        run push<'a>(&mut list, Op.GreaterOrEqual, Version<'a>.make(0, 0, 0))
+      }
+      let lastIndex = List<Comparator<'a>>.length(&list) - 1
+      let mut closing = List<Comparator<'a>>.get(&list, lastIndex)
+      closing.last = true
+      List<Comparator<'a>>.set(&mut list, lastIndex, closing)
+      if at >= text.length {
+        break
+      }
+      at = at + 2
+    }
+    return Option<Range<'a>>.some(Range<'a> { comparators: move list })
+  }
+
+  /// The comparators of the range, in order.
+  pub fn all(self: &Self) -> &[Comparator<'a>] {
+    return List<Comparator<'a>>.asSlice(&self.comparators)
+  }
+
+  /// Whether `version` satisfies the range. A prerelease version satisfies an alternative only
+  /// when one of its comparators has a prerelease on the same `major.minor.patch`, unless
+  /// `includePrerelease` is set.
+  pub fn satisfies(self: &Self, version: &Version<'_>, includePrerelease: bool) -> bool {
+    let all = List<Comparator<'a>>.asSlice(&self.comparators)
+    let mut index: usize = 0
+    let mut passes = true
+    let mut allowed = includePrerelease || version.pre.length == 0
+    while index < all.length {
+      let comparator = all[index]
+      if passes && test(comparator.op, Version.compare(version, &comparator.version)) == false {
+        passes = false
+      }
+      if comparator.version.pre.length > 0
+        && comparator.version.major == version.major
+        && comparator.version.minor == version.minor
+        && comparator.version.patch == version.patch {
+        allowed = true
+      }
+      if comparator.last {
+        if passes && allowed {
+          return true
+        }
+        passes = true
+        allowed = includePrerelease || version.pre.length == 0
+      }
+      index = index + 1
+    }
+    return false
+  }
+}
+
+fn bytes2(bytes: &[u8], at: usize, first: u8, second: u8) -> bool {
+  return at + 1 < bytes.length && bytes[at] == first && bytes[at + 1] == second
+}

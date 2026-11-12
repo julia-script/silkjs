@@ -2,15 +2,13 @@
 
 const host = require('internal/host');
 const apply = Reflect.apply;
-const descriptor = Object.getOwnPropertyDescriptor;
-const typedArrayTag = descriptor(Object.getPrototypeOf(Uint8Array.prototype), Symbol.toStringTag).get;
-function accepts(method, value, args = []) {
-  try { apply(method, value, args); return true; } catch { return false; }
+const typedArrayTag = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(Uint8Array.prototype), Symbol.toStringTag).get;
+// The engine's own class-ID checks, which nothing replaces later.
+function classCheck(name) {
+  if (typeof host.types?.[name] === 'function') return host.types[name];
+  return native(name);
 }
-function getterBrand(prototype, name) {
-  const get = descriptor(prototype, name).get;
-  return value => accepts(get, value);
-}
+// Looked up per call: crypto installs isKeyObject and isCryptoKey after this module loads.
 function native(name) {
   return function(value) {
     if (host.types && typeof host.types[name] === 'function') return host.types[name](value);
@@ -19,25 +17,15 @@ function native(name) {
     throw error;
   };
 }
+// Brand checks read the engine's class IDs (V8's IsDate and the rest): a throwing
+// getter per failed check made each one cost an error object.
 const types = module.exports = {
-  isDate: value => accepts(Date.prototype.getTime, value),
-  isRegExp: getterBrand(RegExp.prototype, 'source'),
-  isMap: getterBrand(Map.prototype, 'size'),
-  isSet: getterBrand(Set.prototype, 'size'),
-  isWeakMap: value => accepts(WeakMap.prototype.has, value, [types]),
-  isWeakSet: value => accepts(WeakSet.prototype.has, value, [types]),
-  isArrayBuffer: getterBrand(ArrayBuffer.prototype, 'byteLength'),
-  isSharedArrayBuffer: typeof SharedArrayBuffer === 'undefined' ? native('isSharedArrayBuffer') : getterBrand(SharedArrayBuffer.prototype, 'byteLength'),
   isArrayBufferView: ArrayBuffer.isView,
-  isDataView: value => ArrayBuffer.isView(value) && apply(typedArrayTag, value, []) === undefined,
   isTypedArray: value => apply(typedArrayTag, value, []) !== undefined,
-  isBooleanObject: value => typeof value === 'object' && value !== null && accepts(Boolean.prototype.valueOf, value),
-  isNumberObject: value => typeof value === 'object' && value !== null && accepts(Number.prototype.valueOf, value),
-  isStringObject: value => typeof value === 'object' && value !== null && accepts(String.prototype.valueOf, value),
-  isSymbolObject: value => typeof value === 'object' && value !== null && accepts(Symbol.prototype.valueOf, value),
-  isBigIntObject: value => typeof value === 'object' && value !== null && accepts(BigInt.prototype.valueOf, value),
 };
-types.isAnyArrayBuffer = value => types.isArrayBuffer(value) || (typeof SharedArrayBuffer !== 'undefined' && types.isSharedArrayBuffer(value));
+for (const name of ['isDate', 'isRegExp', 'isMap', 'isSet', 'isWeakMap', 'isWeakSet', 'isArrayBuffer', 'isDataView',
+  'isBooleanObject', 'isNumberObject', 'isStringObject', 'isSymbolObject', 'isBigIntObject', 'isSharedArrayBuffer']) types[name] = classCheck(name);
+types.isAnyArrayBuffer = value => types.isArrayBuffer(value) || types.isSharedArrayBuffer(value);
 types.isBoxedPrimitive = value => types.isBooleanObject(value) || types.isNumberObject(value) || types.isStringObject(value) || types.isSymbolObject(value) || types.isBigIntObject(value);
 for (const name of ['Uint8Array', 'Uint8ClampedArray', 'Uint16Array', 'Uint32Array', 'Int8Array', 'Int16Array', 'Int32Array', 'Float16Array', 'Float32Array', 'Float64Array', 'BigInt64Array', 'BigUint64Array']) {
   types['is' + name] = value => apply(typedArrayTag, value, []) === name;

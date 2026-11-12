@@ -1,0 +1,317 @@
+//! Reads the registry's document for one package (a "packument") and picks versions from it.
+//!
+//! The document lists every published version with its dependencies, so it can be megabytes.
+//! [`Packument.parse`] makes one pass and keeps, per version, only the parsed version, where its
+//! tarball is, and the byte range of its object. The dependencies of the one version the
+//! resolver picks are read later from that range. A [`Packument`] owns the document, and a
+//! version is named by its index.
+
+import pkg.json_walk { Text, Walker }
+import pkg.semver { Range, Version }
+import pkg.text { same }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.collections.bytes { Bytes }
+import silk.collections.list { List }
+import silk.collections.slice { Slice }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.core.ownership { Copy }
+import silk.core.result { Result }
+import silk.json.text { JsonText }
+
+// A range of the document.
+struct Place {
+  start: usize,
+  length: usize,
+}
+
+impl Copy for Place {}
+
+// A string of the document: the bytes between its quotes, and whether they have escapes.
+struct Quoted {
+  place: Place,
+  escaped: bool,
+}
+
+impl Copy for Quoted {}
+
+fn quoted(text: &Text<'_>) -> Quoted {
+  if Text.present(text) == false {
+    return Quoted { place: Place { start: 0, length: 0 }, escaped: false }
+  }
+  return Quoted { place: Place { start: Text.start(text), length: Text.bytes(text).length }, escaped: text.escaped }
+}
+
+struct Published {
+  major: u64,
+  minor: u64,
+  patch: u64,
+  // The prerelease part of `text`.
+  pre: Place,
+  text: Place,
+  tarball: Quoted,
+  integrity: Quoted,
+  shasum: Quoted,
+  object: Place,
+}
+
+impl Copy for Published {}
+
+struct Tag {
+  name: Place,
+  version: Place,
+}
+
+impl Copy for Tag {}
+
+/// The versions and dist-tags of one package.
+pub struct Packument {
+  source: Bytes,
+  versions: List<Published>,
+  tags: List<Tag>,
+}
+
+// Reads the `dist` object of a version into `published`.
+fn readDist(walker: &mut Walker<'_>, published: &mut Published) -> () {
+  if Walker.enterObject(&mut walker) == false {
+    return ()
+  }
+  while true {
+    match move Walker.key(&mut walker) {
+      Option.None => { break }
+      Option.Some { value: key } => {
+        let name = Text.bytes(&key)
+        if same(name, b"tarball") {
+          let value = Walker.string(&mut walker)
+          published.tarball = quoted(&value)
+        } else if same(name, b"integrity") {
+          let value = Walker.string(&mut walker)
+          published.integrity = quoted(&value)
+        } else if same(name, b"shasum") {
+          let value = Walker.string(&mut walker)
+          published.shasum = quoted(&value)
+        } else {
+          Walker.skip(&mut walker)
+        }
+      }
+    }
+  }
+  return ()
+}
+
+// Reads the document into the two lists. Returns false when it is not a packument.
+effect fn scan(source: &[u8], versions: &mut List<Published>, tags: &mut List<Tag>) -> bool ! OutOfMemoryError ? &mut Allocator {
+  let mut walker = Walker.make(source)
+  if Walker.enterObject(&mut walker) == false {
+    return false
+  }
+  while true {
+    match move Walker.key(&mut walker) {
+      Option.None => { break }
+      Option.Some { value: key } => {
+        let name = Text.bytes(&key)
+        if same(name, b"dist-tags") {
+          if Walker.enterObject(&mut walker) {
+            while true {
+              match move Walker.key(&mut walker) {
+                Option.None => { break }
+                Option.Some { value: tag } => {
+                  let target = Walker.string(&mut walker)
+                  run tags.append(Tag { name: quoted(&tag).place, version: quoted(&target).place })
+                }
+              }
+            }
+          }
+        } else if same(name, b"versions") {
+          if Walker.enterObject(&mut walker) {
+            while true {
+              match move Walker.key(&mut walker) {
+                Option.None => { break }
+                Option.Some { value: versionKey } => {
+                  let text = Text.bytes(&versionKey)
+                  if Walker.enterObject(&mut walker) == false {
+                    continue
+                  }
+                  let start = Walker.position(&walker)
+                  let empty = Quoted { place: Place { start: 0, length: 0 }, escaped: false }
+                  let mut published = Published {
+                    major: 0,
+                    minor: 0,
+                    patch: 0,
+                    pre: Place { start: 0, length: 0 },
+                    text: quoted(&versionKey).place,
+                    tarball: empty,
+                    integrity: empty,
+                    shasum: empty,
+                    object: Place { start: start, length: 0 },
+                  }
+                  while true {
+                    match move Walker.key(&mut walker) {
+                      Option.None => { break }
+                      Option.Some { value: field } => {
+                        if same(Text.bytes(&field), b"dist") {
+                          readDist(&mut walker, &mut published)
+                        } else {
+                          Walker.skip(&mut walker)
+                        }
+                      }
+                    }
+                  }
+                  published.object.length = Walker.position(&walker) + 1 - start
+                  match Version.parse(text) {
+                    Option.None => {}
+                    Option.Some { value: parsed } => {
+                      if published.tarball.place.length > 0 {
+                        published.major = parsed.major
+                        published.minor = parsed.minor
+                        published.patch = parsed.patch
+                        // The prerelease is the part after the first `-`, up to any build tag.
+                        let mut dash: usize = 0
+                        while dash < text.length && text[dash] != 45 {
+                          dash = dash + 1
+                        }
+                        if parsed.pre.length > 0 {
+                          published.pre = Place { start: published.text.start + dash + 1, length: parsed.pre.length }
+                        }
+                        run versions.append(published)
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        } else {
+          Walker.skip(&mut walker)
+        }
+      }
+    }
+  }
+  return Walker.failed(&walker) == false
+}
+
+impl Packument {
+  /// Reads a packument. Returns none when `document` is not one. Versions the registry lists
+  /// with a name that is not a valid version, or without a tarball, are left out.
+  pub effect fn parse(document: Bytes) -> Option<Packument> ! OutOfMemoryError ? &mut Allocator {
+    let mut versions = List<Published>.make()
+    let mut tags = List<Tag>.make()
+    let valid = run scan(Bytes.asSlice(&document), &mut versions, &mut tags)
+    if valid == false {
+      return Option<Packument>.none()
+    }
+    return Option<Packument>.some(Packument { source: move document, versions: move versions, tags: move tags })
+  }
+
+  fn slice(self: &Self, place: Place) -> &[u8] {
+    return Slice.view<u8>(Bytes.asSlice(&self.source), place.start, place.length)
+  }
+
+  effect fn decoded(self: &Self, value: Quoted) -> Bytes ! OutOfMemoryError ? &mut Allocator {
+    if value.escaped == false {
+      return run Bytes.copy(Packument.slice(self, value.place))
+    }
+    let raw = Slice.view<u8>(Bytes.asSlice(&self.source), value.place.start - 1, value.place.length + 2)
+    return match move run Effect.result(JsonText.decode(raw, value.place.start - 1, true)) {
+      Result.Success { value: text } => move text
+      Result.Failure {..} => Bytes.make()
+    }
+  }
+
+  /// How many usable versions the package has. They are numbered in the order of the document.
+  pub fn count(self: &Self) -> usize {
+    return List<Published>.length(&self.versions)
+  }
+
+  /// The parsed version at `index`.
+  pub fn version(self: &Self, index: usize) -> Version<'_> {
+    let published = List<Published>.get(&self.versions, index)
+    return Version<'_> {
+      major: published.major,
+      minor: published.minor,
+      patch: published.patch,
+      pre: Packument.slice(self, published.pre),
+    }
+  }
+
+  /// The version at `index` as the registry spells it.
+  pub fn versionText(self: &Self, index: usize) -> &[u8] {
+    return Packument.slice(self, List<Published>.get(&self.versions, index).text)
+  }
+
+  /// The URL of the tarball of the version at `index`.
+  pub effect fn tarball(self: &Self, index: usize) -> Bytes ! OutOfMemoryError ? &mut Allocator {
+    return run Packument.decoded(self, List<Published>.get(&self.versions, index).tarball)
+  }
+
+  /// The Subresource Integrity value of the tarball, such as `sha512-…`. Empty when the registry
+  /// has none.
+  pub effect fn integrity(self: &Self, index: usize) -> Bytes ! OutOfMemoryError ? &mut Allocator {
+    return run Packument.decoded(self, List<Published>.get(&self.versions, index).integrity)
+  }
+
+  /// The SHA-1 of the tarball in hex. Empty when the registry has none.
+  pub effect fn shasum(self: &Self, index: usize) -> Bytes ! OutOfMemoryError ? &mut Allocator {
+    return run Packument.decoded(self, List<Published>.get(&self.versions, index).shasum)
+  }
+
+  /// The JSON object of the version at `index`, from `{` to `}`: its dependencies, bin, engines
+  /// and the rest.
+  pub fn object(self: &Self, index: usize) -> &[u8] {
+    return Packument.slice(self, List<Published>.get(&self.versions, index).object)
+  }
+
+  /// The index of the version a dist-tag such as `latest` points to.
+  pub fn tagged(self: &Self, name: &[u8]) -> Option<usize> {
+    let tags = List<Tag>.asSlice(&self.tags)
+    let mut index: usize = 0
+    while index < tags.length {
+      if same(Packument.slice(self, tags[index].name), name) {
+        return Packument.exact(self, Packument.slice(self, tags[index].version))
+      }
+      index = index + 1
+    }
+    return Option<usize>.none()
+  }
+
+  /// The index of the version spelled exactly `text`.
+  pub fn exact(self: &Self, text: &[u8]) -> Option<usize> {
+    let mut index: usize = 0
+    while index < Packument.count(self) {
+      if same(Packument.versionText(self, index), text) {
+        return Option<usize>.some(index)
+      }
+      index = index + 1
+    }
+    return Option<usize>.none()
+  }
+
+  /// The index of the version to install for `range`, as npm picks it: the `latest` tag when it
+  /// satisfies the range, and else the highest version that does.
+  pub fn pick(self: &Self, range: &Range<'_>) -> Option<usize> {
+    match Packument.tagged(self, b"latest") {
+      Option.None => {}
+      Option.Some { value: latest } => {
+        if Range.satisfies(range, &Packument.version(self, latest), false) {
+          return Option<usize>.some(latest)
+        }
+      }
+    }
+    let total = Packument.count(self)
+    let mut best: usize = total
+    let mut index: usize = 0
+    while index < total {
+      let candidate = Packument.version(self, index)
+      if Range.satisfies(range, &candidate, false) {
+        if best == total || Version.compare(&candidate, &Packument.version(self, best)) > 0 {
+          best = index
+        }
+      }
+      index = index + 1
+    }
+    if best == total {
+      return Option<usize>.none()
+    }
+    return Option<usize>.some(best)
+  }
+}

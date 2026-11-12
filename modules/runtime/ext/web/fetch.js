@@ -4,9 +4,9 @@ const { Buffer } = require('buffer');
 const { URL } = require('internal/url');
 const { Blob, resolveObjectURL } = require('internal/web/blob');
 const { TextEncoder } = require('internal/encoding');
-const { Headers, immutable } = require('internal/web/fetch/headers');
+const { Headers, immutable, copyHeaders } = require('internal/web/fetch/headers');
 const { FormData } = require('internal/web/fetch/formdata');
-const { Request, Response, copyRequestRecord, requestState, responseState, redirectStatus } = require('internal/web/fetch/message');
+const { Request, Response, copyRequestRecord, abortSource, requestState, responseState, redirectStatus } = require('internal/web/fetch/message');
 const body = require('internal/web/fetch/body');
 const { dispatch, networkError, performance } = require('internal/web/fetch/transport');
 
@@ -76,18 +76,23 @@ function fetch(input, init = undefined) {
   try { request = new Request(input, init); }
   catch (error) { return Promise.reject(error); }
   const original = requestState(request);
-  if (original.signal.aborted) return Promise.reject(original.signal.reason);
+  const signal = abortSource(original);
+  if (signal?.aborted) return Promise.reject(signal.reason);
   if (original.dispatcher !== undefined) require('assert').ok(original.dispatcher);
   return performFetch(original);
 }
+// The dispatcher undici's setGlobalDispatcher installs (Node's or a user's copy of
+// undici): fetch sends through it, as Node's does, when the request names none.
+const kGlobalDispatcher = Symbol.for('undici.globalDispatcher.1');
 async function performFetch(original) {
-  const dispatcher = original.dispatcher;
+  const dispatcher = original.dispatcher ?? globalThis[kGlobalDispatcher];
   const record = copyRequestRecord(original);
-  record.headers = new Headers(original.headers);
+  record.headers = copyHeaders(original.headers);
+  const signal = abortSource(record);
   const timing = { startTime: performance.now() };
   let redirects = 0;
   for (;;) {
-    if (record.signal.aborted) throw record.signal.reason;
+    if (signal?.aborted) throw signal.reason;
     const url = new URL(record.url);
     if (url.protocol === 'data:' || url.protocol === 'blob:') {
       const response = url.protocol === 'data:' ? dataResponse(url) : blobResponse(record, url);
@@ -95,7 +100,7 @@ async function performFetch(original) {
       return integrityResponse(response, record.integrity);
     }
     if (url.protocol !== 'http:' && url.protocol !== 'https:') throw networkError('Unsupported URL scheme: ' + url.protocol);
-    const transaction = await dispatch(record, timing, dispatcher);
+    const transaction = await dispatch(record, timing, dispatcher, url, signal);
     const response = transaction.response;
     if (redirectStatus.has(response.status) && record.redirect === 'error') {
       transaction.cancel();
