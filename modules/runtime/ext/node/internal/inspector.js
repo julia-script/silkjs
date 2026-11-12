@@ -170,7 +170,8 @@ function dispatch(session, method, params) {
   unsupported(method);
 }
 function createSession(key, send) {
-  const session = { id: nextSession++, runtime: false, contexts: new Map(), values: null,
+  // A same-thread Session cannot answer while its thread is paused.
+  const session = { id: nextSession++, local: key.startsWith('local:'), runtime: false, contexts: new Map(), values: null,
     send(message) { if (sessions.get(key) === session) send(message); },
     emit(method, params) { if (sessions.get(key) === session) send({ method, params }); },
     evaluation(result, params) { return evaluation(session, result, params); },
