@@ -405,8 +405,17 @@ function countObservers() {
 // 'gc' entries, as Node's GC prologue/epilogue callbacks queue them: the trace
 // provider keeps each collection's start and end while an observer watches, and
 // they become entries once per loop turn, or right after a forced gc().
+// v8.GCProfiler reads the same records through host.watchCollections, so the
+// provider stays on while either wants them.
 let stopCollections;
+let observingEntries = false;
+const collectionListeners = new Set();
 function observeCollections(watch) {
+  observingEntries = watch;
+  refreshCollections();
+}
+function refreshCollections() {
+  const watch = observingEntries || collectionListeners.size !== 0;
   if (watch === (stopCollections !== undefined) || typeof host.traceNative !== 'function') return;
   host.traceNative('observe', watch);
   if (watch) {
@@ -418,16 +427,35 @@ function observeCollections(watch) {
     host.gcObserver = undefined;
   }
 }
+// Each record is start and end (ns), whether it was a young collection, the
+// allocator bytes in use at the start, the young part of them, and the bytes in
+// use at the end.
+const RECORD = 6;
 function takeCollections(flags) {
-  const count = host.traceNative('collections') * 3;
+  const count = host.traceNative('collections') * RECORD;
   if (!(count > 0)) return;
   const values = [];
   for (let index = 0; index < count; index++) values.push(host.traceNative('collection', index));
-  for (let index = 0; index + 2 < values.length; index += 3) {
-    const kind = values[index + 2] ? constants.NODE_PERFORMANCE_GC_MINOR : constants.NODE_PERFORMANCE_GC_MAJOR;
-    emitNodeEntry('gc', 'gc', values[index] / 1e6 - clockStart(), (values[index + 1] - values[index]) / 1e6, { kind, flags });
+  const records = [];
+  for (let index = 0; index + RECORD - 1 < values.length; index += RECORD) {
+    records.push({ start: values[index], end: values[index + 1], young: values[index + 2] !== 0,
+      usedBefore: values[index + 3], youngBefore: values[index + 4], usedAfter: values[index + 5] });
   }
+  if (observingEntries) {
+    for (const record of records) {
+      const kind = record.young ? constants.NODE_PERFORMANCE_GC_MINOR : constants.NODE_PERFORMANCE_GC_MAJOR;
+      emitNodeEntry('gc', 'gc', record.start / 1e6 - clockStart(), (record.end - record.start) / 1e6, { kind, flags });
+    }
+  }
+  for (const listener of collectionListeners) listener(records);
 }
+// listener(records) gets each batch of collections while it is registered; take
+// reads the ones not delivered yet.
+host.watchCollections = {
+  add(listener) { collectionListeners.add(listener); refreshCollections(); },
+  delete(listener) { collectionListeners.delete(listener); refreshCollections(); },
+  take() { if (stopCollections !== undefined) takeCollections(0); },
+};
 const constants = {
   NODE_PERFORMANCE_GC_MAJOR: 4, NODE_PERFORMANCE_GC_MINOR: 1, NODE_PERFORMANCE_GC_MINOR_MARK_SWEEP: 2, NODE_PERFORMANCE_GC_INCREMENTAL: 8, NODE_PERFORMANCE_GC_WEAKCB: 16,
   NODE_PERFORMANCE_GC_FLAGS_NO: 0, NODE_PERFORMANCE_GC_FLAGS_CONSTRUCT_RETAINED: 2, NODE_PERFORMANCE_GC_FLAGS_FORCED: 4,
