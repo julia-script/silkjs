@@ -6,11 +6,16 @@
 //! dependencies are symbolic links beside it, so a package can load exactly what it declares.
 //! The project's own dependencies are symbolic links in `node_modules`, and their commands are
 //! links in `node_modules/.bin`.
+//!
+//! Tarballs are downloaded on the calling thread, a window at a time, and checked and unpacked
+//! on the threads of a pool while the next window downloads.
 
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.collections.bytes { Bytes }
 import silk.collections.list { List }
 import silk.collections.slice { Slice }
+import silk.concurrency.fiber { Cancelled }
+import silk.concurrency.thread_pool { Pool, PoolFiber }
 import silk.core.effect { Effect }
 import silk.core.option { Option }
 import silk.core.result { Result }
@@ -28,7 +33,7 @@ import pkg.text { same, startsWith }
 pub const VIRTUAL_STORE: &'static [u8] = b".sjs"
 
 /// How many tarballs are held in memory at once.
-const BATCH: usize = 24
+const BATCH: usize = 96
 
 /// A failed install.
 pub struct InstallError {
@@ -74,39 +79,84 @@ effect fn identity(graph: &Graph, index: usize) -> Bytes ! OutOfMemoryError ? &m
   return move text
 }
 
+// One downloaded tarball on its way to a worker thread, with what is needed to check and
+// unpack it. A job owns all of it, so it can move to another thread.
+struct Job {
+  package: usize,
+  tarball: Bytes,
+  integrity: Bytes,
+  shasum: Bytes,
+  id: Bytes,
+  store: Bytes,
+}
+
+// What a worker made of a job: the files, or a message when the tarball could not be used.
+struct Done {
+  package: usize,
+  files: Option<PackageFiles>,
+  problem: string<'static>,
+}
+
+fn refused(package: usize, problem: string<'static>) -> Done {
+  return Done { package: package, files: Option<PackageFiles>.none(), problem: problem }
+}
+
 // Checks, unpacks and records one downloaded tarball.
-effect fn unpack(graph: &Graph, store: &Store, index: usize, tarball: &[u8]) -> PackageFiles
-  ! InstallError | OutOfMemoryError ? &mut Allocator {
-  let expected = match Integrity.parse(Graph.integrity(graph, index)) {
+effect fn unpack(job: Job) -> Done ! OutOfMemoryError ? &mut Allocator {
+  let Job { package, tarball, integrity, shasum, id, store: root } = move job
+  let expected = match Integrity.parse(Bytes.asSlice(&integrity)) {
     Option.Some { value } => value
-    Option.None => match Integrity.fromShasum(Graph.shasum(graph, index)) {
+    Option.None => match Integrity.fromShasum(Bytes.asSlice(&shasum)) {
       Option.Some { value } => value
-      Option.None => { run stopAt("the registry gives no digest for the tarball of", graph, index) }
+      Option.None => { return refused(package, "the registry gives no digest for the tarball of") }
     }
   }
-  if Integrity.matches(&expected, tarball) == false {
-    run stopAt("the tarball does not have the digest the registry promised for", graph, index)
+  if Integrity.matches(&expected, Bytes.asSlice(&tarball)) == false {
+    return refused(package, "the tarball does not have the digest the registry promised for")
   }
-  let files = match move run Effect.result(Store.addTarball(store, tarball)) {
+  let store = Store.at(move root)
+  let files = match move run Effect.result(Store.addTarball(&store, Bytes.asSlice(&tarball))) {
     Result.Success { value } => move value
     Result.Failure { error } => match move error {
-      StoreError _ => { run stopAt("the store could not unpack", graph, index) }
+      StoreError _ => { return refused(package, "the store could not unpack") }
       OutOfMemoryError exhausted => { fail move exhausted }
     }
   }
-  let id = run identity(graph, index)
-  match move run Effect.result(Store.record(store, Bytes.asSlice(&id), &files)) {
+  match move run Effect.result(Store.record(&store, Bytes.asSlice(&id), &files)) {
     Result.Success {..} => {}
     Result.Failure { error } => match move error {
-      StoreError _ => { run stopAt("the store could not record", graph, index) }
+      StoreError _ => { return refused(package, "the store could not record") }
       OutOfMemoryError exhausted => { fail move exhausted }
     }
   }
-  return move files
+  return Done { package: package, files: Option<PackageFiles>.some(move files), problem: "" }
+}
+
+// The body of a worker fiber. Each one has its own allocator handle.
+effect fn work(job: Job) -> Done ! OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run unpack(move job) |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+// Waits for every worker fiber, inside the pool, and returns what they made.
+effect fn collect(fibers: List<PoolFiber<Done, OutOfMemoryError>>) -> List<Done> ! OutOfMemoryError | Cancelled {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut waiting = move fibers
+  let mut finished = List<Done>.make()
+  while true {
+    match move List<PoolFiber<Done, OutOfMemoryError>>.pop(&mut waiting) {
+      Option.None => { break }
+      Option.Some { value: fiber } => {
+        let done = run fiber.join()
+        run finished.append(move done) |> Effect.provideMut<Allocator>(&mut allocator)
+      }
+    }
+  }
+  return move finished
 }
 
 // The files of every package, downloading the packages the store does not have.
-effect fn gather(graph: &Graph, store: &Store, host: Host, summary: &mut Summary) -> List<Option<PackageFiles>>
+effect fn gather(graph: &Graph, store: &Store, host: Host, pool: &Pool, summary: &mut Summary) -> List<Option<PackageFiles>>
   ! InstallError | OutOfMemoryError ? &mut Registry | &mut Allocator {
   let mut files = List<Option<PackageFiles>>.make()
   let mut missing = List<usize>.make()
@@ -125,6 +175,7 @@ effect fn gather(graph: &Graph, store: &Store, host: Host, summary: &mut Summary
     index = index + 1
   }
   let wanted = List<usize>.asSlice(&missing)
+  let mut running = List<PoolFiber<Done, OutOfMemoryError>>.make()
   let mut start: usize = 0
   while start < wanted.length {
     let mut end = start + BATCH
@@ -152,11 +203,40 @@ effect fn gather(graph: &Graph, store: &Store, host: Host, summary: &mut Summary
           fail InstallError { message: error.message, subject: run label(graph, package) }
         }
       }
-      let unpacked = run unpack(graph, store, package, Bytes.asSlice(&tarball))
-      List<Option<PackageFiles>>.set(&mut files, package, Option<PackageFiles>.some(move unpacked))
-      summary.downloaded = summary.downloaded + 1
+      let job = Job {
+        package: package,
+        tarball: move tarball,
+        integrity: run Bytes.copy(Graph.integrity(graph, package)),
+        shasum: run Bytes.copy(Graph.shasum(graph, package)),
+        id: run identity(graph, package),
+        store: run Bytes.copy(Store.directory(store)),
+      }
+      run running.append(run pool.fork(work(move job)))
     }
     start = end
+  }
+  if List<PoolFiber<Done, OutOfMemoryError>>.length(&running) == 0 {
+    return move files
+  }
+  let mut finished = match move run Effect.result(pool.block(collect(move running))) {
+    Result.Success { value } => move value
+    Result.Failure { error } => match move error {
+      OutOfMemoryError exhausted => { fail move exhausted }
+      Cancelled _ => { run stop("the unpacking was interrupted", b"") }
+    }
+  }
+  while true {
+    match move List<Done>.pop(&mut finished) {
+      Option.None => { break }
+      Option.Some { value: done } => {
+        let Done { package, files: unpacked, problem } = move done
+        if Option.isSome(&unpacked) == false {
+          run stopAt(problem, graph, package)
+        }
+        List<Option<PackageFiles>>.set(&mut files, package, move unpacked)
+        summary.downloaded = summary.downloaded + 1
+      }
+    }
   }
   return move files
 }
@@ -320,16 +400,16 @@ effect fn expose(graph: &Graph, host: Host, modules: &[u8]) -> () ! InstallError
 }
 
 /// Installs `graph` into the project directory `project` for `host`, using `store`. Packages
-/// that are not for `host` are left out.
+/// that are not for `host` are left out. Tarballs are unpacked on the threads of `pool`.
 ///
 /// # Errors
 ///
 /// - [`InstallError`] when a package cannot be downloaded or does not match its digest, or when
 ///   the store or `node_modules` cannot be written.
-pub effect fn install(project: &[u8], graph: &Graph, store: &Store, host: Host) -> Summary
+pub effect fn install(project: &[u8], graph: &Graph, store: &Store, host: Host, pool: &Pool) -> Summary
   ! InstallError | OutOfMemoryError ? &mut Registry | &mut Allocator {
   let mut summary = Summary { packages: 0, downloaded: 0, linked: 0 }
-  let files = run gather(graph, store, host, &mut summary)
+  let files = run gather(graph, store, host, pool, &mut summary)
 
   let mut modules = run Bytes.copy(project)
   run modules.append(b"/node_modules")
