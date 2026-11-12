@@ -148,9 +148,52 @@ function takeCoverage() {
 function stopCoverage() {
   require('internal/profiler_binding').stopCoverage();
 }
+// lib/v8.js GCProfiler over the collections the engine reports: each one's
+// generation, its cost, and the heap in use before and after it. Only measured
+// fields appear. Heap sizes are the allocator's bytes in use (buffer backing
+// included); new_space is what was allocated since the previous collection, and
+// every survivor is old afterwards. Young collections do not move cells, so they
+// are named MinorMarkSweep rather than Scavenge; there is no compaction either,
+// but MarkSweepCompact is V8's only name for a full collection.
+function gcSnapshot(used, young) {
+  const space = (spaceName, bytes) => ({ spaceName, spaceSize: bytes, spaceUsedSize: bytes, physicalSpaceSize: bytes });
+  return {
+    heapStatistics: { totalHeapSize: used, usedHeapSize: used, totalPhysicalSize: used },
+    heapSpaceStatistics: [space('new_space', young), space('old_space', used - young), space('code_space', 0)],
+  };
+}
 class GCProfiler {
-  start() { unsupported('GCProfiler.start', 'native GC events do not capture the before/after heap statistics required by this profile'); }
-  stop() { unsupported('GCProfiler.stop', 'native GC events do not capture the before/after heap statistics required by this profile'); }
+  #statistics = null;
+  #startTime = 0;
+  #listener = null;
+  start() {
+    if (this.#statistics !== null) return;
+    const statistics = [];
+    this.#statistics = statistics;
+    this.#startTime = Date.now();
+    this.#listener = records => {
+      for (const record of records) {
+        const young = Math.min(record.youngBefore, record.usedBefore);
+        statistics.push({
+          gcType: record.young ? 'MinorMarkSweep' : 'MarkSweepCompact',
+          beforeGC: gcSnapshot(record.usedBefore, young),
+          cost: (record.end - record.start) / 1e3,
+          afterGC: gcSnapshot(record.usedAfter, 0),
+        });
+      }
+    };
+    require('perf_hooks');
+    host.watchCollections.add(this.#listener);
+  }
+  stop() {
+    if (this.#statistics === null) return;
+    host.watchCollections.take();
+    host.watchCollections.delete(this.#listener);
+    const data = { version: 1, startTime: this.#startTime, statistics: this.#statistics, endTime: Date.now() };
+    this.#statistics = null;
+    this.#listener = null;
+    return data;
+  }
   [Symbol.dispose]() { this.stop(); }
 }
 // lib/v8.js: startupSnapshot is internal/v8/startup_snapshot's namespace.
