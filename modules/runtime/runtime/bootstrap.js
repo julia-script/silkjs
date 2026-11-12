@@ -208,6 +208,8 @@ function systemError(errno, syscall, path, dest) {
   if (dest !== undefined) error.dest = dest;
   return error;
 }
+// libc's text for an errno, as node's ErrnoException (api/exceptions.cc) words it.
+host.strerror = number => rawStd.strerror(number);
 function pair(result, syscall, path) { if (result[1] !== 0) throw systemError(result[1], syscall, path); return result[0]; }
 // node_process_methods.cc Cwd: a uv_cwd UVException, worded for a removed directory.
 host.cwd = () => {
@@ -1521,7 +1523,7 @@ function loop() {
 }
 const imageModules = ['fs', 'fs/promises', 'internal/fs/streams', 'internal/streams/fast-utf8-stream', 'path', 'os',
   'events', 'stream', 'stream/promises', 'string_decoder', 'util', 'assert', 'console', 'net', 'tty', 'http',
-  'internal/tty/write', 'url', 'internal/web/url', 'internal/encoding', 'internal/abort_controller',
+  'internal/tty/write', 'url', 'internal/url', 'internal/encoding', 'internal/abort_controller',
   'internal/process/execution'];
 globalThis.__silkRuntime = {
   normalize(name, parent, attributes) { return loader.importKey(name, parent, attributes); },

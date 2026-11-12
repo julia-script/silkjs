@@ -850,7 +850,7 @@ function prepareAsymmetricKeyOptions(key, ctx, name, isPrivateKeyInput) {
   const parsed = parseKeyEncoding(key, undefined, isPrivateKeyInput ? false : undefined, name);
   return { data: keyData, format: parsed.format, type: parsed.type, passphrase: parsed.passphrase };
 }
-function webURL() { return require('internal/web/url'); }
+function webURL() { return require('internal/url'); }
 // lib/internal/crypto/keys.js prepareStorePrivateKey: the URI comes from the
 // URL's private state, file: URLs become paths, and NUL bytes are refused
 // because OpenSSL reads both strings as C strings.
