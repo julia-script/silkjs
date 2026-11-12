@@ -77,6 +77,9 @@ for (const name of ['dispose', 'asyncDispose']) {
   if (Symbol[name] === undefined) Object.defineProperty(Symbol, name, { value: Symbol.for('nodejs.' + name) });
 }
 const host = { ...native, rawOS, rawStd };
+// Node's internals keep SharedArrayBuffer when the global is left out
+// (--enable-sharedarraybuffer-per-context): a Worker still shares its cwd counter.
+host.SharedArrayBuffer = SharedArrayBuffer;
 // Startup snapshots: what Node keeps in internalBinding('mksnapshot') for
 // internal/v8/startup_snapshot. With --build-snapshot (native.snapshotBuild) the
 // heap is saved as the blob when the loop ends; a start from the blob runs
@@ -697,6 +700,8 @@ Object.assign(process, {
     return true;
   },
   _fatalException: internalRequire('internal/startup_controls').fatalException,
+  // realm.js: the allowlisted internal bindings and the natives/util legacy wrappers.
+  binding(module) { return internalRequire('internal/bindings').processBinding(module); },
   // node_binding.cc GetLinkedBinding: the addon permission names the module, then the embedder's
   // linked modules are searched. This runtime links none.
   _linkedBinding(module) {
@@ -704,8 +709,6 @@ Object.assign(process, {
     internalRequire('internal/permission').check('addon', module);
     throw Object.assign(new Error(`No such binding was linked: ${module}`), { code: 'ERR_INVALID_MODULE' });
   },
-  // lib/internal/bootstrap/realm.js: the bindings still allowed, as this runtime emulates them.
-  binding(module) { return internalRequire('internal/bindings').processBinding(module); },
   // Formats like console.log and writes to fd 2 at once: no streams, ticks or console.
   _rawDebug(...args) { host.writeText(2, internalRequire('util').format(...args) + '\n'); },
 });
@@ -988,6 +991,7 @@ function runPreloads(entry, loadImports = true, loadRequires = true, runImports 
   // Before any preload: Node applies it when the context is made.
   native.vmSetImportModuleDynamically(undefined, missingImportCallback, true);
   if (host.disableProto !== undefined) disableProto(globalThis);
+  if (host.noSharedArrayBuffer) delete globalThis.SharedArrayBuffer;
   if (host.disallowCodeGeneration) native.vmSetCodeGeneration(undefined, false);
   if (host.jitless) delete globalThis.WebAssembly;
   if (host.experimentalShadowRealm) internalRequire('internal/shadow_realm').enable();
@@ -1058,6 +1062,16 @@ function runtimeFlag(arg) {
   if (arg.startsWith('--v8-pool-size=')) return true;
   if (arg === '--async-context-frame' || arg === '--no-async-context-frame') {
     host.asyncContextFrame = arg === '--async-context-frame'; return true;
+  }
+  // V8's --stack-size, in KiB: the main thread's JavaScript stack (worker_native
+  // mainStackBytes). A Worker keeps its resourceLimits stack, as in Node.
+  const stackSize = /^--stack[-_]size=(\d+)$/.exec(arg);
+  if (stackSize) { native.workerNative('setStackSize', [Number(stackSize[1])]); return true; }
+  // V8 with these flags and no embedder callback, as in Node, installs no
+  // SharedArrayBuffer global (runPreloads removes it before user code).
+  if (arg === '--enable-sharedarraybuffer-per-context' || arg === '--no-harmony-sharedarraybuffer' ||
+      arg === '--no-harmony_sharedarraybuffer') {
+    host.noSharedArrayBuffer = true; return true;
   }
   if (arg === '--expose-gc' || arg === '--no-expose-gc') {
     host.exposeGC = arg === '--expose-gc'; return true;

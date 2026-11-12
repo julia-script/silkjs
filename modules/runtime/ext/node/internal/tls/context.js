@@ -120,17 +120,39 @@ function setDefaultCACertificates(certs) {
     if (typeof certs[i] !== 'string' && !ArrayBuffer.isView(certs[i]))
       throw invalidArgType(`certs[${i}]`, ['string', 'ArrayBufferView'], certs[i]);
   }
+  // Node's ResetRootCertStore: every certificate of every entry is parsed, data without a PEM
+  // start line is skipped, any other parse error throws, and duplicates count once.
   const next = [];
-  for (const cert of certs) next.push(...pemBlocks(bytes(cert).toString('latin1')));
-  if (next.length !== certs.length) {
-    const context = native('context');
-    try { for (const cert of certs) native('ca', context, bytes(cert)); } finally { native('release', context); }
-  }
-  userRoots = Object.freeze(next);
+  const context = native('context');
+  try {
+    for (const cert of certs) {
+      const blocks = pemBlocks(bytes(cert).toString('latin1'));
+      if (blocks.length === 0) continue;
+      native('ca', context, bytes(cert));
+      next.push(...blocks);
+    }
+  } finally { native('release', context); }
+  if (certs.length > 0 && next.length === 0) throw error('ERR_CRYPTO_OPERATION_FAILED', 'No valid certificates found in the provided array');
+  userRoots = Object.freeze([...new Set(next)]);
   defaultCache = undefined;
 }
 
-const finalizer = typeof FinalizationRegistry === 'function' ? new FinalizationRegistry(id => { try { native('release', id); } catch {} }) : null;
+const finalizer = typeof FinalizationRegistry === 'function' ? new FinalizationRegistry(id => { answering.delete(id); try { native('release', id); } catch {} }) : null;
+// Contexts and sessions whose OpenSSL callbacks need a synchronous JS answer (ticket keys,
+// PSK), by native id: the native side calls back from inside the OpenSSL call that needs it.
+const answering = new Map();
+let answerInstalled = false;
+function answerNative(kind, id, data, a, b) {
+  let owner = answering.get(id);
+  if (owner instanceof WeakRef) owner = owner.deref();
+  return owner ? answerBytes(owner.answer(kind, data, a, b)) : null;
+}
+// The native side reads the answer as an ArrayBuffer.
+function answerBytes(view) { return view == null ? null : view.buffer.slice(view.byteOffset, view.byteOffset + view.byteLength); }
+function answerFor(id, owner) {
+  if (!answerInstalled) { native('setCallback', answerNative); answerInstalled = true; }
+  answering.set(id, owner);
+}
 function ticketKeysBuffer(keys) {
   if (!ArrayBuffer.isView(keys)) throw invalidArgType('keys', ['Buffer', 'TypedArray', 'DataView'], keys);
   if (keys.byteLength !== 48) throw error('ERR_INVALID_ARG_VALUE', 'Session ticket keys must be a 48-byte buffer', TypeError);
@@ -209,7 +231,9 @@ class NativeSecureContext {
   }
   setKey(key, passphrase) { native('key', idOf(this), bytes(key), passphrase == null ? '' : String(passphrase)); }
   setCert(cert) { native('cert', idOf(this), bytes(cert)); }
-  addCACert(cert) { native('ca', idOf(this), bytes(cert)); }
+  // SecureContext::AddCACert: each certificate found is trusted and named to clients as an
+  // acceptable CA; data with no certificate adds nothing and is no error.
+  addCACert(cert) { native('clientCa', idOf(this), bytes(cert)); }
   addRootCerts() { for (const cert of rootStore()) native('ca', idOf(this), cert); }
   setAllowPartialTrustChain() { native('trustFlags', idOf(this), 0x80000); }
   addCRL(crl) {
@@ -234,7 +258,44 @@ class NativeSecureContext {
     if (status === 2) throw error('ERR_CRYPTO_OPERATION_FAILED', 'Unable to load certificate from PFX data');
   }
   setALPN(protocols) { this._alpn = protocols; native('contextALPN', idOf(this), protocols); }
-  close() {}
+  // SecureContext::GetCertificate and GetIssuer: DER, or null when unset.
+  getCertificate() { const der = Buffer.from(native('contextCertificate', idOf(this))); return der.length ? der : null; }
+  getIssuer() { const der = Buffer.from(native('contextIssuer', idOf(this))); return der.length ? der : null; }
+  // SecureContext::EnableTicketKeyCallback: OpenSSL asks this.onticketkeycallback for ticket keys.
+  enableTicketKeyCallback() {
+    const id = idOf(this);
+    answerFor(id, new WeakRef(this));
+    native('enableTicketKeyCallback', id);
+  }
+  // SecureContext::TicketKeyCallback's answer, encoded for the native side.
+  answer(kind, data, enc) {
+    const bytes = Buffer.from(data);
+    const ret = this.onticketkeycallback(bytes.subarray(0, 16), bytes.subarray(16, 32), !!enc);
+    const failed = Buffer.from([0xff, 0xff, 0xff, 0xff, 0, 0]);
+    if (!Array.isArray(ret)) return failed;
+    const result = ret[0] | 0;
+    const head = Buffer.alloc(6); head.writeInt32BE(result, 0);
+    if (result < 0) return head;
+    const hmac = ret[1], aes = ret[2];
+    if (!ArrayBuffer.isView(hmac) || !ArrayBuffer.isView(aes) || aes.byteLength !== 16 || hmac.byteLength > 1024) return failed;
+    const parts = [head, Buffer.from(hmac.buffer, hmac.byteOffset, hmac.byteLength), Buffer.from(aes.buffer, aes.byteOffset, aes.byteLength)];
+    head.writeUInt16BE(hmac.byteLength, 4);
+    if (enc) {
+      const name = ret[3], iv = ret[4];
+      if (!ArrayBuffer.isView(name) || !ArrayBuffer.isView(iv) || name.byteLength !== 16 || iv.byteLength !== 16) return failed;
+      parts.push(Buffer.from(name.buffer, name.byteOffset, 16), Buffer.from(iv.buffer, iv.byteOffset, 16));
+    }
+    return Buffer.concat(parts);
+  }
+  // SecureContext::Close: the SSL_CTX goes now (sessions made from it keep their own reference).
+  close() {
+    const id = this.#id;
+    if (!id) return;
+    this.#id = 0;
+    answering.delete(id);
+    finalizer?.unregister(this);
+    try { native('release', id); } catch {}
+  }
 }
 
 function toV(which, v, def) {
@@ -387,5 +448,6 @@ function clearBlockedSPKIsForTesting() { native('clearBlockedSPKIs'); }
 module.exports = {
   addBlockedSPKIForTesting, clearBlockedSPKIsForTesting,
   SecureContext, createSecureContext, configSecureContext, NativeSecureContext, ticketKeysBuffer, native, bytes, alpn, error,
+  answerFor, answering,
   bundledRootCertificates: bundled, getCACertificates, setDefaultCACertificates,
 };

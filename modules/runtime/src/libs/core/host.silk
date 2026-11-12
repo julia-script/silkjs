@@ -55,6 +55,7 @@ import libs.core.async_events { Queue }
 import silkjs.js_runtime_registry { ClassIdAllocator }
 import ext.fs_native
 import ext.fs_async
+import ext.fs_descriptors as descriptors
 import ext.crypto_native
 import ext.net_native
 import ext.os_native
@@ -107,10 +108,11 @@ pub struct Services {
   pub importTrace: ValueBits,
   pub cacheRead: ValueBits,
   pub cacheWrite: ValueBits,
+  /// The worker's (fd, closed) callback for an unmanaged fd opened twice or closed unopened.
+  pub fdWarning: ValueBits,
   pub permissionGuard: ValueBits,
   pub rejection: ValueBits,
   pub workerError: ValueBits,
-  pub trackerFailed: bool,
   pub meta: ValueBits,
   pub asyncEvent: ValueBits,
   pub asyncDestroyEvent: ValueBits,
@@ -142,9 +144,9 @@ pub struct Services {
 impl Services {
   pub fn make(classes: ClassIdAllocator) -> Self { return Self {
     started: clock.nowNanoseconds(), engineStarted: 0,
-    normalize: ValueBits.Undefined, load: ValueBits.Undefined, rejection: ValueBits.Undefined, workerError: ValueBits.Undefined, trackerFailed: false,
+    normalize: ValueBits.Undefined, load: ValueBits.Undefined, rejection: ValueBits.Undefined, workerError: ValueBits.Undefined,
     registerSource: ValueBits.Undefined, moduleSource: ValueBits.Undefined, moduleError: ValueBits.Undefined, importTrace: ValueBits.Undefined,
-    cacheRead: ValueBits.Undefined, cacheWrite: ValueBits.Undefined,
+    cacheRead: ValueBits.Undefined, cacheWrite: ValueBits.Undefined, fdWarning: ValueBits.Undefined,
     permissionGuard: ValueBits.Undefined,
     meta: ValueBits.Undefined, asyncEvent: ValueBits.Undefined, asyncDestroyEvent: ValueBits.Undefined,
     destroyQueue: Queue.make(), io: Pointer.null<fs_async.State>(), crypto: Pointer.null<crypto_native.State>(),
@@ -325,6 +327,20 @@ pub unsafe effect fn fatal<'m>(engine: &mut Engine<'m, Services>, context: *mut 
   let _written = platform.writeAll(2, b"\n")
   unsafe native.exit(1)
 }
+/// Node's PromiseRejectCallback when the rejection tracker throws (a stack
+/// overflow, say): the exception is reported and the program goes on.
+unsafe effect fn reportRejectCallback<'m>(engine: &mut Engine<'m, Services>, context: *mut HeapHeader) -> () ? &mut Allocator {
+  let memory = engine.memory let rt = unsafe runtime.contextRuntime(context)
+  let exception = unsafe exceptions.take(rt)
+  let _header = platform.writeAll(2, b"Exception in PromiseRejectCallback:\n")
+  let printed = run Effect.result(printing.printValue(&mut engine, memory, unsafe lendRealm(&context, context), unsafe lendFor(exception), Options.defaults()))
+  match move printed {
+    Result<List<u8>, OutOfMemoryError | JsException>.Success { value: bytes } => { let _written = platform.writeAll(2, bytes.asSlice()) }
+    _ => { let pending = unsafe exceptions.take(rt) unsafe gc.release(&mut engine, rt, pending) }
+  }
+  let _newline = platform.writeAll(2, b"\n\n")
+  unsafe gc.release(&mut engine, rt, exception)
+}
 unsafe effect fn deliver<'m>(engine: &mut Engine<'m, Services>, context: *mut HeapHeader, function: ValueBits, arguments: &[ValueBits]) -> () ? &mut Allocator {
   if core.undefined(function) { return () }
   let result = run Effect.result(promise.call(&mut engine, unsafe lendRealm(&context, context), unsafe lendFor(function), unsafe lendFor(ValueBits.Undefined), arguments))
@@ -332,6 +348,20 @@ unsafe effect fn deliver<'m>(engine: &mut Engine<'m, Services>, context: *mut He
   match move result {
     Result<Value, JsException>.Success { value } => { unsafe gc.release(&mut engine, rt, value.intoBits()) }
     Result<Value, JsException>.Failure { .. } => { let error = unsafe exceptions.take(rt) run unsafe fatal(&mut engine, context, error) }
+  }
+}
+// Node's ProcessEmitWarning for Add/RemoveUnmanagedFd, after the fs call that found it.
+unsafe effect fn descriptorWarnings<'m>(engine: &mut Engine<'m, Services>, context: *mut HeapHeader) -> () ! OutOfMemoryError | JsException ? &mut Allocator {
+  let tracking = unsafe fs_async.descriptorState(unsafe ioState(&engine))
+  let rt = unsafe runtime.contextRuntime(context)
+  while true {
+    let encoded = match unsafe descriptors.takeWarning(tracking) { Option<i32>.Some { value } => value Option<i32>.None => { return () } }
+    let callback = engine.services.fdWarning
+    if core.undefined(callback) { continue }
+    let closed = encoded < 0
+    let fd = if closed { -encoded - 1 } else { encoded }
+    let called = run promise.call(&mut engine, unsafe lendRealm(&context, context), unsafe lendFor(callback), unsafe lendFor(ValueBits.Undefined), &[ValueBits.Int { value: fd }, ValueBits.Bool { value: closed }])
+    unsafe gc.release(&mut engine, rt, called.intoBits())
   }
 }
 unsafe effect fn drainDestroy<'m>(engine: &mut Engine<'m, Services>, context: *mut HeapHeader) -> () ? &mut Allocator {
@@ -638,7 +668,12 @@ impl EngineServices for Services {
     if id == 3099 { return run unsafe vm_native.rejectHandleCall(&mut engine, context) }
     if id == 2000 {
       let tracking = unsafe fs_async.descriptorState(unsafe ioState(&engine))
-      return run unsafe fs_native.dispatch(&mut engine, context, tracking, argc, argv)
+      let result = run unsafe fs_native.dispatch(&mut engine, context, tracking, argc, argv)
+      if unsafe descriptors.pending(tracking) {
+        let warned = run Effect.result(unsafe descriptorWarnings(&mut engine, context))
+        if let Result<(), OutOfMemoryError | JsException>.Failure { error } = move warned { unsafe gc.release(&mut engine, unsafe runtime.contextRuntime(context), result) fail move error }
+      }
+      return result
     }
     if id == 2007 {
       let io = unsafe ioState(&engine)
@@ -651,8 +686,20 @@ impl EngineServices for Services {
         }
       }
     }
+    // fsTracking(0, enabled, onWarning) turns tracking on or off; fsTracking(1, fd) adopts and
+    // fsTracking(2, fd) releases a transferred FileHandle's fd without a warning.
     if id == 2006 {
-      unsafe fs_async.trackDescriptors(unsafe ioState(&engine), unsafe primitives.toBoolean(unsafe common.argument(argv, 0)) != 0)
+      let io = unsafe ioState(&engine)
+      let operation = run unsafe integer(&mut engine, context, unsafe common.argument(argv, 0))
+      if operation == 0 {
+        unsafe fs_async.trackDescriptors(io, unsafe primitives.toBoolean(unsafe common.argument(argv, 1)) != 0)
+        let previous = Intrinsic.replace(engine.services.fdWarning, unsafe (unsafe common.argument(argv, 2)).retained())
+        unsafe gc.release(&mut engine, unsafe runtime.contextRuntime(context), previous)
+        return ValueBits.Undefined
+      }
+      let fd = run unsafe integer(&mut engine, context, unsafe common.argument(argv, 1))
+      if operation == 1 { run unsafe descriptors.adopt(unsafe fs_async.descriptorState(io), fd) }
+      else { let _held = unsafe descriptors.release(unsafe fs_async.descriptorState(io), fd) }
       return ValueBits.Undefined
     }
     if id >= 2001 && id <= 2005 {
@@ -689,6 +736,7 @@ impl EngineServices for Services {
         if wait != 0 { unsafe cpuProfile.observeNow(rt, cpuProfile.IDLE) }
         let ran = run unsafe fs_async.poll(&mut engine, context, io, wait)
         if wait != 0 { unsafe cpuProfile.observeNow(rt, cpuProfile.IDLE) }
+        if unsafe descriptors.pending(unsafe fs_async.descriptorState(io)) { run unsafe descriptorWarnings(&mut engine, context) }
         run unsafe pumpControl(&mut engine, context)
         if unsafe exceptions.has(unsafe runtime.contextRuntime(context)) { fail JsException {} }
         let crypto = unsafe cryptoState(&engine)
@@ -773,7 +821,6 @@ impl EngineServices for Services {
     if id == 3 {
       let ran = run unsafe drain(&mut engine, context)
       run unsafe drainDestroy(&mut engine, context)
-      if engine.services.trackerFailed { engine.services.trackerFailed = false fail JsException {} }
       return ValueBits.Bool { value: ran }
     }
     if id == 4 { return ValueBits.Float64 { value: i64.toF64(clock.nowNanoseconds()) / 1000000.0 } }
@@ -979,7 +1026,7 @@ impl EngineServices for Services {
     let called = run Effect.result(promise.call(&mut engine, unsafe lendRealm(&context, context), unsafe lendFor(function), unsafe lendFor(ValueBits.Undefined), &[promiseValue, reason, ValueBits.Bool { value: handled }]))
     match move called {
       Result<Value, JsException>.Success { value } => { let rt = unsafe runtime.contextRuntime(context) unsafe gc.release(&mut engine, rt, value.intoBits()) }
-      Result<Value, JsException>.Failure { .. } => { engine.services.trackerFailed = true }
+      Result<Value, JsException>.Failure { .. } => { run unsafe reportRejectCallback(&mut engine, context) }
     }
   }
   effect fn compiledSource<'r, 'v, 'm>(engine: &mut Engine<'m, Self>, contextRealm: Realm<'r>, compiledRef: ValueRef<'v>, source: &[u8], filename: &[u8], compilationFlags: i32, sourceURL: &[u8], sourceMapURL: &[u8]) -> ()

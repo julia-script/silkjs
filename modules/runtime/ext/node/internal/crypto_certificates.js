@@ -118,6 +118,8 @@ function subjectAltName(cert, legacy) {
     if (legacy) return 'DNS:';
     throw c.error('ERR_CRYPTO_OPERATION_FAILED', 'Failed to format subject alternative name');
   }
+  // A malformed name (a GeneralName tag X509V3_EXT_print cannot read) reads the same way.
+  if (legacy) { try { return names.map(generalName).join(', '); } catch { return 'DNS:'; } }
   return names.map(generalName).join(', ');
 }
 function extension(cert, id, convert) { const data = parsed(cert).extensions[id]; return data === undefined ? undefined : convert(children(node(data).data)); }
