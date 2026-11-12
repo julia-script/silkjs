@@ -965,7 +965,7 @@ function missingImportCallback() {
   const { ERR_VM_DYNAMIC_IMPORT_CALLBACK_MISSING } = internalRequire('internal/errors').codes;
   return promiseReject(new ERR_VM_DYNAMIC_IMPORT_CALLBACK_MISSING());
 }
-function runPreloads(entry, loadImports = true, loadRequires = true) {
+function runPreloads(entry, loadImports = true, loadRequires = true, runImports = loadImports) {
   if (host.configFile) process.emitWarning('--experimental-config-file is an experimental feature and might change at any time', 'ExperimentalWarning');
   // Before any preload: Node applies it when the context is made.
   native.vmSetImportModuleDynamically(undefined, missingImportCallback, true);
@@ -975,6 +975,12 @@ function runPreloads(entry, loadImports = true, loadRequires = true) {
   if (host.experimentalShadowRealm) internalRequire('internal/shadow_realm').enable();
   // --experimental-loader: each one is module.register(specifier, cwd) before any preload.
   if (loadImports && loaderPreloads.length) {
+    // createModuleLoader's warning, with the --import that does the same.
+    const readable = text => encodeURIComponent(text).replace(/'/g, '%27').replace(/%22/g, '"').replace(/%2F/ig, '/');
+    process.emitWarning('`--experimental-loader` may be removed in the future; instead use `register()`:\n' +
+      `--import 'data:text/javascript,import { register } from "node:module"; import { pathToFileURL } from "node:url"; ${
+        loaderPreloads.map(specifier => `register(${readable(JSON.stringify(specifier))}, pathToFileURL("./"))`).join('; ')};'`,
+      'ExperimentalWarning');
     const base = internalRequire('url').pathToFileURL(host.cwd() + host.path.sep).href;
     for (const specifier of loaderPreloads) loader.Module.register(specifier, base);
   }
@@ -983,7 +989,7 @@ function runPreloads(entry, loadImports = true, loadRequires = true) {
     process.emitWarning('Frozen intristics is an experimental feature and might change at any time', 'ExperimentalWarning');
     internalRequire('internal/freeze_intrinsics')();
   }
-  if (!loadImports || !importPreloads.length) return entry();
+  if (!runImports || !importPreloads.length) return entry();
   const name = host.path.join(host.tryGetCwd(), '[preload]');
   let pending = Promise.resolve();
   for (const specifier of importPreloads) {
@@ -1049,6 +1055,11 @@ function runtimeFlag(arg) {
     return true;
   }
   if (arg === '--disable-sigusr1') { host.disableSigusr1 = true; return true; }
+  if (arg.startsWith('--trace-require-module=')) {
+    const mode = arg.slice('--trace-require-module='.length);
+    if (mode !== 'all' && mode !== 'no-node-modules') { cliError('invalid value for --trace-require-module'); return true; }
+    host.traceRequireModule = mode; return true;
+  }
   if (arg === '--trace-events-enabled') { (host.traceOptions ||= {}).enabled = true; return true; }
   if (arg.startsWith('--trace-event-categories=')) { (host.traceOptions ||= {}).categories = arg.slice(25); return true; }
   if (arg.startsWith('--trace-event-file-pattern=')) { (host.traceOptions ||= {}).filePattern = arg.slice(27); return true; }
@@ -1073,8 +1084,9 @@ function runtimeFlag(arg) {
   // V8's optimizing tiers (Sparkplug, Maglev, Turbofan) and their switches. The engine
   // is an interpreter with no compiler tiers, so turning one on or off changes nothing,
   // as these V8 flags change nothing under --jitless. Spellings as V8 parses them:
-  // --no-x, --nox, and _ for -.
-  if (/^--(no-?)?(maglev|turbofan|sparkplug|opt|concurrent[-_]recompilation|always[-_]osr|use[-_]osr)$/.test(arg)) return true;
+  // --no-x, --nox, and _ for -. --minor-ms picks V8's non-moving young collector;
+  // the engine's young collections never move cells, so it changes nothing either.
+  if (/^--(no-?)?(maglev|turbofan|sparkplug|opt|concurrent[-_]recompilation|always[-_]osr|use[-_]osr|minor[-_]ms)$/.test(arg)) return true;
   // Node maps its code to large pages on request; this binary does not, which Node
   // reports as its ENOTSUP result (src/large_pages/node_large_page.cc).
   if (arg.startsWith('--use-largepages=')) {
@@ -1146,7 +1158,7 @@ function runtimeFlag(arg) {
   }
   return false;
 }
-function installRuntimeOptions(args, entrypoints = [], preloadEntrypoints = true) {
+function installRuntimeOptions(args, entrypoints = [], preloadEntrypoints = true, startInspector = true) {
   const preloadParent = host.path.join(host.tryGetCwd(), '[preload]');
   if (preloadEntrypoints) for (const [specifiers, mode] of [[requirePreloads, 'require'], [importPreloads, 'import']]) {
     for (const specifier of specifiers) {
@@ -1169,12 +1181,23 @@ function installRuntimeOptions(args, entrypoints = [], preloadEntrypoints = true
   if (host.exposeGC) {
     // A collection gc() asks for is a forced one to 'gc' performance entries.
     const collect = rawStd.gc;
-    const gc = function gc() {
+    // V8's gc(options): type 'minor' collects only the young generation, and
+    // execution 'async' collects in a later task and returns a promise for it.
+    const run = young => {
       const observer = host.gcObserver;
-      if (observer === undefined) return Reflect.apply(collect, undefined, arguments);
-      observer(false);
-      try { return Reflect.apply(collect, undefined, arguments); }
-      finally { observer(true); }
+      if (observer !== undefined) observer(false);
+      try { if (young) host.collectGarbage(true); else collect(); }
+      finally { if (host.gcObserver !== undefined) host.gcObserver(true); }
+    };
+    const gc = function gc(options) {
+      let young = false;
+      let async = false;
+      if (options !== null && typeof options === 'object') {
+        young = options.type === 'minor';
+        async = options.execution === 'async';
+      }
+      if (!async) return run(young);
+      return new Promise(resolve => setImmediate(() => { run(young); resolve(); }));
     };
     Object.defineProperty(globalThis, 'gc', { value: gc, writable: true, enumerable: true });
   }
@@ -1201,7 +1224,8 @@ function installRuntimeOptions(args, entrypoints = [], preloadEntrypoints = true
     const options = host.inspectorOptions;
     if (options?.port !== undefined) process.debugPort = options.port;
     process._breakFirstLine = !!options?.breakFirst;
-    if (options?.enabled) inspectorBackend._start(options.port, options.host, options.wait, options.breakFirst);
+    // A --test runner opens no endpoint of its own: its test processes get the inspector.
+    if (options?.enabled && startInspector) inspectorBackend._start(options.port, options.host, options.wait, options.breakFirst);
     if (workerThreads.isMainThread) inspectorBackend._installProcess(process, options?.host, !host.disableSigusr1);
     if (!workerThreads.isMainThread) inspectorBackend._waitForWorker();
   }
@@ -1560,12 +1584,13 @@ function run(restored = false) {
   }
   // With --test, --watch is the test runner's own watch mode (run({ watch })), as in Node.
   if (testMode) watchMode = false;
-  installRuntimeOptions(environment.concat(process.execArgv), entrypoints, !watchMode);
+  installRuntimeOptions(environment.concat(process.execArgv), entrypoints, !watchMode, !testMode);
   if (watchMode) return internalRequire('internal/main/watch_mode');
   // Counts start before user code; the harness's setupCoverage then finds coverage active.
   if (testCoverage && !testMode && !check) internalRequire('internal/profiler_binding').startCoverage();
-  // Node's internal/main/test_runner loads the -r modules itself (not with isolation none).
-  if (testMode) return runPreloads(() => internalRequire('internal/main/test_runner'), true, false);
+  // Node's internal/main/test_runner loads the -r modules itself (not with isolation none),
+  // and never runs --import: test files get it in their processes, or run() imports it.
+  if (testMode) return runPreloads(() => internalRequire('internal/main/test_runner'), true, false, false);
   return runPreloads(() => {
   if (check) {
     const fromStdin = filename === undefined || filename === '-';

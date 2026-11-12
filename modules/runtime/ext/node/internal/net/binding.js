@@ -108,27 +108,48 @@ function statusOf(error) {
   return typeof error.errno === 'number' ? error.errno : uv.UV_ECANCELED;
 }
 
+// The binding's own bookkeeping, which Node keeps in C++: writable but not enumerable, so the
+// handle shows only the properties Node's handles have (util.inspect, v8 serialize errors).
+function internalFields(handle, fields) {
+  for (const key of Object.keys(fields)) {
+    Object.defineProperty(handle, key, { __proto__: null, value: fields[key], writable: true, configurable: true, enumerable: false });
+  }
+}
+// LibuvStreamWrap's own properties (JSStream has none of them).
+function libuvFields(handle) {
+  handle.reading = false;
+  handle.onconnection = null;
+  handle.writeQueueSize = 0;
+}
+
 // src/handle_wrap.cc and src/stream_wrap.cc (LibuvStreamWrap) over one transport.
 class StreamHandle {
   #owner = undefined;
+  #onread = null;
+  #bytesRead = 0;
+  #bytesWritten = 0;
   constructor(transport) {
     bindingObjects.add(this);
-    this.reading = false;
-    this.onread = null;
-    this.onconnection = null;
-    this.writeQueueSize = 0;
-    this.bytesRead = 0;
-    this.bytesWritten = 0;
-    this._closeCallback = null;
-    this._closeReported = false;
-    this._userBuffer = null;
-    // Reads a stopped user-buffer stream holds, in order, until it reads again.
-    this._pendingReads = [];
-    this._flushScheduled = false;
-    this._connectRequest = null;
-    this._consumers = null;
+    internalFields(this, {
+      _transport: undefined,
+      _closeCallback: null,
+      _closeReported: false,
+      _userBuffer: null,
+      // Reads a stopped user-buffer stream holds, in order, until it reads again.
+      _pendingReads: [],
+      _flushScheduled: false,
+      _connectRequest: null,
+      _consumers: null,
+    });
     if (transport !== undefined) this._adopt(transport);
   }
+  // StreamBase's prototype accessors: onread can be set, the byte counts are read-only.
+  get onread() { return this.#onread; }
+  set onread(value) { this.#onread = value; }
+  get bytesRead() { return this.#bytesRead; }
+  get bytesWritten() { return this.#bytesWritten; }
+  _countRead(bytes) { this.#bytesRead += bytes; }
+  _countWritten(bytes) { this.#bytesWritten += bytes; }
   // Node's StreamBase: an HTTP parser can consume the handle directly (parser.consume).
   get isStreamBase() { return true; }
   _adopt(transport) {
@@ -272,7 +293,7 @@ class StreamHandle {
       this._transport.write(chunk instanceof Uint8Array ? chunk : new Uint8Array(chunk.buffer, chunk.byteOffset, chunk.byteLength), done);
     }
     sync = false;
-    this.bytesWritten += bytes;
+    this._countWritten(bytes);
     if (pending === 0) {
       streamBaseState[kLastWriteWasAsync] = 0;
       if (req) return failure;
@@ -292,7 +313,7 @@ class StreamHandle {
         // A WebSocket peer (internal/ws) owns the frames of this socket after its upgrade.
         if (owner?._wsPeer && status >= 0) {
           if (payload?.byteLength) {
-            this.bytesRead += payload.byteLength;
+            this._countRead(payload.byteLength);
             host.net('wsFeed', [this._transport.id, payload, 0, payload.byteLength]);
           }
           return;
@@ -405,7 +426,7 @@ class StreamHandle {
         const count = Math.min(target.byteLength, bytes.byteLength - offset);
         target.set(bytes.subarray(offset, offset + count));
         offset += count;
-        this.bytesRead += count;
+        this._countRead(count);
         streamBaseState[kReadBytesOrError] = count;
         streamBaseState[kArrayBufferOffset] = 0;
         const next = this.onread(undefined);
@@ -413,7 +434,7 @@ class StreamHandle {
       }
       return;
     }
-    this.bytesRead += bytes.byteLength;
+    this._countRead(bytes.byteLength);
     streamBaseState[kReadBytesOrError] = bytes.byteLength;
     streamBaseState[kArrayBufferOffset] = bytes.byteOffset;
     this.onread(bytes.buffer);
@@ -424,7 +445,8 @@ class StreamHandle {
 class NativeStreamHandle extends StreamHandle {
   constructor(kind, id) {
     super();
-    this._kind = kind;
+    libuvFields(this);
+    internalFields(this, { _kind: kind, _connectTraceId: undefined });
     this._adopt(new Transport(kind, undefined, () => {}, id));
   }
   _call(operation, ...args) {
@@ -466,8 +488,7 @@ class NativeStreamHandle extends StreamHandle {
 class TCP extends NativeStreamHandle {
   constructor(type, id) {
     super(1, id);
-    this._type = type;
-    this._tos = undefined;
+    internalFields(this, { _type: type, _tos: undefined });
   }
   // libuv makes and binds the socket in uv_tcp_bind; the native socket binds when it
   // listens, so a server handle listens passively (bound, not accepting) right away. Its
@@ -509,8 +530,7 @@ class Pipe extends NativeStreamHandle {
   constructor(type, id) {
     if (type === Pipe.IPC) throw new Error('IPC pipes are made by child_process');
     super(2, id);
-    this._type = type;
-    this._mode = 0;
+    internalFields(this, { _type: type, _mode: 0 });
   }
   bind(path) { return this._call('bind', path, 0, 0); }
   connect(req, path) {
@@ -535,6 +555,7 @@ const PipeConstants = { SOCKET: Pipe.SOCKET, SERVER: Pipe.SERVER, IPC: Pipe.IPC,
 class TTY extends StreamHandle {
   constructor(fd, ctx) {
     super();
+    libuvFields(this);
     // As uv_tty_init: a regular file, or a descriptor it cannot tell, is EINVAL.
     const kind = host.net('guessHandleType', [fd]);
     if (kind < 0 || kind === 6) { fillContext(ctx, uv.UV_EINVAL, 'uv_tty_init'); return; }
@@ -578,7 +599,7 @@ class TTY extends StreamHandle {
     } catch (err) {
       return statusOf(err);
     }
-    this.bytesWritten += bytes;
+    this._countWritten(bytes);
     return 0;
   }
 }
@@ -596,7 +617,8 @@ function fillContext(ctx, status, syscall) {
 class JSTransportHandle extends StreamHandle {
   constructor(transport) {
     super(transport);
-    this._pendingWrites = new Set();
+    libuvFields(this);
+    internalFields(this, { _pendingWrites: new Set() });
   }
   // TLSWrap cancels its queued writes as it closes (InvokeQueued(UV_ECANCELED)), before
   // the close or any error of its owner surfaces.
@@ -627,11 +649,8 @@ class JSTransportHandle extends StreamHandle {
 class JSStream extends StreamHandle {
   constructor() {
     super();
-    this.onreadstart = null;
-    this.onreadstop = null;
-    this.onshutdown = null;
-    this.onwrite = null;
-    this._resource = require('async_hooks')._createResource('JSSTREAM', this);
+    // internal/js_stream_socket assigns onreadstart, onreadstop, onshutdown and onwrite.
+    internalFields(this, { _resource: require('async_hooks')._createResource('JSSTREAM', this) });
   }
   getAsyncId() { return this._resource.asyncId(); }
   getProviderType() { return require('async_hooks').asyncWrapProviders.JSSTREAM; }
@@ -667,7 +686,7 @@ class JSStream extends StreamHandle {
     streamBaseState[kBytesWritten] = bytes;
     streamBaseState[kLastWriteWasAsync] = 1;
     streamBaseState[kLastWriteErr] = 0;
-    this.bytesWritten += bytes;
+    this._countWritten(bytes);
     const status = this._callback(this.onwrite, [wrap, buffers]) ?? 0;
     return req ? status : wrap;
   }
