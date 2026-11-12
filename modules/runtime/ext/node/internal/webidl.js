@@ -974,6 +974,11 @@ function validateAllowResizableArrayBuffer(resizable, options) {
  * @param {ConversionOptions} [options] Conversion options.
  * @returns {Uint8Array}
  */
+// lib/internal/abort_controller.js installs this; the runtime's AbortSignal brand is looked
+// up when a value is converted, so loading webidl does not load the event target module.
+converters.AbortSignal = createInterfaceConverter('AbortSignal',
+  (value) => require('internal/path_events/event_target').isAbortSignalInstance(value));
+
 converters.Uint8Array = (V, options = kEmptyObject) => {
   // Typed array conversion steps 1-2: T is Uint8Array, and V must
   // have [[TypedArrayName]] equal to "Uint8Array".

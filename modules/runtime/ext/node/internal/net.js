@@ -120,6 +120,9 @@ function isLoopback(host) {
 
 module.exports = {
   kReinitializeHandle: Symbol('kReinitializeHandle'),
+  // The TLSSocket a transport socket carries: net.client.socket publishes it, as Node's
+  // TLSSocket is the socket that connects.
+  kClientSocketOwner: Symbol('kClientSocketOwner'),
   kSetNoDelay: Symbol('kSetNoDelay'),
   kSetKeepAlive: Symbol('kSetKeepAlive'),
   kSetKeepAliveInitialDelay: Symbol('kSetKeepAliveInitialDelay'),

@@ -97,12 +97,27 @@ function isWindowsDeviceRoot(code) {
 // are like that (a resolved './x' among them), and this is much cheaper than the walk
 // below.
 const unnormalizedPosix = /\/\/|(?:^|\/)\.\.(?:\/|$)/;
-const dotSegments = /(?:^|\/)\.(?=\/|$)/g;
+// Drops the . segments of a path, each with the separator before it. No RegExp: user code
+// may have replaced RegExp.prototype[Symbol.replace].
+function dropDotSegments(path) {
+  if (StringPrototypeIndexOf(path, '.') === -1) return path;
+  let result = '';
+  let start = 0;
+  while (start <= path.length) {
+    let end = StringPrototypeIndexOf(path, '/', start);
+    if (end === -1) end = path.length;
+    if (!(end - start === 1 && StringPrototypeCharCodeAt(path, start) === CHAR_DOT)) {
+      result += start === 0 ? StringPrototypeSlice(path, 0, end) : StringPrototypeSlice(path, start - 1, end);
+    }
+    start = end + 1;
+  }
+  return result;
+}
 
 // Resolves . and .. elements in a path with directory names
 function normalizeString(path, allowAboveRoot, separator, isPathSeparator) {
   if (isPathSeparator === isPosixPathSeparator && !RegExpPrototypeExec(unnormalizedPosix, path)) {
-    path = StringPrototypeReplace(path, dotSegments, '');
+    path = dropDotSegments(path);
     const start = StringPrototypeCharCodeAt(path, 0) === CHAR_FORWARD_SLASH ? 1 : 0;
     const end = path.length > start && StringPrototypeCharCodeAt(path, path.length - 1) === CHAR_FORWARD_SLASH ? path.length - 1 : path.length;
     return start === 0 && end === path.length ? path : StringPrototypeSlice(path, start, end);

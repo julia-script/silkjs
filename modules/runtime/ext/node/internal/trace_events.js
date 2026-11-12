@@ -32,11 +32,13 @@ function enabled(group) {
   if (patterns.length === 0) return false;
   return group.split(',').some(category => patterns.some(pattern => pattern.test(category)));
 }
+// NodeTraceWriter::GetFilePath for the first file.
+function tracePath() {
+  return filePattern.replace(/\$\{(pid|rotation)\}/g, (_, key) => key === 'pid' ? String(process.pid) : '1');
+}
 function ensureOpen() {
   if (opened) return;
-  const path = require('path').resolve(filePattern.replace(/\$\{(pid|rotation)\}/g, (_, key) => key === 'pid' ? String(process.pid) : '1'));
-  // The trace file is written natively, so the permission model checks it here.
-  if (host.builtinLoaded('internal/permission')) require('internal/permission').check('fs.write', path);
+  const path = require('path').resolve(tracePath());
   native('open', path);
   opened = true;
   writeMetadata();
@@ -213,7 +215,12 @@ function setTraceCategoryStateUpdateHandler(handler) { stateUpdateHandler = hand
 class CategorySet {
   #categories; #enabled = false;
   constructor(categories) { this.#categories = new Set(categories); }
-  enable() { if (!this.#enabled) { add(this.#categories); this.#enabled = true; } }
+  enable() {
+    if (this.#enabled) return;
+    // NodeCategorySet::Enable checks the trace file; categories from the command line are not checked.
+    if (host.builtinLoaded('internal/permission')) require('internal/permission').check('fs.write', tracePath());
+    add(this.#categories); this.#enabled = true;
+  }
   disable() { if (this.#enabled) { remove(this.#categories); this.#enabled = false; } }
 }
 // internalBinding('trace_events').trace: the phase is a character code, and data, when

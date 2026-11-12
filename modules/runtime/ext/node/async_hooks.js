@@ -267,7 +267,11 @@ class InternalResource {
     try { return apply(fn, thisArg, args); }
     finally { leaveResource(this); }
   }
-  emitDestroy() { enqueueDestroy(this); return this; }
+  emitDestroy() {
+    // AsyncWrap::EmitDestroy drops the context frame: the queued destroy keeps no stores alive.
+    this.stores = undefined; this.scope = undefined;
+    enqueueDestroy(this); return this;
+  }
 }
 
 class AsyncContextFrame extends Map {}

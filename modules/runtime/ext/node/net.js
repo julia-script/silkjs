@@ -49,6 +49,7 @@ let debug = require('util').debuglog('net', (fn) => {
 });
 const {
   kReinitializeHandle,
+  kClientSocketOwner,
   kSetNoDelay,
   kSetKeepAlive,
   kSetKeepAliveInitialDelay,
@@ -1592,7 +1593,7 @@ Socket.prototype.connect = function(...args) {
 
   if (netClientSocketChannel.hasSubscribers) {
     netClientSocketChannel.publish({
-      socket: this,
+      socket: this[kClientSocketOwner] ?? this,
     });
   }
 

@@ -278,6 +278,8 @@ function open(port = 9229, hostname = '127.0.0.1', wait = false) {
   process.debugPort = Number(new URL(endpoint).port);
   // Startup can park immediately below; publish without queued stdio work.
   host.writeStartupDiagnostic(`Debugger listening on ${endpoint}\nFor help, see: https://nodejs.org/en/docs/inspector\n`);
+  // Agent::StartIoThread: NotifyClusterWorkersDebugEnabled tells a cluster primary to debug its workers.
+  host.processEmit('internalMessage', { cmd: 'NODE_DEBUG_ENABLED' });
   if (wait) waitForDebugger();
   return { __proto__: null, [Symbol.dispose]() { close(); } };
 }

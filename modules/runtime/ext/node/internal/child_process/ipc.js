@@ -153,12 +153,10 @@ function setupChannel(target, fd, mode = 'json', onClose) {
           const internal = value.msg?.cmd === 'NODE_CLUSTER';
           const socket = new net.Socket({ fd: passed, readable: true, writable: true, manualStart: internal });
           if (value.key !== undefined) {
+            // child_process.js getSocketList('got', ...): one SocketListReceive per key.
             let list = socketLists.get(value.key);
-            if (!list) { list = { count: 0, notify: false }; socketLists.set(value.key, list); }
-            list.count++;
-            socket.once('close', () => {
-              if (--list.count === 0 && list.notify && !closed) control({ cmd: 'NODE_SOCKET_ALL_CLOSED', key: value.key });
-            });
+            if (!list) { list = new (require('internal/socket_list').SocketListReceive)(target, value.key); socketLists.set(value.key, list); }
+            list.add({ socket });
           }
           deliver(value.msg, socket);
         } else if (value.type === 'net.Server') {
@@ -191,15 +189,6 @@ function setupChannel(target, fd, mode = 'json', onClose) {
           }
           deliver(value.msg, handle);
         } else { native('closeFd', [passed]); target.emit('error', failure('ERR_INVALID_HANDLE_TYPE', `Unsupported IPC handle ${value.type}`)); }
-        return;
-      }
-      if (value.cmd === 'NODE_SOCKET_GET_COUNT') {
-        control({ cmd: 'NODE_SOCKET_COUNT', key: value.key, count: socketLists.get(value.key)?.count || 0 }); return;
-      }
-      if (value.cmd === 'NODE_SOCKET_NOTIFY_CLOSE') {
-        const list = socketLists.get(value.key);
-        if (!list || list.count === 0) control({ cmd: 'NODE_SOCKET_ALL_CLOSED', key: value.key });
-        else list.notify = true;
         return;
       }
       target.emit('internalMessage', value); return;
@@ -276,7 +265,7 @@ function setupChannel(target, fd, mode = 'json', onClose) {
       const key = envelope.key = handle.server._connectionKey;
       let list = sentSocketLists.get(key);
       if (!list) {
-        list = new (require('internal/child_process/socket_list').SocketListSend)(target, key);
+        list = new (require('internal/socket_list').SocketListSend)(target, key);
         sentSocketLists.set(key, list);
         handle.server._setupWorker(list);
       }
