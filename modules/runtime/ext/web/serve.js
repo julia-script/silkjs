@@ -9,7 +9,7 @@ const host = require('internal/host');
 const { AsyncResource } = require('async_hooks');
 const { Response, readResponse, takeResponseText, responseState, serverRequest } = require('internal/web/fetch/message');
 const { headerList } = require('internal/web/fetch/headers');
-const { URL } = require('internal/web/url');
+const { URL } = require('internal/url');
 const { _memoryBytes: memoryBytes } = require('internal/web/blob');
 
 // net_native event kinds and statuses.
@@ -99,8 +99,19 @@ function request(connection, flags, payload, bytes) {
   const head = payload[0] === 'HEAD';
   server._pending++;
   let result;
-  try { result = server._fetch.call(server, req, server); }
+  // A method call: the handler sees the server as `this`, as Bun's does.
+  try { result = server._fetch(req, server); }
   catch (error) { result = server._failure(error); }
+  // The common case: a kept-alive GET answered at once with a Response made from text alone.
+  if ((flags & KEEP_ALIVE) !== 0 && !head && connection.queue.length === 0 && !connection.streaming && !server._stopping) {
+    const text = takeResponseText(result);
+    if (text !== undefined) {
+      server._pending--;
+      if (connection.closed || connection.closing || connection.finished) return;
+      if (httpRespondText(connection.id, 200, '', 'text/plain;charset=UTF-8', text) < 0) connection.close();
+      return;
+    }
+  }
   if (result instanceof Response && connection.queue.length === 0 && !connection.streaming) { send(connection, flags, head, result); return; }
   const slot = { flags, head, response: result, done: result instanceof Response };
   connection.queue.push(slot);

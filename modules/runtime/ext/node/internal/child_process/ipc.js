@@ -6,10 +6,12 @@ const { AsyncResource } = require('async_hooks');
 const native = (op, args) => host.processNative(op, args);
 const failure = (code, message) => Object.assign(new Error(message), { code });
 const { codes: { ERR_INVALID_ARG_TYPE, ERR_MISSING_ARGS }, codedError, validateObject } = require('internal/validators');
+// Node's target[kChannelHandle]: the channel's pipe handle, null once it closes.
+const kChannelHandle = Symbol('kChannelHandle');
 function setupChannel(target, fd, mode = 'json', onClose) {
   const resource = new AsyncResource('PIPEWRAP');
   let input = Buffer.alloc(0), receivedFD = -1, queue = [], bytes = 0, pendingHandle = null;
-  let closing = false, closed = false, explicitRef = null;
+  let closing = false, closed = false, explicitRef = null, reading = true;
   const socketLists = new Map();
   const sentSocketLists = new Map();
   const codec = mode === 'advanced' ? require('internal/serialization/v8') : null;
@@ -24,6 +26,20 @@ function setupChannel(target, fd, mode = 'json', onClose) {
     const ref = explicitRef === null ? queue.length > 0 || pendingHandle !== null || target.listenerCount('message') > 0 || target.listenerCount('disconnect') > 0 : explicitRef;
     native(ref ? 'ref' : 'unref', [id]);
   }
+  // Readable interest follows readStart/readStop, as uv_read_start/stop do for Node's
+  // pipe: while stopped, messages wait in the kernel and arrive together on readStart.
+  function arm() {
+    if (closed) return;
+    native('ipcEvents', [id, (reading ? 1 : 0) | (queue.length && (!pendingHandle || queue[0].control) ? 2 : 0)]);
+  }
+  target[kChannelHandle] = {
+    __proto__: null,
+    fd,
+    readStart() { if (closed) return -9; reading = true; arm(); return 0; },
+    readStop() { if (closed) return -9; reading = false; arm(); return 0; },
+    ref() { channel.ref(); },
+    unref() { channel.unref(); },
+  };
   Object.defineProperty(channel, 'fd', { value: fd, enumerable: true });
   channel.ref = () => { explicitRef = true; refState(); };
   channel.unref = () => { explicitRef = false; refState(); };
@@ -39,7 +55,7 @@ function setupChannel(target, fd, mode = 'json', onClose) {
   target.on('removeListener', changed);
   function complete(error) {
     if (closed) return;
-    closed = true; target.connected = false; target.channel = null;
+    closed = true; target.connected = false; target.channel = null; target[kChannelHandle] = null;
     native('ipcClose', [id]);
     if (receivedFD >= 0) native('closeFd', [receivedFD]);
     receivedFD = -1;
@@ -85,7 +101,7 @@ function setupChannel(target, fd, mode = 'json', onClose) {
       if (item.transfer) pendingHandle = item.transfer;
       if (item.callback) process.nextTick(item.callback, null);
     }
-    native('ipcEvents', [id, 1 | (queue.length && (!pendingHandle || queue[0].control) ? 2 : 0)]);
+    arm();
     if (closing && !queue.length && !pendingHandle) complete();
     refState();
   }
@@ -208,7 +224,7 @@ function setupChannel(target, fd, mode = 'json', onClose) {
     if (closed) return;
     if (events < 0) { complete(failure(native('errorName', [events]), 'IPC channel failed')); return; }
     if (events & 1) {
-      while (!closed) {
+      while (!closed && reading) {
         const result = native('ipcRead', [fd]);
         if (typeof result === 'number') {
           const code = native('errorName', [result]);
@@ -295,4 +311,4 @@ function installChild(process) {
   delete process.env.NODE_CHANNEL_FD; delete process.env.NODE_CHANNEL_SERIALIZATION_MODE;
   setupChannel(process, Number(value), mode);
 }
-module.exports = { setupChannel, installChild };
+module.exports = { setupChannel, installChild, kChannelHandle };

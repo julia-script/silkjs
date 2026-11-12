@@ -17,7 +17,7 @@ const groups = [
   ['internal/web/compression', ['CompressionStream', 'DecompressionStream']],
   ['internal/web/navigator', ['Navigator', 'navigator']],
   ['internal/web/urlpattern', ['URLPattern']],
-  ['internal/web/url', ['URL', 'URLSearchParams']],
+  ['internal/url', ['URL', 'URLSearchParams']],
   ['internal/web/blob', ['Blob', 'File']],
   ['internal/web/websocket', ['WebSocket', 'MessageEvent', 'CloseEvent']],
   ['worker_threads', ['MessageChannel', 'MessagePort', 'BroadcastChannel']],
@@ -45,7 +45,7 @@ function defineLazy(target, name, load, enumerable) {
 
 // Modules every process has loaded anyway (the heap image holds them): their
 // interfaces are plain data properties from the start, as Node's are.
-const eagerGroups = new Set(['internal/encoding', 'internal/web/url']);
+const eagerGroups = new Set(['internal/encoding', 'internal/url']);
 
 function install(target) {
   for (const [id, names] of groups) {
@@ -63,6 +63,8 @@ function install(target) {
       else defineLazy(target, name, load, enumerableGlobals.has(name));
     }
   }
+  // As lib/internal/bootstrap/web/exposed-window-or-worker.js does.
+  require('internal/url').installObjectURLMethods();
 }
 
 module.exports = { install, defineLazy };

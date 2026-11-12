@@ -202,8 +202,9 @@ function processOption(name) {
   return /^--(?:no-)?(?:expose-gc|trace-sigint)$/.test(name) || /^--trace-event(?:s-enabled|-categories|-file-pattern)$/.test(name) || reportOptions.processWideOption(name);
 }
 // The flags of an explicit Worker execArgv that a Worker cannot take, as Node's
-// per-isolate parser sees them: unknown or V8 options and process-wide ones.
-// Throws a parse error.
+// per-isolate parser sees them: unknown or V8 options and process-wide ones,
+// and the execArgv the Worker reports (node_worker.cc exec_argv_out, which
+// leaves out `--`). Throws a parse error.
 function invalidWorkerArguments(args) {
   const parsed = parseArguments(args, false);
   if (parsed.error !== undefined) throw new Error(parsed.error);
@@ -220,7 +221,7 @@ function invalidWorkerArguments(args) {
     const error = typeof value === 'string' ? startupControls.valueError(name, value) : undefined;
     if (error) throw new Error(error);
   }
-  return invalid;
+  return { invalid, execArgv: parsed.execArgv };
 }
 
 // The form an option takes as one argument: a boolean as --name or --no-name,
