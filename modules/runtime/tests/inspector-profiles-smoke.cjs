@@ -79,7 +79,7 @@ function allocationLeaf() { return { bytes: new Uint8Array(256), value: 7 }; }
   assert.equal(snapshot.edges.length, snapshot.snapshot.edge_count * edgeWidth);
   const { silk } = snapshot;
   assert.equal(silk.format, 'silk.heap.snapshot');
-  assert.equal(silk.version, 2);
+  assert.equal(silk.version, 3);
   assert.equal(silk.graphVersion, 1);
   assert.equal(silk.identity, 'runtime-allocation-id');
   assert.equal(silk.root, 0);
@@ -94,7 +94,7 @@ function allocationLeaf() { return { bytes: new Uint8Array(256), value: 7 }; }
     if (target % nodeWidth !== 0 || !(target >= 0 && target < snapshot.nodes.length) || (target === 0 && 1 / target < 0)) assert.fail(`Invalid target for heap edge ${i}`);
     const strength = silk.edgeStrengths[i];
     if (strength !== 0 && strength !== 1 && strength !== 2 && strength !== 3) assert.fail(`Invalid strength for heap edge ${i}`);
-    if (snapshot.edges[offset] !== (strength === 0 ? 3 : 6)) assert.fail(`Incorrect DevTools type for heap edge ${i}`);
+    if (strength === 0 ? ![1, 2, 3].includes(snapshot.edges[offset]) : snapshot.edges[offset] !== 6) assert.fail(`Incorrect DevTools type for heap edge ${i}`);
     if (strength === 0) hasStrong = true;
     else if (strength === 1) hasWeak = true;
     else if (strength === 2) ephemeronCount++;

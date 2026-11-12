@@ -26,8 +26,60 @@ function parse(value, message) {
 function heapSnapshot() {
   return host.heapSnapshotDevtools();
 }
-function emitSnapshot(session, params) {
-  const snapshot = heapSnapshot();
+// V8's trace_function_infos and trace_tree from the recorded allocation stacks of
+// objects still alive; each node's trace_node_id names the stack that allocated it.
+function withAllocationTraces(text, recording) {
+  const snapshot = JSON.parse(text);
+  const strings = snapshot.strings, stringIds = new Map();
+  for (let i = 0; i < strings.length; i++) stringIds.set(strings[i], i);
+  const string = value => { let id = stringIds.get(value); if (id === undefined) { id = strings.length; strings.push(value); stringIds.set(value, id); } return id; };
+  const functions = [], functionIds = new Map();
+  const functionInfo = (key, name, scriptId, line, column) => {
+    let index = functionIds.get(key);
+    if (index === undefined) {
+      index = functions.length / 6; functionIds.set(key, index);
+      functions.push(index, string(name), string(''), Number(scriptId) || 0, line, column);
+    }
+    return index;
+  };
+  let nextId = 1;
+  const root = { id: nextId++, info: functionInfo('(root)', '(root)', 0, 0, 0), count: 0, size: 0, children: new Map() };
+  const alive = new Map();
+  for (const event of recording.events) {
+    if (event.reclaimed) alive.delete(event.id); else alive.set(event.id, event);
+  }
+  const traceOf = new Map();
+  for (const event of alive.values()) {
+    let node = root;
+    for (let i = event.stack.length - 1; i >= 0; i--) {
+      const frame = event.stack[i];
+      const key = `${frame.functionAddress}:${frame.scriptId}:${frame.pc}`;
+      let child = node.children.get(key);
+      if (!child) {
+        const info = functionInfo(`${frame.functionAddress}:${frame.scriptId}`, frame.functionName || (frame.scriptId === '0' ? '(native)' : ''), frame.scriptId, frame.line > 0 ? frame.line : 0, frame.column > 0 ? frame.column : 0);
+        child = { id: nextId++, info, count: 0, size: 0, children: new Map() };
+        node.children.set(key, child);
+      }
+      node = child;
+    }
+    node.count++; node.size += event.requestedBytes;
+    traceOf.set(String(event.id), node.id);
+  }
+  const flatten = node => [node.id, node.info, node.count, node.size, [...node.children.values()].flatMap(flatten)];
+  const width = snapshot.snapshot.meta.node_fields.length;
+  const idField = snapshot.snapshot.meta.node_fields.indexOf('id'), traceField = snapshot.snapshot.meta.node_fields.indexOf('trace_node_id');
+  for (let at = 0; at < snapshot.nodes.length; at += width) {
+    const trace = traceOf.get(String(snapshot.nodes[at + idField]));
+    if (trace !== undefined) snapshot.nodes[at + traceField] = trace;
+  }
+  snapshot.snapshot.trace_function_count = functions.length / 6;
+  snapshot.trace_function_infos = functions;
+  snapshot.trace_tree = flatten(root);
+  if (snapshot.silk) snapshot.silk.allocationTraces = { droppedEvents: recording.droppedEvents, incomplete: recording.droppedEvents !== 0 };
+  return JSON.stringify(snapshot);
+}
+function emitSnapshot(session, params, recording) {
+  const snapshot = recording !== undefined ? withAllocationTraces(heapSnapshot(), parse(recording, 'No allocation profile is active')) : heapSnapshot();
   // Progress counts are actual serialized UTF-16 code units, never fabricated objects.
   const total = snapshot.length;
   for (let at = 0; at < total; at += 65536) {
@@ -192,8 +244,14 @@ function dispatch(session, method, params = {}) {
     case 'HeapProfiler.startTrackingHeapObjects': {
       if (!current.heapEnabled) throw protocolError(-32000, 'HeapProfiler is not enabled');
       if (current.tracking) return {};
-      if (params.trackAllocations) throw protocolError(-32602, 'Allocation-site tracking uses HeapProfiler.startSampling; snapshot tracking reports observed heap nodes');
-      const tracking = { ids: new Map(), buckets: new Map(), next: 0, lastId: 0, timer: null, error: null };
+      const tracking = { ids: new Map(), buckets: new Map(), next: 0, lastId: 0, timer: null, error: null, allocations: false };
+      // V8's AllocationTracker: every allocation's stack, recorded by the allocation
+      // observer at a one-byte interval and joined to snapshot nodes by allocation id.
+      if (params.trackAllocations) {
+        if (allocationOwner) throw protocolError(-32000, 'An allocation profile is already active');
+        if (!host.allocationProfileStart(1, 2048)) throw protocolError(-32000, 'An allocation profile is already active');
+        allocationOwner = session; tracking.allocations = true;
+      }
       sampleTracking(session, tracking);
       current.tracking = tracking;
       tracking.timer = setInterval(() => {
@@ -207,9 +265,12 @@ function dispatch(session, method, params = {}) {
       if (!current.tracking) throw protocolError(-32000, 'Heap object tracking is not active');
       const tracking = current.tracking;
       stopTracking(current);
+      // Kept as text until the snapshot is taken, so its parsed events are not in it.
+      const recording = tracking.allocations ? host.allocationProfileStop() : undefined;
+      if (tracking.allocations) allocationOwner = undefined;
       if (tracking.error) throw tracking.error;
       sampleTracking(session, tracking);
-      emitSnapshot(session, params); return {};
+      emitSnapshot(session, params, recording); return {};
     }
     case 'HeapProfiler.takeHeapSnapshot': emitSnapshot(session, params); return {};
     case 'HeapProfiler.collectGarbage': host.collectGarbage(); return {};

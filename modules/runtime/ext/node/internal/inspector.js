@@ -262,7 +262,7 @@ function onNative(kind, connection, payload, source) {
     if (source >= 0 && payload === '{"inspectorWorker":true}') {
       const info = host.workerNative('info', []);
       const metadata = JSON.parse(info.metadata);
-      native(5, connection, JSON.stringify({ inspectorWorkerInfo: { title: metadata.name, url: metadata.eval ? '' : metadata.filename }, waitingForDebugger: waiting }), source);
+      native(5, connection, JSON.stringify({ inspectorWorkerInfo: { title: `[worker ${native(10)}] ${metadata.name}`, url: metadata.eval ? '' : metadata.filename }, waitingForDebugger: waiting }), source);
     }
   } else if (kind === 2) {
     const session = sessions.get(key);
@@ -296,8 +296,11 @@ function atExit() {
   if (worker && sessions.size === 0) return;
   if (!worker && remoteSessions()) host.writeStartupDiagnostic('Waiting for the debugger to disconnect...\n');
   const list = sessionList();
-  for (let i = 0; i < list.length; i++) if (list[i].notifyDisconnect) { list[i].emit('NodeRuntime.waitingForDisconnect', {}); exitRetained = true; }
+  // Retain before the first notification: any statement may pump the inspector
+  // (a debugger hook does), and a detach handled then must see the retention.
+  for (let i = 0; i < list.length; i++) if (list[i].notifyDisconnect) exitRetained = true;
   if (!exitRetained) contextsDestroyed();
+  else for (let i = 0; i < list.length; i++) if (list[i].notifyDisconnect) list[i].emit('NodeRuntime.waitingForDisconnect', {});
   // Node's worker Agent::WaitForDisconnect: the thread stays until those sessions detach.
   if (worker) { while (exitRetained) native(4, 10); return; }
   while (url() && remoteSessions()) native(4, 10);
