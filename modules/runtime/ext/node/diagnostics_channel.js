@@ -11,13 +11,7 @@ const { validateFunction } = require('internal/validators');
 function triggerUncaught(error) { process.nextTick(() => { throw error; }); }
 
 // A channel stays reachable while it has subscribers or stores, even if user code drops it.
-class WeakReference {
-  #weak; #strong = null; #count = 0;
-  constructor(value) { this.#weak = new WeakRef(value); }
-  get() { return this.#weak.deref(); }
-  incRef() { if (this.#count++ === 0) this.#strong = this.#weak.deref(); return this.#count; }
-  decRef() { if (--this.#count === 0) this.#strong = null; return this.#count; }
-}
+const { WeakReference } = require('internal/util');
 
 // Can't delete when the reference count reaches 0 as it could increment again.
 // Only GC can be used as a valid time to clean up the channels map.

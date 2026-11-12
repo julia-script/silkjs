@@ -207,7 +207,8 @@ class CloneSerializer extends Serializer {
       this.writeRawBytes(data.bytes);
       return;
     }
-    this._fail(value);
+    // node_messaging.cc: a host object that is neither cloneable nor transferable.
+    throw cloneError('Cannot clone object of unsupported type.');
   }
 }
 CloneSerializer.prototype._getDataCloneError = function(message) { return cloneError(message); };

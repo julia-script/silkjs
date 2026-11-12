@@ -132,7 +132,7 @@ async function snapshots(root) {
     assert.equal(v8.stopCoverage(), undefined);
     assert.throws(() => v8.setFlagsFromString('--expose-gc'), { code: 'ERR_NOT_SUPPORTED' });
     assert.throws(() => v8.startupSnapshot.addSerializeCallback(() => {}), { code: 'ERR_NOT_BUILDING_SNAPSHOT' });
-    assert.equal(v8.startupSnapshot.isBuildingSnapshot(), false);
+    assert.equal(v8.startupSnapshot.isBuildingSnapshot(), 0);
   }
 }
 async function promises(root) {

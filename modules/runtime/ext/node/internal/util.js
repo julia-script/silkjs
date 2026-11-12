@@ -54,6 +54,7 @@ const {
   SafeMap,
   SafeSet,
   SafeWeakMap,
+  SafeWeakRef,
   SymbolPrototypeGetDescription,
   StringPrototypeReplace,
   StringPrototypeToLowerCase,
@@ -586,6 +587,39 @@ function setupCoverageHooks(dir) {
   return coverageDirectory;
 }
 
+class WeakReference {
+  #weak = null;
+  // eslint-disable-next-line no-unused-private-class-members
+  #strong = null;
+  #refCount = 0;
+  constructor(object) {
+    this.#weak = new SafeWeakRef(object);
+  }
+
+  incRef() {
+    this.#refCount++;
+    if (this.#refCount === 1) {
+      const derefed = this.#weak.deref();
+      if (derefed !== undefined) {
+        this.#strong = derefed;
+      }
+    }
+    return this.#refCount;
+  }
+
+  decRef() {
+    this.#refCount--;
+    if (this.#refCount === 0) {
+      this.#strong = null;
+    }
+    return this.#refCount;
+  }
+
+  get() {
+    return this.#weak.deref();
+  }
+}
+
 let validateUint32;
 // Node keeps convertToValidSignal here; the runtime's lives with the validators that
 // child_process already loads.
@@ -603,6 +637,7 @@ function sleep(msec) {
 }
 
 module.exports = {
+  WeakReference,
   assertCrypto,
   sleep,
   assignFunctionName,
