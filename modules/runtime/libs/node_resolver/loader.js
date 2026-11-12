@@ -1425,8 +1425,27 @@ function createLoader(host, builtins) {
     return error('ERR_REQUIRE_CYCLE_MODULE', `Cannot require() ES Module ${filesystemName(filename)} in a cycle.${from}`);
   }
 
-  function asyncModuleError(filename, parent) {
-    return error('ERR_REQUIRE_ASYNC_MODULE', filesystemName(filename), parent, undefined);
+  // Node's throwIfAsyncGraph: under --experimental-print-required-tla the error lists
+  // the graph's top-level awaits, which the engine found as it parsed them.
+  function asyncModuleError(filename, parent, cause) {
+    const locations = [];
+    const sites = cause?.topLevelAwaits;
+    if (sites !== undefined && require('internal/options').getOptionValue('--experimental-print-required-tla')) {
+      const lines = new Map();
+      for (let index = 0; index < sites.length; index++) {
+        const { 0: name, 1: line, 2: column } = sites[index];
+        const url = asURL(keyName(name));
+        if (!lines.has(url)) {
+          let source;
+          try { source = text(filesystemName(url)).split(/\r?\n/); } catch { source = null; }
+          lines.set(url, source);
+        }
+        const source = lines.get(url);
+        if (source === null) continue;
+        locations[locations.length] = { __proto__: null, url, line, column, sourceLine: source[line - 1] };
+      }
+    }
+    return error('ERR_REQUIRE_ASYNC_MODULE', filesystemName(filename), parent, locations);
   }
 
   // Node's hint for a CommonJS global used in an ES module.
@@ -1559,7 +1578,7 @@ function createLoader(host, builtins) {
     requiringESM++;
     try { namespace = host.requireModule(filename); }
     catch (cause) {
-      if (cause !== null && typeof cause === 'object' && cause.code === 'ERR_REQUIRE_ASYNC_MODULE') throw asyncModuleError(filename, module[kModuleParent]);
+      if (cause !== null && typeof cause === 'object' && cause.code === 'ERR_REQUIRE_ASYNC_MODULE') throw asyncModuleError(filename, module[kModuleParent], cause);
       if (cause !== null && typeof cause === 'object' && cause.code === 'ERR_REQUIRE_CYCLE_MODULE' && !importCycles.has(cause)) {
         // The engine names a request whose module an enclosing import still evaluates.
         if (typeof cause.specifier !== 'string') throw cycleError(filename, module[kModuleParent]);
