@@ -1123,6 +1123,7 @@ function createLoader(host, builtins) {
         owner: this, scriptId: metadata?.scriptId, sourceURL: metadata?.sourceURL ?? null, sourceMapURL: metadata?.sourceMapURL ?? null,
       });
       if (this === main && host.inspectorEntry) host.inspectorEntry(wrapper);
+      if (this === main) host.clearRegExpStatics();
       return wrapper.call(this.exports, this.exports, makeRequire(filename, this, moduleAsyncModes.get(this) === true), this, filename, path.dirname(filename));
     }
     load(filename) {
@@ -1465,8 +1466,9 @@ function createLoader(host, builtins) {
   // Node's ModuleWrap compile failure (AppendExceptionLine): a module that did
   // not parse reports the line of the bad token in its own file, by URL.
   function moduleSyntaxArrow(cause) {
-    if (!(cause instanceof SyntaxError) || typeof cause.fileName !== 'string' || host.errorArrows.has(cause)) return;
-    const url = asURL(cause.fileName);
+    const fileName = cause instanceof SyntaxError ? cause[host.syntaxOrigin.file] : undefined;
+    if (typeof fileName !== 'string' || host.errorArrows.has(cause)) return;
+    const url = asURL(fileName);
     if (!url.startsWith('file:')) return;
     let source;
     try { source = text(filesystemName(url)); } catch (_) { return; }

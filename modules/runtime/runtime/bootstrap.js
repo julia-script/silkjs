@@ -389,20 +389,41 @@ host.privateSymbols = {
   arrow_message_private_symbol: native.privateSymbol('node:arrowMessage'),
   decorated_private_symbol: native.privateSymbol('node:decorated'),
 };
+// Where the engine puts a SyntaxError's origin. V8 keeps it in the message, so the
+// error itself has only its stack and message as own properties.
+const syntaxOrigin = host.syntaxOrigin = {
+  __proto__: null,
+  file: native.privateSymbol('node:syntaxFile'),
+  line: native.privateSymbol('node:syntaxLine'),
+  column: native.privateSymbol('node:syntaxColumn'),
+};
+native.workerNative('syntaxOriginKeys', [syntaxOrigin.file, syntaxOrigin.line, syntaxOrigin.column]);
+// V8 starts a context with empty RegExp statics (RegExp.$1, lastMatch...), and
+// Node's startup leaves them so. The runtime's own startup runs regexps in the
+// user's realm, so the user's code starts from the empty match V8 starts from.
+const regExpExec = RegExp.prototype.exec;
+const emptyPattern = /(?:)/;
+host.clearRegExpStatics = () => { Reflect.apply(regExpExec, emptyPattern, ['']); };
+// The carets under a SyntaxError's site, from column (0-based) of text: V8 underlines
+// the token a message names ("Unexpected identifier 'line'"), else one character.
+const namedToken = /^Unexpected (?:identifier|token|reserved word|strict mode reserved word) '(.+)'$/;
+host.syntaxUnderline = (message, text, column) => {
+  const token = Reflect.apply(regExpExec, namedToken, [String(message)])?.[1];
+  const width = token !== undefined && stringStartsWith(text, token, column) ? token.length : 1;
+  let underline = '';
+  for (let index = 0; index < width; index++) underline += '^';
+  return underline;
+};
 host.attachArrow = (error, scriptName, source, prefix) => {
-  if (!(error instanceof SyntaxError) || host.errorArrows.has(error) || !Number.isInteger(error.lineNumber)) return;
-  const line = error.lineNumber;
+  if (!(error instanceof SyntaxError) || host.errorArrows.has(error) || !Number.isInteger(error[syntaxOrigin.line])) return;
+  const line = error[syntaxOrigin.line];
   const text = String(source).split(/\r\n|[\n\r\u2028\u2029]/)[line - 1];
   if (text === undefined) return;
-  const column = error.columnNumber - 1 - (line === 1 ? prefix : 0);
+  const column = error[syntaxOrigin.column] - 1 - (line === 1 ? prefix : 0);
   let caret = '';
   if (column >= 0 && column < text.length) {
     for (let index = 0; index < column; index++) caret += text[index] === '\t' ? '\t' : ' ';
-    // V8 underlines the token a message names ("Unexpected identifier 'line'").
-    const token = /^Unexpected (?:identifier|token|reserved word|strict mode reserved word) '(.+)'$/.exec(error.message)?.[1];
-    const width = token !== undefined && stringStartsWith(text, token, column) ? token.length : 1;
-    for (let index = 0; index < width; index++) caret += '^';
-    caret += '\n';
+    caret += host.syntaxUnderline(error.message, text, column) + '\n';
   }
   const arrow = scriptName + ':' + line + '\n' + text + '\n' + caret;
   host.errorArrows.set(error, arrow);
@@ -1018,6 +1039,7 @@ function evaluateMain(source, name) {
   // Node's ModuleJob.run hint for a CommonJS global (an --eval module has no load step
   // that would add it).
   let result;
+  host.clearRegExpStatics();
   try { result = native.evaluateModule(source, name, true); }
   catch (cause) { throw loader.decorateModuleError(cause, name); }
   // As loader.runMain does for a file entry.
@@ -1116,6 +1138,8 @@ function runtimeFlag(arg) {
   // mainStackBytes). A Worker keeps its resourceLimits stack, as in Node.
   const stackSize = /^--stack[-_]size=(\d+)$/.exec(arg);
   if (stackSize) { native.workerNative('setStackSize', [Number(stackSize[1])]); return true; }
+  // V8's --use-strict: every script, eval and Function body compiled from here on is strict code.
+  if (arg === '--use-strict' || arg === '--no-use-strict') { native.workerNative('useStrict', [arg === '--use-strict']); return true; }
   // V8 with these flags and no embedder callback, as in Node, installs no
   // SharedArrayBuffer global (runPreloads removes it before user code).
   if (arg === '--enable-sharedarraybuffer-per-context' || arg === '--no-harmony-sharedarraybuffer' ||
@@ -1373,9 +1397,11 @@ function runWorker() {
 }
 function startRepl() {
   console.log('Welcome to SilkJS Runtime.\nType ".help" for more information.');
-  return internalRequire('internal/repl').createInternalRepl(process.env, {
+  const repl = internalRequire('internal/repl').createInternalRepl(process.env, {
     input: process.stdin, output: process.stdout, terminal: !!process.stdout.isTTY, preview: !!process.stdout.isTTY,
   }, error => { if (error) console.error('REPL history:', error.message); });
+  host.clearRegExpStatics();
+  return repl;
 }
 function installCommonJSInputGlobals(filename, id) {
   // Node's createModule (lib/internal/process/execution.js): lookup paths from the cwd.

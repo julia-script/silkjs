@@ -5,9 +5,10 @@
 const asyncHooks = require('async_hooks');
 const { _newAsyncId, executionAsyncId } = asyncHooks;
 
+// internalBinding('symbols'), with Node's descriptions (env_properties.h).
 const symbols = {
-  async_id_symbol: Symbol('asyncId'),
-  trigger_async_id_symbol: Symbol('triggerAsyncId'),
+  async_id_symbol: Symbol('async_id_symbol'),
+  trigger_async_id_symbol: Symbol('trigger_async_id_symbol'),
   owner_symbol: Symbol('owner_symbol'),
   // Where a resource keeps its AsyncLocalStorage stores with --no-async-context-frame.
   async_local_storage_context_symbol: Symbol('kAsyncLocalStorageContext'),
