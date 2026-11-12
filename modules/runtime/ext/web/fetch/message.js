@@ -53,6 +53,66 @@ function copyRequestRecord(record) {
 }
 function signalGetter() { return this.followed ??= followSignal(this.signalSource); }
 function lazySignal(record) { Object.defineProperty(record, 'signal', { get: signalGetter, enumerable: true, configurable: true }); }
+// The record of `new Request(input, init)`.
+function requestRecord(input, init) {
+  init = dictionary(init);
+  const original = readRequest(input) ?? null;
+  let url;
+  try { url = new URL(original ? original.url : scalar(input)); }
+  catch (cause) { throw new TypeError('Failed to parse URL from ' + String(input), { cause }); }
+  if (url.username || url.password) throw new TypeError('Request cannot be constructed from a URL that includes credentials');
+  let method = init.method === undefined ? original?.method || 'GET' : byteString(init.method);
+  if (!token.test(method)) throw new TypeError('Invalid HTTP method');
+  const upper = method.toUpperCase();
+  if (['CONNECT', 'TRACE', 'TRACK'].includes(upper)) throw new TypeError('Forbidden HTTP method: ' + method);
+  if (normalizedMethods.has(upper)) method = upper;
+  const dispatcher = init.dispatcher;
+  const record = {
+    url: url.href, method,
+    dispatcher: dispatcher === undefined ? original?.dispatcher : dispatcher,
+    headers: new Headers(init.headers === undefined ? original?.headers : init.headers),
+    mode: init.mode === undefined ? original?.mode || 'cors' : choice(init.mode, ['cors', 'no-cors', 'same-origin', 'navigate'], 'mode'),
+    credentials: init.credentials === undefined ? original?.credentials || 'same-origin' : choice(init.credentials, ['omit', 'same-origin', 'include'], 'credentials'),
+    cache: init.cache === undefined ? original?.cache || 'default' : choice(init.cache, ['default', 'no-store', 'reload', 'no-cache', 'force-cache', 'only-if-cached'], 'cache'),
+    redirect: init.redirect === undefined ? original?.redirect || 'follow' : choice(init.redirect, ['follow', 'error', 'manual'], 'redirect'),
+    referrer: original?.referrer ?? 'about:client',
+    referrerPolicy: init.referrerPolicy === undefined ? original?.referrerPolicy || '' : choice(init.referrerPolicy, ['', 'no-referrer', 'no-referrer-when-downgrade', 'same-origin', 'origin', 'strict-origin', 'origin-when-cross-origin', 'strict-origin-when-cross-origin', 'unsafe-url'], 'referrerPolicy'),
+    integrity: init.integrity === undefined ? original?.integrity || '' : scalar(init.integrity),
+    keepalive: init.keepalive === undefined ? original?.keepalive || false : Boolean(init.keepalive),
+    // An AbortController per request costs more than the rest of the request: the
+    // request's signal follows its source from the first time someone reads it.
+    signalSource: init.signal === undefined ? original?.signal : init.signal,
+    followed: null,
+    body: null,
+  };
+  lazySignal(record);
+  if (record.signalSource != null && !(record.signalSource instanceof AbortSignal)) throw new TypeError('signal must be an AbortSignal');
+  if (record.mode === 'navigate') throw new TypeError('Request constructor: invalid request mode navigate');
+  if (record.mode === 'no-cors' && !['GET', 'HEAD', 'POST'].includes(method)) throw new TypeError('Method is unsupported in no-cors mode');
+  if (record.cache === 'only-if-cached' && record.mode !== 'same-origin') throw new TypeError('only-if-cached requires same-origin mode');
+  if (init.referrer !== undefined) {
+    const referrer = scalar(init.referrer);
+    if (referrer === '' || referrer === 'about:client') record.referrer = referrer;
+    else {
+      let parsed; try { parsed = new URL(referrer); } catch { throw new TypeError('Invalid referrer URL'); }
+      parsed.username = ''; parsed.password = ''; parsed.hash = ''; record.referrer = parsed.href;
+    }
+  }
+  if (init.duplex !== undefined) choice(init.duplex, ['half'], 'duplex');
+  const suppliedBody = init.body !== undefined && init.body !== null;
+  if ((suppliedBody || original?.body) && (method === 'GET' || method === 'HEAD')) throw new TypeError('Request with GET/HEAD method cannot have body');
+  if (suppliedBody) {
+    record.body = body.extract(init.body, record.keepalive);
+    if (record.body.streaming && init.duplex === undefined) throw new TypeError('RequestInit: duplex option is required when sending a body');
+    if (record.body.streaming && !['same-origin', 'cors'].includes(record.mode)) throw new TypeError('Streaming request requires cors or same-origin mode');
+  } else if (original?.body) {
+    if (original.body.streaming && record.keepalive) throw new TypeError('keepalive cannot be used with a streaming body');
+    if (original.body.streaming && !['same-origin', 'cors'].includes(record.mode)) throw new TypeError('Streaming request requires cors or same-origin mode');
+    record.body = body.transfer(original.body);
+  }
+  if (record.body?.type && !record.headers.has('content-type')) record.headers.set('content-type', record.body.type);
+  return record;
+}
 class Request {
   #state;
   static {
@@ -63,65 +123,10 @@ class Request {
     };
   }
   constructor(input, init = {}) {
+    // The fast path first: a function with no locals of its own costs less to enter.
     if (input === internal) { this.#state = init; return; }
     if (!arguments.length) throw new TypeError('Request requires an argument');
-    init = dictionary(init);
-    const original = readRequest(input) ?? null;
-    let url;
-    try { url = new URL(original ? original.url : scalar(input)); }
-    catch (cause) { throw new TypeError('Failed to parse URL from ' + String(input), { cause }); }
-    if (url.username || url.password) throw new TypeError('Request cannot be constructed from a URL that includes credentials');
-    let method = init.method === undefined ? original?.method || 'GET' : byteString(init.method);
-    if (!token.test(method)) throw new TypeError('Invalid HTTP method');
-    const upper = method.toUpperCase();
-    if (['CONNECT', 'TRACE', 'TRACK'].includes(upper)) throw new TypeError('Forbidden HTTP method: ' + method);
-    if (normalizedMethods.has(upper)) method = upper;
-    const dispatcher = init.dispatcher;
-    const record = {
-      url: url.href, method,
-      dispatcher: dispatcher === undefined ? original?.dispatcher : dispatcher,
-      headers: new Headers(init.headers === undefined ? original?.headers : init.headers),
-      mode: init.mode === undefined ? original?.mode || 'cors' : choice(init.mode, ['cors', 'no-cors', 'same-origin', 'navigate'], 'mode'),
-      credentials: init.credentials === undefined ? original?.credentials || 'same-origin' : choice(init.credentials, ['omit', 'same-origin', 'include'], 'credentials'),
-      cache: init.cache === undefined ? original?.cache || 'default' : choice(init.cache, ['default', 'no-store', 'reload', 'no-cache', 'force-cache', 'only-if-cached'], 'cache'),
-      redirect: init.redirect === undefined ? original?.redirect || 'follow' : choice(init.redirect, ['follow', 'error', 'manual'], 'redirect'),
-      referrer: original?.referrer ?? 'about:client',
-      referrerPolicy: init.referrerPolicy === undefined ? original?.referrerPolicy || '' : choice(init.referrerPolicy, ['', 'no-referrer', 'no-referrer-when-downgrade', 'same-origin', 'origin', 'strict-origin', 'origin-when-cross-origin', 'strict-origin-when-cross-origin', 'unsafe-url'], 'referrerPolicy'),
-      integrity: init.integrity === undefined ? original?.integrity || '' : scalar(init.integrity),
-      keepalive: init.keepalive === undefined ? original?.keepalive || false : Boolean(init.keepalive),
-      // An AbortController per request costs more than the rest of the request: the
-      // request's signal follows its source from the first time someone reads it.
-      signalSource: init.signal === undefined ? original?.signal : init.signal,
-      followed: null,
-      body: null,
-    };
-    lazySignal(record);
-    if (record.signalSource != null && !(record.signalSource instanceof AbortSignal)) throw new TypeError('signal must be an AbortSignal');
-    if (record.mode === 'navigate') throw new TypeError('Request constructor: invalid request mode navigate');
-    if (record.mode === 'no-cors' && !['GET', 'HEAD', 'POST'].includes(method)) throw new TypeError('Method is unsupported in no-cors mode');
-    if (record.cache === 'only-if-cached' && record.mode !== 'same-origin') throw new TypeError('only-if-cached requires same-origin mode');
-    if (init.referrer !== undefined) {
-      const referrer = scalar(init.referrer);
-      if (referrer === '' || referrer === 'about:client') record.referrer = referrer;
-      else {
-        let parsed; try { parsed = new URL(referrer); } catch { throw new TypeError('Invalid referrer URL'); }
-        parsed.username = ''; parsed.password = ''; parsed.hash = ''; record.referrer = parsed.href;
-      }
-    }
-    if (init.duplex !== undefined) choice(init.duplex, ['half'], 'duplex');
-    const suppliedBody = init.body !== undefined && init.body !== null;
-    if ((suppliedBody || original?.body) && (method === 'GET' || method === 'HEAD')) throw new TypeError('Request with GET/HEAD method cannot have body');
-    if (suppliedBody) {
-      record.body = body.extract(init.body, record.keepalive);
-      if (record.body.streaming && init.duplex === undefined) throw new TypeError('RequestInit: duplex option is required when sending a body');
-      if (record.body.streaming && !['same-origin', 'cors'].includes(record.mode)) throw new TypeError('Streaming request requires cors or same-origin mode');
-    } else if (original?.body) {
-      if (original.body.streaming && record.keepalive) throw new TypeError('keepalive cannot be used with a streaming body');
-      if (original.body.streaming && !['same-origin', 'cors'].includes(record.mode)) throw new TypeError('Streaming request requires cors or same-origin mode');
-      record.body = body.transfer(original.body);
-    }
-    if (record.body?.type && !record.headers.has('content-type')) record.headers.set('content-type', record.body.type);
-    this.#state = record;
+    this.#state = requestRecord(input, init);
   }
   clone() {
     const record = requestState(this);
@@ -167,6 +172,28 @@ class ResponseRecord {
 // What most responses share; a response that differs gets its own field.
 Object.assign(ResponseRecord.prototype, { type: 'default', url: '', redirected: false, immutable: false });
 
+// The record of `new Response(value, init)`.
+function responseRecord(value, init) {
+  let status = 200, statusText = '', headers = null;
+  if (init !== undefined) {
+    init = dictionary(init);
+    if (init.status !== undefined) {
+      const number = +init.status;
+      status = Number.isFinite(number) ? ((Math.trunc(number) % 65536) + 65536) % 65536 : 0;
+      if (status < 200 || status > 599) throw new RangeError('Response status must be in the range 200 to 599');
+    }
+    if (init.statusText !== undefined) {
+      statusText = byteString(init.statusText);
+      if (/[^\t\x20-\x7e\x80-\xff]/.test(statusText)) throw new TypeError('Invalid statusText');
+    }
+    if (init.headers !== undefined) headers = new Headers(init.headers);
+  }
+  const payload = typeof value === 'string' ? textBody(value) : body.extract(value);
+  if (payload !== null && status !== 200 && nullBodyStatus.has(status)) throw new TypeError('Invalid response status code for a body: ' + status);
+  const type = payload === null ? null : payload.type;
+  if (type && headers !== null && !headers.has('content-type')) headers.set('content-type', type);
+  return new ResponseRecord(status, statusText, headers, payload, headers === null && type ? type : null);
+}
 class Response {
   #state;
   static {
@@ -186,27 +213,10 @@ class Response {
     };
   }
   constructor(value = null, init = undefined) {
+    // The fast paths first: a function with no locals of its own costs less to enter.
     if (typeof value === 'string' && init === undefined) { this.#state = value; return; }
     if (value === internal) { this.#state = init; return; }
-    let status = 200, statusText = '', headers = null;
-    if (init !== undefined) {
-      init = dictionary(init);
-      if (init.status !== undefined) {
-        const number = +init.status;
-        status = Number.isFinite(number) ? ((Math.trunc(number) % 65536) + 65536) % 65536 : 0;
-        if (status < 200 || status > 599) throw new RangeError('Response status must be in the range 200 to 599');
-      }
-      if (init.statusText !== undefined) {
-        statusText = byteString(init.statusText);
-        if (/[^\t\x20-\x7e\x80-\xff]/.test(statusText)) throw new TypeError('Invalid statusText');
-      }
-      if (init.headers !== undefined) headers = new Headers(init.headers);
-    }
-    const payload = typeof value === 'string' ? textBody(value) : body.extract(value);
-    if (payload !== null && status !== 200 && nullBodyStatus.has(status)) throw new TypeError('Invalid response status code for a body: ' + status);
-    const type = payload === null ? null : payload.type;
-    if (type && headers !== null && !headers.has('content-type')) headers.set('content-type', type);
-    this.#state = new ResponseRecord(status, statusText, headers, payload, headers === null && type ? type : null);
+    this.#state = responseRecord(value, init);
   }
   clone() {
     const record = responseState(this), headers = new Headers(record.headers);
@@ -279,4 +289,4 @@ function serverRequest(fields, authority, bytes) {
 }
 body.readStates(value => readRequest(value) ?? readResponse(value));
 body.installBody(Request.prototype); body.installBody(Response.prototype);
-module.exports = { Request, Response, copyRequestRecord, readResponse, takeResponseText, requestState, responseState, makeResponse, serverRequest, nullBodyStatus, redirectStatus };
+module.exports = { Request, Response, internal, copyRequestRecord, readResponse, takeResponseText, requestState, responseState, makeResponse, serverRequest, nullBodyStatus, redirectStatus };
