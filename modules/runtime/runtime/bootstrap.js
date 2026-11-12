@@ -330,6 +330,11 @@ host.diagnostics = {
     const channels = dc.tracingChannel(name);
     return channels.hasSubscribers ? channels : undefined;
   },
+  // Node's SetChannelStatusCallback: native publishers that must switch work on and off with
+  // a channel's subscribers (SQLite tracing) watch it; diagnostics_channel calls status().
+  watchers: new Map(),
+  watch(name, callback) { this.watchers.set(name, callback); },
+  status(name, active) { const callback = this.watchers.get(name); if (callback !== undefined) callback(active); },
 };
 host.nextTick = function nextTick(callback, ...args) {
   if (typeof callback !== 'function') throw new (internalRequire('internal/errors').codes.ERR_INVALID_ARG_TYPE)('callback', 'function', callback);
@@ -857,6 +862,7 @@ const prefixOnlyBuiltinHas = Set.prototype.has.bind(new Set(['test', 'test/repor
 const defineBuiltinName = Object.defineProperty;
 function publicBuiltin(name) {
   if (!publicBuiltinHas(name)) return host.exposeInternals === true && exposedInternal(name);
+  if (name === 'sqlite') return host.sqliteDisabled !== true;
   return (name !== 'stream/iter' && name !== 'zlib/iter') || host.experimentalStreamIter === true;
 }
 // With --expose-internals, Node's internal/* modules load like public ones
@@ -953,15 +959,28 @@ function evaluateMain(source, name) {
   return result instanceof Promise ? promiseThen(result, undefined, cause => { throw loader.decorateModuleError(cause, name); }) : result;
 }
 const requirePreloads = [], importPreloads = [], loaderPreloads = [];
+// The main context has no importModuleDynamically: an import() with no referrer
+// script (an indirect eval run by a job, say) reports the missing callback, as in Node.
+function missingImportCallback() {
+  const { ERR_VM_DYNAMIC_IMPORT_CALLBACK_MISSING } = internalRequire('internal/errors').codes;
+  return promiseReject(new ERR_VM_DYNAMIC_IMPORT_CALLBACK_MISSING());
+}
 function runPreloads(entry, loadImports = true, loadRequires = true) {
   if (host.configFile) process.emitWarning('--experimental-config-file is an experimental feature and might change at any time', 'ExperimentalWarning');
   // Before any preload: Node applies it when the context is made.
+  native.vmSetImportModuleDynamically(undefined, missingImportCallback, true);
   if (host.disableProto !== undefined) disableProto(globalThis);
   if (host.disallowCodeGeneration) native.vmSetCodeGeneration(undefined, false);
   if (host.jitless) delete globalThis.WebAssembly;
   if (host.experimentalShadowRealm) internalRequire('internal/shadow_realm').enable();
   // --experimental-loader: each one is module.register(specifier, cwd) before any preload.
   if (loadImports && loaderPreloads.length) {
+    // createModuleLoader's warning, with the --import that does the same.
+    const readable = text => encodeURIComponent(text).replace(/'/g, '%27').replace(/%22/g, '"').replace(/%2F/ig, '/');
+    process.emitWarning('`--experimental-loader` may be removed in the future; instead use `register()`:\n' +
+      `--import 'data:text/javascript,import { register } from "node:module"; import { pathToFileURL } from "node:url"; ${
+        loaderPreloads.map(specifier => `register(${readable(JSON.stringify(specifier))}, pathToFileURL("./"))`).join('; ')};'`,
+      'ExperimentalWarning');
     const base = internalRequire('url').pathToFileURL(host.cwd() + host.path.sep).href;
     for (const specifier of loaderPreloads) loader.Module.register(specifier, base);
   }
@@ -1036,6 +1055,11 @@ function runtimeFlag(arg) {
     return true;
   }
   if (arg === '--disable-sigusr1') { host.disableSigusr1 = true; return true; }
+  if (arg.startsWith('--trace-require-module=')) {
+    const mode = arg.slice('--trace-require-module='.length);
+    if (mode !== 'all' && mode !== 'no-node-modules') { cliError('invalid value for --trace-require-module'); return true; }
+    host.traceRequireModule = mode; return true;
+  }
   if (arg === '--trace-events-enabled') { (host.traceOptions ||= {}).enabled = true; return true; }
   if (arg.startsWith('--trace-event-categories=')) { (host.traceOptions ||= {}).categories = arg.slice(25); return true; }
   if (arg.startsWith('--trace-event-file-pattern=')) { (host.traceOptions ||= {}).filePattern = arg.slice(27); return true; }
@@ -1057,6 +1081,12 @@ function runtimeFlag(arg) {
   // Read before the bootstrap runs (worker.silk snapshotWanted): without a snapshot the
   // start skips the heap image and runs the bootstrap itself.
   if (arg === '--node-snapshot' || arg === '--no-node-snapshot') return true;
+  // V8's optimizing tiers (Sparkplug, Maglev, Turbofan) and their switches. The engine
+  // is an interpreter with no compiler tiers, so turning one on or off changes nothing,
+  // as these V8 flags change nothing under --jitless. Spellings as V8 parses them:
+  // --no-x, --nox, and _ for -. --minor-ms picks V8's non-moving young collector;
+  // the engine's young collections never move cells, so it changes nothing either.
+  if (/^--(no-?)?(maglev|turbofan|sparkplug|opt|concurrent[-_]recompilation|always[-_]osr|use[-_]osr|minor[-_]ms)$/.test(arg)) return true;
   // Node maps its code to large pages on request; this binary does not, which Node
   // reports as its ENOTSUP result (src/large_pages/node_large_page.cc).
   if (arg.startsWith('--use-largepages=')) {
@@ -1080,6 +1110,10 @@ function runtimeFlag(arg) {
   if (arg === '--zero-fill-buffers') { host.zeroFillBuffers = true; return true; }
   if (arg === '--experimental-webstorage' || arg === '--no-experimental-webstorage') {
     host.experimentalWebStorage = arg === '--experimental-webstorage'; return true;
+  }
+  // node:sqlite is on by default; --no-experimental-sqlite takes it out of the builtins.
+  if (arg === '--experimental-sqlite' || arg === '--no-experimental-sqlite') {
+    host.sqliteDisabled = arg === '--no-experimental-sqlite'; return true;
   }
   if (arg === '--experimental-stream-iter' || arg === '--no-experimental-stream-iter') {
     host.experimentalStreamIter = arg === '--experimental-stream-iter'; return true;
@@ -1147,12 +1181,23 @@ function installRuntimeOptions(args, entrypoints = [], preloadEntrypoints = true
   if (host.exposeGC) {
     // A collection gc() asks for is a forced one to 'gc' performance entries.
     const collect = rawStd.gc;
-    const gc = function gc() {
+    // V8's gc(options): type 'minor' collects only the young generation, and
+    // execution 'async' collects in a later task and returns a promise for it.
+    const run = young => {
       const observer = host.gcObserver;
-      if (observer === undefined) return Reflect.apply(collect, undefined, arguments);
-      observer(false);
-      try { return Reflect.apply(collect, undefined, arguments); }
-      finally { observer(true); }
+      if (observer !== undefined) observer(false);
+      try { if (young) host.collectGarbage(true); else collect(); }
+      finally { if (host.gcObserver !== undefined) host.gcObserver(true); }
+    };
+    const gc = function gc(options) {
+      let young = false;
+      let async = false;
+      if (options !== null && typeof options === 'object') {
+        young = options.type === 'minor';
+        async = options.execution === 'async';
+      }
+      if (!async) return run(young);
+      return new Promise(resolve => setImmediate(() => { run(young); resolve(); }));
     };
     Object.defineProperty(globalThis, 'gc', { value: gc, writable: true, enumerable: true });
   }

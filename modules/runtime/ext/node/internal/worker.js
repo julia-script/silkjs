@@ -142,16 +142,16 @@ function handleControl(worker, message) {
   }
   require('assert').fail(`Unknown worker message type ${message.type}`);
 }
-function unsupported(api) {
-  return clone().codedError('ERR_NOT_SUPPORTED', `${api} is not supported by SilkJS: the engine has no V8 heap generations or code range`, Error);
-}
 function resourceLimits(options) {
   const limits = { stackSizeMb: 4 };
   if (options === null || typeof options !== 'object') return limits;
-  // SilkJS has neither generations nor a JIT code range. A whole-runtime
-  // allocator budget is not a faithful implementation of any of these options.
-  for (const key of ['maxOldGenerationSizeMb', 'maxYoungGenerationSizeMb', 'codeRangeSizeMb']) {
-    if (typeof options[key] === 'number') throw unsupported(`Worker resourceLimits.${key}`);
+  // As Node's parseResourceLimits: each limit is read once, in this order, and only
+  // numbers count. maxOldGenerationSizeMb is the worker's heap budget, the young
+  // generation bounds the growth between collections, and codeRangeSizeMb is kept
+  // for the API only: the engine compiles no machine code.
+  for (const key of ['maxYoungGenerationSizeMb', 'maxOldGenerationSizeMb', 'codeRangeSizeMb']) {
+    const value = options[key];
+    if (typeof value === 'number') limits[key] = value;
   }
   const stack = options.stackSizeMb;
   if (typeof stack === 'number' && stack > 0) {
@@ -160,6 +160,10 @@ function resourceLimits(options) {
     limits.stackSizeMb = Math.max(0.1875, stack);
   }
   return limits;
+}
+// A limit in bytes for the native worker, or undefined for none (a negative or NaN limit).
+function limitBytes(megabytes) {
+  return typeof megabytes === 'number' && megabytes >= 0 ? Math.floor(Math.min(megabytes * 1048576, Number.MAX_SAFE_INTEGER)) : undefined;
 }
 function optionString(value) {
   if (typeof value === 'symbol') throw new TypeError('Cannot convert a Symbol value to a string');
@@ -301,7 +305,7 @@ class Worker extends EventEmitter {
       controlChannel.port1.postMessage({ type: messageTypes.LOAD_SCRIPT, cwdCounter: cwdCounter || sharedCwdCounter, workerData: config.options.workerData,
         environmentData: Array.from(environmentData), parentPort: userChannel.port2,
         options: config.metadata }, [userChannel.port2, ...list]);
-      state.id = host.workerNative('startWorker', [JSON.stringify(config.metadata), ports().id(controlChannel.port2), Math.floor(config.metadata.resourceLimits.stackSizeMb * 1048576), config.metadata.name]);
+      state.id = host.workerNative('startWorker', [JSON.stringify(config.metadata), ports().id(controlChannel.port2), Math.floor(config.metadata.resourceLimits.stackSizeMb * 1048576), config.metadata.name, limitBytes(config.metadata.resourceLimits.maxOldGenerationSizeMb), limitBytes(config.metadata.resourceLimits.maxYoungGenerationSizeMb)]);
       // Native ownership of this endpoint moved into the new isolate.
       clone().commit({ moved: [controlChannel.port2] });
       workers.set(state.id, this);
@@ -409,7 +413,10 @@ function poll() {
       state.stdin?.destroy();
       state.resolveTermination?.(event.code);
       try {
-        if (event.initFailed && !state.errorReceived) state.resource.runInAsyncScope(worker.emit, worker, 'error',
+        // As Node's OnThreadStopped: a worker that ran out of its heap budget reports that.
+        if (event.outOfMemory) state.resource.runInAsyncScope(worker.emit, worker, 'error',
+          new (nodeErrors().codes.ERR_WORKER_OUT_OF_MEMORY)('JS heap out of memory'));
+        else if (event.initFailed && !state.errorReceived) state.resource.runInAsyncScope(worker.emit, worker, 'error',
           clone().codedError('ERR_WORKER_INIT_FAILED', 'Worker initialization failed before becoming online', Error));
         state.resource.runInAsyncScope(worker.emit, worker, 'exit', event.code);
       }
@@ -560,6 +567,8 @@ function install(proc = process, metadata = bootstrap()) {
 }
 function reportError(error) {
   if (!control) return false;
+  // An error from an exhausted heap budget ends the worker instead (ERR_WORKER_OUT_OF_MEMORY).
+  if (host.workerNative('heapExhausted', [])) return true;
   if (typeof error === 'symbol') {
     controlSend(control, { type: messageTypes.ERROR_MESSAGE, symbol: error.description ?? '' });
     return true;

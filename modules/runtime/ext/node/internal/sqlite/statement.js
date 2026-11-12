@@ -1,5 +1,5 @@
 'use strict';
-const { native, databases, statements, token, finalizers, statement, statementOptions, stateError, error, boolean, bindValue, isBinary, readValue } = require('internal/sqlite/shared');
+const { native, databases, statements, token, finalizers, release, statement, runnable, notInAuthorizer, notStepping, finalized, stateError, error, argValue, invalid, isObject, bindValue, isBinary, readValue } = require('internal/sqlite/shared');
 function reset(s, checked = true) { if (checked) return native('reset', [s.id]); try { native('reset', [s.id]); } catch {} }
 function bind(s, args) {
   s.resetGeneration++;
@@ -7,7 +7,7 @@ function bind(s, args) {
   native('clear', [s.id]);
   const names = s.parameters;
   let first = 0;
-  if (args.length && args[0] !== null && typeof args[0] === 'object' && !isBinary(args[0])) {
+  if (args.length && isObject(args[0]) && !isBinary(args[0])) {
     const named = args[0];
     let bare;
     if (s.options.allowBareNamedParameters) {
@@ -56,11 +56,15 @@ function execution(s, fn) {
   try { return fn(); } finally { s.busy = false; db.executing--; }
 }
 function execute(self, args, mode) {
-  const s = statement(self);
+  const s = runnable(self);
   bind(s, args);
+  return run(s, mode);
+}
+function run(s, mode) {
   return execution(s, () => {
     let resetDone = false;
     try {
+      if (mode === 'iterate') { resetDone = true; return new StatementSyncIterator(token, s.self.deref()); }
       if (mode === 'all') return fetch(s, 0);
       if (mode === 'get') { const rows = fetch(s, 1); return rows.length ? rows[0] : undefined; }
       const code = native('step', [s.id]);
@@ -73,51 +77,87 @@ function execute(self, args, mode) {
 }
 const iteratorStates = new WeakMap();
 const iteratorPrototype = typeof Iterator === 'function' ? Iterator.prototype : Object.getPrototypeOf(Object.getPrototypeOf([][Symbol.iterator]()));
+function doneResult() { return { __proto__: null, done: true, value: null }; }
 class StatementSyncIterator {
-  constructor(secret, stmt) { if (secret !== token) throw error('ERR_ILLEGAL_CONSTRUCTOR', 'Illegal constructor', TypeError); const s = statement(stmt); iteratorStates.set(this, { stmt, generation: s.resetGeneration, done: false }); }
+  constructor(secret, stmt) { if (secret !== token) throw error('ERR_ILLEGAL_CONSTRUCTOR', 'Illegal constructor', TypeError); const s = statements.get(stmt); iteratorStates.set(this, { stmt, generation: s.resetGeneration, done: false }); }
   next() {
     const iterator = iteratorStates.get(this);
     if (!iterator) throw error('ERR_INVALID_THIS', 'Invalid SQLite iterator', TypeError);
-    const s = statement(iterator.stmt, !iterator.done);
-    if (iterator.done) return Object.assign(Object.create(null), { done: true, value: null });
+    const s = statement(iterator.stmt);
+    // A drained iterator touches no SQLite state, so it stays usable from a callback.
+    if (iterator.done) return doneResult();
+    notInAuthorizer(databases.get(s.db));
+    notStepping(s);
     if (s.resetGeneration !== iterator.generation) throw stateError('iterator was invalidated');
     return execution(s, () => {
       const rows = fetch(s, 1);
-      if (rows.length) return Object.assign(Object.create(null), { done: false, value: rows[0] });
+      if (rows.length) return { __proto__: null, done: false, value: rows[0] };
       reset(s, false); iterator.done = true;
-      return Object.assign(Object.create(null), { done: true, value: null });
+      return doneResult();
     });
   }
   return() {
     const iterator = iteratorStates.get(this);
     if (!iterator) throw error('ERR_INVALID_THIS', 'Invalid SQLite iterator', TypeError);
-    const s = statement(iterator.stmt, !iterator.done);
-    if (!iterator.done) execution(s, () => reset(s, false));
+    const s = statement(iterator.stmt);
+    if (!iterator.done) {
+      notInAuthorizer(databases.get(s.db));
+      notStepping(s);
+      execution(s, () => reset(s, false));
+    }
     iterator.done = true;
-    return Object.assign(Object.create(null), { done: true, value: null });
+    return doneResult();
   }
 }
 Object.setPrototypeOf(StatementSyncIterator.prototype, iteratorPrototype);
+function closeStatement(self, s) { release(s.id); s.id = 0; finalizers.unregister(self); }
 class StatementSync {
   constructor(secret, db, id, options) {
     if (secret !== token) throw error('ERR_ILLEGAL_CONSTRUCTOR', 'Illegal constructor', TypeError);
     const owner = databases.get(db);
-    const s = { db, id, generation: owner.generation, statementGeneration: owner.statementGeneration, options: statementOptions(options, owner.options), resetGeneration: 0, busy: false, parameters: native('parameters', [id]) };
+    const s = { db, id, self: new WeakRef(this), generation: owner.generation, statementGeneration: owner.statementGeneration, options, resetGeneration: 0, busy: false, parameters: native('parameters', [id]) };
     statements.set(this, s);
     finalizers.register(this, { id }, this);
   }
   all(...args) { return execute(this, args, 'all'); }
+  iterate(...args) { return execute(this, args, 'iterate'); }
   get(...args) { return execute(this, args, 'get'); }
   run(...args) { return execute(this, args, 'run'); }
-  iterate(...args) { const s = statement(this); bind(s, args); return new StatementSyncIterator(token, this); }
-  columns() { return native('columns', [statement(this).id]).map(([name, column, table, database, type]) => ({ column, database, name, table, type })); }
-  get sourceSQL() { return native('source', [statement(this, false).id]); }
-  get expandedSQL() { return native('expanded', [statement(this, false).id]); }
-  setAllowBareNamedParameters(enabled) { statement(this, false).options.allowBareNamedParameters = boolean(enabled, 'enabled'); }
-  setAllowUnknownNamedParameters(enabled) { statement(this, false).options.allowUnknownNamedParameters = boolean(enabled, 'enabled'); }
-  setReadBigInts(enabled) { statement(this, false).options.readBigInts = boolean(enabled, 'enabled'); }
-  setReturnArrays(enabled) { statement(this, false).options.returnArrays = boolean(enabled, 'enabled'); }
-  close() { const s = statement(this); native('close', [s.id]); s.id = 0; finalizers.unregister(this); }
-  [Symbol.dispose]() { const s = statements.get(this); if (!s) throw error('ERR_INVALID_THIS', 'Invalid StatementSync', TypeError); const db = databases.get(s.db); if (s.id && db.id && db.generation === s.generation && db.statementGeneration === s.statementGeneration) this.close(); }
+  columns() {
+    return native('columns', [statement(this).id]).map(([name, column, table, database, type]) => ({ __proto__: null, column, database, name, table, type }));
+  }
+  get sourceSQL() { return native('source', [statement(this).id]); }
+  get expandedSQL() {
+    const expanded = native('expanded', [statement(this).id]);
+    if (expanded === null) throw Object.assign(new Error('Expanded SQL text would exceed configured limits'), { code: 'ERR_SQLITE_ERROR' });
+    return expanded;
+  }
+  setAllowBareNamedParameters(enabled) { const s = statement(this); if (typeof enabled !== 'boolean') throw invalid('allowBareNamedParameters', 'a boolean'); s.options.allowBareNamedParameters = enabled; }
+  setAllowUnknownNamedParameters(enabled) { const s = statement(this); if (typeof enabled !== 'boolean') throw invalid('enabled', 'a boolean'); s.options.allowUnknownNamedParameters = enabled; }
+  setReadBigInts(readBigInts) { const s = statement(this); if (typeof readBigInts !== 'boolean') throw invalid('readBigInts', 'a boolean'); s.options.readBigInts = readBigInts; }
+  setReturnArrays(returnArrays) { const s = statement(this); if (typeof returnArrays !== 'boolean') throw invalid('returnArrays', 'a boolean'); s.options.returnArrays = returnArrays; }
+  close() { const s = statement(this); notStepping(s); closeStatement(this, s); }
+  // Disposal is idempotent: a finalized statement is a no-op even inside a callback.
+  [Symbol.dispose]() {
+    const s = statements.get(this);
+    if (!s) throw error('ERR_INVALID_THIS', 'Invalid StatementSync', TypeError);
+    if (finalized(s)) return;
+    notStepping(s);
+    closeStatement(this, s);
+  }
 }
-module.exports = { StatementSync };
+function prepared(db, id, options) {
+  try { return new StatementSync(token, db, id, { ...options }); } catch (e) { release(id); throw e; }
+}
+// SQLTagStore::ResetAndBindStatement: every argument binds by position, objects included.
+function tagExecute(stmt, values, mode) {
+  const s = statements.get(stmt);
+  notStepping(s);
+  s.resetGeneration++;
+  reset(s);
+  native('clear', [s.id]);
+  if (s.parameters.length !== values.length) throw argValue('SQLite parameters must be bound using template literal placeholders.');
+  for (let i = 0; i < values.length; i++) bindValue(s.id, i + 1, values[i]);
+  return run(s, mode);
+}
+module.exports = { StatementSync, prepared, tagExecute };
