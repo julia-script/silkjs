@@ -51,6 +51,7 @@ const { addAbortListener } = require('events');
 const fs = require('fs');
 const http = require('http');
 const net = require('net');
+const JSStreamSocket = require('internal/js_stream_socket');
 const { Duplex } = require('stream');
 const tls = require('tls');
 const { setImmediate, setTimeout, clearTimeout } = require('timers');
@@ -1316,6 +1317,9 @@ class Http2Session extends EventEmitter {
 
     socket[kBoundSession] = this;
 
+    if (!socket._handle || !socket._handle.isStreamBase) {
+      socket = new JSStreamSocket(socket);
+    }
     socket.on('error', socketOnError);
     socket.on('close', socketOnClose);
 

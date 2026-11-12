@@ -12,7 +12,12 @@ function site(error, fromPromise) {
   if (!fromPromise) {
     const thrown = host.captureCallSites(-4, error);
     // Its column counts in the script's own text, before any column offset.
-    if (thrown !== undefined) return { name: thrown[0], line: thrown[1], column: thrown[2], text: thrown[3], textColumn: true };
+    // A script without a name (an eval) is V8's "<anonymous_script>" in the message.
+    // A module link error spans its import name, which V8 underlines whole.
+    if (thrown !== undefined) {
+      const name = thrown[0] === '' && typeof thrown[3] === 'string' ? '<anonymous_script>' : thrown[0];
+      return { name, line: thrown[1], column: thrown[2], text: thrown[3], textColumn: true, length: thrown[4] };
+    }
   }
   if (error === null || typeof error !== 'object') return undefined;
   // A script that did not compile: V8's message points at the bad token.
@@ -67,20 +72,24 @@ function arrow(error, fromPromise, scriptName, lineOffset = 0, columnOffset = 0,
   if (!(start >= 0) || start >= text.length) return result;
   let underline = '';
   for (let index = 0; index < start; index++) underline += text[index] === '\t' ? '\t' : ' ';
-  return result + underline + '^\n';
+  const span = where.length > 1 ? Math.min(where.length, text.length - start) : 1;
+  return result + underline + '^'.repeat(span) + '\n';
 }
 function stringOf(value) {
   try { return String(value); } catch { return '<toString() threw exception>'; }
 }
 // fatalExceptionStackEnhancers.afterInspector.
 function inspected(error) {
+  // Node's afterInspector reads the stack first: when that throws there is no trace.
+  let originalStack;
+  try { originalStack = error.stack; } catch { return undefined; }
   const { inspect } = require('util');
   let colors = inspect.defaultOptions.colors;
   try { colors = colors || (process.stderr.isTTY === true && process.stderr.hasColors?.() === true); } catch {}
   try {
     return inspect(error, { colors, customInspect: false, depth: Math.max(inspect.defaultOptions.depth, 5) });
   } catch {
-    try { return error.stack; } catch { return undefined; }
+    return originalStack;
   }
 }
 function format(error, fromPromise) {
@@ -113,6 +122,8 @@ function format(error, fromPromise) {
     const program = require('path').basename(process.argv0 || 'node', '.exe') || 'node';
     text += '(Use `' + program + ' --trace-uncaught ...` to show where the exception was thrown)\n';
   }
+  // --no-extra-info-on-fatal-exception leaves out the version line.
+  if (host.extraInfoOnFatalException === false) return text;
   return text + '\nNode.js ' + process.version + '\n';
 }
 

@@ -24,6 +24,23 @@ let timerDue = -1;
 let timerRefed = false;
 // The idle handle that keeps the loop polling while referenced immediates wait.
 let immediateRefed = false;
+// Environment::SetImmediate's native queue: binding work (an http2 session's
+// scheduled write) that the check phase runs before the JS immediate queue.
+const nativeImmediates = [];
+let nativeRefs = 0;
+host.setNativeImmediate = (callback, ref = true) => {
+  nativeImmediates.push({ callback, ref });
+  if (ref) nativeRefs++;
+};
+function runNativeImmediates() {
+  // Callbacks queued while the queue runs run in the same pass, as RunAndClearNativeImmediates.
+  for (let i = 0; i < nativeImmediates.length; i++) {
+    const { callback, ref } = nativeImmediates[i];
+    if (ref) nativeRefs--;
+    callback();
+  }
+  nativeImmediates.length = 0;
+}
 
 function getLibuvNow() { return Math.floor(host.now()); }
 
@@ -42,11 +59,11 @@ const binding = {
 
 host.timerLoop = {
   // Whether a timer or an immediate keeps the loop alive.
-  hasRef() { return (timerRefed && timerDue !== -1) || immediateRefed; },
+  hasRef() { return (timerRefed && timerDue !== -1) || immediateRefed || nativeRefs !== 0; },
   // Milliseconds the poll may wait for I/O before a phase has work: 0 while
   // referenced immediates wait, the delay to the loop timer, or -1 for none.
   pollDelay() {
-    if (immediateRefed) return 0;
+    if (immediateRefed || nativeImmediates.length !== 0) return 0;
     if (timerDue === -1) return -1;
     return Math.max(0, timerDue - host.now());
   },
@@ -85,12 +102,13 @@ function runTimers() {
 }
 
 function checkImmediate() {
-  // The runtime queues no native immediates; Node traces their (here empty) run first.
+  const ranNative = nativeImmediates.length !== 0;
   if (host.traceEnvironment) {
     const trace = require('internal/trace_events');
-    trace.phase('RunAndClearNativeImmediates', trace.now());
-  }
-  if (immediateInfo[0] === 0) return false;
+    const start = trace.now();
+    try { runNativeImmediates(); } finally { trace.phase('RunAndClearNativeImmediates', start); }
+  } else if (ranNative) runNativeImmediates();
+  if (immediateInfo[0] === 0) return ranNative;
   do processImmediateCallback();
   while (immediateInfo[2] !== 0);
   if (immediateInfo[1] === 0) immediateRefed = false;

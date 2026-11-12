@@ -5,7 +5,7 @@ const host = require('internal/host');
 const { RegExpPrototypeExec } = require('internal/per_context/primordials');
 const { ArrayBufferIsView } = require('internal/streams/iter/primordials');
 const {
-  contexts, error, invalid, contextData, isContext, syntaxDiagnostic, run, writeCache, readCache,
+  contexts, error, invalid, contextData, isContext, syntaxDiagnostic, run, runBegin, runEnd, runFailure, rethrow, writeCache, readCache,
 } = require('internal/vm');
 const scripts = new WeakMap();
 const DONT_CONTEXTIFY = Symbol('vm_context_no_contextify');
@@ -207,7 +207,13 @@ class Script {
   runInThisContext(value) {
     const data = scriptData(this);
     const execution = runOptions(value);
-    return run(data.handle, execution, false, true, execution.displayErrors ? data : undefined);
+    const listeners = runBegin(execution.breakOnSigint, true);
+    let result;
+    // No finally: leaving through one would move the recorded throw site.
+    try { result = host.vmRun(data.handle, execution.timeout, false, execution.breakOnSigint); }
+    catch (cause) { runEnd(listeners); rethrow(cause, runFailure(cause, execution.timeout, execution.displayErrors ? data : undefined)); }
+    runEnd(listeners);
+    return result;
   }
   runInContext(contextifiedObject, value) {
     const data = scriptData(this);
@@ -219,7 +225,13 @@ class Script {
       host.vmSetImportModuleDynamically(handle, data.dynamicImport);
       data.realms.set(contextifiedObject, handle);
     }
-    return run(handle, execution, context.afterEvaluate, true, execution.displayErrors ? data : undefined);
+    const listeners = runBegin(execution.breakOnSigint, true);
+    let result;
+    // No finally: leaving through one would move the recorded throw site.
+    try { result = host.vmRun(handle, execution.timeout, context.afterEvaluate, execution.breakOnSigint); }
+    catch (cause) { runEnd(listeners); rethrow(cause, runFailure(cause, execution.timeout, execution.displayErrors ? data : undefined)); }
+    runEnd(listeners);
+    return result;
   }
   runInNewContext(sandbox, value) {
     // As in Node, the context takes its options under context-prefixed names.
