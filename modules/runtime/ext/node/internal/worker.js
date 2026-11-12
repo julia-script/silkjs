@@ -107,6 +107,7 @@ function handleControl(worker, message) {
   const state = workerState(worker);
   switch (message.type) {
     case 'watch:dependency': require('internal/watch_mode/dependencies').report(message.filename); return;
+    case 'trace:event': require('internal/trace_events').record(message.json, message.timestamp, message.tid); return;
     case messageTypes.COULD_NOT_SERIALIZE_ERROR:
       state.errorReceived = true;
       state.resource.runInAsyncScope(worker.emit, worker, 'error', new (nodeErrors().codes.ERR_WORKER_UNSERIALIZABLE_ERROR)());
@@ -189,6 +190,8 @@ function workerOptions(filename, options) {
   }
   result.name = 'WorkerThread';
   result.watchReportDependencies = require('internal/watch_mode/dependencies').enabled();
+  // Node's workers share the process's trace agent.
+  if (host.builtinLoaded('internal/trace_events')) result.traceCategories = require('internal/trace_events').getEnabledCategories();
   if (options.name) {
     validators().validateString(options.name, 'options.name');
     result.name = options.name.trim();
@@ -487,6 +490,8 @@ function install(proc = process, metadata = bootstrap()) {
   host.fsTracking(metadata.trackUnmanagedFds);
   require('internal/watch_mode/dependencies').initialize(
     filename => controlSend(control, { type: 'watch:dependency', filename }), metadata.watchReportDependencies === true);
+  if (metadata.traceCategories) require('internal/trace_events').initializeWorker(metadata.traceCategories, metadata.name,
+    (json, timestamp, tid) => controlSend(control, { type: 'trace:event', json, timestamp, tid }));
   let stdinReading = false;
   const stdin = readableFrom(() => {
     if (metadata.stdin && !stdinReading) { stdinReading = true; controlRef(control, 1); }
