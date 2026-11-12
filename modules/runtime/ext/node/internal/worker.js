@@ -30,6 +30,13 @@ const workers = new Map();
 const workerStates = new WeakMap();
 let environmentData = new Map();
 let control = null;
+// Node's cwd counter: the main thread counts its chdir calls in shared memory,
+// so a worker's process.cwd() reads the directory again only after one. The
+// counter is made with the first worker; a worker passes on the one it got.
+const AtomicsAdd = Atomics.add;
+const AtomicsLoad = Atomics.load;
+let cwdCounter;
+let sharedCwdCounter;
 let bootstrapResult;
 let installed = false;
 let exitRequested = false;
@@ -38,6 +45,13 @@ const stdioCallbacks = new Map();
 const controlRefs = new WeakMap();
 const readableAcks = new WeakMap();
 const info = host.workerNative('info', []);
+if (info.isMainThread) {
+  const originalChdir = process.chdir;
+  process.chdir = function(path) {
+    originalChdir(path);
+    if (cwdCounter) AtomicsAdd(cwdCounter, 0, 1);
+  };
+}
 
 function workerState(worker) {
   const state = workerStates.get(worker);
@@ -107,6 +121,7 @@ function handleControl(worker, message) {
   const state = workerState(worker);
   switch (message.type) {
     case 'watch:dependency': require('internal/watch_mode/dependencies').report(message.filename); return;
+    case 'trace:event': require('internal/trace_events').record(message.json, message.timestamp, message.tid); return;
     case messageTypes.COULD_NOT_SERIALIZE_ERROR:
       state.errorReceived = true;
       state.resource.runInAsyncScope(worker.emit, worker, 'error', new (nodeErrors().codes.ERR_WORKER_UNSERIALIZABLE_ERROR)());
@@ -127,16 +142,16 @@ function handleControl(worker, message) {
   }
   require('assert').fail(`Unknown worker message type ${message.type}`);
 }
-function unsupported(api) {
-  return clone().codedError('ERR_NOT_SUPPORTED', `${api} is not supported by SilkJS: the engine has no V8 heap generations or code range`, Error);
-}
 function resourceLimits(options) {
   const limits = { stackSizeMb: 4 };
   if (options === null || typeof options !== 'object') return limits;
-  // SilkJS has neither generations nor a JIT code range. A whole-runtime
-  // allocator budget is not a faithful implementation of any of these options.
-  for (const key of ['maxOldGenerationSizeMb', 'maxYoungGenerationSizeMb', 'codeRangeSizeMb']) {
-    if (typeof options[key] === 'number') throw unsupported(`Worker resourceLimits.${key}`);
+  // As Node's parseResourceLimits: each limit is read once, in this order, and only
+  // numbers count. maxOldGenerationSizeMb is the worker's heap budget, the young
+  // generation bounds the growth between collections, and codeRangeSizeMb is kept
+  // for the API only: the engine compiles no machine code.
+  for (const key of ['maxYoungGenerationSizeMb', 'maxOldGenerationSizeMb', 'codeRangeSizeMb']) {
+    const value = options[key];
+    if (typeof value === 'number') limits[key] = value;
   }
   const stack = options.stackSizeMb;
   if (typeof stack === 'number' && stack > 0) {
@@ -145,6 +160,10 @@ function resourceLimits(options) {
     limits.stackSizeMb = Math.max(0.1875, stack);
   }
   return limits;
+}
+// A limit in bytes for the native worker, or undefined for none (a negative or NaN limit).
+function limitBytes(megabytes) {
+  return typeof megabytes === 'number' && megabytes >= 0 ? Math.floor(Math.min(megabytes * 1048576, Number.MAX_SAFE_INTEGER)) : undefined;
 }
 function optionString(value) {
   if (typeof value === 'symbol') throw new TypeError('Cannot convert a Symbol value to a string');
@@ -189,6 +208,8 @@ function workerOptions(filename, options) {
   }
   result.name = 'WorkerThread';
   result.watchReportDependencies = require('internal/watch_mode/dependencies').enabled();
+  // Node's workers share the process's trace agent.
+  if (host.builtinLoaded('internal/trace_events')) result.traceCategories = require('internal/trace_events').getEnabledCategories();
   if (options.name) {
     validators().validateString(options.name, 'options.name');
     result.name = options.name.trim();
@@ -280,10 +301,11 @@ class Worker extends EventEmitter {
       state.user.on('message', value => state.resource.runInAsyncScope(this.emit, this, 'message', value));
       state.user.on('messageerror', error => state.resource.runInAsyncScope(this.emit, this, 'messageerror', error));
       state.user.unref();
-      controlChannel.port1.postMessage({ type: messageTypes.LOAD_SCRIPT, workerData: config.options.workerData,
+      if (info.isMainThread) cwdCounter ??= new Uint32Array(new SharedArrayBuffer(4));
+      controlChannel.port1.postMessage({ type: messageTypes.LOAD_SCRIPT, cwdCounter: cwdCounter || sharedCwdCounter, workerData: config.options.workerData,
         environmentData: Array.from(environmentData), parentPort: userChannel.port2,
         options: config.metadata }, [userChannel.port2, ...list]);
-      state.id = host.workerNative('startWorker', [JSON.stringify(config.metadata), ports().id(controlChannel.port2), Math.floor(config.metadata.resourceLimits.stackSizeMb * 1048576), config.metadata.name]);
+      state.id = host.workerNative('startWorker', [JSON.stringify(config.metadata), ports().id(controlChannel.port2), Math.floor(config.metadata.resourceLimits.stackSizeMb * 1048576), config.metadata.name, limitBytes(config.metadata.resourceLimits.maxOldGenerationSizeMb), limitBytes(config.metadata.resourceLimits.maxYoungGenerationSizeMb)]);
       // Native ownership of this endpoint moved into the new isolate.
       clone().commit({ moved: [controlChannel.port2] });
       workers.set(state.id, this);
@@ -391,7 +413,10 @@ function poll() {
       state.stdin?.destroy();
       state.resolveTermination?.(event.code);
       try {
-        if (event.initFailed && !state.errorReceived) state.resource.runInAsyncScope(worker.emit, worker, 'error',
+        // As Node's OnThreadStopped: a worker that ran out of its heap budget reports that.
+        if (event.outOfMemory) state.resource.runInAsyncScope(worker.emit, worker, 'error',
+          new (nodeErrors().codes.ERR_WORKER_OUT_OF_MEMORY)('JS heap out of memory'));
+        else if (event.initFailed && !state.errorReceived) state.resource.runInAsyncScope(worker.emit, worker, 'error',
           clone().codedError('ERR_WORKER_INIT_FAILED', 'Worker initialization failed before becoming online', Error));
         state.resource.runInAsyncScope(worker.emit, worker, 'exit', event.code);
       }
@@ -412,6 +437,7 @@ function bootstrap() {
   const data = initial.message;
   environmentData = new Map();
   assignEnvironmentData(new Map(data.environmentData));
+  sharedCwdCounter = data.cwdCounter;
   // As Node's worker_thread main: the public module gets this thread's ports and data.
   const workerThreads = require('worker_threads');
   workerThreads.parentPort = data.parentPort;
@@ -487,6 +513,8 @@ function install(proc = process, metadata = bootstrap()) {
   host.fsTracking(metadata.trackUnmanagedFds);
   require('internal/watch_mode/dependencies').initialize(
     filename => controlSend(control, { type: 'watch:dependency', filename }), metadata.watchReportDependencies === true);
+  if (metadata.traceCategories) require('internal/trace_events').initializeWorker(metadata.traceCategories, metadata.name,
+    (json, timestamp, tid) => controlSend(control, { type: 'trace:event', json, timestamp, tid }));
   let stdinReading = false;
   const stdin = readableFrom(() => {
     if (metadata.stdin && !stdinReading) { stdinReading = true; controlRef(control, 1); }
@@ -502,6 +530,17 @@ function install(proc = process, metadata = bootstrap()) {
   for (const [name, value] of Object.entries({ stdin, stdout, stderr })) Object.defineProperty(proc, name, { value, configurable: true, enumerable: true });
   proc.env = workerEnvironment();
   proc.openStdin = () => { proc.stdin.resume(); return proc.stdin; };
+  let cachedCwd = '';
+  let lastCounter = -1;
+  const originalCwd = proc.cwd;
+  proc.cwd = function() {
+    const currentCounter = AtomicsLoad(sharedCwdCounter, 0);
+    if (currentCounter === lastCounter)
+      return cachedCwd;
+    lastCounter = currentCounter;
+    cachedCwd = originalCwd();
+    return cachedCwd;
+  };
   proc.execArgv = metadata.execArgv;
   for (const method of ['chdir', 'abort', 'setuid', 'setgid', 'seteuid', 'setegid', 'setgroups', 'initgroups']) {
     if (typeof proc[method] === 'function') proc[method] = () => { throw clone().codedError('ERR_WORKER_UNSUPPORTED_OPERATION', `process.${method}() is not supported in workers`, Error); };
@@ -525,6 +564,8 @@ function install(proc = process, metadata = bootstrap()) {
 }
 function reportError(error) {
   if (!control) return false;
+  // An error from an exhausted heap budget ends the worker instead (ERR_WORKER_OUT_OF_MEMORY).
+  if (host.workerNative('heapExhausted', [])) return true;
   if (typeof error === 'symbol') {
     controlSend(control, { type: messageTypes.ERROR_MESSAGE, symbol: error.description ?? '' });
     return true;

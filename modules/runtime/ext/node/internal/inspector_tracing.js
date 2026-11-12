@@ -36,6 +36,8 @@ function stop(session) {
   active.delete(session);
   const events = tracing.sink.finish();
   for (let at = 0; at < events.length; at += CHUNK) session.emit('NodeTracing.dataCollected', { value: events.slice(at, at + CHUNK) });
+  // Node's agent flushes its writer once more on stop, which sends the metadata again.
+  session.emit('NodeTracing.dataCollected', { value: tracing.sink.metadata });
   session.emit('NodeTracing.tracingComplete', {});
   return {};
 }

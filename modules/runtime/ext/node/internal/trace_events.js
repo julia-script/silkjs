@@ -19,8 +19,12 @@ const watchers = [];
 // getCategoryEnabledBuffer: one byte per category group, kept current by sync().
 const enabledBuffers = new Map();
 let stateUpdateHandler;
-function native(operation, value, timestamp) {
-  const errno = host.traceNative(operation, value, timestamp);
+// A worker's agent forwards its events to the main thread's writer (see initializeWorker).
+let forward;
+let threadId;
+function native(operation, value, timestamp, tid) {
+  if (forward !== undefined && operation === 'record') { forward(value, timestamp, threadId); return; }
+  const errno = host.traceNative(operation, value, timestamp, tid);
   if (errno) throw Object.assign(new Error(`Trace file ${operation} failed (errno ${errno})`), { code: 'ERR_TRACE_EVENTS_WRITE', errno: -errno });
 }
 function available() { return typeof host.traceNative === 'function'; }
@@ -66,7 +70,7 @@ function emit(category, name, phase, args = {}, id, timestamp, duration) {
       const ts = timestamp === undefined ? Number(process.hrtime.bigint() / 1000n) : Math.trunc(timestamp);
       for (const sink of sinks) if (sink.matches(category)) sink.events.push({ pid: process.pid, tid: process.pid, ts, ...event });
     }
-    if (opened) native('record', stringify(event).slice(0, -1), timestamp);
+    if (opened || forward !== undefined) native('record', stringify(event).slice(0, -1), timestamp);
   } finally { writing = false; }
 }
 function categoryPattern(category) {
@@ -78,6 +82,7 @@ function sync() {
   if (enabled('node.diagnostics_channel')) require('diagnostics_channel');
   const track = enabled('node,node.async_hooks');
   native('gc', enabled('v8,gc'));
+  native('threadpool', enabled('node,node.threadpoolwork,node.threadpoolwork.async'), enabled('node,node.threadpoolwork,node.threadpoolwork.sync'));
   for (const [group, buffer] of enabledBuffers) buffer[0] = enabled(group) ? 1 : 0;
   if (typeof stateUpdateHandler === 'function') stateUpdateHandler(track);
   for (const watcher of watchers) {
@@ -122,20 +127,25 @@ function remove(categories) {
   sync();
   if (opened) native('flush');
 }
-// Collects the events of `categories` in memory until finish(), which returns
-// them after Node's two metadata events, as Node's inspector trace writer does.
+// Collects the events of `categories` in memory until finish(). As Node's inspector trace
+// writer, the agent's metadata events, stamped when collecting starts, follow the events.
 function collect(categories) {
   const own = [...categories].map(categoryPattern);
+  const ts = Number(process.hrtime.bigint() / 1000n);
+  const record = (name, args) => ({ pid: process.pid, tid: process.pid, ts, ph: 'M', cat: '__metadata', name, args });
+  const { versions, arch, platform, release } = process;
   const sink = {
-    events: [
-      { pid: process.pid, tid: process.pid, ts: 0, ph: 'M', cat: '__metadata', name: 'process_name', args: { name: processName() } },
-      { pid: process.pid, tid: process.pid, ts: 0, ph: 'M', cat: '__metadata', name: 'thread_name', args: { name: 'JavaScriptMainThread' } },
+    events: [],
+    metadata: [
+      record('process_name', { name: processName() }),
+      record('version', { node: process.versions.node }),
+      record('thread_name', { name: 'JavaScriptMainThread' }),
+      record('node', { process: { versions, arch, platform, release } }),
     ],
     matches(group) { return group.split(',').some(category => own.some(pattern => pattern.test(category))); },
     finish() {
-      if (!sinks.delete(sink)) return sink.events;
-      remove(categories);
-      return sink.events;
+      if (sinks.delete(sink)) remove(categories);
+      return sink.events.concat(sink.metadata);
     },
   };
   sinks.add(sink);
@@ -152,7 +162,21 @@ function initialize(options = {}) {
       Array.isArray(options.categories) ? options.categories : options.categories.split(',');
     add(new Set(categories));
   }
+  watch(kEnvironment, on => { host.traceEnvironment = on; if (on) environmentBegin(); });
 }
+// A worker traces into the main thread's file, under its own thread id, with the categories
+// enabled when it started; `send` hands each event to the main thread (record()).
+function initializeWorker(categories, name, send) {
+  if (initialized || !categories) return;
+  initialized = true;
+  threadId = host.traceNative('tid');
+  forward = send;
+  metadata('thread_name', { name: `[worker ${require('worker_threads').threadId}] ${name}` });
+  add(new Set(categories.split(',')), false);
+  watch(kEnvironment, on => { host.traceEnvironment = on; });
+}
+// An event a worker forwarded.
+function record(json, timestamp, tid) { if (opened) native('record', `${json}`, timestamp, tid); }
 function begin(category, name, args) {
   if (!enabled(category)) return;
   const id = nextId++;
@@ -199,5 +223,21 @@ function trace(phase, category, name, id, data) {
   emit(category, `${name}`, String.fromCharCode(phase), data === undefined ? {} : { data }, id);
 }
 function flush() { if (opened) native('flush'); }
+// Node's node.environment events (src/env.cc, src/api/hooks.cc) over the runtime's
+// Environment: the loop phases call phase() with their start time while host.traceEnvironment is set.
+const kEnvironment = 'node,node.environment';
+let environmentId;
+function now() { return Number(process.hrtime.bigint() / 1000n); }
+function phase(name, start) { emit(kEnvironment, name, 'X', {}, undefined, start, now() - start); }
+function environmentBegin() {
+  if (environmentId !== undefined || !enabled(kEnvironment)) return;
+  environmentId = nextId++;
+  emit(kEnvironment, 'Environment', 'b', { args: { args: process.argv, exec_args: process.execArgv } }, environmentId);
+}
+function environmentEnd() {
+  if (environmentId !== undefined) emit(kEnvironment, 'Environment', 'e', {}, environmentId);
+  environmentId = undefined;
+}
 module.exports = { available, enabled, isTraceCategoryEnabled: enabled, watch, trace, processTitleChanged,
-  getCategoryEnabledBuffer, setTraceCategoryStateUpdateHandler, CategorySet, add, remove, collect, getEnabledCategories, initialize, emit, begin, end, performanceEntry, diagnostic, flush };
+  getCategoryEnabledBuffer, setTraceCategoryStateUpdateHandler, CategorySet, add, remove, collect, getEnabledCategories, initialize, emit, begin, end, performanceEntry, diagnostic, flush,
+  now, phase, environmentEnd, initializeWorker, record };

@@ -26,6 +26,8 @@ const kCloseReject = Symbol('kCloseReject');
 const kCloseReason = Symbol('kCloseReason');
 const kCloseSync = Symbol('kCloseSync');
 const kLocked = Symbol('kLocked');
+const kHandle = Symbol('kHandle');
+const { kDeserialize, kTransfer, kTransferList, markTransferMode } = require('internal/worker/js_transferable');
 const invalidState = (message, Base = Error) => new (Base === Error ? ERR_INVALID_STATE : ERR_INVALID_STATE[Base.name])(message);
 
 // One native request with Promise ownership (requestKind 1), or 2 for a FileHandle close.
@@ -73,6 +75,7 @@ class FileHandle extends EventEmitter {
     if (this[kFd] !== -1) gcCloser.register(this, this[kFd], this);
     this[kRefs] = 1;
     this[kClosePromise] = null;
+    markTransferMode(this, false, true);
   }
   getAsyncId() { return -1; }
   get fd() { return this[kFd]; }
@@ -145,6 +148,32 @@ class FileHandle extends EventEmitter {
   }
   createReadStream(options = undefined) { return new (require('internal/fs/streams').ReadStream)(undefined, { ...options, fd: this }); }
   createWriteStream(options = undefined) { return new (require('internal/fs/streams').WriteStream)(undefined, { ...options, fd: this }); }
+  [kTransfer]() {
+    if (this[kClosePromise] || this[kRefs] > 1 || this[kFd] === -1) {
+      throw new (require('internal/path_events/event_target').DOMException)('Cannot transfer FileHandle while in use', 'DataCloneError');
+    }
+    const handle = this[kHandle];
+    this[kHandle] = null;
+    releaseFd(this);
+    // Until the message is posted, the descriptor belongs to the handle, which
+    // closes it if the post fails and the handle is collected.
+    handleCloser.register(handle, handle.fd, handle);
+    this[kCloseReason] = 'The FileHandle has been transferred';
+    this[kRefs] = 0;
+    return {
+      data: { handle },
+      deserializeInfo: 'internal/fs/promises:FileHandle',
+    };
+  }
+  [kTransferList]() {
+    if (this[kFd] === -1) return [];
+    return [this[kHandle] ??= new FileHandleNative(this[kFd])];
+  }
+  [kDeserialize]({ handle }) {
+    this[kHandle] = handle;
+    this[kFd] = handle.fd;
+    gcCloser.register(this, handle.fd, this);
+  }
   [kRef]() { this[kRefs]++; }
   [kUnref]() {
     this[kRefs]--;
@@ -154,23 +183,17 @@ class FileHandle extends EventEmitter {
     }
   }
 }
-// http2 respondWithFD() accepts a FileHandle as well as a descriptor.
-// Node's kTransfer/kDeserialize, used by internal/worker/clone. Workers share the
-// process's descriptor table, so the descriptor itself moves to the receiver.
+// Node's FileHandle binding object, which a transfer moves: workers share the
+// process's descriptor table, so the receiver gets the same descriptor.
+class FileHandleNative {
+  constructor(fd) { this.fd = fd; }
+}
+const handleCloser = new FinalizationRegistry(fd => { try { fs.closeSync(fd); } catch {} });
 c.fileHandles = {
-  is: value => FileHandle.isFileHandle(value),
-  check(handle) {
-    if (handle[kClosePromise] || handle[kRefs] > 1 || handle[kFd] === -1) {
-      throw new (require('internal/path_events/event_target').DOMException)('Cannot transfer FileHandle while in use', 'DataCloneError');
-    }
-    return handle[kFd];
-  },
-  detach(handle) {
-    releaseFd(handle);
-    handle[kCloseReason] = 'The FileHandle has been transferred';
-    handle[kRefs] = 0;
-  },
-  create: fd => new FileHandle(fd),
+  isNative: value => value instanceof FileHandleNative,
+  // The posted message now owns the descriptor.
+  detach: handle => handleCloser.unregister(handle),
+  create: fd => new FileHandleNative(fd),
 };
 require('internal/fs/iter').register(FileHandle, { kFd, kLocked, kRef, kUnref, kClosePromise, kCloseSync, invalidState });
 
