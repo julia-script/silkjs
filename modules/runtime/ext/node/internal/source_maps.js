@@ -373,13 +373,45 @@ function sourceMapCacheToObject() {
   for (const [key, record] of moduleEntries) {
     const entry = dereference(record);
     if (!entry) continue;
-    obj[key] = { __proto__: null, lineLengths: entry.lineLengths, data: entry.data, url: entry.sourceMapURL };
+    const data = entry.data ?? null;
+    // The map URL is kept only when its data was not read.
+    obj[key] = { __proto__: null, lineLengths: entry.lineLengths, data, url: data ? null : entry.sourceMapURL };
   }
   return obj;
 }
 
+// source_map_cache.js getOriginalSource: the map's sourcesContent, else the file.
+function originalSourceText(payload, originalSourcePath) {
+  const index = payload.sources.indexOf(originalSourcePath);
+  if (payload.sourcesContent?.[index]) return payload.sourcesContent[index];
+  if (!originalSourcePath.startsWith('file://')) return undefined;
+  try { return require('fs').readFileSync(require('url').fileURLToPath(originalSourcePath), 'utf8'); } catch { return undefined; }
+}
+
+// prepare_stack_trace.js getSourceMapErrorSource and getErrorSource: the arrow of
+// an exception at fileName:lineNumber (1-based) and columnNumber (0-based), in the
+// original source, which node_errors.cc GetErrorSource uses under --enable-source-maps.
+function errorSource(fileName, lineNumber, columnNumber) {
+  const sm = findSourceMap(fileName);
+  if (sm === undefined) return undefined;
+  const { originalLine, originalColumn, originalSource } = sm.findEntry(lineNumber - 1, columnNumber);
+  if (typeof originalSource !== 'string') return undefined;
+  const source = originalSourceText(sm.payload, originalSource);
+  if (typeof source !== 'string') return undefined;
+  const line = source.split(/\r?\n/, originalLine + 1)[originalLine];
+  if (!line) return undefined;
+  const path = originalSource.startsWith('file://') ? require('url').fileURLToPath(originalSource) : originalSource;
+  const { getStringWidth } = require('internal/util/inspect');
+  let prefix = '';
+  for (const character of line.slice(0, originalColumn + 1)) {
+    prefix += character === '\t' ? '\t' : ' '.repeat(getStringWidth(character));
+  }
+  prefix = prefix.slice(0, -1);
+  return `${path}:${originalLine + 1}\n${line}\n${prefix}^\n`;
+}
+
 module.exports = {
-  kMappings, sourceMapCacheToObject,
+  kMappings, sourceMapCacheToObject, errorSource,
   SourceMap, findSourceMap, getSourceMapsSupport, setSourceMapsSupport,
   registerSource, unregisterSource, mapPosition,
 };

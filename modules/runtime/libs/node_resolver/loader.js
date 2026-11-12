@@ -7,6 +7,7 @@ const builtinPrefix = Function.prototype.call.bind(String.prototype.startsWith);
 const builtinSlice = Function.prototype.call.bind(String.prototype.slice);
 // Node's kFirstModuleParent: internal/errors reads it for require stacks.
 const kModuleParent = require('internal/host').kFirstModuleParent;
+const { loaderRequire } = require('internal/modules/helpers');
 // Captured before user code runs: the main module's evaluation promise is
 // observed without a user-replaced Promise.prototype.then.
 const ReflectApply = Reflect.apply;
@@ -1484,7 +1485,7 @@ function createLoader(host, builtins) {
       else from &&= `CommonJS module ${from}`;
       if (from && to) prefix = `${from} is loading ES Module ${to} using require().\n`;
     }
-    require('internal/util').emitExperimentalWarning('Support for loading ES Module in require()', prefix, undefined, parent?.require);
+    require('internal/util').emitExperimentalWarning('Support for loading ES Module in require()', prefix, undefined, requireEntry);
     requireModuleTrace = true;
   }
 
@@ -1524,14 +1525,17 @@ function createLoader(host, builtins) {
   // The module.require tracing channel, once diagnostics_channel is loaded: no channel
   // has a subscriber before that.
   let requireTracing;
-  function makeRequire(filename, parent, allowAsync = false) {
-    function require(specifier) {
-      const dc = host.diagnosticsChannel;
-      if (dc !== undefined && (requireTracing ??= dc.tracingChannel('module.require')).hasSubscribers) {
-        return requireTracing.traceSync(load, { __proto__: null, parentFilename: (parent || cache[filename])?.filename, id: specifier }, undefined, specifier);
-      }
-      return load(specifier);
+  // Every module-scoped require calls this, as Node's calls mod.require: a stack
+  // captured above it (traceRequireModule) starts at the require in helpers.js.
+  function requireEntry(state, specifier) {
+    const dc = host.diagnosticsChannel;
+    if (dc !== undefined && (requireTracing ??= dc.tracingChannel('module.require')).hasSubscribers) {
+      return requireTracing.traceSync(state.load, { __proto__: null, parentFilename: (state.parent || cache[state.filename])?.filename, id: specifier }, undefined, specifier);
     }
+    return state.load(specifier);
+  }
+  function makeRequire(filename, parent, allowAsync = false) {
+    const require = loaderRequire(requireEntry, { __proto__: null, load, filename, parent });
     function load(specifier) {
       // Module.prototype.require goes through Module._load, so a replaced one sees every require.
       if (Module._load !== defaultModuleLoad) return Module._load(specifier, parent || cache[filename], false);

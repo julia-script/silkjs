@@ -267,6 +267,10 @@ class RemoteValues {
         if (property.set !== undefined) descriptor.set = this.remote(property.set, entry.group, false, false, entry.context);
         result.push(descriptor);
       }
+      if (first && info.type === 'function') {
+        const location = native(19, value);
+        if (location) internalProperties.push({ name: '[[FunctionLocation]]', value: { type: 'object', subtype: 'internal#location', value: { scriptId: location.scriptId, lineNumber: location.lineNumber, columnNumber: location.columnNumber }, description: 'Object' } });
+      }
       if (first && info.prototype !== undefined && info.prototype !== null) internalProperties.push({ name: '[[Prototype]]', value: this.remote(info.prototype, entry.group, false, false, entry.context) });
       if (first && info.subtype === 'proxy') {
         const details = host.getProxyDetails(value);
