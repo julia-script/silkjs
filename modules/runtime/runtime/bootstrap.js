@@ -157,7 +157,7 @@ function disableProto(global) {
     Object.defineProperty(prototype, '__proto__', { get: thrower, set: thrower, enumerable: false, configurable: true });
   }
 }
-host.initializeRealmBuiltins = (handle, global, wasmCodeGeneration) => {
+host.initializeRealmBuiltins = (handle, global, wasmCodeGeneration, isolated = false) => {
   delete global.InternalError;
   if (host.disableProto !== undefined) disableProto(global);
   const cache = new Map();
@@ -186,7 +186,7 @@ host.initializeRealmBuiltins = (handle, global, wasmCodeGeneration) => {
     factory(module, module.exports, load, process);
     return module.exports;
   }
-  load('internal/error_stack').install(global);
+  load('internal/error_stack').install(global, isolated);
   Object.defineProperty(global, 'WebAssembly', {
     value: load('internal/web/wasm').WebAssembly, writable: true, configurable: true,
   });
