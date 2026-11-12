@@ -197,7 +197,9 @@ function dispatch(record, timing, dispatcher) {
         },
         pull() { if (!cancelled && !streamDone) source.resume(); },
         cancel(reason) { cancelled = true; streamDone = true; removeAbort(); stop(reason); },
-      });
+      // undici's fetch reads ahead into a 64 KiB Readable: a body that fits completes
+      // (and reports its end) before anything reads it.
+      }, { highWaterMark: 65536 });
       const responseURL = new URL(record.url); responseURL.hash = '';
       const result = makeResponse({ status: response.statusCode, statusText: response.statusMessage, headers: immutable(responseHeaders), body: stream ? require('internal/web/fetch/body').streamBody(stream) : null, type: 'basic', url: responseURL.href, redirected: false, immutable: true });
       const completion = new Promise(done => {
