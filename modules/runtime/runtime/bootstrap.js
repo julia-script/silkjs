@@ -389,20 +389,55 @@ host.privateSymbols = {
   arrow_message_private_symbol: native.privateSymbol('node:arrowMessage'),
   decorated_private_symbol: native.privateSymbol('node:decorated'),
 };
+// Where the engine puts a SyntaxError's origin. V8 keeps it in the message, so the
+// error itself has only its stack and message as own properties.
+const syntaxOrigin = host.syntaxOrigin = {
+  __proto__: null,
+  file: native.privateSymbol('node:syntaxFile'),
+  line: native.privateSymbol('node:syntaxLine'),
+  column: native.privateSymbol('node:syntaxColumn'),
+};
+native.workerNative('syntaxOriginKeys', [syntaxOrigin.file, syntaxOrigin.line, syntaxOrigin.column]);
+// V8 starts a context with empty RegExp statics (RegExp.$1, lastMatch...), and
+// Node's startup leaves them so. The runtime's own startup runs regexps in the
+// user's realm, so the user's code starts from the empty match V8 starts from.
+const regExpExec = RegExp.prototype.exec;
+const emptyPattern = /(?:)/;
+host.clearRegExpStatics = () => { Reflect.apply(regExpExec, emptyPattern, ['']); };
+// Whether value starts with a URL scheme ("file:", "node:"). A scan, not a RegExp:
+// the loader runs it in the user's realm, where a RegExp would set RegExp.input.
+host.hasURLScheme = value => {
+  if (typeof value !== 'string') value = String(value);
+  const first = value.charCodeAt(0) | 0x20;
+  if (first < 0x61 || first > 0x7a) return false;
+  for (let index = 1; index < value.length; index++) {
+    const code = value.charCodeAt(index);
+    if (code === 0x3a) return true;
+    const lower = code | 0x20;
+    if (!((lower >= 0x61 && lower <= 0x7a) || (code >= 0x30 && code <= 0x39) || code === 0x2b || code === 0x2e || code === 0x2d)) return false;
+  }
+  return false;
+};
+// The carets under a SyntaxError's site, from column (0-based) of text: V8 underlines
+// the token a message names ("Unexpected identifier 'line'"), else one character.
+const namedToken = /^Unexpected (?:identifier|token|reserved word|strict mode reserved word) '(.+)'$/;
+host.syntaxUnderline = (message, text, column) => {
+  const token = Reflect.apply(regExpExec, namedToken, [String(message)])?.[1];
+  const width = token !== undefined && stringStartsWith(text, token, column) ? token.length : 1;
+  let underline = '';
+  for (let index = 0; index < width; index++) underline += '^';
+  return underline;
+};
 host.attachArrow = (error, scriptName, source, prefix) => {
-  if (!(error instanceof SyntaxError) || host.errorArrows.has(error) || !Number.isInteger(error.lineNumber)) return;
-  const line = error.lineNumber;
+  if (!(error instanceof SyntaxError) || host.errorArrows.has(error) || !Number.isInteger(error[syntaxOrigin.line])) return;
+  const line = error[syntaxOrigin.line];
   const text = String(source).split(/\r\n|[\n\r\u2028\u2029]/)[line - 1];
   if (text === undefined) return;
-  const column = error.columnNumber - 1 - (line === 1 ? prefix : 0);
+  const column = error[syntaxOrigin.column] - 1 - (line === 1 ? prefix : 0);
   let caret = '';
   if (column >= 0 && column < text.length) {
     for (let index = 0; index < column; index++) caret += text[index] === '\t' ? '\t' : ' ';
-    // V8 underlines the token a message names ("Unexpected identifier 'line'").
-    const token = /^Unexpected (?:identifier|token|reserved word|strict mode reserved word) '(.+)'$/.exec(error.message)?.[1];
-    const width = token !== undefined && stringStartsWith(text, token, column) ? token.length : 1;
-    for (let index = 0; index < width; index++) caret += '^';
-    caret += '\n';
+    caret += host.syntaxUnderline(error.message, text, column) + '\n';
   }
   const arrow = scriptName + ':' + line + '\n' + text + '\n' + caret;
   host.errorArrows.set(error, arrow);
@@ -1018,6 +1053,7 @@ function evaluateMain(source, name) {
   // Node's ModuleJob.run hint for a CommonJS global (an --eval module has no load step
   // that would add it).
   let result;
+  host.clearRegExpStatics();
   try { result = native.evaluateModule(source, name, true); }
   catch (cause) { throw loader.decorateModuleError(cause, name); }
   host.entryModule = { name, source, promise: result };
@@ -1449,9 +1485,11 @@ function runWorker() {
 }
 function startRepl() {
   console.log('Welcome to SilkJS Runtime.\nType ".help" for more information.');
-  return internalRequire('internal/repl').createInternalRepl(process.env, {
+  const repl = internalRequire('internal/repl').createInternalRepl(process.env, {
     input: process.stdin, output: process.stdout, terminal: !!process.stdout.isTTY, preview: !!process.stdout.isTTY,
   }, error => { if (error) console.error('REPL history:', error.message); });
+  host.clearRegExpStatics();
+  return repl;
 }
 function installCommonJSInputGlobals(filename, id) {
   // Node's createModule (lib/internal/process/execution.js): lookup paths from the cwd.
@@ -1846,7 +1884,7 @@ function checkUnsettledTopLevelAwait() {
       const sourceLine = sources.get(name)[line - 1] ?? '';
       let caret = '';
       for (let at = 0; at < column - 1 && at < sourceLine.length; at++) caret += sourceLine[at] === '\t' ? '\t' : ' ';
-      const location = /^[A-Za-z][A-Za-z\d+.-]*:/.test(name) ? name : url.pathToFileURL(name).href;
+      const location = host.hasURLScheme(name) ? name : url.pathToFileURL(name).href;
       host.writeText(2, `Warning: Detected unsettled top-level await at ${location}:${line}\n${sourceLine}\n${caret}^\n\n\n\n`);
     }
   }
@@ -1932,7 +1970,7 @@ globalThis.__silkRuntime = {
   importTrace(specifier, referrer, promise) {
     const channels = host.diagnostics.tracing('module.import');
     if (channels === undefined) return promise;
-    const parentURL = typeof referrer === 'string' ? (/^[A-Za-z][A-Za-z\d+.-]*:/.test(referrer) ? referrer : fileHref(referrer)) : undefined;
+    const parentURL = typeof referrer === 'string' ? (host.hasURLScheme(referrer) ? referrer : fileHref(referrer)) : undefined;
     const context = { __proto__: null, parentURL, url: specifier };
     const { end, asyncStart, asyncEnd, error } = channels;
     const resolve = result => {
@@ -1956,11 +1994,11 @@ globalThis.__silkRuntime = {
   registerSource(filename, source, metadata) {
     host.registerSource(filename, source, { ...metadata, owner: metadata });
     if (!metadata.generated && typeof filename === 'string') {
-      return /^[A-Za-z][A-Za-z\d+.-]*:/.test(filename) ? filename : fileHref(filename);
+      return host.hasURLScheme(filename) ? filename : fileHref(filename);
     }
   },
   importMeta(name) {
-    const asURL = value => /^[A-Za-z][A-Za-z\d+.-]*:/.test(value) ? value : fileHref(value);
+    const asURL = value => host.hasURLScheme(value) ? value : fileHref(value);
     const url = asURL(name);
     // As in Node: a null prototype, keys in this order, filename and dirname for file: only.
     const meta = { __proto__: null };

@@ -451,7 +451,7 @@ function createLoader(host, builtins) {
   function packageTarget(pkg, target, replacement, key, pattern, internal, parent, mode, seen, pathMap = false) {
     if (typeof target === 'string') {
       if (!target.startsWith('./')) {
-        if (internal && !target.startsWith('../') && !target.startsWith('/') && !/^[A-Za-z][A-Za-z\d+.-]*:/.test(target) && !target.startsWith('#')) {
+        if (internal && !target.startsWith('../') && !target.startsWith('/') && !host.hasURLScheme(target) && !target.startsWith('#')) {
           const request = pattern ? target.split('*').join(replacement) : target;
           return { external: request, parent: pkg.filename };
         }
@@ -642,7 +642,7 @@ function createLoader(host, builtins) {
       }
       // Node's moduleResolve: an absolute URL resolves to itself, whatever its scheme;
       // loading it is what fails (unsupportedScheme).
-      if (mode === 'import' && /^[A-Za-z][A-Za-z\d+.-]*:/.test(specifier)) {
+      if (mode === 'import' && host.hasURLScheme(specifier)) {
         const parsed = builtins.get('url').URL.parse(specifier);
         if (parsed !== null) return { filename: parsed.href, format: undefined };
       }
@@ -754,7 +754,7 @@ function createLoader(host, builtins) {
   }
 
   function asURL(filename) {
-    return /^[A-Za-z][A-Za-z\d+.-]*:/.test(filename) ? filename : fileURL(filename);
+    return host.hasURLScheme(filename) ? filename : fileURL(filename);
   }
 
   function identity(url, mode) {
@@ -765,7 +765,7 @@ function createLoader(host, builtins) {
 
   // A module whose URL is neither file: nor a builtin's (a data: or http: module).
   function urlParent(parent) {
-    return /^[A-Za-z][A-Za-z\d+.-]*:/.test(parent) && !parent.startsWith('file:') && !isBuiltinFile(parent);
+    return host.hasURLScheme(parent) && !parent.startsWith('file:') && !isBuiltinFile(parent);
   }
   // Node's moduleResolve for such a parent, after builtins: a relative or absolute path
   // resolves against the URL, a URL stands for itself (undefined: the caller goes on),
@@ -800,7 +800,7 @@ function createLoader(host, builtins) {
       if (mode === 'import') {
         const href = urlParentResolve(specifier, context.parentURL);
         if (href !== undefined) return { url: href, format: undefined };
-      } else if (!/^[A-Za-z][A-Za-z\d+.-]*:/.test(specifier) && !path.isAbsolute(specifier)) {
+      } else if (!host.hasURLScheme(specifier) && !path.isAbsolute(specifier)) {
         throw error('ERR_UNSUPPORTED_RESOLVE_REQUEST', specifier, context.parentURL);
       }
     }
@@ -972,7 +972,7 @@ function createLoader(host, builtins) {
   }
 
   function defaultLoad(url, context) {
-    const unsupported = /^[A-Za-z][A-Za-z\d+.-]*:/.test(url) ? unsupportedScheme(url) : undefined;
+    const unsupported = host.hasURLScheme(url) ? unsupportedScheme(url) : undefined;
     if (unsupported) throw unsupported;
     const data = url.startsWith('data:') ? dataSource(url) : undefined;
     const textImport = host.importText && context.importAttributes && context.importAttributes.type === 'text';
@@ -1123,6 +1123,7 @@ function createLoader(host, builtins) {
         owner: this, scriptId: metadata?.scriptId, sourceURL: metadata?.sourceURL ?? null, sourceMapURL: metadata?.sourceMapURL ?? null,
       });
       if (this === main && host.inspectorEntry) host.inspectorEntry(wrapper);
+      if (this === main) host.clearRegExpStatics();
       return wrapper.call(this.exports, this.exports, makeRequire(filename, this, moduleAsyncModes.get(this) === true), this, filename, path.dirname(filename));
     }
     load(filename) {
@@ -1465,8 +1466,9 @@ function createLoader(host, builtins) {
   // Node's ModuleWrap compile failure (AppendExceptionLine): a module that did
   // not parse reports the line of the bad token in its own file, by URL.
   function moduleSyntaxArrow(cause) {
-    if (!(cause instanceof SyntaxError) || typeof cause.fileName !== 'string' || host.errorArrows.has(cause)) return;
-    const url = asURL(cause.fileName);
+    const fileName = cause instanceof SyntaxError ? cause[host.syntaxOrigin.file] : undefined;
+    if (typeof fileName !== 'string' || host.errorArrows.has(cause)) return;
+    const url = asURL(fileName);
     if (!url.startsWith('file:')) return;
     let source;
     try { source = text(filesystemName(url)); } catch (_) { return; }
@@ -1878,7 +1880,7 @@ function createLoader(host, builtins) {
     if (!resolved) {
       let detected;
       if (filename.startsWith('data:')) detected = dataFormat(filename);
-      else if (/^[A-Za-z][A-Za-z\d+.-]*:/.test(filename) && unsupportedScheme(filename)) detected = undefined;
+      else if (host.hasURLScheme(filename) && unsupportedScheme(filename)) detected = undefined;
       else {
         // An unknown extension is reported by the default load step, after the hooks ran.
         try { detected = format(filename, 'import'); }
