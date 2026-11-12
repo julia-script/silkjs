@@ -82,6 +82,7 @@ function sync() {
   if (enabled('node.diagnostics_channel')) require('diagnostics_channel');
   const track = enabled('node,node.async_hooks');
   native('gc', enabled('v8,gc'));
+  native('threadpool', enabled('node,node.threadpoolwork,node.threadpoolwork.async'), enabled('node,node.threadpoolwork,node.threadpoolwork.sync'));
   for (const [group, buffer] of enabledBuffers) buffer[0] = enabled(group) ? 1 : 0;
   if (typeof stateUpdateHandler === 'function') stateUpdateHandler(track);
   for (const watcher of watchers) {

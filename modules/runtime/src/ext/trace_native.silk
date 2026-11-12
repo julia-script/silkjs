@@ -32,7 +32,7 @@ import ext.os_abi as memory
 import ext.trace_abi as c
 import ext.fs_native { equal }
 
-pub struct State { fd:i32, offset:i64, error:i32, first:bool, gc:bool, pid:u64, tid:u64,
+pub struct State { fd:i32, offset:i64, error:i32, first:bool, gc:bool, threadpoolAsync:bool, threadpoolSync:bool, pid:u64, tid:u64,
   observe:bool, started:u64, collections:usize, records:[u64;96] }
 pub effect fn open(allocator:*mut RuntimeHeap)->*mut State !OutOfMemoryError {
   let raw=unsafe memory.calloc(1,Layout.of<State>().bytes)
@@ -42,7 +42,7 @@ pub effect fn open(allocator:*mut RuntimeHeap)->*mut State !OutOfMemoryError {
   let mut tid:u64=0
   static if Intrinsic.targetOperatingSystem()=="darwin" { let _ignored=unsafe c.pthread_threadid_np(Pointer.null<u8>(),Pointer.fromMutRef<u64>(&mut tid)) }
   else { tid=i32.toU64(unsafe c.gettid()) }
-  unsafe Pointer.put<State>(state,State { fd:-1,offset:0,error:0,first:true,gc:false,pid:i32.toU64(unsafe c.getpid()),tid:tid,
+  unsafe Pointer.put<State>(state,State { fd:-1,offset:0,error:0,first:true,gc:false,threadpoolAsync:false,threadpoolSync:false,pid:i32.toU64(unsafe c.getpid()),tid:tid,
     observe:false,started:0,collections:0,records:[0;96] })
   return state
 }
@@ -74,9 +74,18 @@ unsafe fn record(state:&mut State,prefix:&[u8],timestamp:u64)->() { let tid=stat
 // An event of another thread of this process (a worker's, forwarded to the writer) carries that thread's id.
 unsafe fn recordOn(state:&mut State,prefix:&[u8],timestamp:u64,tid:u64)->() {
   if state.fd<0 || state.error!=0 { return () }
+  let saved=unsafe begin(&mut state)
+  unsafe literal(&mut state,prefix)
+  unsafe commit(&mut state,saved,timestamp,tid)
+}
+// Starts an event after the last committed one; returns where it starts.
+unsafe fn begin(state:&mut State)->i64 {
   let saved=state.offset
   if !state.first { unsafe literal(&mut state,b",") }
-  unsafe literal(&mut state,prefix)
+  return saved
+}
+// Ends the event begun at `saved` with its time and ids, or takes it back when a write failed.
+unsafe fn commit(state:&mut State,saved:i64,timestamp:u64,tid:u64)->() {
   unsafe literal(&mut state,b",\"ts\":") unsafe decimal(&mut state,timestamp)
   let pid=state.pid
   unsafe literal(&mut state,b",\"pid\":") unsafe decimal(&mut state,pid)
@@ -87,6 +96,33 @@ unsafe fn recordOn(state:&mut State,prefix:&[u8],timestamp:u64,tid:u64)->() {
   let error=state.error state.error=0 state.offset=saved
   unsafe literal(&mut state,b"]}") let _ignored=unsafe c.ftruncate(state.fd,saved+2)
   state.offset=saved state.error=error
+}
+unsafe fn hexadecimal(state:&mut State,value:u64)->() {
+  let mut digits:[u8;16]=[0;16] let mut at:usize=16 let mut n=value
+  while true { at=at-1 let digit=u64.toU8(n%16) if digit<10 { digits[at]=48+digit } else { digits[at]=87+digit } n=n/16 if n==0 { break } }
+  unsafe bytes(&mut state,Pointer.fromRef<u8>(&digits[at]),16-at)
+}
+/// Node's ThreadPoolWork events for a job of the blocking pool (ext.fs_async): phase b or e (98,
+/// 101) is the async span on the loop thread, now; B or E (66, 69) the worker's run, at
+/// `nanoseconds` on `thread`. Runs on the loop thread and never enters JS or the allocator.
+export "C" fn silkThreadpoolTrace(tracing:*mut u8,kind:u8,phase:u8,id:u64,nanoseconds:u64,thread:u64)->() {
+  let mut anchor=() let s=unsafe Pointer.borrowMut<(),State>(&mut anchor,unsafe Intrinsic.pointerReinterpret<*mut u8,*mut State>(tracing))
+  let sync=phase==66 || phase==69
+  if sync && !s.threadpoolSync { return () }
+  if !sync && !s.threadpoolAsync { return () }
+  if s.fd<0 || s.error!=0 { return () }
+  let saved=unsafe begin(&mut s.*)
+  if sync { unsafe literal(&mut s.*,b"{\"cat\":\"node,node.threadpoolwork,node.threadpoolwork.sync\",\"name\":\"") }
+  else { unsafe literal(&mut s.*,b"{\"cat\":\"node,node.threadpoolwork,node.threadpoolwork.async\",\"name\":\"") }
+  if kind==2 { unsafe literal(&mut s.*,b"zlib") } else if kind==3 { unsafe literal(&mut s.*,b"node_api") } else { unsafe literal(&mut s.*,b"crypto") }
+  if phase==66 { unsafe literal(&mut s.*,b"\",\"ph\":\"B\",\"args\":{}") }
+  else if phase==69 { unsafe literal(&mut s.*,b"\",\"ph\":\"E\",\"args\":{}") }
+  else if phase==98 { unsafe literal(&mut s.*,b"\",\"ph\":\"b\",\"args\":{}") }
+  else { unsafe literal(&mut s.*,b"\",\"ph\":\"e\",\"args\":{\"result\":0}") }
+  if !sync { unsafe literal(&mut s.*,b",\"id\":\"0x") unsafe hexadecimal(&mut s.*,id) unsafe literal(&mut s.*,b"\"") }
+  let mut timestamp=nanoseconds/1000 let mut tid=thread
+  if !sync { timestamp=i64.toU64(clock.nowNanoseconds())/1000 tid=s.tid }
+  unsafe commit(&mut s.*,saved,timestamp,tid)
 }
 /// Called only from EngineServices.gcLifecycle; never enters JS or the allocator.
 pub unsafe fn gcLifecycle(state:*mut State,event:u32)->() {
@@ -131,6 +167,12 @@ pub unsafe effect fn dispatch<'m,S:EngineServices>(engine:&mut Engine<'m,S>,cont
     // This thread's id, which the events a worker forwards to the writer carry.
     let a=() let s=unsafe Pointer.borrow<(),State>(&a,state)
     return ValueBits.Float64 { value:u64.toF64(s.tid) }
+  } else if equal(op,b"threadpool") {
+    // Whether node.threadpoolwork.async and node.threadpoolwork.sync events are traced.
+    let asyncInput=unsafe common.argument(argv,1) let syncInput=unsafe common.argument(argv,2)
+    let mut a=() let s=unsafe Pointer.borrowMut<(),State>(&mut a,state)
+    s.threadpoolAsync=match asyncInput { ValueBits.Bool { value }=>value _=>false }
+    s.threadpoolSync=match syncInput { ValueBits.Bool { value }=>value _=>false }
   } else if equal(op,b"gc") {
     let input=unsafe common.argument(argv,1) let mut a=() let s=unsafe Pointer.borrowMut<(),State>(&mut a,state)
     s.gc=match input { ValueBits.Bool { value }=>value _=>false }
