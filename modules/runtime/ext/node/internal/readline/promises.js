@@ -26,14 +26,14 @@ const {
   ArrayPrototypeJoin,
   ArrayPrototypePush,
   Promise,
-} = require('internal/readline/primordials');
+} = require('internal/per_context/primordials');
 
 const { CSI } = require('internal/readline/utils');
-const { validateBoolean, validateInteger } = require('internal/readline/support');
+const { validateBoolean, validateInteger } = require('internal/validators');
 const { isWritable } = require('internal/streams/utils');
 const { codes: {
   ERR_INVALID_ARG_TYPE,
-} } = require('internal/readline/support');
+} } = require('internal/errors');
 
 const {
   kClearToLineBeginning,
