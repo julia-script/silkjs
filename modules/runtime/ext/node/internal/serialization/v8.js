@@ -51,7 +51,7 @@ const UNRESOLVED = Symbol('unresolved wire object');
 
 function isHostObject(value) {
   if (types.isKeyObject(value) || types.isCryptoKey(value) || host.types.isX509Certificate?.(value)) return true;
-  if (host.types.isStorage?.(value) || host.types.isEventSource?.(value)) return true;
+  if (host.types.isStorage?.(value) || host.types.isEventSource?.(value) || host.types.isStreamBindingObject?.(value)) return true;
   try { apply(blobSize, value, []); return true; } catch { return false; }
 }
 

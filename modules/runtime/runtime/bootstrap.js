@@ -694,9 +694,21 @@ host.activeResources = () => {
   names.push(...native.workerNative('activeResources', []));
   return names;
 };
+// lib/internal/async_hooks.js fatalError: the error's stack, or for a value
+// without one, a stack captured here under "Error: <value>".
+function asyncHookFatalText(error) {
+  try {
+    if (typeof error?.stack === 'string') return error.stack;
+    const holder = {};
+    Error.captureStackTrace(holder, host.asyncHookFatal);
+    const lines = String(holder.stack).split('\n');
+    lines[0] = `Error: ${String(error)}`;
+    return lines.join('\n');
+  } catch { return error; }
+}
 host.asyncHookFatal = error => {
   try { internalRequire('internal/process_report').onFatalError(error); }
-  finally { native.asyncHookFatal(error); }
+  finally { native.asyncHookFatal(asyncHookFatalText(error)); }
 };
 internalRequire('internal/process_native').install(process);
 Object.defineProperty(process, 'sourceMapsEnabled', {

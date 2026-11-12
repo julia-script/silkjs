@@ -10,9 +10,13 @@ module.exports = function createAsyncFS(native) {
   const uvSyscalls = { __proto__: null, copyFile: 'copyfile', utimes: 'utime', lutimes: 'lutime', futimes: 'futime' };
   function primitive(requestKind, operation, args) {
     return new Promise((resolve, reject) => {
+      const tracer = host.fsAsyncTracer;
+      const traceName = tracer === undefined ? undefined : uvSyscalls[operation] ?? operation;
+      const traceId = tracer?.begin(traceName);
       // Completion callbacks are named, as Node's oncomplete is: the REPL trims an
       // error's frames below the last one without a function name.
       native.submit(operation, args, function oncomplete(status, value, code) {
+        if (traceId !== undefined) tracer.end(traceName, traceId);
         if (status < 0) reject(c().error(code || 'UNKNOWN', uvSyscalls[operation] ?? operation,
           typeof args[0] === 'string' ? args[0] : undefined,
           ['rename', 'link', 'symlink', 'copyFile'].includes(operation) ? args[1] : undefined, status));
@@ -196,7 +200,10 @@ module.exports = function createAsyncFS(native) {
       case 'readdir': return readdir(requestKind, ...args);
       case 'opendir': {
         const o = Object.assign({}, args[1], { withFileTypes: true });
-        const entries = await readdir(requestKind, args[0], o);
+        const tracer = host.fsAsyncTracer, traceId = tracer?.begin('opendir', true);
+        let entries;
+        try { entries = await readdir(requestKind, args[0], o); }
+        finally { if (traceId !== undefined) tracer.end('opendir', traceId, true); }
         return entries.map(entry => Object.assign(entry, { name: c().encoded(entry.name, c().encoding(o.encoding, 'utf8', true)) }));
       }
       case 'cp': return copy(requestKind, ...args);
@@ -244,7 +251,10 @@ module.exports = function createAsyncFS(native) {
   // hops, which cost more than the system call for a 64 KiB chunk.
   function transferIO(operation, args, callback, requestKind) {
     const fd = args[0], view = args[1], position = args[4];
+    const tracer = host.fsAsyncTracer;
+    const traceId = tracer?.begin(operation);
     const done = (status, value, code) => {
+      if (traceId !== undefined) tracer.end(operation, traceId);
       // The native request holds view.buffer until it ends.
       const error = status < 0 ? c().error(code || 'UNKNOWN', operation, undefined, undefined, status) : null;
       host.enqueueIOCompletion(error === null ? () => callback(null, value) : () => callback(error));
