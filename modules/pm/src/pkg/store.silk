@@ -6,8 +6,10 @@
 //! are two files that can each be hard-linked into a project. [`Store.addTarball`] turns a gzip
 //! tar archive into store files and returns the list a package is made of.
 //!
-//! Writes are idempotent: a file that is already there with the right size is left alone, so two
-//! processes filling the store at once need no lock. Nothing here knows what kind of package the
+//! Writes can race. The first writer of a content creates its file, and a file with the whole
+//! size is complete, so a second writer leaves it alone. One that finds a file with another size
+//! writes its own under `staging` and renames it over the name. So threads and processes filling
+//! the store at once need no lock. Nothing here knows what kind of package the
 //! files belong to.
 
 import silk.mem.allocator { Allocator, OutOfMemoryError }
@@ -326,6 +328,9 @@ impl Store {
     let mut files = run Bytes.copy(root)
     run Bytes.append(&mut files, b"/files")
     run makeDirectories(Bytes.asSlice(&files))
+    let mut staging = run Bytes.copy(root)
+    run Bytes.append(&mut staging, b"/staging")
+    run makeDirectories(Bytes.asSlice(&staging))
     return Store { root: run Bytes.copy(root) }
   }
 
@@ -366,7 +371,62 @@ impl Store {
     return move path
   }
 
+  // Makes a directory of this writer's own in the store.
+  effect fn stage(self: &Self) -> Bytes ! StoreError | OutOfMemoryError ? &mut Allocator {
+    let mut template = run Bytes.copy(Bytes.asSlice(&self.root))
+    run Bytes.append(&mut template, b"/staging/XXXXXX")
+    let mut made = run Bytes.copy(Bytes.asSlice(&template))
+    match run Effect.result(NativeFile.makeTemporaryDirectory(Bytes.asSlice(&template), Bytes.asMutSlice(&mut made))) {
+      Result.Success {..} => {}
+      Result.Failure { error } => { fail io(&error) }
+    }
+    return move made
+  }
+
+  // Creates `path`, which must not exist, with `content`.
+  effect fn create(path: &[u8], content: &[u8], mode: u32) -> () ! NativeFileError {
+    let fd = run NativeFile.open(path, OPEN_WRITE_ONLY | OPEN_CREATE | OPEN_EXCLUSIVE, mode)
+    let outcome = run Effect.result(writeAll(fd, content))
+    let closed = run Effect.result(NativeFile.close(fd))
+    match move outcome {
+      Result<(), NativeFileError>.Failure { error } => { fail move error }
+      Result<(), NativeFileError>.Success {..} => {}
+    }
+    match move closed {
+      Result<(), NativeFileError>.Failure { error } => { fail move error }
+      Result<(), NativeFileError>.Success {..} => {}
+    }
+  }
+
+  // Puts `content` at `target` over a file that is there with another size: one that a writer
+  // is still filling, or that a writer left unfinished. The content is written in a directory
+  // of its own and moved over the name, so the other writer is not disturbed and the name never
+  // holds less than the whole content from here on.
+  effect fn replace(self: &Self, target: &[u8], content: &[u8], mode: u32) -> ()
+    ! StoreError | OutOfMemoryError
+    ? &mut Allocator {
+    let staging = run Store.stage(self)
+    let mut prepared = run Bytes.copy(Bytes.asSlice(&staging))
+    run Bytes.append(&mut prepared, b"/file")
+    let source = Bytes.asSlice(&prepared)
+    let moved = match move run Effect.result(Store.create(source, content, mode)) {
+      Result<(), NativeFileError>.Success {..} => run Effect.result(NativeFile.rename(source, target))
+      Result<(), NativeFileError>.Failure { error } => Result<(), NativeFileError>.failResult(move error)
+    }
+    // Gone after the rename; still there when something failed.
+    drop run Effect.result(NativeFile.remove(source))
+    drop run Effect.result(NativeFile.removeDirectory(Bytes.asSlice(&staging)))
+    match move moved {
+      Result<(), NativeFileError>.Failure { error } => { fail io(&error) }
+      Result<(), NativeFileError>.Success {..} => {}
+    }
+  }
+
   /// Writes `content` to the store when it is not there yet, and returns its key.
+  ///
+  /// # Details
+  /// Writers in other threads and processes can add the same content at the same time. The
+  /// first one creates the file, and a file with the whole size is complete.
   ///
   /// # Errors
   /// - [`StoreError`] with `Io` when the file cannot be written.
@@ -381,28 +441,12 @@ impl Store {
       mode = 365
     }
     let mut attempt: u8 = 0
-    while attempt < 3 {
+    while attempt < 2 {
       attempt = attempt + 1
-      match run Effect.result(NativeFile.open(target, OPEN_WRITE_ONLY | OPEN_CREATE | OPEN_EXCLUSIVE, mode)) {
-        Result<i32, NativeFileError>.Success { value: fd } => {
-          let outcome = run Effect.result(writeAll(fd, content))
-          let closed = run Effect.result(NativeFile.close(fd))
-          match move outcome {
-            Result<(), NativeFileError>.Failure { error } => {
-              // Do not leave a short file under a name that promises the whole content.
-              drop run Effect.result(NativeFile.remove(target))
-              fail io(&error)
-            }
-            Result<(), NativeFileError>.Success {..} => {}
-          }
-          match move closed {
-            Result<(), NativeFileError>.Failure { error } => { fail io(&error) }
-            Result<(), NativeFileError>.Success {..} => {}
-          }
-          return key
-        }
-        Result<i32, NativeFileError>.Failure { error } => {
-          if error.code == MISSING {
+      match run Effect.result(Store.create(target, content, mode)) {
+        Result<(), NativeFileError>.Success {..} => { return key }
+        Result<(), NativeFileError>.Failure { error } => {
+          if error.code == MISSING && attempt == 1 {
             // The two-character directory of this key is not there yet.
             run makeDirectories(Slice.view<u8>(target, 0, Bytes.length(&self.root) + 9))
           } else if error.code == EXISTS {
@@ -414,15 +458,15 @@ impl Store {
               }
               Result.Failure {..} => {}
             }
-            // A writer stopped part way. Replace its file.
-            drop run Effect.result(NativeFile.remove(target))
+            run Store.replace(self, target, content, mode)
+            return key
           } else {
             fail io(&error)
           }
         }
       }
     }
-    fail StoreError { kind: StoreErrorKind.Io, code: EXISTS }
+    fail StoreError { kind: StoreErrorKind.Io, code: MISSING }
   }
 
   /// Unpacks a gzip tar archive into the store and returns its files.
