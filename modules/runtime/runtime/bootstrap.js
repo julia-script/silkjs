@@ -1023,7 +1023,18 @@ function installRuntimeOptions(args, entrypoints = [], preloadEntrypoints = true
   host.typeScriptMode = host.transformTypes ? 'transform' : host.stripTypes === false ? false : 'strip';
   host.initialExecArgv = process.execArgv.slice();
   host.workerRuntimeArgs = args.slice();
-  if (host.exposeGC) Object.defineProperty(globalThis, 'gc', { value: rawStd.gc, writable: true, enumerable: true });
+  if (host.exposeGC) {
+    // A collection gc() asks for is a forced one to 'gc' performance entries.
+    const collect = rawStd.gc;
+    const gc = function gc() {
+      const observer = host.gcObserver;
+      if (observer === undefined) return Reflect.apply(collect, undefined, arguments);
+      observer(false);
+      try { return Reflect.apply(collect, undefined, arguments); }
+      finally { observer(true); }
+    };
+    Object.defineProperty(globalThis, 'gc', { value: gc, writable: true, enumerable: true });
+  }
   if (host.experimentalEventSource) Object.defineProperty(globalThis, 'EventSource', {
     value: internalRequire('internal/web/eventsource').EventSource, writable: true, configurable: true,
   });

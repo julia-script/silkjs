@@ -207,7 +207,7 @@ class CloneSerializer extends Serializer {
       this.writeRawBytes(data.bytes);
       return;
     }
-    this._fail();
+    this._fail(value);
   }
 }
 CloneSerializer.prototype._getDataCloneError = function(message) { return cloneError(message); };

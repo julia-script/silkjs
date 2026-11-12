@@ -16,7 +16,7 @@ const enqueueObserver = Symbol('enqueue');
 const deliverObserver = Symbol('deliver');
 const observesType = Symbol('observesType');
 const reservedMarks = new Set(['nodeStart', 'v8Start', 'environment', 'loopStart', 'loopExit', 'bootstrapComplete']);
-const supportedTypes = Object.freeze([...new Set(['function', 'http', 'http2', 'mark', 'measure', 'resource', ...(host.performanceObserverTypes || [])])].sort());
+const supportedTypes = Object.freeze([...new Set(['function', 'gc', 'http', 'http2', 'mark', 'measure', 'resource', ...(host.performanceObserverTypes || [])])].sort());
 // Only an installed instance counts: reading the lazy global would load this module
 // again while it loads, and settle globalThis.performance to undefined.
 const previousDescriptor = Object.getOwnPropertyDescriptor(globalThis, 'performance');
@@ -391,6 +391,33 @@ function countObservers() {
     let count = 0;
     for (const observer of observers) if (observer[observesType](nodeEntryTypes[index])) count++;
     counts[index] = count;
+  }
+  observeCollections(counts[0] !== 0);
+}
+// 'gc' entries, as Node's GC prologue/epilogue callbacks queue them: the trace
+// provider keeps each collection's start and end while an observer watches, and
+// they become entries once per loop turn, or right after a forced gc().
+let stopCollections;
+function observeCollections(watch) {
+  if (watch === (stopCollections !== undefined) || typeof host.traceNative !== 'function') return;
+  host.traceNative('observe', watch);
+  if (watch) {
+    stopCollections = host.performanceAddLoopListener(() => takeCollections(0));
+    host.gcObserver = forced => takeCollections(forced ? constants.NODE_PERFORMANCE_GC_FLAGS_FORCED : 0);
+  } else {
+    stopCollections();
+    stopCollections = undefined;
+    host.gcObserver = undefined;
+  }
+}
+function takeCollections(flags) {
+  const count = host.traceNative('collections') * 3;
+  if (!(count > 0)) return;
+  const values = [];
+  for (let index = 0; index < count; index++) values.push(host.traceNative('collection', index));
+  for (let index = 0; index + 2 < values.length; index += 3) {
+    const kind = values[index + 2] ? constants.NODE_PERFORMANCE_GC_MINOR : constants.NODE_PERFORMANCE_GC_MAJOR;
+    emitNodeEntry('gc', 'gc', values[index] / 1e6 - clockStart(), (values[index + 1] - values[index]) / 1e6, { kind, flags });
   }
 }
 const constants = {
