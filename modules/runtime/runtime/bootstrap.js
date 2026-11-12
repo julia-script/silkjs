@@ -692,6 +692,11 @@ Object.assign(process, {
       number = internalRequire('os').constants.signals[signal];
       if (number === undefined) throw new (internalRequire('internal/errors').codes.ERR_UNKNOWN_SIGNAL)(signal);
     }
+    // A NODE_V8_COVERAGE file is still written when SIGINT or SIGTERM ends the
+    // process, as in Node: a signal this process sends itself with no listener
+    // to take it writes the coverage first.
+    if ((number === 2 || number === 15) && (pid === 0 || pid === process.pid) && moduleHas('internal/profiler_binding') &&
+        process.listenerCount(number === 2 ? 'SIGINT' : 'SIGTERM') === 0) internalRequire('internal/profiler_binding').finish();
     const code = rawOS.kill(pid, number);
     if (code < 0) throw new (internalRequire('internal/errors').ErrnoException)(-Math.abs(code), 'kill');
     // SIGINT listeners hear it through the interrupt broker's thread: wait for it,
