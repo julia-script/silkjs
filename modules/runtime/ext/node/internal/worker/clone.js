@@ -207,7 +207,7 @@ class CloneSerializer extends Serializer {
       this.writeRawBytes(data.bytes);
       return;
     }
-    this._fail();
+    this._fail(value);
   }
 }
 CloneSerializer.prototype._getDataCloneError = function(message) { return cloneError(message); };
@@ -331,6 +331,9 @@ function prepare(value, list, source) {
     } else if (fileHandles(false)?.is(item)) {
       handleFds.push(fileHandles(false).check(item));
       handles.push(item);
+    } else if (host.types.isSlidingWindowHistogram?.(item)) {
+      // markTransferMode(histogram, false, false): neither cloneable nor transferable.
+      throw cloneError();
     } else throw codedError('ERR_INVALID_TRANSFER_OBJECT', 'Found invalid object in transferList');
   }
   try {

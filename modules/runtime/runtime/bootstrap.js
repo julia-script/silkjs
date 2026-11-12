@@ -278,6 +278,7 @@ host.onHydrate = refresh => { hydrations.push(refresh); };
 const asyncHooks = internalRequire('async_hooks');
 function resource(type, owner) { return asyncHooks._createResource(type, owner); }
 const invokeScoped = asyncHooks._invoke;
+const hidePromises = asyncHooks._hidePromises;
 function invokeResource(scope, callback, receiver, args, destroy = true) {
   try { return invokeScoped(scope, invoke, callback, receiver, args); }
   finally { if (destroy) scope.emitDestroy(); }
@@ -516,6 +517,17 @@ let initialNativeIdleTime = 0;
 const loopListeners = new Set();
 host.performanceStartTime = startTime;
 host.performanceTimeOrigin = Date.now() - (native.now() - startTime);
+// A worker takes the process's clock, as Node: performance.timeOrigin, performance.now(),
+// process.uptime() and the milestones count from when the process started.
+host.adoptProcessClock = (processStart, processOrigin) => {
+  const shift = startTime - processStart;
+  for (const name of ['v8Start', 'environment', 'bootstrapComplete', 'loopStart', 'loopExit']) {
+    if (performanceMilestones[name] >= 0) performanceMilestones[name] += shift;
+  }
+  startTime = processStart;
+  host.performanceStartTime = processStart;
+  host.performanceTimeOrigin = processOrigin;
+};
 host.performanceLoopStats = () => {
   if (performanceMilestones.loopStart < 0) return { idle: 0, active: 0 };
   const idle = native.loopIdleTime() - initialNativeIdleTime;
@@ -612,6 +624,13 @@ Object.assign(process, {
     return true;
   },
   _fatalException: internalRequire('internal/startup_controls').fatalException,
+  // node_binding.cc GetLinkedBinding: the addon permission names the module, then the embedder's
+  // linked modules are searched. This runtime links none.
+  _linkedBinding(module) {
+    module = `${module}`;
+    internalRequire('internal/permission').check('addon', module);
+    throw Object.assign(new Error(`No such binding was linked: ${module}`), { code: 'ERR_INVALID_MODULE' });
+  },
   // Formats like console.log and writes to fd 2 at once: no streams, ticks or console.
   _rawDebug(...args) { host.writeText(2, internalRequire('util').format(...args) + '\n'); },
 });
@@ -698,8 +717,10 @@ for (const name of ['Event', 'CustomEvent', 'EventTarget', 'AbortController', 'A
 const asyncFS = internalRequire('internal/fs_async')(native);
 host.submitIO = (operation, args, callback, requestKind) => {
   const scope = resource(requestKind === 1 ? 'FSREQPROMISE' : requestKind === 2 ? 'FILEHANDLECLOSEREQ' : 'FSREQCALLBACK');
+  hidePromises(1);
   try { return asyncFS.submitIO(operation, args, function oncomplete(...values) { return invokeResource(scope, callback, undefined, values); }, requestKind); }
   catch (error) { scope.emitDestroy(); throw error; }
+  finally { hidePromises(-1); }
 };
 host.watch = (filename, options, callback) => {
   const scope = resource(options.stat ? 'STATWATCHER' : 'FSEVENTWRAP');
@@ -1007,6 +1028,7 @@ function runtimeFlag(arg) {
   if (arg.startsWith('--localstorage-file=')) { host.localStorageFile = arg.slice(20); return true; }
   if (arg.startsWith('--require=')) { requirePreloads.push(arg.slice(10)); return true; }
   if (arg.startsWith('--import=')) { importPreloads.push(arg.slice(9)); return true; }
+  if (arg === '--addons' || arg === '--no-addons') { host.noAddons = arg === '--no-addons'; return true; }
   if (arg.startsWith('--conditions=')) { (host.moduleConditions ||= []).push(arg.slice(13)); return true; }
   if (arg === '--preserve-symlinks' || arg === '--no-preserve-symlinks') {
     host.preserveSymlinks = arg === '--preserve-symlinks'; return true;
@@ -1034,7 +1056,18 @@ function installRuntimeOptions(args, entrypoints = [], preloadEntrypoints = true
   host.typeScriptMode = host.transformTypes ? 'transform' : host.stripTypes === false ? false : 'strip';
   host.initialExecArgv = process.execArgv.slice();
   host.workerRuntimeArgs = args.slice();
-  if (host.exposeGC) Object.defineProperty(globalThis, 'gc', { value: rawStd.gc, writable: true, enumerable: true });
+  if (host.exposeGC) {
+    // A collection gc() asks for is a forced one to 'gc' performance entries.
+    const collect = rawStd.gc;
+    const gc = function gc() {
+      const observer = host.gcObserver;
+      if (observer === undefined) return Reflect.apply(collect, undefined, arguments);
+      observer(false);
+      try { return Reflect.apply(collect, undefined, arguments); }
+      finally { observer(true); }
+    };
+    Object.defineProperty(globalThis, 'gc', { value: gc, writable: true, enumerable: true });
+  }
   if (host.experimentalEventSource) Object.defineProperty(globalThis, 'EventSource', {
     value: internalRequire('internal/web/eventsource').EventSource, writable: true, configurable: true,
   });
@@ -1325,6 +1358,8 @@ function run() {
   process._print_eval = print;
   filename = args[index];
   process.argv = [process.execPath, ...args.slice(index)];
+  // As lib/internal/main: an empty script name is no script, so the input is stdin (or the REPL).
+  if (filename === '') filename = undefined;
   // `node inspect ...`: the debugger client (lib/internal/main/inspect.js).
   if (filename === 'inspect' && expression === undefined && !testMode && !check && !watchMode && !interactive) {
     installRuntimeOptions(environment.concat(process.execArgv));

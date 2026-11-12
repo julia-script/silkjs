@@ -210,8 +210,8 @@ function checkFile(op, args) {
   if (!initialized || (!state.enforce && !state.audit)) return;
   const path = args[0];
   switch (op) {
-    case 'close': case 'read': case 'pread': case 'readv': case 'write': case 'pwrite': case 'writev': case 'fstat': case 'futimes': case 'ftruncate': return;
-    case 'fsync': case 'fdatasync': case 'fchmod': case 'fchown':
+    case 'close': case 'read': case 'pread': case 'readv': case 'write': case 'pwrite': case 'writev': case 'fstat': case 'ftruncate': return;
+    case 'fsync': case 'fdatasync': case 'fchmod': case 'fchown': case 'futimes':
       if (initialized && state.enforce) throw apiDenied(`${op} API is disabled when Permission Model is enabled.`);
       return;
     case 'lstat':
@@ -233,18 +233,21 @@ function checkFile(op, args) {
       if (initialized && state.enforce && !has('fs')) throw apiDenied('fs.symlink API requires full fs.read and fs.write permissions.');
       check('fs.read', path); check('fs.write', path); check('fs.write', args[1]); return;
     case 'access': check('fs.read', path); return;
-    case 'mkdir': case 'mkdtemp': case 'unlink': case 'rmdir': case 'chmod': case 'lchmod': case 'chown': case 'lchown': case 'truncate': case 'utimes': case 'lutimes':
+    // lib/fs.js hands the binding the template with its XXXXXX, and that is the resource.
+    case 'mkdtemp': check('fs.write', `${isBuffer(path) ? bufferText(path) : path}XXXXXX`); return;
+    case 'mkdir': case 'unlink': case 'rmdir': case 'chmod': case 'lchmod': case 'chown': case 'lchown': case 'truncate': case 'utimes': case 'lutimes':
       check('fs.write', path); return;
     default: check('fs.read', path);
   }
 }
-// Node's fs bindings check before they queue a request, so a callback API throws the denial.
-// fs.symlink is the exception: Node passes its denial to the callback.
+// Node's fs bindings (src/node_file.cc) check readlink, mkdir, rmdir, chmod, utimes and
+// lutimes before they look at the request, so those callback APIs throw the denial. The
+// others (open, stat, lstat, access, readdir, rename, ...) pass it to the callback, which the
+// native gate does.
 // Only when enforcing without audit: the native gate checks again, and audit would publish twice.
 // A null-prototype table: user code cannot change what it answers.
 const callbackChecked = { __proto__: null };
-for (const op of ['access', 'stat', 'lstat', 'open', 'readdir', 'scandir', 'readlink', 'realpath', 'copyFile',
-  'rename', 'link', 'mkdir', 'mkdtemp', 'unlink', 'rmdir', 'chmod', 'lchmod', 'chown', 'lchown', 'truncate', 'utimes', 'lutimes']) callbackChecked[op] = true;
+for (const op of ['readlink', 'mkdir', 'rmdir', 'chmod', 'lchmod', 'utimes', 'lutimes']) callbackChecked[op] = true;
 function checkCallbackFile(op, args) {
   if (initialized && state.enforce && !state.audit && callbackChecked[op] === true) checkFile(op, args);
 }
@@ -310,6 +313,8 @@ function initialize(options = {}) {
   }
   if (state.enforce || state.audit) {
     addonsDisabled = !state.addon;
+    // env.cc: without --allow-addons the permission model turns native addons off (--no-addons).
+    if (addonsDisabled) host.noAddons = true;
     freeze(require('path'));
     process.binding = function binding() { throw apiDenied('process.binding'); };
     const warningFlags = [
@@ -353,5 +358,11 @@ function initialize(options = {}) {
   }
   initialized = true;
 }
-module.exports = { applyOption, initialize, check, allows, canRead, checkFile, checkCallbackFile, checkNative,
+// ERR_ACCESS_DENIED as lib/internal/errors builds it from JS: (message, permission, resource).
+function accessDenied(message, scope, resource) {
+  const error = apiDenied(message);
+  error.permission = names[scope]; error.resource = resource;
+  return error;
+}
+module.exports = { applyOption, initialize, check, allows, canRead, checkFile, checkCallbackFile, checkNative, has, accessDenied,
   enabled: () => initialized && (state.enforce || state.audit) };
