@@ -33,6 +33,23 @@ run.
 `add` and `remove` edit `package.json` in its text: the formatting and the order of the keys
 stay as they are.
 
+## Workspaces
+
+A `package.json` with `workspaces` is the root of a workspace: the field lists patterns for the
+directories of its packages, such as `["packages/*", "apps/**", "!apps/legacy"]`, or holds that
+list under `packages`. The packages are installed together:
+
+- There is one `sjs.lock` and one `node_modules/.sjs`, at the root. Each package has its own
+  `node_modules` with links into it, so it can load what it declares and nothing else.
+- A dependency written `workspace:*`, `workspace:^`, `workspace:~` or `workspace:<range>` is
+  another package of the workspace, by name, and becomes a link to its directory. A range has
+  to allow the version of that package. `workspace:<name>@*` links it under another name.
+- Every command works from the directory of any package and installs for the whole workspace.
+  `add` and `remove` change the package they are run in; `--filter <name>` (`-F`) picks another
+  one by name, and `-w` the root project.
+- `.npmrc` is read from the home directory, then the root of the workspace, then the working
+  directory.
+
 ## Layout
 
 - `src/pkg` knows nothing about npm: versions and ranges, the content-addressable store,
@@ -40,4 +57,5 @@ stay as they are.
   text. A package manager for another ecosystem can use it
   as is.
 - `src/npm` is what is specific to the npm ecosystem: manifests, registry metadata, the registry
-  client, `.npmrc`, the resolver, the lockfile, the `node_modules` layout and the commands.
+  client, `.npmrc`, workspaces, the resolver, the lockfile, the `node_modules` layout and the
+  commands.

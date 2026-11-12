@@ -85,9 +85,9 @@ const server = http.createServer((request, response) => {
   response.writeHead(200, { 'content-type': 'application/json', 'content-length': Buffer.byteLength(body) }).end(body);
 });
 
-function run(directory, args) {
+function run(directory, args, home = directory) {
   return new Promise((resolve, reject) => {
-    const environment = { PATH: process.env.PATH, HOME: directory, SILKJS_STORE: path.join(directory, 'store') };
+    const environment = { PATH: process.env.PATH, HOME: home, SILKJS_STORE: path.join(home, 'store') };
     const child = spawn(process.execPath, args, { cwd: directory, env: environment });
     let stdout = '';
     let stderr = '';
@@ -139,6 +139,31 @@ server.listen(0, '127.0.0.1', async () => {
     assert.strictEqual(missing.status, 1);
     assert.match(missing.stderr, /^silkjsruntime: /);
     assert.strictEqual(fs.readFileSync(manifest, 'utf8'), '{\n  "name": "app",\n  "private": true\n}\n');
+    // A workspace: one lockfile and one hidden directory at the root, and a package that depends
+    // on another gets a link to its directory.
+    const repo = path.join(directory, 'repo');
+    fs.mkdirSync(path.join(repo, 'packages/app'), { recursive: true });
+    fs.mkdirSync(path.join(repo, 'packages/lib'), { recursive: true });
+    fs.writeFileSync(path.join(repo, '.npmrc'), `registry=http://127.0.0.1:${server.address().port}/\n`);
+    fs.writeFileSync(path.join(repo, 'package.json'), '{"name":"repo","private":true,"workspaces":["packages/*"]}\n');
+    fs.writeFileSync(path.join(repo, 'packages/lib/package.json'), '{"name":"@repo/lib","version":"1.0.0","main":"index.js","dependencies":{"worder":"^2.0.0"}}\n');
+    fs.writeFileSync(path.join(repo, 'packages/lib/index.js'), 'module.exports = () => "lib says " + require("worder");\n');
+    fs.writeFileSync(path.join(repo, 'packages/app/package.json'), '{"name":"app","dependencies":{"@repo/lib":"workspace:*"}}\n');
+    fs.writeFileSync(path.join(repo, 'packages/app/main.js'), 'console.log(require("@repo/lib")(), require("greeter")());\n');
+    const app = path.join(repo, 'packages/app');
+    const shared = await run(app, ['install'], directory);
+    assert.strictEqual(shared.status, 0, shared.stderr);
+    assert.match(shared.stdout, /1 packages: 0 downloaded, 1 linked\n/);
+    assert.ok(fs.existsSync(path.join(repo, 'sjs.lock')));
+    assert.ok(!fs.existsSync(path.join(app, 'sjs.lock')));
+    assert.strictEqual(fs.readlinkSync(path.join(app, 'node_modules/@repo/lib')), '../../../lib');
+    assert.ok(fs.existsSync(path.join(repo, 'node_modules/.sjs/worder@2.1.0')));
+    const filtered = await run(path.join(repo, 'packages/lib'), ['add', '--filter', 'app', 'greeter'], directory);
+    assert.strictEqual(filtered.status, 0, filtered.stderr);
+    assert.match(fs.readFileSync(path.join(app, 'package.json'), 'utf8'), /"greeter":\s*"\^1\.0\.0"/);
+    const together = await run(app, ['main.js'], directory);
+    assert.strictEqual(together.status, 0, together.stderr);
+    assert.strictEqual(together.stdout, 'lib says world hello world\n');
     console.log('ok');
   } finally {
     fs.rmSync(directory, { recursive: true, force: true });
