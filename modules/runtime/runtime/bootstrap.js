@@ -263,6 +263,7 @@ host.onHydrate = refresh => { hydrations.push(refresh); };
 const asyncHooks = internalRequire('async_hooks');
 function resource(type, owner) { return asyncHooks._createResource(type, owner); }
 const invokeScoped = asyncHooks._invoke;
+const hidePromises = asyncHooks._hidePromises;
 function invokeResource(scope, callback, receiver, args, destroy = true) {
   try { return invokeScoped(scope, invoke, callback, receiver, args); }
   finally { if (destroy) scope.emitDestroy(); }
@@ -686,8 +687,10 @@ for (const name of ['Event', 'CustomEvent', 'EventTarget', 'AbortController', 'A
 const asyncFS = internalRequire('internal/fs_async')(native);
 host.submitIO = (operation, args, callback, requestKind) => {
   const scope = resource(requestKind === 1 ? 'FSREQPROMISE' : requestKind === 2 ? 'FILEHANDLECLOSEREQ' : 'FSREQCALLBACK');
+  hidePromises(1);
   try { return asyncFS.submitIO(operation, args, function oncomplete(...values) { return invokeResource(scope, callback, undefined, values); }, requestKind); }
   catch (error) { scope.emitDestroy(); throw error; }
+  finally { hidePromises(-1); }
 };
 host.watch = (filename, options, callback) => {
   const scope = resource(options.stat ? 'STATWATCHER' : 'FSEVENTWRAP');

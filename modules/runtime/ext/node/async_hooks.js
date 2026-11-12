@@ -365,9 +365,19 @@ class AsyncLocalStorage {
 
 // Engine tokens are monotonic and distinct from public async IDs. Metadata must
 // never strongly retain a Promise, otherwise its destroy event cannot occur.
+// Promises the runtime makes for its own work (the fs request pipeline) are
+// not user promises: Node does that work natively, so hooks never see them.
+// They, their children and promises made while their reactions run stay hidden.
+const hiddenPromise = Object.freeze({ hidden: true });
+let hideDepth = 0;
+const latePromises = new WeakMap();
 function nativeEvent(event, token, parent, resource, parentResource) {
   if (promiseObserver !== undefined) promiseObserver(event, token, parentResource !== undefined);
   if (event === 0) {
+    if (hideDepth !== 0 || (parent !== undefined && nativeResources.get(parent) === hiddenPromise)) {
+      nativeResources.set(token, hiddenPromise);
+      return;
+    }
     const state = { id: nextId++, trigger: nativeResources.get(parent)?.id ?? executionAsyncId(),
       resource: new WeakRef(resource), destroyed: false, promise: true };
     nativeResources.set(token, state);
@@ -375,14 +385,21 @@ function nativeEvent(event, token, parent, resource, parentResource) {
     emit('init', [state.id, 'PROMISE', state.trigger, resource], true);
     return;
   }
-  const state = nativeResources.get(token);
-  if (state === undefined) {
-    // Late-enabled promise hooks still observe resources constructed before
-    // token tracking began. Do not invent async IDs or synthesize init events.
-    if (event === 1) emitPromise('before', resource);
-    else if (event === 2) emitPromise('after', resource);
-    else if (event === 3) emitPromise('settled', resource);
+  let state = nativeResources.get(token);
+  if (state === hiddenPromise) {
+    if (event === 1) hideDepth++;
+    else if (event === 2 && hideDepth > 0) hideDepth--;
     return;
+  }
+  if (state === undefined && (resource === null || typeof resource !== 'object')) return;
+  if (state === undefined) {
+    // A promise made before hooks were enabled, as Node's trackPromise: it takes an
+    // id on its first event, without an init.
+    state = latePromises.get(resource);
+    if (state === undefined) {
+      state = { id: nextId++, trigger: executionAsyncId(), resource: new WeakRef(resource), destroyed: true, promise: true };
+      latePromises.set(resource, state);
+    }
   }
   if (event === 1) {
     const context = captureContext();
@@ -403,7 +420,7 @@ function nativeDestroy(token) {
   const state = nativeResources.get(token);
   if (state === undefined) return;
   nativeResources.delete(token);
-  enqueueDestroy(state);
+  if (state !== hiddenPromise) enqueueDestroy(state);
 }
 
 const asyncWrapProviders = Object.freeze({
@@ -438,6 +455,8 @@ Object.defineProperties(module.exports, {
   _runWithContext: { value: runWithContext },
   _nativeEvent: { value: nativeEvent },
   _nativeDestroy: { value: nativeDestroy },
+  // Brackets runtime work whose promises hooks must not see (see hiddenPromise).
+  _hidePromises: { value: delta => { hideDepth += delta; } },
   _setPromiseObserver: { value: setPromiseObserver },
   _drainDestroy: { value: drainDestroy },
   // Node's newAsyncId: the next id from the same counter every resource takes its id from.
