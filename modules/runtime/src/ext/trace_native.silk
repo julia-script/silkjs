@@ -34,7 +34,8 @@ import ext.trace_abi as c
 import ext.fs_native { equal }
 
 pub struct State { fd:i32, offset:i64, error:i32, first:bool, gc:bool, threadpoolAsync:bool, threadpoolSync:bool, pid:u64, tid:u64,
-  observe:bool, started:u64, usedBefore:u64, youngBefore:u64, collections:usize, records:[u64;192] }
+  observe:bool, started:u64, usedBefore:u64, youngBefore:u64, collections:usize, records:[u64;192],
+  printGC:bool, origin:u64, printStarted:u64, printUsedBefore:u64 }
 pub effect fn open(allocator:*mut RuntimeHeap)->*mut State !OutOfMemoryError {
   let raw=unsafe memory.calloc(1,Layout.of<State>().bytes)
   if Pointer.isNull<u8>(raw) { fail OutOfMemoryError {} }
@@ -44,7 +45,8 @@ pub effect fn open(allocator:*mut RuntimeHeap)->*mut State !OutOfMemoryError {
   static if Intrinsic.targetOperatingSystem()=="darwin" { let _ignored=unsafe c.pthread_threadid_np(Pointer.null<u8>(),Pointer.fromMutRef<u64>(&mut tid)) }
   else { tid=i32.toU64(unsafe c.gettid()) }
   unsafe Pointer.put<State>(state,State { fd:-1,offset:0,error:0,first:true,gc:false,threadpoolAsync:false,threadpoolSync:false,pid:i32.toU64(unsafe c.getpid()),tid:tid,
-    observe:false,started:0,usedBefore:0,youngBefore:0,collections:0,records:[0;192] })
+    observe:false,started:0,usedBefore:0,youngBefore:0,collections:0,records:[0;192],
+    printGC:false,origin:i64.toU64(clock.nowNanoseconds()),printStarted:0,printUsedBefore:0 })
   return state
 }
 pub unsafe fn close(state:*mut State)->() {
@@ -125,6 +127,41 @@ export "C" fn silkThreadpoolTrace(tracing:*mut u8,kind:u8,phase:u8,id:u64,nanose
   if !sync { timestamp=i64.toU64(clock.nowNanoseconds())/1000 tid=s.tid }
   unsafe commit(&mut s.*,saved,timestamp,tid)
 }
+struct Line { bytes:[u8;192], used:usize }
+impl Line {
+  fn text(self:&mut Self,value:&[u8])->() { let mut i:usize=0 while i<value.length && self.used<192 { self.bytes[self.used]=value[i] self.used=self.used+1 i=i+1 } }
+  fn digits(self:&mut Self,value:u64,base:u64,width:usize)->() {
+    let mut digits:[u8;20]=[32;20] let mut at:usize=20 let mut n=value
+    while true { at=at-1 let digit=u64.toU8(n%base) if digit<10 { digits[at]=48+digit } else { digits[at]=87+digit } n=n/base if n==0 { break } }
+    while 20-at<width && at>0 { at=at-1 }
+    while at<20 && self.used<192 { self.bytes[self.used]=digits[at] self.used=self.used+1 at=at+1 }
+  }
+  // A size in MB, or a time in ms from nanoseconds, with `places` decimals.
+  fn fixed(self:&mut Self,value:u64,unit:u64,places:u32)->() {
+    let mut scale:u64=1 let mut i:u32=0 while i<places { scale=scale*10 i=i+1 }
+    let scaled=(value*scale+unit/2)/unit
+    self.digits(scaled/scale,10,0) self.text(b".")
+    let mut fraction=scaled%scale let mut divisor=scale/10
+    while divisor>0 { self.digits(fraction/divisor,10,0) fraction=fraction%divisor divisor=divisor/10 }
+  }
+}
+/// V8's --trace-gc line for one collection on stderr: the isolate, ms since start, the kind
+/// (a young collection is V8's Scavenge, a full one its Mark-Compact), heap use before and after.
+unsafe fn printCollection(s:&State,event:u32,now:u64,used:u64)->() {
+  let mut line=Line { bytes:[0;192], used:0 }
+  line.text(b"[") line.digits(s.pid,10,0) line.text(b":0x") line.digits(s.tid,16,0) line.text(b"] ")
+  line.digits((now-s.origin)/1000000,10,8) line.text(b" ms: ")
+  if event&2==2 { line.text(b"Scavenge ") } else { line.text(b"Mark-Compact ") }
+  line.fixed(s.printUsedBefore,1048576,1) line.text(b" -> ") line.fixed(used,1048576,1) line.text(b" MB, ")
+  line.fixed(now-s.printStarted,1000000,2) line.text(b" ms\n")
+  let mut at:usize=0
+  while at<line.used {
+    let count=unsafe c.write(2,Pointer.fromRef<u8>(&line.bytes[at]),line.used-at)
+    if count<0 { if unsafe platform.errno()==4 { continue } return () }
+    if count==0 { return () }
+    at=at+isize.toUsize(count)
+  }
+}
 /// Called only from EngineServices.gcLifecycle; never enters JS or the allocator.
 /// used is the allocator's bytes in use, young the part allocated since the last collection.
 pub unsafe fn gcLifecycle(state:*mut State,event:u32,used:usize,young:usize)->() {
@@ -138,6 +175,11 @@ pub unsafe fn gcLifecycle(state:*mut State,event:u32,used:usize,young:usize)->()
       s.records[at+3]=s.usedBefore s.records[at+4]=s.youngBefore s.records[at+5]=usize.toU64(used)
       s.collections=s.collections+1
     }
+  }
+  if s.printGC {
+    let now=i64.toU64(clock.nowNanoseconds())
+    if event&1==0 { s.printStarted=now s.printUsedBefore=usize.toU64(used) }
+    else { unsafe printCollection(&s.*,event,now,usize.toU64(used)) }
   }
   if !s.gc || s.fd<0 || s.error!=0 { return () }
   let mut prefix:&[u8]=b"{\"cat\":\"v8,gc\",\"name\":\"SilkGC\",\"ph\":\"B\",\"args\":{}"
@@ -179,6 +221,10 @@ pub unsafe effect fn dispatch<'m,S:EngineServices>(engine:&mut Engine<'m,S>,cont
   } else if equal(op,b"gc") {
     let input=unsafe common.argument(argv,1) let mut a=() let s=unsafe Pointer.borrowMut<(),State>(&mut a,state)
     s.gc=match input { ValueBits.Bool { value }=>value _=>false }
+  } else if equal(op,b"printGC") {
+    // V8's --trace-gc: a line on stderr after every collection.
+    let input=unsafe common.argument(argv,1) let mut a=() let s=unsafe Pointer.borrowMut<(),State>(&mut a,state)
+    s.printGC=match input { ValueBits.Bool { value }=>value _=>false }
   } else if equal(op,b"observe") {
     let input=unsafe common.argument(argv,1) let mut a=() let s=unsafe Pointer.borrowMut<(),State>(&mut a,state)
     s.observe=match input { ValueBits.Bool { value }=>value _=>false } s.collections=0
