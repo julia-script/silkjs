@@ -30,6 +30,13 @@ asks the registry nothing when it still matches `package.json`. The graph holds 
 every platform, so the file is the same on every machine; the install skips what the host cannot
 run.
 
+A package gets its peer dependencies from what is above it: the nearest package, up to the
+project, that depends on something under that name. When the same version of a package is used
+with different peers, each use is a node of its own in the graph, with its own entry in the
+lockfile and its own directory, named after the peers: `node_modules/.sjs/plugin@1.0.0_host@2.1.0`.
+A peer nothing above provides is installed for the package that asks, and an optional one is
+left out.
+
 `add` and `remove` edit `package.json` in its text: the formatting and the order of the keys
 stay as they are.
 
