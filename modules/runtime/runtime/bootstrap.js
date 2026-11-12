@@ -9,7 +9,13 @@ delete globalThis.__silkNative;
 // Every exit path ends here. Node's exit handler stops and joins every worker
 // before exit(): libc exit handlers (OpenSSL's cleanup among them) must not tear
 // down shared native state while a worker thread still runs.
-rawStd.exit = code => { native.workerNative('stopThreads', []); stdNamespace.exit(code); };
+// An embedded runtime does not own the process: its exit ends the runtime instead, as a
+// worker's does, and the embedder's turn learns the status.
+rawStd.exit = code => {
+  native.workerNative('stopThreads', []);
+  if (native.embedded) native.workerNative('requestExit', [(Number(code) | 0) >>> 0]);
+  stdNamespace.exit(code);
+};
 const factories = new Map();
 const modules = new Map();
 const realmSources = new Map();
@@ -1689,6 +1695,9 @@ function run(restored = false) {
     catch (error) { host.attachArrow(error, scriptName, source, wrapped.indexOf(source)); throw error; }
     return;
   }
+  // An embedded runtime without a script runs the host's modules (src/runtime/embed.silk):
+  // it neither starts a REPL nor reads a script from stdin.
+  if (native.embedded && expression === undefined && filename === undefined && !interactive) return;
   // As node.cc, ask whether descriptor 0 is a terminal without making process.stdin:
   // that stream would make the descriptor nonblocking before a piped script is read.
   if (expression === undefined && filename === undefined && (interactive || internalRequire('tty').isatty(0))) {
@@ -1789,9 +1798,15 @@ function pollTimeout(pendingPromise) {
   return delay;
 }
 // One turn in libuv's order: timers, poll for I/O, then the check phase (immediates).
-function loopTurn(pendingPromise) {
+// `limit` caps the poll's wait in milliseconds: an embedder that turns the loop from its own
+// passes 0 (or how long it may block); the executable passes none and waits as libuv does.
+// With keepAlive and nothing referenced the wait is the embedder's: up to the next timer
+// (referenced or not) or `limit`, whichever comes first.
+function loopTurn(pendingPromise, limit, keepAlive) {
   if (timerLoop.runTimers()) checkpoint();
-  native.pollIO(pollTimeout(pendingPromise));
+  let timeout = keepAlive && !ticksPending() && !referencedWork() ? timerLoop.pollDelay() : pollTimeout(pendingPromise);
+  if (limit !== undefined && limit >= 0 && (timeout === -1 || timeout > limit)) timeout = limit;
+  native.pollIO(timeout);
   pollWorkers();
   checkpoint();
   if (loopListeners.size !== 0) for (const listener of loopListeners) listener();
@@ -1827,24 +1842,39 @@ function checkUnsettledTopLevelAwait() {
   }
   process.exitCode = 13;
 }
-function loop() {
+// The loop in three parts, so that an embedder can turn it from its own loop:
+// loopStart once, loopStep until it returns false, then loopEnd for the exit status.
+function loopStart() {
   performanceMilestones.loopStart = native.now() - startTime;
   initialNativeIdleTime = native.loopIdleTime();
-  while (true) {
+}
+// One pass of Node's SpinEventLoop. False when the loop has ended: exit was requested,
+// or nothing referenced is left after 'beforeExit'. With keepAlive (an embedder whose
+// own work keeps the process alive, such as open windows) no work left is not an end:
+// the pass polls once and 'beforeExit' waits for loopEnd.
+function loopStep(limit, keepAlive) {
+  checkpoint();
+  pollWorkers();
+  if (workerThreads._exitRequested) return false;
+  if (!keepAlive && !referencedWork()) {
+    const beforeExit = host.traceEnvironment ? internalRequire('internal/trace_events').now() : undefined;
+    invoke(emitProcessEvent, undefined, ['beforeExit']);
+    if (beforeExit !== undefined) internalRequire('internal/trace_events').phase('BeforeExit', beforeExit);
     checkpoint();
-    pollWorkers();
-    if (workerThreads._exitRequested) break;
-    if (!referencedWork()) {
-      const beforeExit = host.traceEnvironment ? internalRequire('internal/trace_events').now() : undefined;
-      invoke(emitProcessEvent, undefined, ['beforeExit']);
-      if (beforeExit !== undefined) internalRequire('internal/trace_events').phase('BeforeExit', beforeExit);
-      checkpoint();
-      // embed_helpers.cc SpinEventLoopInternal: a snapshot builder serializes here.
-      if (snapshotState.serialize !== undefined) { invoke(snapshotState.serialize, undefined, []); checkpoint(); }
-      if (!referencedWork()) break;
-    }
-    loopTurn();
+    // embed_helpers.cc SpinEventLoopInternal: a snapshot builder serializes here.
+    if (snapshotState.serialize !== undefined) { invoke(snapshotState.serialize, undefined, []); checkpoint(); }
+    if (!referencedWork()) return false;
   }
+  loopTurn(undefined, limit, keepAlive);
+  return true;
+}
+// Milliseconds until the loop has work: 0 when JavaScript is ready to run, the delay to
+// the next timer, or -1 when only native completions (which wake the loop) can bring any.
+function loopTimeout() {
+  if (ticksPending()) return 0;
+  return timerLoop.pollDelay();
+}
+function loopEnd() {
   performanceMilestones.loopExit = native.now() - startTime;
   process._exiting = true;
   invoke(checkUnsettledTopLevelAwait, undefined, []);
@@ -1871,6 +1901,11 @@ function loop() {
     rawStd.gc();
   }
   return Number(process.exitCode) || 0;
+}
+function loop() {
+  loopStart();
+  while (loopStep()) {}
+  return loopEnd();
 }
 const imageModules = ['fs', 'fs/promises', 'internal/fs/streams', 'internal/streams/fast-utf8-stream', 'path', 'os',
   'events', 'stream', 'stream/promises', 'string_decoder', 'util', 'assert', 'console', 'net', 'tty', 'http',
@@ -1950,6 +1985,9 @@ globalThis.__silkRuntime = {
   drainDestroy: asyncHooks._drainDestroy,
   workerError: workerThreads._reportError,
   run: () => invoke(run, undefined, []), loop, onRejection,
+  // The loop for an embedder (src/runtime/embed.silk).
+  loopStart, loopTimeout, loopEnd,
+  loopStep: (limit, keepAlive) => loopStep(limit, keepAlive),
   runSnapshot: () => invoke(run, undefined, [true]),
   // Whether the snapshot this builder ends keeps compiled function bodies
   // (a snapshot configuration's "withoutCodeCache").
