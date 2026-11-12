@@ -102,7 +102,6 @@ class CloneSerializer extends Serializer {
       throw cloneError('Object that needs transfer was found in message but not listed in transferList');
     }
     if (isDOMException(value)) return true;
-    if (host.types.isSlidingWindowHistogram?.(value)) throw cloneError();
     if (abort.isTransferable(value)) return true;
     if (isCryptoKey(value) || isKeyObject(value) || host.types.isX509Certificate?.(value)) return true;
     if (host.types.isStorage?.(value) || host.types.isEventSource?.(value)) return true;
@@ -332,8 +331,8 @@ function prepare(value, list, source) {
     } else if (fileHandles(false)?.is(item)) {
       handleFds.push(fileHandles(false).check(item));
       handles.push(item);
-    } else if (host.types.isSlidingWindowHistogram?.(item)) {
-      // markTransferMode(histogram, false, false): neither cloneable nor transferable.
+    } else if (jsTransferable.getTransferMode(item) !== undefined) {
+      // markTransferMode(object, false, false): neither cloneable nor transferable.
       throw cloneError();
     } else throw codedError('ERR_INVALID_TRANSFER_OBJECT', 'Found invalid object in transferList');
   }
