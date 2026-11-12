@@ -50,6 +50,8 @@ typedef struct client {
 struct silk_inspector {
     pthread_mutex_t mutex;
     pthread_cond_t changed;
+    /* Signalled when the IO thread takes outgoing packets, for senders waiting on a full queue. */
+    pthread_cond_t drained;
     pthread_t thread;
     int running, listener, notify[2], stopped;
     _Atomic int pending;
@@ -398,22 +400,38 @@ static void accept_clients(silk_inspector *s) {
         client *c = &s->clients[index]; c->fd = fd; c->id = ++s->next_connection; c->deadline = milliseconds() + 5000;
     }
 }
+static int addressed(const client *c, const silk_inspector_packet *p) {
+    return c->fd >= 0 && c->websocket && !c->closing && (!p->connection || p->connection == c->id);
+}
+/* Whether every client the packet goes to has output room for its frame (10 header bytes at most). */
+static int fits(silk_inspector *s, const silk_inspector_packet *p) {
+    if (p->kind == SILK_INSPECTOR_CLOSE) return 1;
+    for (unsigned i = 0; i < MAX_CLIENTS; i++) {
+        const client *c = &s->clients[i];
+        if (addressed(c, p) && p->length + 10 > OUTPUT_LIMIT - c->output_bytes) return 0;
+    }
+    return 1;
+}
+/* Moves queued packets into client output in order while it has room; a packet that
+   does not fit waits, with every packet after it, until the client's socket drains. */
 static int process_output(silk_inspector *s) {
     pthread_mutex_lock(&s->mutex);
-    silk_inspector_packet *p = s->out_first;
-    s->out_first = s->out_last = NULL; s->out_bytes = s->out_count = 0;
-    int stopping = s->stopping;
-    pthread_mutex_unlock(&s->mutex);
-    while (p) {
-        silk_inspector_packet *next = p->next;
+    int moved = 0;
+    silk_inspector_packet *p;
+    while ((p = s->out_first) && fits(s, p)) {
+        s->out_first = p->next; if (!s->out_first) s->out_last = NULL;
+        s->out_bytes -= p->length; s->out_count--; moved = 1;
         for (unsigned i = 0; i < MAX_CLIENTS; i++) {
             client *c = &s->clients[i];
-            if (c->fd < 0 || !c->websocket || c->closing || (p->connection && p->connection != c->id)) continue;
+            if (!addressed(c, p)) continue;
             if (p->kind == SILK_INSPECTOR_CLOSE) close_frame(c, 1000);
             else if (frame(c, 1, p->bytes, p->length)) close_frame(c, 1011);
         }
-        free(p); p = next;
+        free(p);
     }
+    if (moved) pthread_cond_broadcast(&s->drained);
+    int stopping = s->stopping;
+    pthread_mutex_unlock(&s->mutex);
     return stopping;
 }
 static void *io_thread(void *opaque) {
@@ -445,7 +463,7 @@ static void *io_thread(void *opaque) {
         }
     }
     for (unsigned i = 0; i < MAX_CLIENTS; i++) if (s->clients[i].fd >= 0) retire(s, &s->clients[i]);
-    pthread_mutex_lock(&s->mutex); s->stopped = 1; pthread_cond_broadcast(&s->changed); pthread_mutex_unlock(&s->mutex);
+    pthread_mutex_lock(&s->mutex); s->stopped = 1; pthread_cond_broadcast(&s->changed); pthread_cond_broadcast(&s->drained); pthread_mutex_unlock(&s->mutex);
     return NULL;
 }
 
@@ -456,6 +474,7 @@ silk_inspector *silk_inspector_create(void *wake) {
     for (unsigned i = 0; i < MAX_CLIENTS; i++) s->clients[i].fd = -1;
     if (pthread_mutex_init(&s->mutex, NULL)) { free(s); return NULL; }
     if (pthread_cond_init(&s->changed, NULL)) { pthread_mutex_destroy(&s->mutex); free(s); return NULL; }
+    if (pthread_cond_init(&s->drained, NULL)) { pthread_cond_destroy(&s->changed); pthread_mutex_destroy(&s->mutex); free(s); return NULL; }
     atomic_init(&s->pending, 0);
     return s;
 }
@@ -503,7 +522,7 @@ int silk_inspector_start(silk_inspector *s, const unsigned char *host, size_t le
 }
 void silk_inspector_stop(silk_inspector *s) {
     if (!s || !s->running) return;
-    pthread_mutex_lock(&s->mutex); s->stopping = 1; notify_io(s); pthread_cond_broadcast(&s->changed); pthread_mutex_unlock(&s->mutex);
+    pthread_mutex_lock(&s->mutex); s->stopping = 1; notify_io(s); pthread_cond_broadcast(&s->changed); pthread_cond_broadcast(&s->drained); pthread_mutex_unlock(&s->mutex);
     pthread_join(s->thread, NULL);
     pthread_mutex_lock(&s->mutex);
     close(s->listener); close(s->notify[0]); close(s->notify[1]);
@@ -516,7 +535,7 @@ void silk_inspector_destroy(silk_inspector *s) {
     if (!s) return;
     silk_inspector_stop(s);
     while (s->first) { silk_inspector_packet *next = s->first->next; free(s->first); s->first = next; }
-    pthread_cond_destroy(&s->changed); pthread_mutex_destroy(&s->mutex); free(s);
+    pthread_cond_destroy(&s->changed); pthread_cond_destroy(&s->drained); pthread_mutex_destroy(&s->mutex); free(s);
 }
 size_t silk_inspector_url(silk_inspector *s, unsigned char *buffer, size_t capacity) {
     if (!s || !s->running) return 0;
@@ -560,8 +579,13 @@ static int outgoing(silk_inspector *s, uint32_t kind, uint64_t connection, const
     silk_inspector_packet *p = packet(kind, connection, bytes, length); if (!p) return ENOMEM;
     pthread_mutex_lock(&s->mutex);
     int error = 0;
-    if (s->stopped || s->stopping) error = ENOTCONN;
-    else if (s->out_count >= PACKET_LIMIT || length > QUEUE_LIMIT - s->out_bytes) error = ENOBUFS;
+    /* A full queue blocks the sender until the IO thread drains it, as V8's
+       synchronous sends never drop a message: large heap snapshots stream through. */
+    for (;;) {
+        if (s->stopped || s->stopping) { error = ENOTCONN; break; }
+        if (s->out_count < PACKET_LIMIT && length <= QUEUE_LIMIT - s->out_bytes) break;
+        notify_io(s); pthread_cond_wait(&s->drained, &s->mutex);
+    }
     if (!error) {
         if (s->out_last) s->out_last->next = p; else s->out_first = p;
         s->out_last = p; s->out_count++; s->out_bytes += length; notify_io(s);

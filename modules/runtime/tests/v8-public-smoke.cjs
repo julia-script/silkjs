@@ -77,7 +77,7 @@ function checkSnapshot(snapshot) {
   if (snapshot.silk) {
     const { silk } = snapshot;
     assert.equal(silk.format, 'silk.heap.snapshot');
-    assert.equal(silk.version, 2);
+    assert.equal(silk.version, 3);
     assert.equal(silk.graphVersion, 1);
     assert.equal(silk.identity, 'runtime-allocation-id');
     assert.equal(silk.root, 0);
