@@ -61,6 +61,9 @@ function initialize() {
   }
   state.redirectWarnings ||= process.env.NODE_REDIRECT_WARNINGS;
   if (state.warnings && process.env.NODE_NO_WARNINGS !== '1') process.on('warning', onWarning);
+  // Node's ShouldAbortOnUncaughtException holds for the main thread only: a worker's
+  // uncaught exception goes to its parent (test-worker-abort-on-uncaught-exception).
+  if (state.abortOnUncaughtException && !require('worker_threads').isMainThread) state.abortOnUncaughtException = false;
   if (state.abortOnUncaughtException) host.abortOnUncaughtException = abortOnUncaughtException;
   if (host.startupSnapshot.isBuildingSnapshotBuffer[0])
     require('internal/v8/startup_snapshot').namespace.addSerializeCallback(resetForSerialization);
