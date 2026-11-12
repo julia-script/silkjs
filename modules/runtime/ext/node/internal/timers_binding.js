@@ -53,27 +53,48 @@ host.timerLoop = {
   // Environment::RunTimers, when the loop timer is due.
   runTimers() {
     if (timerDue === -1 || host.now() < timerDue) return false;
-    timerDue = -1;
-    const expiry = processTimersCallback(getLibuvNow());
-    if (expiry !== 0) {
-      const duration = Math.abs(expiry) - getLibuvNow();
-      binding.scheduleTimer(duration > 0 ? duration : 1);
-      timerRefed = expiry > 0;
-    } else {
-      timerRefed = false;
-    }
-    return true;
+    if (host.traceEnvironment) return traced('RunTimers', runTimers);
+    return runTimers();
   },
-  // Environment::CheckImmediate, the check phase.
+  // Environment::CheckImmediate, the check phase, which runs every loop turn.
   checkImmediate() {
-    if (immediateInfo[0] === 0) return false;
-    do processImmediateCallback();
-    while (immediateInfo[2] !== 0);
-    if (immediateInfo[1] === 0) immediateRefed = false;
-    return true;
+    if (host.traceEnvironment) return traced('CheckImmediate', checkImmediate);
+    return checkImmediate();
   },
   immediateInfo,
   timeoutInfo,
 };
+
+function traced(name, phase) {
+  const trace = require('internal/trace_events');
+  const start = trace.now();
+  try { return phase(); } finally { trace.phase(name, start); }
+}
+
+function runTimers() {
+  timerDue = -1;
+  const expiry = processTimersCallback(getLibuvNow());
+  if (expiry !== 0) {
+    const duration = Math.abs(expiry) - getLibuvNow();
+    binding.scheduleTimer(duration > 0 ? duration : 1);
+    timerRefed = expiry > 0;
+  } else {
+    timerRefed = false;
+  }
+  return true;
+}
+
+function checkImmediate() {
+  // The runtime queues no native immediates; Node traces their (here empty) run first.
+  if (host.traceEnvironment) {
+    const trace = require('internal/trace_events');
+    trace.phase('RunAndClearNativeImmediates', trace.now());
+  }
+  if (immediateInfo[0] === 0) return false;
+  do processImmediateCallback();
+  while (immediateInfo[2] !== 0);
+  if (immediateInfo[1] === 0) immediateRefed = false;
+  return true;
+}
 
 module.exports = binding;
