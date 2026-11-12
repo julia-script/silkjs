@@ -21,11 +21,11 @@ const supportedTypes = Object.freeze([...new Set(['function', 'http', 'http2', '
 // again while it loads, and settle globalThis.performance to undefined.
 const previousDescriptor = Object.getOwnPropertyDescriptor(globalThis, 'performance');
 const previousPerformance = previousDescriptor && 'value' in previousDescriptor ? previousDescriptor.value : undefined;
-let startTime = host.performanceStartTime ?? (host.now() - (previousPerformance?.now() ?? process.uptime() * 1000));
-let timeOrigin = host.performanceTimeOrigin ?? previousPerformance?.timeOrigin ?? (Date.now() - (host.now() - startTime));
-// A process started from a heap image has its own start.
-host.onHydrate(() => { startTime = host.performanceStartTime; timeOrigin = host.performanceTimeOrigin; });
-const now = () => host.now() - startTime;
+const fallbackStart = host.performanceStartTime ?? (host.now() - (previousPerformance?.now() ?? process.uptime() * 1000));
+const fallbackOrigin = host.performanceTimeOrigin ?? previousPerformance?.timeOrigin ?? (Date.now() - (host.now() - fallbackStart));
+// Read each time: a heap image start, and a worker (which takes the process's clock), set them later.
+const clockStart = () => host.performanceStartTime ?? fallbackStart;
+const now = () => host.now() - clockStart();
 let deliveryScheduled = false;
 let resourceLimit = 250;
 let resourcePending = false;
@@ -81,7 +81,7 @@ function scheduleDelivery() {
   });
 }
 function enqueue(entry) {
-  trace.performanceEntry(entry, startTime);
+  trace.performanceEntry(entry, clockStart());
   for (const observer of observers) observer[enqueueObserver](entry);
 }
 function bufferResource(entry) {
@@ -247,6 +247,8 @@ function getMark(value) {
   return markTimings.get(name);
 }
 function eventLoopUtilization(util1, util2) {
+  // lib/internal/perf/event_loop_utilization.js: nothing is measured before the loop starts.
+  if (!(nodeTiming.loopStart > 0)) return { idle: 0, active: 0, utilization: 0 };
   if (util2) {
     const idle = util1.idle - util2.idle, active = util1.active - util2.active;
     return { idle, active, utilization: active / (idle + active) };
@@ -303,7 +305,7 @@ class Performance extends EventTarget {
   #handler = null;
   constructor(key) { super(); if (key !== token) throw illegal(); }
   now() { brand(this); return now(); }
-  get timeOrigin() { brand(this); return timeOrigin; }
+  get timeOrigin() { brand(this); return host.performanceTimeOrigin ?? fallbackOrigin; }
   get nodeTiming() { brand(this); return nodeTiming; }
   mark(name, options) {
     brand(this); required(arguments.length, 'name');
@@ -380,7 +382,7 @@ internalEntries.observing = (type) => {
   for (const observer of observers) if (observer[observesType](type)) return true;
   return false;
 };
-internalEntries.emit = (name, type, start, duration, detail) => emitNodeEntry(name, type, start - startTime, duration, detail);
+internalEntries.emit = (name, type, start, duration, detail) => emitNodeEntry(name, type, start - clockStart(), duration, detail);
 // As Node's binding: per Node entry type, how many observers watch it (observerCounts).
 const nodeEntryTypes = ['gc', 'http', 'http2', 'net', 'dns'];
 function countObservers() {

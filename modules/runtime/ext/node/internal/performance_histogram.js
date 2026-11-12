@@ -184,6 +184,11 @@ function bigintValue(value) {
   return value;
 }
 class RecordableHistogram extends Histogram {
+  constructor(key, options) {
+    super(key, options);
+    // lib/internal/histogram.js ClonedRecordableHistogram sets this own property.
+    this.constructor = RecordableHistogram;
+  }
   record(value) {
     const s = state(this);
     if (typeof value !== 'bigint') integer(value, 'val');

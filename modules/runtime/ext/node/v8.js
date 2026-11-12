@@ -134,9 +134,10 @@ class GCProfiler {
   stop() { unsupported('GCProfiler.stop', 'native GC events do not capture the before/after heap statistics required by this profile'); }
   [Symbol.dispose]() { this.stop(); }
 }
+// lib/internal/v8/startup_snapshot.js: outside --build-snapshot (which this runtime does not
+// take) the process is never building one, so every callback API reports that.
 function snapshotCallback(callback) {
-  if (typeof callback !== 'function') throw error('ERR_INVALID_ARG_TYPE', 'The "callback" argument must be a function', TypeError);
-  unsupported('startupSnapshot', 'the runtime has no startup heap-image serialization; replaying source is not a snapshot');
+  throw new (require('internal/errors').codes.ERR_NOT_BUILDING_SNAPSHOT)();
 }
 const startupSnapshot = {
   isBuildingSnapshot() { return false; },

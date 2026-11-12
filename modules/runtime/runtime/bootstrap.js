@@ -501,6 +501,17 @@ let initialNativeIdleTime = 0;
 const loopListeners = new Set();
 host.performanceStartTime = startTime;
 host.performanceTimeOrigin = Date.now() - (native.now() - startTime);
+// A worker takes the process's clock, as Node: performance.timeOrigin, performance.now(),
+// process.uptime() and the milestones count from when the process started.
+host.adoptProcessClock = (processStart, processOrigin) => {
+  const shift = startTime - processStart;
+  for (const name of ['v8Start', 'environment', 'bootstrapComplete', 'loopStart', 'loopExit']) {
+    if (performanceMilestones[name] >= 0) performanceMilestones[name] += shift;
+  }
+  startTime = processStart;
+  host.performanceStartTime = processStart;
+  host.performanceTimeOrigin = processOrigin;
+};
 host.performanceLoopStats = () => {
   if (performanceMilestones.loopStart < 0) return { idle: 0, active: 0 };
   const idle = native.loopIdleTime() - initialNativeIdleTime;
