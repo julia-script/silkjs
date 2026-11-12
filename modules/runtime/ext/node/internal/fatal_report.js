@@ -11,7 +11,8 @@ const host = require('internal/host');
 function site(error, fromPromise) {
   if (!fromPromise) {
     const thrown = host.captureCallSites(-4, error);
-    if (thrown !== undefined) return { name: thrown[0], line: thrown[1], column: thrown[2], text: thrown[3] };
+    // Its column counts in the script's own text, before any column offset.
+    if (thrown !== undefined) return { name: thrown[0], line: thrown[1], column: thrown[2], text: thrown[3], textColumn: true };
   }
   if (error === null || typeof error !== 'object') return undefined;
   // A script that did not compile: V8's message points at the bad token.
@@ -38,14 +39,21 @@ function fileLine(name, line) {
   try { source = require('fs').readFileSync(path, 'utf8'); } catch { return undefined; }
   return source.split(/\r\n|[\n\r\u2028\u2029]/)[line - 1];
 }
-// GetErrorSource: "<script>:<line>\n<source line>\n<caret>\n".
-function arrow(error, fromPromise) {
+// GetErrorSource: "<script>:<line>\n<source line>\n<caret>\n". A script compiled
+// with a column offset (vm's columnOffset) underlines its first line without it.
+// scriptSource is that script's text, for a site in it whose function kept none.
+function arrow(error, fromPromise, scriptName, lineOffset = 0, columnOffset = 0, scriptSource = undefined) {
   const where = site(error, fromPromise);
   if (where === undefined || typeof where.name !== 'string' || !where.name || !(where.line > 0)) return undefined;
-  const text = typeof where.text === 'string' ? where.text : fileLine(where.name, where.line);
+  let text = where.text;
+  if (typeof text !== 'string' && typeof scriptSource === 'string' && where.name === scriptName) {
+    text = scriptSource.split(/\r\n|[\n\r\u2028\u2029]/)[where.line - lineOffset - 1];
+  }
+  if (typeof text !== 'string') text = fileLine(where.name, where.line);
   if (typeof text !== 'string') return undefined;
   const result = where.name + ':' + where.line + '\n' + text + '\n';
-  const start = where.column - 1;
+  const shift = !where.textColumn && where.name === scriptName && where.line === lineOffset + 1 ? columnOffset : 0;
+  const start = where.column - 1 - shift;
   if (!(start >= 0) || start >= text.length) return result;
   let underline = '';
   for (let index = 0; index < start; index++) underline += text[index] === '\t' ? '\t' : ' ';
@@ -111,4 +119,4 @@ function caught(error) {
   return text;
 }
 
-module.exports = { format, caught };
+module.exports = { format, caught, arrow };
