@@ -289,13 +289,13 @@ function removeSync(path, options) {
       if (info.isDirectory()) {
         if (!options.recursive) throw isDirectoryError(path);
         // Index loops over scandir: user code may have replaced the array iterator.
-        const names = c.native('scandir', [path]);
+        // Raw names: an entry whose name is not valid UTF-8 is removed too.
+        const names = c.native('scandir', [c.path(path), true]);
         for (let index = 0; index < names.length; index++) {
-          const name = names[index];
-          if (name !== '.' && name !== '..') removeSync(p.join(path, name), { ...options, maxRetries: 0 });
+          removeSync(c.rawEntryPath(path, names[index]), { ...options, maxRetries: 0 });
         }
-        c.native('rmdir', [path]);
-      } else c.native('unlink', [path]);
+        c.native('rmdir', [c.path(path)]);
+      } else c.native('unlink', [c.path(path)]);
       return;
     } catch (e) {
       if (options.force && e.code === 'ENOENT') return;
@@ -383,11 +383,12 @@ function readdirEntries(dir, o, recursive) {
   const queue = [dir];
   for (let i = 0; i < queue.length; i++) {
     const current = queue[i];
-    const names = c.native('scandir', [current]);
+    const raw = !recursive && c.rawNames(o.encoding);
+    const names = c.native('scandir', [current, raw]);
     for (let index = 0; index < names.length; index++) {
       const name = names[index];
       if (name === '.' || name === '..') continue;
-      const full = p.join(current, name);
+      const full = raw ? c.rawEntryPath(current, name) : p.join(current, name);
       const info = o.withFileTypes || recursive ? fs.lstatSync(full) : null;
       if (o.withFileTypes) output.push(new Dirent(c.encoded(name, o.encoding), info.mode, current));
       else output.push(c.encoded(recursive ? p.relative(dir, full) : name, o.encoding));
@@ -407,7 +408,7 @@ fs.readdir = function readdir(path, options, callback) {
   if (o.recursive != null) validateBoolean(o.recursive, 'options.recursive');
   c.submit('readdir', [path, o], (err, value) => {
     if (err) { callback(err); return; }
-    callback(null, value.map(entry => o.withFileTypes ? entry instanceof Dirent ? entry : new Dirent(c.encoded(entry.name, o.encoding), entry.mode, entry.parentPath === undefined ? path : entry.parentPath) : typeof entry === 'string' ? c.encoded(entry, o.encoding) : Buffer.from(entry)));
+    callback(null, value.map(entry => o.withFileTypes ? entry instanceof Dirent ? entry : new Dirent(c.encoded(entry.name, o.encoding), entry.mode, entry.parentPath === undefined ? path : entry.parentPath) : c.encoded(entry, o.encoding)));
   }, callback);
 };
 

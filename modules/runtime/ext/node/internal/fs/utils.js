@@ -61,7 +61,9 @@ function path(value, name = 'path') {
   }
   if (value instanceof Uint8Array) {
     if (value.includes(0)) throw new ERR_INVALID_ARG_VALUE(name, value, 'must be a string, Uint8Array, or URL without null bytes');
-    return Buffer.from(value.buffer, value.byteOffset, value.byteLength).toString();
+    const bytes = Buffer.from(value.buffer, value.byteOffset, value.byteLength);
+    // A name that is not valid UTF-8 goes to the native operations as its raw bytes.
+    return require('buffer').isUtf8(bytes) ? bytes.toString() : value.buffer.slice(value.byteOffset, value.byteOffset + value.byteLength);
   }
   throw new ERR_INVALID_ARG_TYPE(name, ['string', 'Buffer', 'URL'], value);
 }
@@ -204,7 +206,19 @@ function encoding(value, fallback = 'utf8', bufferAllowed = false) {
   assertEncoding(value);
   return value;
 }
-function encoded(value, enc) { return enc === 'buffer' ? Buffer.from(value) : enc === 'utf8' || enc === 'utf-8' ? value : Buffer.from(value).toString(enc); }
+// A directory entry name in the requested encoding. Names arrive as strings, or as their raw
+// bytes (an ArrayBuffer) when rawNames(enc) asked scandir for them.
+function encoded(value, enc) {
+  if (typeof value !== 'string') { const bytes = Buffer.from(value); return enc === 'buffer' ? bytes : bytes.toString(enc); }
+  return enc === 'buffer' ? Buffer.from(value) : enc === 'utf8' || enc === 'utf-8' ? value : Buffer.from(value).toString(enc);
+}
+// Names that are not valid UTF-8 survive only as bytes, so every other encoding reads them raw.
+function rawNames(enc) { return enc != null && enc !== 'utf8' && enc !== 'utf-8' && String(enc).toLowerCase() !== 'utf8' && String(enc).toLowerCase() !== 'utf-8'; }
+// The path, as a Buffer, of a raw entry name inside a directory given as a string or bytes.
+function rawEntryPath(directory, name) {
+  const parent = Buffer.from(directory);
+  return Buffer.concat(parent[parent.length - 1] === 0x2f ? [parent, Buffer.from(name)] : [parent, Buffer.from('/'), Buffer.from(name)]);
+}
 function aborted(signal) { if (signal && signal.aborted) throw new AbortError(undefined, { cause: signal?.reason }); }
 // Node's Stats and BigIntStats (lib/internal/fs/utils.js): function constructors taking the
 // fields in order, with atime, mtime, ctime and birthtime as Dates made when first read.
@@ -372,4 +386,4 @@ function getDirents(path, { 0: names, 1: types }, callback) {
   if (toFinish === 0) finish(null, names);
 }
 
-module.exports = { defaultRmOptions, validateRmdirOptions, validateRmOptions, validateRmOptionsSync, isDirectoryError, emitRecursiveRmdirWarning, realpathCacheKey, getDirent, getDirents, kRef, kUnref, host, os, std, Buffer, constants, error, fail, pair, invalid, range, integer, path, toPathIfFileURL, fd, options, assertEncoding, mode, stringToFlags, native, callback, promiseCallback, submit, time, bytes, position, validateOffsetLengthRead, validateOffsetLengthWrite, validateStringAfterArrayBufferView, bufferArray, encoding, encoded, aborted, Stats, BigIntStats, makeStats, Dirent, StatFs, makeStatFs, v };
+module.exports = { defaultRmOptions, validateRmdirOptions, validateRmOptions, validateRmOptionsSync, isDirectoryError, emitRecursiveRmdirWarning, realpathCacheKey, getDirent, getDirents, kRef, kUnref, host, os, std, Buffer, constants, error, fail, pair, invalid, range, integer, path, toPathIfFileURL, fd, options, assertEncoding, mode, stringToFlags, native, callback, promiseCallback, submit, time, bytes, position, validateOffsetLengthRead, validateOffsetLengthWrite, validateStringAfterArrayBufferView, bufferArray, encoding, encoded, rawNames, rawEntryPath, aborted, Stats, BigIntStats, makeStats, Dirent, StatFs, makeStatFs, v };
