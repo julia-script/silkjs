@@ -1,6 +1,6 @@
 // SilkJS regression test for the delete operator's in-place object path: strict
 // and sloppy rejection, arrays, proxies, primitives, the global object, compaction,
-// symbols and accessors. Expected values come from C QuickJS.
+// symbols and accessors. Expected values come from C QuickJS, with V8 wording for the strict delete error.
 var out=[];
 var o={a:1,b:2}; out.push(delete o.a, 'a' in o, delete o.zz, Object.keys(o).join());
 var f=Object.freeze({x:1}); out.push(delete f.x, f.x);
@@ -16,6 +16,6 @@ var sym=Symbol('s'); var so={[sym]:1}; out.push(delete so[sym], Object.getOwnPro
 var dk={}; dk[1]=1; dk['1.5']=2; out.push(delete dk[1], delete dk['1.5'], Object.keys(dk).length);
 var getter={get x(){ return 1 }}; out.push(delete getter.x, 'x' in getter);
 const got = out.join(',');
-const expected = "true,false,true,b,false,1,true,could not delete property,true,3,false,false,3,trap:q,trap:5,true,true,false,true,false,true,false,true,undefined,k25,k26,k27,k28,k29,27,true,0,true,true,0,true,false";
+const expected = "true,false,true,b,false,1,true,Cannot delete property 'x' of #<Object>,true,3,false,false,3,trap:q,trap:5,true,true,false,true,false,true,false,true,undefined,k25,k26,k27,k28,k29,27,true,0,true,true,0,true,false";
 console.log(got === expected ? 'PASS delete operator' : 'FAIL ' + got);
 if (got !== expected) throw new Error('delete operator regressions');
