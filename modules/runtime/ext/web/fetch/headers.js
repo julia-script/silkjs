@@ -113,6 +113,14 @@ function parsedHeaders(fields, start) {
   states.set(headers, { list, immutable: false });
   return headers;
 }
+// A mutable copy of headers, without validating again what it already holds.
+function copyHeaders(headers) {
+  const copy = Object.create(Headers.prototype);
+  const list = new Map();
+  for (const [name, values] of state(headers).list) list.set(name, values.slice());
+  states.set(copy, { list, immutable: false });
+  return copy;
+}
 // The name -> values map of `headers`, for serializing a response.
 function headerList(headers) { return state(headers).list; }
-module.exports = { Headers, immutable, rawHeaders, parsedHeaders, headerList, string, scalar, token, byteString };
+module.exports = { Headers, immutable, rawHeaders, parsedHeaders, headerList, copyHeaders, string, scalar, token, byteString };
