@@ -1,5 +1,182 @@
-import pkg.store { Store }
+//! A development entry point for the package manager while it grows outside the runtime binary.
+//! The runtime's command line will dispatch to the same modules.
+//!
+//! `pm fetch <name> [version, range or tag]` resolves one package against its registry, downloads
+//! the tarball, checks it and unpacks it into the store.
 
-pub fn main() -> i32 {
-  return 0
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.collections.bytes { Bytes }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.http.client { Http, HttpError }
+import silk.http.client_native { NativeHttp }
+import silk.io.writer { Writer, WriterError }
+import silk.io.writer_native { StdoutWriter }
+import silk.system.host_input { HostInput, HostInputError }
+import silk.text.format { Format }
+import silk.text.string { String }
+import npm.npmrc { Npmrc }
+import npm.packument { Packument, Published }
+import npm.registry { RegistryError, RegistryErrorKind, fetchPackument, fetchTarball }
+import pkg.files { readOptional }
+import pkg.integrity { Integrity }
+import pkg.json_walk { Text }
+import pkg.semver { Range }
+import pkg.store { PackageFiles, Store, StoreError }
+import pkg.text { same }
+
+/// Why the command stopped, as a message for the person.
+struct Stop {
+  message: string<'static>,
+}
+
+effect fn stop(message: string<'static>) -> never ! Stop {
+  fail Stop { message: message }
+}
+
+effect fn variable(name: &[u8]) -> Bytes ! HostInputError | OutOfMemoryError ? &mut HostInput | &mut Allocator {
+  return match move run HostInput.variable(name) {
+    Option.None => Bytes.make()
+    Option.Some { value } => move value
+  }
+}
+
+// The settings of the user's `.npmrc` and then the one in the working directory.
+effect fn settings() -> Npmrc ! HostInputError | OutOfMemoryError ? &mut HostInput | &mut Allocator {
+  let mut config = Npmrc.make()
+  let mut user = run variable(b"HOME")
+  run user.append(b"/.npmrc")
+  match move run readOptional(Bytes.asSlice(&user)) {
+    Option.None => {}
+    Option.Some { value } => { run Npmrc.add(&mut config, Bytes.asSlice(&value)) }
+  }
+  match move run readOptional(b".npmrc") {
+    Option.None => {}
+    Option.Some { value } => { run Npmrc.add(&mut config, Bytes.asSlice(&value)) }
+  }
+  return move config
+}
+
+effect fn choose<'a>(packument: &Packument<'a>, wanted: &[u8]) -> Published<'a> ! Stop | OutOfMemoryError ? &mut Allocator {
+  let tagged = if wanted.length == 0 { Packument.tagged(packument, b"latest") } else { Packument.tagged(packument, wanted) }
+  match tagged {
+    Option.Some { value } => { return value }
+    Option.None => {}
+  }
+  let range = match move run Range.parse(wanted) {
+    Option.None => { run stop("that is not a version, a range or a tag of the package") }
+    Option.Some { value } => move value
+  }
+  return match Packument.pick(packument, &range) {
+    Option.Some { value } => value
+    Option.None => { run stop("no published version satisfies the range") }
+  }
+}
+
+effect fn fetch(name: &[u8], wanted: &[u8]) -> ()
+  ! Stop | RegistryError | HttpError | StoreError | HostInputError | WriterError | OutOfMemoryError
+  ? &mut Http | &mut HostInput | &mut Writer | &mut Allocator {
+  let config = run settings()
+  let document = run fetchPackument(&config, name)
+  let packument = match move run Packument.parse(Bytes.asSlice(&document)) {
+    Option.None => { run stop("the registry did not answer with package metadata") }
+    Option.Some { value } => move value
+  }
+  let published = run choose(&packument, wanted)
+
+  let expected = match Integrity.parse(Text.bytes(&published.integrity)) {
+    Option.Some { value } => value
+    Option.None => match Integrity.fromShasum(Text.bytes(&published.shasum)) {
+      Option.Some { value } => value
+      Option.None => { run stop("the registry gives no digest for the tarball") }
+    }
+  }
+  let url = run Text.decode(&published.tarball)
+  let tarball = run fetchTarball(&config, Bytes.asSlice(&url))
+  if Integrity.matches(&expected, Bytes.asSlice(&tarball)) == false {
+    run stop("the tarball does not have the digest the registry promised")
+  }
+
+  let mut root = run variable(b"SILKJS_STORE")
+  if Bytes.length(&root) == 0 {
+    root = run variable(b"HOME")
+    run root.append(b"/.silkjs/store")
+  }
+  let store = run Store.open(Bytes.asSlice(&root))
+  let files = run Store.addTarball(&store, Bytes.asSlice(&tarball))
+  let mut total: u64 = 0
+  let entries = PackageFiles.all(&files)
+  let mut index: usize = 0
+  while index < entries.length {
+    total = total + entries[index].size
+    index = index + 1
+  }
+  run Format.format("{name}@{version}: {count} files, {bytes} bytes, from a {packed} byte tarball\n", &.{
+    name: run text(name),
+    version: run text(published.text),
+    count: entries.length,
+    bytes: total,
+    packed: Bytes.length(&tarball),
+  })
+}
+
+effect fn text(bytes: &[u8]) -> string ! Stop {
+  return match move String.fromUtf8(bytes) {
+    Result.Success { value } => move value
+    Result.Failure {..} => { run stop("a name is not valid text") }
+  }
+}
+
+effect fn command() -> ()
+  ! Stop | RegistryError | HttpError | StoreError | HostInputError | WriterError | OutOfMemoryError
+  ? &mut Http | &mut HostInput | &mut Writer | &mut Allocator {
+  let verb = match move run HostInput.argument(1) {
+    Option.None => Bytes.make()
+    Option.Some { value } => move value
+  }
+  let name = match move run HostInput.argument(2) {
+    Option.None => Bytes.make()
+    Option.Some { value } => move value
+  }
+  let wanted = match move run HostInput.argument(3) {
+    Option.None => Bytes.make()
+    Option.Some { value } => move value
+  }
+  if same(Bytes.asSlice(&verb), b"fetch") == false || Bytes.length(&name) == 0 {
+    run stop("usage: pm fetch <name> [version, range or tag]")
+  }
+  run fetch(Bytes.asSlice(&name), Bytes.asSlice(&wanted))
+}
+
+effect fn program() -> i32 ! HttpError | HostInputError | WriterError | OutOfMemoryError ? &mut HostInput | &mut Allocator {
+  let mut writer = StdoutWriter.make()
+  let mut http = run NativeHttp.fromEnvironment()
+  let outcome = run Effect.result(command())
+    |> Effect.provideMut<Http>(&mut http)
+    |> Effect.provideMut<Writer>(&mut writer)
+  let message: string = match move outcome {
+    Result.Success {..} => { return 0 }
+    Result.Failure { error } => match move error {
+      Stop stopped => stopped.message
+      RegistryError failure => match failure.kind {
+        RegistryErrorKind.NotFound => "the registry has no such package"
+        RegistryErrorKind.Unauthorized => "the registry refused the credentials"
+        RegistryErrorKind.Status => "the registry answered with an error status"
+        RegistryErrorKind.Url => "the registry URL is not valid"
+      }
+      HttpError failure => failure.message
+      StoreError _ => "the store could not be written"
+      HostInputError failure => { fail move failure }
+      WriterError failure => { fail move failure }
+      OutOfMemoryError failure => { fail move failure }
+    }
+  }
+  run Format.format("pm: {message}\n", &.{ message: message }) |> Effect.provideMut<Writer>(&mut writer)
+  return 1
+}
+
+pub effect fn main() -> i32 ! HttpError | HostInputError | WriterError | OutOfMemoryError ? &mut HostInput {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run program() |> Effect.provideMut<Allocator>(&mut allocator)
 }
