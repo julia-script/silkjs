@@ -1049,6 +1049,7 @@ function runPreloads(entry, loadImports = true, loadRequires = true, runImports 
   return pending.then(entry);
 }
 const optionFlag = entry => internalRequire('internal/options').optionFlag(entry);
+let heapPercentage = false;
 function runtimeFlag(arg) {
   try {
     if (internalRequire('internal/permission').applyOption(arg) ||
@@ -1101,12 +1102,36 @@ function runtimeFlag(arg) {
   // mainStackBytes). A Worker keeps its resourceLimits stack, as in Node.
   const stackSize = /^--stack[-_]size=(\d+)$/.exec(arg);
   if (stackSize) { native.workerNative('setStackSize', [Number(stackSize[1])]); return true; }
+  // V8's heap budgets in MiB on the main thread (worker_native setHeapLimit); a
+  // Worker takes its budgets from resourceLimits, as in Node.
+  // --max-old-space-size-percentage takes precedence over every --max-old-space-size,
+  // wherever each comes (PerIsolateOptions::HandleMaxOldSpaceSizePercentage).
+  const heapSize = /^--max[-_](old|semi)[-_]space[-_]size=(\d+)$/.exec(arg);
+  if (heapSize) {
+    if (heapSize[1] === 'semi') native.workerNative('setHeapLimit', [undefined, Number(heapSize[2])]);
+    else if (!heapPercentage) native.workerNative('setHeapLimit', [Number(heapSize[2]), undefined]);
+    return true;
+  }
+  if (arg.startsWith('--max-old-space-size-percentage=') || arg.startsWith('--max_old_space_size_percentage=')) {
+    const text = arg.slice(32);
+    const percentage = /^[+-]?(\d+\.?\d*|\.\d+)([eE][+-]?\d+)?$/.test(text.trim()) ? Number(text) : NaN;
+    if (!(percentage > 0 && percentage <= 100)) {
+      cliError(`--max-old-space-size-percentage must be greater than 0 and up to 100. Got: ${text}`); return true;
+    }
+    // The cgroup limit when there is one, else physical memory.
+    const constrained = process.constrainedMemory();
+    const total = constrained > 0 && constrained !== 2 ** 64 - 1 ? constrained : internalRequire('os').totalmem();
+    heapPercentage = true;
+    native.workerNative('setHeapLimit', [Math.floor(total * percentage / 100 / 1048576), undefined]);
+    return true;
+  }
   // V8 with these flags and no embedder callback, as in Node, installs no
   // SharedArrayBuffer global (runPreloads removes it before user code).
   if (arg === '--enable-sharedarraybuffer-per-context' || arg === '--no-harmony-sharedarraybuffer' ||
       arg === '--no-harmony_sharedarraybuffer') {
     host.noSharedArrayBuffer = true; return true;
   }
+  if (arg === '--trace-gc' || arg === '--no-trace-gc') { host.traceNative('printGC', arg === '--trace-gc'); return true; }
   if (arg === '--expose-gc' || arg === '--no-expose-gc') {
     host.exposeGC = arg === '--expose-gc'; return true;
   }
