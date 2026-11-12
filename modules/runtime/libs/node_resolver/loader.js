@@ -43,8 +43,9 @@ function createLoader(host, builtins) {
   const parentNames = new Map();
   // What a require of a relative or bare specifier found, by the specifier and its
   // directory or lookup paths, as with Node's Module._pathCache: a module found once is
-  // not looked for again. Callers get a copy.
-  const foundPaths = new Map();
+  // not looked for again. Callers get a copy. It is Module._pathCache, so code that
+  // replaces that object starts the lookups over, as in Node.
+  let foundPaths = { __proto__: null };
   // The source format() read to tell a module from a script, for the load that follows.
   let probed = null;
   const cache = Object.create(null);
@@ -144,7 +145,9 @@ function createLoader(host, builtins) {
     return name;
   }
 
-  function readPackage(directory) {
+  // importing names what an ES module resolution was importing, for Node's
+  // "while importing" part of ERR_INVALID_PACKAGE_CONFIG.
+  function readPackage(directory, importing) {
     const filename = path.join(directory, 'package.json');
     if (typeof host.checkModuleRead === 'function') host.checkModuleRead(filename);
     const known = packages.get(directory);
@@ -154,7 +157,7 @@ function createLoader(host, builtins) {
     try { data = JSON.parse(text(filename).replace(/^\uFEFF/, '')); }
     catch (cause) {
       if (!(cause instanceof SyntaxError)) throw cause;
-      throw Object.assign(error('ERR_INVALID_PACKAGE_CONFIG', filename, undefined, cause.message), { cause });
+      throw Object.assign(error('ERR_INVALID_PACKAGE_CONFIG', filename, importing, cause.message), { cause });
     }
     // Like Node, keep only the fields resolution reads, on a null-prototype object, so
     // a getter on Object.prototype never stands in for a missing field.
@@ -576,13 +579,14 @@ function createLoader(host, builtins) {
         const bases = options && Array.isArray(options.paths) ? options.paths : [path.dirname(parent)];
         const key = cacheable(mode, options, isMain) ? specifier + '\0' + bases[0] : null;
         if (key !== null) {
-          const known = foundPaths.get(key);
+          const known = foundPaths[key];
           if (known !== undefined) return { ...known };
         }
         for (let i5 = 0, a5 = bases; i5 < a5.length; i5++) { const base = a5[i5];
           const candidate = path.resolve(base, requested);
           if (mode === 'import') return strictFile(candidate, specifier, parent, mode, suffix, isMain);
-          const found = legacyFile(candidate, true, /[\\/]$/.test(specifier) || specifier === '.' || specifier === '..');
+          // Node's _findPath: a trailing slash or a last "." or ".." segment names a directory.
+          const found = legacyFile(candidate, true, /[\\/]$/.test(specifier) || /(?:^|[\\/])\.?\.$/.test(specifier));
           if (found) return remember(key, descriptor(found, mode, undefined, isMain));
         }
         throw missing(specifier, parent, mode);
@@ -616,7 +620,7 @@ function createLoader(host, builtins) {
       }
       const key = cacheable(mode, options, isMain) ? specifier + '\0' + search.join('\0') : null;
       if (key !== null) {
-        const known = foundPaths.get(key);
+        const known = foundPaths[key];
         if (known !== undefined) return { ...known };
       }
       return remember(key, findPackage(search, parsed, specifier, parent, mode, seen, isMain));
@@ -631,7 +635,7 @@ function createLoader(host, builtins) {
 
   function remember(key, result) {
     if (key === null) return result;
-    foundPaths.set(key, result);
+    foundPaths[key] = result;
     return { ...result };
   }
 
@@ -647,7 +651,8 @@ function createLoader(host, builtins) {
   // The module that parsed.subpath names in the package at root, or undefined when
   // root holds no such package.
   function packageAt(root, parsed, specifier, parent, mode, seen, isMain) {
-    const pkg = readPackage(root);
+    const base = typeof parent === 'string' && parent.startsWith('file:') ? filesystemName(parent) : parent;
+    const pkg = readPackage(root, mode === 'import' && base ? `"${specifier}" from ${base}` : undefined);
     if (pkg && pkg.data.exports !== undefined && pkg.data.exports !== null) return packageMap(pkg, pkg.data.exports, parsed.subpath, false, parent, mode, seen, isMain);
     const candidate = parsed.subpath === '.' ? root : path.join(root, parsed.subpath.slice(2));
     if (mode === 'import' && parsed.subpath !== '.') {
@@ -832,7 +837,13 @@ function createLoader(host, builtins) {
   }
   function dataSource(url) {
     const match = /^data:([^/]+\/[^;,]+)(?:[^,]*?)(;base64)?,([\s\S]*)$/.exec(url);
-    if (!match) throw error('ERR_INVALID_URL', url);
+    if (!match) {
+      // A MIME type the pattern does not take still has a body (fetch's data:
+      // URL processor reads it as text/plain): only its format is unknown.
+      const result = require('internal/data_url').dataURLProcessor(new URL(url));
+      if (result === 'failure') throw error('ERR_INVALID_URL', url);
+      return { format: null, source: host.Buffer.from(result.body).toString('utf8') };
+    }
     // Percent escapes are bytes, decoded as UTF-8 with replacement characters, as Node does.
     const bytes = match[2] ? host.Buffer.from(match[3], 'base64') : host.Buffer.concat(match[3].split(/(%[0-9A-Fa-f]{2})/)
       .map(part => /^%[0-9A-Fa-f]{2}$/.test(part) ? host.Buffer.from([parseInt(part.slice(1), 16)]) : host.Buffer.from(part, 'utf8')));
@@ -889,7 +900,8 @@ function createLoader(host, builtins) {
     sourceLoadActive = true;
     strippedSource = undefined;
     try {
-      const url = resolved.url || asURL(resolved.filename);
+      // Own properties only: user code may have put a url accessor on Object.prototype.
+      const url = (own(resolved, 'url') && resolved.url) || asURL(resolved.filename);
       const loaded = hooks.run('load', url, { format: resolved.format,
         importAttributes: attributes || resolved.importAttributes || {}, conditions: conditions(mode) }, allowAsync);
       let source = loaded.source == null || loaded.format === 'wasm' ? loaded.source : sourceText(loaded.source);
@@ -966,7 +978,8 @@ function createLoader(host, builtins) {
       this.id = id;
       this.filename = null;
       this.path = path.dirname(id);
-      this.exports = {};
+      // Node's setOwnProperty: no setter on Object.prototype runs.
+      Object.defineProperty(this, 'exports', { value: {}, writable: true, enumerable: true, configurable: true });
       this[kModuleParent] = parent;
       this.children = [];
       // As Node, paths come with load() (or from whoever made the module).
@@ -1026,6 +1039,11 @@ function createLoader(host, builtins) {
   Module.Module = Module;
   Module._cache = cache;
   Module._extensions = extensions;
+  Object.defineProperty(Module, '_pathCache', {
+    get() { return foundPaths; },
+    set(value) { foundPaths = value; },
+    enumerable: true, configurable: true,
+  });
   Module._nodeModulePaths = directory => modulePaths(path.resolve(directory));
   // Node's internalModuleStat: 0 for a file, 1 for a directory, negative otherwise.
   Module._stat = filename => {
@@ -1254,7 +1272,18 @@ function createLoader(host, builtins) {
       throw cause;
     }
   }
+  // Node's ModuleWrap compile failure (AppendExceptionLine): a module that did
+  // not parse reports the line of the bad token in its own file, by URL.
+  function moduleSyntaxArrow(cause) {
+    if (!(cause instanceof SyntaxError) || typeof cause.fileName !== 'string' || host.errorArrows.has(cause)) return;
+    const url = asURL(cause.fileName);
+    if (!url.startsWith('file:')) return;
+    let source;
+    try { source = text(filesystemName(url)); } catch (_) { return; }
+    host.attachArrow(cause, url, cleanSource(source), 0);
+  }
   function decorateModuleError(cause, filename) {
+    moduleSyntaxArrow(cause);
     if (cause === null || typeof cause !== 'object' || cause.name !== 'ReferenceError') return cause;
     const match = /^(require|module|exports|__filename|__dirname) is not defined$/.exec(cause.message);
     if (!match) return cause;
@@ -1325,6 +1354,11 @@ function createLoader(host, builtins) {
     }
     require.resolve = (specifier, options) => {
       if (typeof specifier !== 'string') throw invalidArgType('request', 'string', specifier);
+      // Node's _resolveFilename: a node: name that is no builtin is looked up like any other.
+      if (builtinPrefix(specifier, 'node:')) {
+        try { builtinName(specifier); }
+        catch (cause) { if (cause?.code === 'ERR_UNKNOWN_BUILTIN_MODULE') throw missing(specifier, parentName(parent || filename), 'require'); throw cause; }
+      }
       const result = resolve(specifier, parent || filename, 'require', undefined, options, false, allowAsync);
       return result.format === 'builtin' && !specifier.startsWith('node:') && result.filename.startsWith('node:') ? result.filename.slice(5) : result.filename;
     };
@@ -1378,7 +1412,7 @@ function createLoader(host, builtins) {
     const modules = new Set(Object.keys(cache)), directories = new Set(packages.keys());
     const resolved = new Set(resolutions.keys()), previous = main;
     const scoped = new Set(scopes.keys()), looked = new Set(lookupPaths.keys()), reals = new Set(realPaths.keys());
-    const parents = new Set(parentNames.keys()), founds = new Set(foundPaths.keys());
+    const parents = new Set(parentNames.keys()), founds = new Set(Object.keys(foundPaths));
     try { runMain(filename); }
     finally {
       for (const key of Object.keys(cache)) if (!modules.has(key)) delete cache[key];
@@ -1387,7 +1421,7 @@ function createLoader(host, builtins) {
       for (const key of [...lookupPaths.keys()]) if (!looked.has(key)) lookupPaths.delete(key);
       for (const key of [...realPaths.keys()]) if (!reals.has(key)) realPaths.delete(key);
       for (const key of [...parentNames.keys()]) if (!parents.has(key)) parentNames.delete(key);
-      for (const key of [...foundPaths.keys()]) if (!founds.has(key)) foundPaths.delete(key);
+      for (const key of Object.keys(foundPaths)) if (!founds.has(key)) delete foundPaths[key];
       for (const key of [...resolutions.keys()]) if (!resolved.has(key)) resolutions.delete(key);
       main = previous;
       probed = null;

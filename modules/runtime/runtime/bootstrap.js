@@ -936,8 +936,15 @@ function evaluateMain(source, name) {
   return result instanceof Promise ? promiseThen(result, undefined, cause => { throw loader.decorateModuleError(cause, name); }) : result;
 }
 const requirePreloads = [], importPreloads = [], loaderPreloads = [];
+// The main context has no importModuleDynamically: an import() with no referrer
+// script (an indirect eval run by a job, say) reports the missing callback, as in Node.
+function missingImportCallback() {
+  const { ERR_VM_DYNAMIC_IMPORT_CALLBACK_MISSING } = internalRequire('internal/errors').codes;
+  return promiseReject(new ERR_VM_DYNAMIC_IMPORT_CALLBACK_MISSING());
+}
 function runPreloads(entry, loadImports = true) {
   // Before any preload: Node applies it when the context is made.
+  native.vmSetImportModuleDynamically(undefined, missingImportCallback, true);
   if (host.disableProto !== undefined) disableProto(globalThis);
   if (host.disallowCodeGeneration) native.vmSetCodeGeneration(undefined, false);
   if (host.jitless) delete globalThis.WebAssembly;

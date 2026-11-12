@@ -9,9 +9,9 @@ const {
   DataViewPrototypeGetByteLength, TypedArrayPrototypeGetBuffer,
   TypedArrayPrototypeGetByteOffset, TypedArrayPrototypeGetByteLength, Uint8Array,
 } = require('internal/streams/iter/primordials');
-const { isDataView } = require('util/types');
+const { isDataView, isNativeError } = require('util/types');
 const {
-  contexts, error, invalid, contextData, isContext, syntaxDiagnostic, run,
+  contexts, error, invalid, contextData, isContext, syntaxDiagnostic, run, terminationErrors,
 } = require('internal/vm');
 const scripts = new WeakMap();
 const cacheMagic = Buffer.from('SILKVM01');
@@ -155,7 +155,7 @@ function runOptions(value) {
   const timeout = duration === undefined ? 0 : integer(duration, 'options.timeout', 1, 4294967295);
   if (displayErrors !== undefined) boolean(displayErrors, 'options.displayErrors');
   boolean(breakOnSigint, 'options.breakOnSigint');
-  return { timeout, breakOnSigint };
+  return { timeout, breakOnSigint, displayErrors: displayErrors !== false };
 }
 function digest(value, encoding) { return createHash('sha256').update(value, encoding).digest(); }
 function writeCache(handle, source, kind) {
@@ -238,7 +238,7 @@ class Script {
     const dynamicImport = internalImport !== undefined ? (specifier, attributes) => internalImport(specifier, this, attributes || Object.create(null), 'evaluation')
       : importCallback(opts.importModuleDynamically, this, filename);
     host.vmSetImportModuleDynamically(handle, dynamicImport);
-    scripts.set(this, { source, handle, dynamicImport, realms: new WeakMap() });
+    scripts.set(this, { source, handle, dynamicImport, realms: new WeakMap(), filename, line, column });
     // The last "//# sourceMappingURL=" magic comment, as V8 reports it.
     let mapURL;
     for (const match of source.matchAll(/\/\/[#@][ \t]+sourceMappingURL=[ \t]*([^\s'"]+)[ \t]*$/gm)) mapURL = match[1];
@@ -250,7 +250,9 @@ class Script {
   }
   runInThisContext(value) {
     const data = scriptData(this);
-    return run(data.handle, runOptions(value), false);
+    const execution = runOptions(value);
+    try { return run(data.handle, execution, false); }
+    catch (cause) { if (execution.displayErrors) decorateErrorStack(cause, data); throw cause; }
   }
   runInContext(contextifiedObject, value) {
     const data = scriptData(this);
@@ -262,7 +264,8 @@ class Script {
       host.vmSetImportModuleDynamically(handle, data.dynamicImport);
       data.realms.set(contextifiedObject, handle);
     }
-    return run(handle, execution, context.afterEvaluate);
+    try { return run(handle, execution, context.afterEvaluate); }
+    catch (cause) { if (execution.displayErrors) decorateErrorStack(cause, data); throw cause; }
   }
   runInNewContext(sandbox, value) {
     // As in Node, the context takes its options under context-prefixed names.
@@ -276,6 +279,20 @@ class Script {
     const data = scriptData(this);
     return writeCache(data.handle, data.source, 0);
   }
+}
+// DecorateErrorStack (node_errors.cc), for a script run with displayErrors: a
+// native error leaving the script gets the arrow of where it was thrown before
+// its stack, once. A timeout or interrupt is Node's own error and gets none.
+function decorateErrorStack(cause, data) {
+  try {
+    if (!isNativeError(cause) || terminationErrors.has(cause) || host.decoratedErrors.has(cause)) return;
+    const stack = cause.stack;
+    if (typeof stack !== 'string') return;
+    const arrow = require('internal/fatal_report').arrow(cause, false, data.filename, data.line, data.column);
+    if (arrow === undefined) return;
+    cause.stack = arrow + '\n' + stack;
+    host.decoratedErrors.add(cause);
+  } catch {}
 }
 function scriptData(value) {
   const data = scripts.get(value);
