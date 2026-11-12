@@ -1066,6 +1066,22 @@ function runPreloads(entry, loadImports = true, loadRequires = true, runImports 
 }
 const optionFlag = entry => internalRequire('internal/options').optionFlag(entry);
 let heapPercentage = false;
+let traceSyncIO = false;
+const perfOutput = { basic: false, jitdump: false, basicPath: '/tmp' };
+// V8's LinuxPerfBasicLogger and LinuxPerfJitLogger open their files when the isolate starts.
+function writePerfOutput() {
+  const fs = internalRequire('fs');
+  if (perfOutput.basic) fs.writeFileSync(`${perfOutput.basicPath}/perf-${process.pid}.map`, '');
+  if (perfOutput.jitdump) {
+    // The jitdump header (tools/perf/Documentation/jitdump-specification.txt), with no code records.
+    const header = internalRequire('buffer').Buffer.alloc(40);
+    header.writeUInt32LE(0x4A695444, 0); header.writeUInt32LE(1, 4); header.writeUInt32LE(40, 8);
+    header.writeUInt32LE(process.arch === 'arm64' ? 183 : process.arch === 'arm' ? 40 : 62, 12);
+    header.writeUInt32LE(process.pid, 20);
+    header.writeBigUInt64LE(process.hrtime.bigint(), 24);
+    fs.writeFileSync(`jit-${process.pid}.dump`, header);
+  }
+}
 function runtimeFlag(arg) {
   try {
     if (internalRequire('internal/permission').applyOption(arg) ||
@@ -1124,8 +1140,11 @@ function runtimeFlag(arg) {
   // wherever each comes (PerIsolateOptions::HandleMaxOldSpaceSizePercentage).
   const heapSize = /^--max[-_](old|semi)[-_]space[-_]size=(\d+)$/.exec(arg);
   if (heapSize) {
-    if (heapSize[1] === 'semi') native.workerNative('setHeapLimit', [undefined, Number(heapSize[2])]);
-    else if (!heapPercentage) native.workerNative('setHeapLimit', [Number(heapSize[2]), undefined]);
+    // 0 keeps V8's default heap configuration.
+    const size = Number(heapSize[2]);
+    if (size === 0) return true;
+    if (heapSize[1] === 'semi') native.workerNative('setHeapLimit', [undefined, size]);
+    else if (!heapPercentage) native.workerNative('setHeapLimit', [size, undefined]);
     return true;
   }
   if (arg.startsWith('--max-old-space-size-percentage=') || arg.startsWith('--max_old_space_size_percentage=')) {
@@ -1146,6 +1165,28 @@ function runtimeFlag(arg) {
   if (arg === '--enable-sharedarraybuffer-per-context' || arg === '--no-harmony-sharedarraybuffer' ||
       arg === '--no-harmony_sharedarraybuffer') {
     host.noSharedArrayBuffer = true; return true;
+  }
+  // V8's --use-strict: scripts and eval compile as strict code from here on.
+  if (arg === '--use-strict' || arg === '--no-use-strict') { native.workerNative('setUseStrict', [arg === '--use-strict']); return true; }
+  // V8's perf integration writes, at startup, a map of the machine code it generates
+  // (perf-PID.map) or a jitdump file (jit-PID.dump). The runtime generates no machine
+  // code, so the files it writes list none: perf resolves the interpreter's own frames
+  // from the binary's symbols.
+  const perfPath = /^--perf[-_]basic[-_]prof[-_]path=(.*)$/.exec(arg);
+  if (perfPath) { perfOutput.basicPath = perfPath[1]; return true; }
+  if (/^--(no-)?perf[-_]basic[-_]prof([-_]only[-_]functions)?$/.test(arg)) { perfOutput.basic = !arg.startsWith('--no-'); return true; }
+  if (/^--(no-)?perf[-_]prof$/.test(arg)) { perfOutput.jitdump = !arg.startsWith('--no-'); return true; }
+  // Both only change the machine code V8 generates: unwinding records for --perf-prof's
+  // code, and a trampoline copy per interpreted function for native profilers.
+  if (/^--(no-)?(perf[-_]prof[-_]unwinding[-_]info|interpreted[-_]frames[-_]native[-_]stack)$/.test(arg)) return true;
+  // Node's --trace-sync-io: once the event loop starts, sync fs calls print their stack.
+  if (arg === '--trace-sync-io' || arg === '--no-trace-sync-io') { traceSyncIO = arg === '--trace-sync-io'; return true; }
+  // Node's --track-heap-objects (HeapProfiler::StartTrackingHeapObjects(true)): every
+  // allocation's stack is recorded from startup, for the heap snapshots taken later.
+  if (arg === '--track-heap-objects' || arg === '--no-track-heap-objects') {
+    if (arg === '--track-heap-objects') host.allocationProfileStart(1, 2048);
+    else host.allocationProfileStop();
+    return true;
   }
   if (arg === '--trace-gc' || arg === '--no-trace-gc') { host.traceNative('printGC', arg === '--trace-gc'); return true; }
   if (arg === '--expose-gc' || arg === '--no-expose-gc') {
@@ -1425,77 +1466,6 @@ function installCommonJSInputGlobals(filename, id) {
   globalThis.module = module; globalThis.exports = module.exports;
   globalThis.__filename = id; globalThis.__dirname = '.';
 }
-const HELP_TEXT = `Usage: silkjsruntime [options] [script.js] [arguments]
-  -e, --eval CODE    Evaluate JavaScript (also --eval=CODE)
-  -p, --print [CODE] Evaluate and print; read stdin when CODE is omitted
-  -c, --check        Check syntax without executing
-  -i, --interactive Start the REPL, also after evaluating a script
-  --inspect[=[HOST:]PORT]       Activate the inspector (default 127.0.0.1:9229)
-  --inspect-brk[=[HOST:]PORT]   Wait for a debugger and break at user entry
-  --inspect-wait[=[HOST:]PORT]  Wait for Runtime.runIfWaitingForDebugger
-  --inspect-port=[HOST:]PORT   Set the inspector address without activating
-  --experimental-inspector-network-resource  Enable inspector network resources
-  -r, --require ID  Preload a CommonJS module (repeatable)
-  --import ID       Preload a module, awaiting evaluation (repeatable)
-  -C, --conditions NAME  Add a package resolution condition (repeatable)
-  --preserve-symlinks, --no-preserve-symlinks
-  --preserve-symlinks-main, --no-preserve-symlinks-main
-  --env-file=PATH, --env-file-if-exists=PATH
-  --watch, --watch-path=PATH
-  --watch-preserve-output, --watch-kill-signal=SIGNAL
-  --run [SCRIPT]    Run a package.json script; pass arguments after --
-  --permission, --permission-audit
-  --allow-fs-read=PATH, --allow-fs-write=PATH
-  --allow-child-process, --allow-worker, --allow-addons
-  --allow-wasi, --allow-inspector, --allow-openssl-store
-  --input-type=module|commonjs|module-typescript|commonjs-typescript
-  --strip-types, --no-strip-types
-  --experimental-transform-types, --no-experimental-transform-types
-  --enable-source-maps, --no-enable-source-maps
-  --warnings, --no-warnings, --trace-warnings, --no-trace-warnings
-  --trace-sigint, --no-trace-sigint
-  --deprecation, --no-deprecation, --trace-deprecation, --throw-deprecation
-  --pending-deprecation, --no-pending-deprecation
-  --disable-warning=CODE|NAME, --redirect-warnings=PATH
-  --unhandled-rejections=throw|strict|warn|warn-with-error-code|none
-  --insecure-http-parser, --no-insecure-http-parser, --max-http-header-size=SIZE,
-  --dns-result-order=ORDER, --no-extra-info-on-fatal-exception
-  --async-context-frame, --no-async-context-frame
-  --expose-gc, --no-expose-gc
-  --experimental-eventsource
-  --experimental-webstorage, --localstorage-file=PATH
-  --experimental-stream-iter
-  --experimental-shadow-realm, --no-experimental-shadow-realm
-  --experimental-vm-modules, --no-experimental-vm-modules
-  --experimental-test-module-mocks, --no-experimental-test-module-mocks
-  --trace-events-enabled
-  --trace-event-categories=CATEGORIES
-  --trace-event-file-pattern=PATH
-  --experimental-sea-config=PATH
-  --report-directory=PATH, --report-filename=PATH
-  --report-signal=SIGNAL, --report-on-signal
-  --report-uncaught-exception, --report-on-fatalerror
-  --report-compact, --report-exclude-env, --report-exclude-network
-  --test [files]    Run Node tests
-  --test-isolation=process|none
-  --test-concurrency=N, --test-timeout=MS, --test-only
-  --test-name-pattern=REGEXP, --test-skip-pattern=REGEXP
-  --test-shard=INDEX/TOTAL
-  --test-update-snapshots
-  --experimental-test-coverage
-  --test-coverage-include=GLOB, --test-coverage-exclude=GLOB
-  --test-coverage-lines=N, --test-coverage-branches=N, --test-coverage-functions=N
-  --test-reporter=NAME, --test-reporter-destination=PATH
-  --build-snapshot ENTRY.js, --build-snapshot-config=FILE
-                     Run ENTRY.js and save the heap after its loop as a startup snapshot
-  --snapshot-blob=PATH Where --build-snapshot saves the snapshot, or the snapshot to start from
-  -h, --help         Print these options
-  -v, --version
-Environment:
-  NODE_OPTIONS      Supported runtime flags, applied before CLI flags
-  NODE_PATH         Additional CommonJS package lookup directories
-  NODE_NO_WARNINGS, NODE_REDIRECT_WARNINGS, NODE_PENDING_DEPRECATION
-`;
 function cliError(messages) {
   if (typeof messages === 'string') messages = [messages];
   host.writeStartupDiagnostic(messages.map((message) => process.execPath + ': ' + message + '\n').join(''));
@@ -1632,7 +1602,8 @@ function run(restored = false) {
       case '--check': check = value; continue;
       case '--test': testMode = value; continue;
       case '--version': host.stdout.write('silkjsruntime 0.1.0 (QuickJS; Node 24 target)\n'); return;
-      case '--help': host.stdout.write(HELP_TEXT); return;
+      // node.cc: --help runs internal/main/print_help from Node's option table.
+      case '--help': internalRequire('internal/main/print_help').print(process.stdout); return;
     }
     // The test runner and the watch supervisor read their options with getOptionValue, as Node's do.
     if (name.startsWith('--test-') || name.startsWith('--experimental-test-') || name.startsWith('--watch-')) continue;
@@ -1643,6 +1614,7 @@ function run(restored = false) {
     if (entry.type === 'NoOp' || runtimeFlag(optionFlag(entry)) || entry.implied) continue;
     return cliError('bad option: ' + entry.raw);
   }
+  if (perfOutput.basic || perfOutput.jitdump) writePerfOutput();
   // node.cc: --build-snapshot runs the builder, --snapshot-blob alone starts from a blob.
   // Both take a process of their own (src/runtime/worker.silk), so this one becomes it.
   if (!restored && !snapshotState.building && (buildSnapshot || snapshotBlob !== undefined)) {
@@ -1757,7 +1729,7 @@ function run(restored = false) {
     const code = !inputType.startsWith('module') && /\bcrypto\b/.test(expression) ?
       (print ? 'let crypto=require("node:crypto");{' + expression + '}' : '(crypto=>{{' + expression + '}})(require("node:crypto"))') : expression;
     if (inputType.startsWith('module') || (!inputTypeSet && native.detectModuleSyntax(code))) {
-      if (print) throw Object.assign(new Error('--print cannot be used with ESM'), { code: 'ERR_EVAL_ESM_CANNOT_PRINT' });
+      if (print) throw new (internalRequire('internal/errors').codes.ERR_EVAL_ESM_CANNOT_PRINT)();
       return afterMain(evaluateMain(code, evalModuleURL()));
     }
     installCommonJSInputGlobals(name, '[eval]');
@@ -1771,7 +1743,7 @@ function run(restored = false) {
     process._eval = source;
     source = prepareInput(source, name, inputType, inputTypeSet);
     if (inputType.startsWith('module') || (!inputTypeSet && native.detectModuleSyntax(source))) {
-      if (print) throw Object.assign(new Error('--print cannot be used with ESM'), { code: 'ERR_EVAL_ESM_CANNOT_PRINT' });
+      if (print) throw new (internalRequire('internal/errors').codes.ERR_EVAL_ESM_CANNOT_PRINT)();
       return afterMain(evaluateMain(source, evalModuleURL()));
     }
     installCommonJSInputGlobals(name, '[stdin]');
@@ -1887,6 +1859,7 @@ function checkUnsettledTopLevelAwait() {
 // The loop in three parts, so that an embedder can turn it from its own loop:
 // loopStart once, loopStep until it returns false, then loopEnd for the exit status.
 function loopStart() {
+  if (traceSyncIO) host.traceSyncIO = true;
   performanceMilestones.loopStart = native.now() - startTime;
   initialNativeIdleTime = native.loopIdleTime();
 }
