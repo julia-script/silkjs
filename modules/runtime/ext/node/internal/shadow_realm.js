@@ -28,6 +28,8 @@ function moduleSource(filename, format) {
 }
 
 function realmLoader(handle) {
+  // As for a vm context: Node's stack formatting (its own Error.prepareStackTrace) and WebAssembly.
+  host.initializeRealmBuiltins(handle, host.vmGlobal(handle), true);
   const modules = new Map();
   const evaluations = new Map();
 

@@ -117,6 +117,8 @@ define('internal/host', module => { module.exports = host; });
 const ProcessConstructor = { process: function () {} }.process;
 const process = Object.create(ProcessConstructor.prototype);
 internalRequire('internal/error_stack').install(globalThis);
+// QuickJS's InternalError is no Node global; the engine still throws its errors.
+delete globalThis.InternalError;
 let warnedTransformTypes = false;
 host.stripTypeScriptModuleTypes = (source, filename, sourceURL = filename) => {
   const transform = host.typeScriptMode === 'transform';
@@ -156,6 +158,7 @@ function disableProto(global) {
   }
 }
 host.initializeRealmBuiltins = (handle, global, wasmCodeGeneration) => {
+  delete global.InternalError;
   if (host.disableProto !== undefined) disableProto(global);
   const cache = new Map();
   const bridge = {
