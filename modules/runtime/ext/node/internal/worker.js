@@ -477,7 +477,9 @@ function workerEnvironment() {
     host.workerNative('envSet', [key, `${value}`]);
   };
   const invalidDescriptor = message => clone().codedError('ERR_INVALID_OBJECT_DEFINE_PROPERTY', message);
-  return new Proxy(Object.create(null), {
+  // A host interceptor object, as Node's is (node_env_var.cc), not a Proxy: util.types.isProxy
+  // is false and the inspector previews its properties.
+  return host.createInterceptor({}, {
     get(target, key) {
       if (typeof key === 'symbol') return undefined;
       const value = lookup(key);
@@ -502,7 +504,10 @@ function workerEnvironment() {
         throw invalidDescriptor("'process.env' does not accept an accessor(getter/setter) descriptor");
       throw invalidDescriptor("'process.env' only accepts a configurable, writable, and enumerable data descriptor");
     },
-    getPrototypeOf() { return Object.prototype; },
+    getPrototypeOf(target) { return Reflect.getPrototypeOf(target); },
+    setPrototypeOf(target, prototype) { return Reflect.setPrototypeOf(target, prototype); },
+    isExtensible(target) { return Reflect.isExtensible(target); },
+    preventExtensions() { return false; },
   });
 }
 function install(proc = process, metadata = bootstrap()) {
