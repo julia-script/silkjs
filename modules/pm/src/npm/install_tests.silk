@@ -1,0 +1,182 @@
+import npm.install { InstallError, install }
+import npm.manifest { Manifest }
+import npm.registry { Registry, RegistryError, RegistryErrorKind }
+import npm.resolve { Graph, Host, ResolveError, resolve }
+import pkg.names { Names }
+import pkg.store { Store, StoreError }
+import pkg.test_archive { ARCHIVE }
+import pkg.text { same }
+import silk.collections.bytes { Bytes }
+import silk.collections.list { List }
+import silk.collections.slice { Slice }
+import silk.concurrency.thread_native { SpawnError }
+import silk.concurrency.thread_pool { Pool, ThreadPool }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.platform.native.file { NativeFile, NativeFileError }
+import silk.testing.testing { AssertionError, Testing }
+
+const DEMO: &'static [u8] = b"{\"name\":\"demo\",\"dist-tags\":{\"latest\":\"1.0.0\"},\"versions\":{\"1.0.0\":{\"name\":\"demo\",\"version\":\"1.0.0\",\"bin\":{\"demo\":\"lib/index.js\",\"cli\":\"./bin/cli.js\"},\"dependencies\":{\"@scope/dep\":\"1\"},\"dist\":{\"tarball\":\"https://r.example/demo.tgz\",\"integrity\":\"sha512-Q/ma7OddxE2COC3caOkW8g7m94kfckjmKJHsLvy3Q9OOfplMyfA5U9ZjmglR1a10u3lqc7A63wxeWNiIx7r1gA==\"}}}}"
+const DEP: &'static [u8] = b"{\"name\":\"@scope/dep\",\"dist-tags\":{\"latest\":\"1.0.0\"},\"versions\":{\"1.0.0\":{\"name\":\"@scope/dep\",\"version\":\"1.0.0\",\"dependencies\":{\"demo\":\"1\"},\"dist\":{\"tarball\":\"https://r.example/dep.tgz\",\"integrity\":\"sha512-Q/ma7OddxE2COC3caOkW8g7m94kfckjmKJHsLvy3Q9OOfplMyfA5U9ZjmglR1a10u3lqc7A63wxeWNiIx7r1gA==\"}}}}"
+const BAD: &'static [u8] = b"{\"name\":\"bad\",\"dist-tags\":{\"latest\":\"1.0.0\"},\"versions\":{\"1.0.0\":{\"name\":\"bad\",\"version\":\"1.0.0\",\"dist\":{\"tarball\":\"https://r.example/bad.tgz\",\"integrity\":\"sha512-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==\"}}}}"
+const WINONLY: &'static [u8] = b"{\"name\":\"winonly\",\"dist-tags\":{\"latest\":\"1.0.0\"},\"versions\":{\"1.0.0\":{\"name\":\"winonly\",\"version\":\"1.0.0\",\"os\":[\"win32\"],\"dist\":{\"tarball\":\"https://r.example/win.tgz\",\"integrity\":\"sha512-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==\"}}}}"
+
+// A registry where every tarball is the test archive.
+struct Canned {
+  // How many tarballs were asked for.
+  downloads: usize,
+}
+
+impl Canned {
+  effect fn documents(self: &mut Self, names: &Names, ids: &[usize]) -> List<Result<Bytes, RegistryError>>
+    ! OutOfMemoryError ? &mut Allocator {
+    let mut answers = List<Result<Bytes, RegistryError>>.make()
+    let mut index: usize = 0
+    while index < ids.length {
+      let name = Names.bytes(names, ids[index])
+      if same(name, b"demo") {
+        run answers.append(Result<Bytes, RegistryError>.succeed(run Bytes.copy(DEMO)))
+      } else if same(name, b"@scope/dep") {
+        run answers.append(Result<Bytes, RegistryError>.succeed(run Bytes.copy(DEP)))
+      } else if same(name, b"winonly") {
+        run answers.append(Result<Bytes, RegistryError>.succeed(run Bytes.copy(WINONLY)))
+      } else if same(name, b"bad") {
+        run answers.append(Result<Bytes, RegistryError>.succeed(run Bytes.copy(BAD)))
+      } else {
+        run answers.append(Result<Bytes, RegistryError>.failResult(RegistryError { kind: RegistryErrorKind.NotFound, status: 404, message: "no such package" }))
+      }
+      index = index + 1
+    }
+    return move answers
+  }
+
+  effect fn tarballs(self: &mut Self, urls: &[Bytes]) -> List<Result<Bytes, RegistryError>>
+    ! OutOfMemoryError ? &mut Allocator {
+    let mut answers = List<Result<Bytes, RegistryError>>.make()
+    let mut index: usize = 0
+    while index < urls.length {
+      self.downloads = self.downloads + 1
+      run answers.append(Result<Bytes, RegistryError>.succeed(run Bytes.copy(ARCHIVE)))
+      index = index + 1
+    }
+    return move answers
+  }
+}
+
+impl Registry for Canned {
+  documents: Canned.documents
+  tarballs: Canned.tarballs
+}
+
+const LINUX: Host = Host { os: b"linux", cpu: b"x64", libc: b"glibc" }
+
+effect fn path(directory: &[u8], rest: &[u8]) -> Bytes ! OutOfMemoryError ? &mut Allocator {
+  let mut joined = run Bytes.copy(directory)
+  run joined.append(rest)
+  return move joined
+}
+
+// Whether following links from `directory` + `rest` reaches a file of `size` bytes.
+effect fn reaches(directory: &[u8], rest: &[u8], size: u64) -> bool ! OutOfMemoryError ? &mut Allocator {
+  let full = run path(directory, rest)
+  return match run Effect.result(NativeFile.status(Bytes.asSlice(&full), true)) {
+    Result.Success { value: status } => status.size == size
+    Result.Failure {..} => false
+  }
+}
+
+effect fn installsTwice(pool: &Pool) -> ()
+  ! AssertionError<'static> | ResolveError | InstallError | StoreError | NativeFileError | OutOfMemoryError
+  ? &mut Registry | &mut Allocator {
+  let mut buffer: [u8; 64] = [0; 64]
+  let length = run NativeFile.makeTemporaryDirectory(b"/tmp/pm-install-XXXXXX", &mut buffer)
+  let directory = Slice.view<u8>(&buffer, 0, length)
+  let storeRoot = run path(directory, b"/store")
+  let project = run path(directory, b"/project")
+  let store = run Store.open(Bytes.asSlice(&storeRoot))
+  let root = match move run Manifest.parse(b"{\"dependencies\":{\"demo\":\"^1\"},\"optionalDependencies\":{\"winonly\":\"1\"}}") {
+    Option.Some { value } => move value
+    Option.None => { return run Testing.expect(false, "the project manifest parses") }
+  }
+  let graph = run resolve(&root, Option<&Graph>.none())
+  let first = run install(Bytes.asSlice(&project), &graph, &store, LINUX, pool)
+  run Testing.expect(first.packages == 2 && first.downloaded == 2 && first.linked == 2, "two packages are downloaded and linked")
+
+  let here = Bytes.asSlice(&project)
+  let viaProject = run reaches(here, b"/node_modules/demo/lib/index.js", 19)
+  run Testing.expect(viaProject, "the project reaches its dependency")
+  let viaDependency = run reaches(here, b"/node_modules/demo/../@scope/dep/lib/index.js", 19)
+  run Testing.expect(viaDependency, "a package has its scoped dependency beside it")
+  let aroundTheCycle = run reaches(here, b"/node_modules/.sjs/@scope+dep@1.0.0/node_modules/demo/package.json", 34)
+  run Testing.expect(aroundTheCycle, "a dependency cycle is two links")
+  let hidden = run reaches(here, b"/node_modules/@scope/dep/package.json", 34)
+  run Testing.expect(hidden == false, "what the project does not depend on is not in its node_modules")
+  run Testing.expect(Graph.count(&graph) == 3, "the package for another platform is in the graph")
+  let foreign = run path(here, b"/node_modules/winonly")
+  let absent = match run Effect.result(NativeFile.status(Bytes.asSlice(&foreign), false)) {
+    Result.Success {..} => false
+    Result.Failure {..} => true
+  }
+  run Testing.expect(absent, "a package for another platform is not installed")
+  let command = run reaches(here, b"/node_modules/.bin/demo", 19)
+  run Testing.expect(command, "a command is linked into .bin")
+
+  // lib/index.js is not executable in the archive, but it is a command of the package.
+  let binary = run path(here, b"/node_modules/.bin/demo")
+  let status = run NativeFile.status(Bytes.asSlice(&binary), true)
+  run Testing.expect((status.mode & 73) != 0, "the file of a command is executable")
+
+  let second = run install(Bytes.asSlice(&project), &graph, &store, LINUX, pool)
+  run Testing.expect(second.downloaded == 0 && second.linked == 0, "a second install has nothing to do")
+
+  // Another project gets the packages from the store.
+  let other = run path(directory, b"/other")
+  let third = run install(Bytes.asSlice(&other), &graph, &store, LINUX, pool)
+  run Testing.expect(third.downloaded == 0 && third.linked == 2, "the store serves the next project")
+}
+
+test effect fn installsFromTheStore() -> ()
+  ! AssertionError<'static> | ResolveError | InstallError | StoreError | NativeFileError | SpawnError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut registry = Canned { downloads: 0 }
+  let threads = run ThreadPool.make(2) |> Effect.provideMut<Allocator>(&mut allocator)
+  let pool = threads.pool()
+  run installsTwice(&pool) |> Effect.provideMut<Registry>(&mut registry) |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(registry.downloads == 2, "each tarball is downloaded once")
+}
+
+effect fn wrongDigest(pool: &Pool) -> ()
+  ! AssertionError<'static> | ResolveError | StoreError | NativeFileError | OutOfMemoryError
+  ? &mut Registry | &mut Allocator {
+  let mut buffer: [u8; 64] = [0; 64]
+  let length = run NativeFile.makeTemporaryDirectory(b"/tmp/pm-install-XXXXXX", &mut buffer)
+  let directory = Slice.view<u8>(&buffer, 0, length)
+  let storeRoot = run path(directory, b"/store")
+  let store = run Store.open(Bytes.asSlice(&storeRoot))
+  let root = match move run Manifest.parse(b"{\"dependencies\":{\"bad\":\"1\"}}") {
+    Option.Some { value } => move value
+    Option.None => { return run Testing.expect(false, "the project manifest parses") }
+  }
+  let graph = run resolve(&root, Option<&Graph>.none())
+  let refused = match move run Effect.result(install(directory, &graph, &store, LINUX, pool)) {
+    Result.Success {..} => false
+    Result.Failure { error } => match move error {
+      InstallError failed => same(Bytes.asSlice(&failed.subject), b"bad@1.0.0")
+      OutOfMemoryError exhausted => { fail move exhausted }
+    }
+  }
+  run Testing.expect(refused, "a tarball with another digest is not installed")
+  let linked = run reaches(directory, b"/node_modules/bad/package.json", 34)
+  run Testing.expect(linked == false, "nothing of it is linked")
+}
+
+test effect fn refusesATarballWithAnotherDigest() -> ()
+  ! AssertionError<'static> | ResolveError | StoreError | NativeFileError | SpawnError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut registry = Canned { downloads: 0 }
+  let threads = run ThreadPool.make(2) |> Effect.provideMut<Allocator>(&mut allocator)
+  let pool = threads.pool()
+  run wrongDigest(&pool) |> Effect.provideMut<Registry>(&mut registry) |> Effect.provideMut<Allocator>(&mut allocator)
+}

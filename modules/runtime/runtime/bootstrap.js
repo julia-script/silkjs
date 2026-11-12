@@ -1042,6 +1042,7 @@ function evaluateMain(source, name) {
   host.clearRegExpStatics();
   try { result = native.evaluateModule(source, name, true); }
   catch (cause) { throw loader.decorateModuleError(cause, name); }
+  host.entryModule = { name, source, promise: result };
   // As loader.runMain does for a file entry.
   return result instanceof Promise ? promiseThen(result, undefined, cause => { throw loader.decorateModuleError(cause, name); }) : result;
 }
@@ -1086,6 +1087,7 @@ function runPreloads(entry, loadImports = true, loadRequires = true, runImports 
   return pending.then(entry);
 }
 const optionFlag = entry => internalRequire('internal/options').optionFlag(entry);
+let heapPercentage = false;
 function runtimeFlag(arg) {
   try {
     if (internalRequire('internal/permission').applyOption(arg) ||
@@ -1140,12 +1142,36 @@ function runtimeFlag(arg) {
   if (stackSize) { native.workerNative('setStackSize', [Number(stackSize[1])]); return true; }
   // V8's --use-strict: every script, eval and Function body compiled from here on is strict code.
   if (arg === '--use-strict' || arg === '--no-use-strict') { native.workerNative('useStrict', [arg === '--use-strict']); return true; }
+  // V8's heap budgets in MiB on the main thread (worker_native setHeapLimit); a
+  // Worker takes its budgets from resourceLimits, as in Node.
+  // --max-old-space-size-percentage takes precedence over every --max-old-space-size,
+  // wherever each comes (PerIsolateOptions::HandleMaxOldSpaceSizePercentage).
+  const heapSize = /^--max[-_](old|semi)[-_]space[-_]size=(\d+)$/.exec(arg);
+  if (heapSize) {
+    if (heapSize[1] === 'semi') native.workerNative('setHeapLimit', [undefined, Number(heapSize[2])]);
+    else if (!heapPercentage) native.workerNative('setHeapLimit', [Number(heapSize[2]), undefined]);
+    return true;
+  }
+  if (arg.startsWith('--max-old-space-size-percentage=') || arg.startsWith('--max_old_space_size_percentage=')) {
+    const text = arg.slice(32);
+    const percentage = /^[+-]?(\d+\.?\d*|\.\d+)([eE][+-]?\d+)?$/.test(text.trim()) ? Number(text) : NaN;
+    if (!(percentage > 0 && percentage <= 100)) {
+      cliError(`--max-old-space-size-percentage must be greater than 0 and up to 100. Got: ${text}`); return true;
+    }
+    // The cgroup limit when there is one, else physical memory.
+    const constrained = process.constrainedMemory();
+    const total = constrained > 0 && constrained !== 2 ** 64 - 1 ? constrained : internalRequire('os').totalmem();
+    heapPercentage = true;
+    native.workerNative('setHeapLimit', [Math.floor(total * percentage / 100 / 1048576), undefined]);
+    return true;
+  }
   // V8 with these flags and no embedder callback, as in Node, installs no
   // SharedArrayBuffer global (runPreloads removes it before user code).
   if (arg === '--enable-sharedarraybuffer-per-context' || arg === '--no-harmony-sharedarraybuffer' ||
       arg === '--no-harmony_sharedarraybuffer') {
     host.noSharedArrayBuffer = true; return true;
   }
+  if (arg === '--trace-gc' || arg === '--no-trace-gc') { host.traceNative('printGC', arg === '--trace-gc'); return true; }
   if (arg === '--expose-gc' || arg === '--no-expose-gc') {
     host.exposeGC = arg === '--expose-gc'; return true;
   }
@@ -1168,6 +1194,7 @@ function runtimeFlag(arg) {
   if (arg === '--trace-events-enabled') { (host.traceOptions ||= {}).enabled = true; return true; }
   if (arg.startsWith('--trace-event-categories=')) { (host.traceOptions ||= {}).categories = arg.slice(25); return true; }
   if (arg.startsWith('--trace-event-file-pattern=')) { (host.traceOptions ||= {}).filePattern = arg.slice(27); return true; }
+  if (arg === '--use-env-proxy' || arg === '--no-use-env-proxy') { host.useEnvProxy = arg === '--use-env-proxy'; return true; }
   if (arg === '--experimental-eventsource' || arg === '--no-experimental-eventsource') {
     host.experimentalEventSource = arg === '--experimental-eventsource'; return true;
   }
@@ -1316,9 +1343,17 @@ function installRuntimeOptions(args, entrypoints = [], preloadEntrypoints = true
   if (host.experimentalWebStorage) internalRequire('internal/web/storage').install(globalThis, { localStorageFile: host.localStorageFile, inspect: !!host.experimentalStorageInspection });
   if (host.experimentalStreamIter) { internalRequire('fs/promises'); internalRequire('internal/fs/iter').install(); }
   // http is in the heap image, whose global agent was made without this process's options.
+  // node_options.cc: NODE_USE_ENV_PROXY=1 sets it, and the flags override that.
+  if (host.useEnvProxy === undefined) host.useEnvProxy = process.env.NODE_USE_ENV_PROXY === '1';
   if (internalRequire('internal/options').getOptionValue('--use-env-proxy')) {
     const agent = internalRequire('_http_agent');
     agent.globalAgent = internalRequire('internal/http').getGlobalAgent(process.env, agent.Agent);
+    // Node's setupHttpProxy: fetch goes through Undici's EnvHttpProxyAgent.
+    const env = process.env;
+    if (env.HTTP_PROXY || env.HTTPS_PROXY || env.http_proxy || env.https_proxy) {
+      const { setGlobalDispatcher, EnvHttpProxyAgent } = internalRequire('internal/deps/undici/undici');
+      setGlobalDispatcher(new EnvHttpProxyAgent());
+    }
   }
   if (workerThreads.isMainThread) internalRequire('internal/trace_events').initialize(host.traceOptions);
   if (workerThreads.isMainThread && host.traceSigint) internalRequire('util').setTraceSigInt(true);
@@ -1379,7 +1414,7 @@ function runWorker() {
   const moduleEval = evaluate && (inputType?.startsWith('module') || (inputType === undefined && native.detectModuleSyntax(workerSource)));
   return runPreloads(() => {
     if (evaluate) {
-      if (moduleEval) return evaluateMain(workerSource, host.path.join(host.tryGetCwd(), '[eval1]'));
+      if (moduleEval) return evaluateMain(workerSource, evalModuleURL());
       const name = host.path.join(host.tryGetCwd(), '[worker eval]');
       installCommonJSInputGlobals(name, '[worker eval]');
       armInspectorEntry();
@@ -1843,6 +1878,34 @@ function loopTurn(pendingPromise, limit, keepAlive) {
 }
 // An exception in a 'beforeExit' or 'exit' listener is uncaught like any other.
 function emitProcessEvent(name) { process.emit(name, Number(process.exitCode) || 0); }
+// Node's EmitProcessExitInternal: with no exit code set, an entry module whose
+// evaluation never settled exits with kUnsettledTopLevelAwait (13), after a warning
+// for each await its graph is suspended at (ModuleWrap::CheckUnsettledTopLevelAwait).
+function checkUnsettledTopLevelAwait() {
+  const entry = host.entryModule;
+  if (entry === undefined || (Number(process.exitCode) || 0) !== 0) return;
+  if (!(entry.promise instanceof Promise) || native.promiseState(entry.promise) !== 0) return;
+  const stalled = native.stalledTopLevelAwaits(entry.name);
+  if (stalled.length === 0) return;
+  if (internalRequire('internal/options').getOptionValue('--warnings')) {
+    const url = internalRequire('url');
+    const sources = new Map();
+    for (let index = 0; index < stalled.length; index++) {
+      const { 0: name, 1: line, 2: column } = stalled[index];
+      if (!sources.has(name)) {
+        let text = name === entry.name ? entry.source : undefined;
+        if (text === undefined) { try { text = host.readText(name.startsWith('file:') ? url.fileURLToPath(name) : name); } catch {} }
+        sources.set(name, typeof text === 'string' ? text.split(/\r\n|[\n\r\u2028\u2029]/) : []);
+      }
+      const sourceLine = sources.get(name)[line - 1] ?? '';
+      let caret = '';
+      for (let at = 0; at < column - 1 && at < sourceLine.length; at++) caret += sourceLine[at] === '\t' ? '\t' : ' ';
+      const location = /^[A-Za-z][A-Za-z\d+.-]*:/.test(name) ? name : url.pathToFileURL(name).href;
+      host.writeText(2, `Warning: Detected unsettled top-level await at ${location}:${line}\n${sourceLine}\n${caret}^\n\n\n\n`);
+    }
+  }
+  process.exitCode = 13;
+}
 // The loop in three parts, so that an embedder can turn it from its own loop:
 // loopStart once, loopStep until it returns false, then loopEnd for the exit status.
 function loopStart() {
@@ -1878,6 +1941,7 @@ function loopTimeout() {
 function loopEnd() {
   performanceMilestones.loopExit = native.now() - startTime;
   process._exiting = true;
+  invoke(checkUnsettledTopLevelAwait, undefined, []);
   invoke(emitProcessEvent, undefined, ['exit']);
   // Node's Environment::RunCleanup and RunAtExit: the runtime's cleanup is its exit work below.
   const trace = host.traceEnvironment ? internalRequire('internal/trace_events') : undefined;

@@ -80,8 +80,11 @@ function fetch(input, init = undefined) {
   if (original.dispatcher !== undefined) require('assert').ok(original.dispatcher);
   return performFetch(original);
 }
+// The dispatcher undici's setGlobalDispatcher installs (Node's or a user's copy of
+// undici): fetch sends through it, as Node's does, when the request names none.
+const kGlobalDispatcher = Symbol.for('undici.globalDispatcher.1');
 async function performFetch(original) {
-  const dispatcher = original.dispatcher;
+  const dispatcher = original.dispatcher ?? globalThis[kGlobalDispatcher];
   const record = copyRequestRecord(original);
   record.headers = new Headers(original.headers);
   const timing = { startTime: performance.now() };

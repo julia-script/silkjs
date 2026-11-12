@@ -1,0 +1,306 @@
+//! Walks a JSON document in one pass without building a tree, for readers that want a few fields
+//! out of a large document.
+//!
+//! A [`Walker`] wraps the token scanner and keeps one error flag, so a reader is written as
+//! straight-line code and checks [`Walker.failed`] once at the end. A [`Text`] is a string token
+//! that still borrows the document; most strings in package metadata have no escapes, so their
+//! bytes are used in place and only an escaped one is decoded.
+
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.collections.bytes { Bytes }
+import silk.collections.slice { Slice }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.core.ownership { Copy }
+import silk.core.result { Result }
+import silk.json.scanner { JsonScanner, JsonToken }
+import silk.num.u8
+import silk.json.text { JsonText }
+
+/// A JSON string that borrows the document.
+pub struct Text<'a> {
+  // The token with its quotes, or empty for an absent string.
+  raw: &'a [u8],
+  offset: usize,
+  /// Whether the string has backslash escapes, so [`Text.bytes`] is not its text.
+  pub escaped: bool,
+}
+
+impl<'a> Copy for Text<'a> {}
+
+impl<'a> Text<'a> {
+  /// An absent string. Its bytes are empty.
+  pub fn none() -> Text<'a> {
+    return Text<'a> { raw: b"", offset: 0, escaped: false }
+  }
+
+  /// Whether the string was present in the document.
+  pub fn present(self: &Self) -> bool {
+    return self.raw.length >= 2
+  }
+
+  /// The offset in the document of the first byte between the quotes.
+  pub fn start(self: &Self) -> usize {
+    return self.offset + 1
+  }
+
+  /// The bytes between the quotes, as written. They are the text when `escaped` is false.
+  pub fn bytes(self: &Self) -> &'a [u8] {
+    if self.raw.length < 2 {
+      return b""
+    }
+    return Slice.view<u8>(self.raw, 1, self.raw.length - 2)
+  }
+
+  /// An owned copy of the text with escapes decoded. An absent or invalid string is empty.
+  pub effect fn decode(self: &Self) -> Bytes ! OutOfMemoryError ? &mut Allocator {
+    if self.raw.length < 2 {
+      return Bytes.make()
+    }
+    return match move run Effect.result(JsonText.decode(self.raw, self.offset, self.escaped)) {
+      Result.Success { value } => move value
+      Result.Failure {..} => Bytes.make()
+    }
+  }
+}
+
+/// A one-pass reader over a JSON document.
+pub struct Walker<'a> {
+  scanner: JsonScanner<'a>,
+  broken: bool,
+}
+
+impl<'a> Walker<'a> {
+  /// A walker at the start of `document`.
+  pub fn make(document: &'a [u8]) -> Walker<'a> {
+    return Walker<'a> { scanner: JsonScanner<'a>.make(document), broken: false }
+  }
+
+  /// Whether the document turned out not to be valid JSON, or not to have the expected shape.
+  pub fn failed(self: &Self) -> bool {
+    return self.broken
+  }
+
+  /// Marks the document as not having the expected shape.
+  pub fn reject(self: &mut Self) -> () {
+    self.broken = true
+  }
+
+  /// The byte offset of the token read last.
+  pub fn position(self: &Self) -> usize {
+    return JsonScanner.offset(&self.scanner)
+  }
+
+  /// The next token. After a failure every token is `EndOfInput`.
+  pub fn token(self: &mut Self) -> JsonToken {
+    if self.broken {
+      return JsonToken.EndOfInput
+    }
+    return match move JsonScanner.next(&mut self.scanner) {
+      Result.Success { value } => value
+      Result.Failure {..} => {
+        self.broken = true
+        JsonToken.EndOfInput
+      }
+    }
+  }
+
+  // Reads to the end of the array or object whose opening token was just read.
+  fn finish(self: &mut Self) -> () {
+    let mut depth: usize = 1
+    while depth > 0 {
+      match move Walker.token(&mut self) {
+        JsonToken.ObjectBegin => { depth = depth + 1 }
+        JsonToken.ArrayBegin => { depth = depth + 1 }
+        JsonToken.ObjectEnd => { depth = depth - 1 }
+        JsonToken.ArrayEnd => { depth = depth - 1 }
+        JsonToken.EndOfInput => { return () }
+        _ => {}
+      }
+    }
+    return ()
+  }
+
+  /// Reads one whole value and ignores it.
+  pub fn skip(self: &mut Self) -> () {
+    match move Walker.token(&mut self) {
+      JsonToken.ObjectBegin => { Walker.finish(&mut self) }
+      JsonToken.ArrayBegin => { Walker.finish(&mut self) }
+      _ => {}
+    }
+    return ()
+  }
+
+  /// Reads one value. Returns true when it is an object, leaving the walker before its first
+  /// key; any other value is read whole and ignored.
+  pub fn enterObject(self: &mut Self) -> bool {
+    return match move Walker.token(&mut self) {
+      JsonToken.ObjectBegin => true
+      JsonToken.ArrayBegin => {
+        Walker.finish(&mut self)
+        false
+      }
+      _ => false
+    }
+  }
+
+  /// Reads one value. Returns true when it is an array, leaving the walker before its first
+  /// element; any other value is read whole and ignored.
+  pub fn enterArray(self: &mut Self) -> bool {
+    return match move Walker.token(&mut self) {
+      JsonToken.ArrayBegin => true
+      JsonToken.ObjectBegin => {
+        Walker.finish(&mut self)
+        false
+      }
+      _ => false
+    }
+  }
+
+  /// Inside an object: the next key, or none at the end of the object. The caller reads the
+  /// key's value before asking for the next key.
+  pub fn key(self: &mut Self) -> Option<Text<'a>> {
+    let token = match move Walker.token(&mut self) {
+      JsonToken.ValueSeparator => Walker.token(&mut self)
+      JsonToken other => other
+    }
+    return match move token {
+      JsonToken.String { span, escaped } => {
+        let found = Text<'a> { raw: JsonScanner.slice(&self.scanner, span), offset: span.offset, escaped: escaped }
+        match move Walker.token(&mut self) {
+          JsonToken.KeySeparator => {}
+          _ => { self.broken = true }
+        }
+        Option<Text<'a>>.some(found)
+      }
+      JsonToken.ObjectEnd => Option<Text<'a>>.none()
+      _ => {
+        self.broken = true
+        Option<Text<'a>>.none()
+      }
+    }
+  }
+
+  /// Inside an array: the next element when it is a string, with `more` set to false at the end
+  /// of the array. An element that is not a string is read whole and gives an absent text.
+  pub fn element(self: &mut Self, more: &mut bool) -> Text<'a> {
+    let token = match move Walker.token(&mut self) {
+      JsonToken.ValueSeparator => Walker.token(&mut self)
+      JsonToken other => other
+    }
+    return match move token {
+      JsonToken.String { span, escaped } => Text<'a> {
+        raw: JsonScanner.slice(&self.scanner, span),
+        offset: span.offset,
+        escaped: escaped,
+      }
+      JsonToken.ArrayEnd => {
+        more.* = false
+        Text<'a>.none()
+      }
+      JsonToken.ObjectBegin => {
+        Walker.finish(&mut self)
+        Text<'a>.none()
+      }
+      JsonToken.ArrayBegin => {
+        Walker.finish(&mut self)
+        Text<'a>.none()
+      }
+      JsonToken.EndOfInput => {
+        more.* = false
+        Text<'a>.none()
+      }
+      _ => Text<'a>.none()
+    }
+  }
+
+  /// Reads one value and returns whether it is the literal `true`. Any other value is read whole.
+  pub fn isTrue(self: &mut Self) -> bool {
+    return match move Walker.token(&mut self) {
+      JsonToken.True => true
+      JsonToken.ObjectBegin => {
+        Walker.finish(&mut self)
+        false
+      }
+      JsonToken.ArrayBegin => {
+        Walker.finish(&mut self)
+        false
+      }
+      _ => false
+    }
+  }
+
+  /// Reads one value that may be a string or an object. A string is returned. For an object,
+  /// `entered` is set and the walker is left before its first key. Any other value is read whole.
+  pub fn stringOrObject(self: &mut Self, entered: &mut bool) -> Text<'a> {
+    return match move Walker.token(&mut self) {
+      JsonToken.String { span, escaped } => Text<'a> {
+        raw: JsonScanner.slice(&self.scanner, span),
+        offset: span.offset,
+        escaped: escaped,
+      }
+      JsonToken.ObjectBegin => {
+        entered.* = true
+        Text<'a>.none()
+      }
+      JsonToken.ArrayBegin => {
+        Walker.finish(&mut self)
+        Text<'a>.none()
+      }
+      _ => Text<'a>.none()
+    }
+  }
+
+  /// Reads one value and returns it when it is a whole number that is not negative. Any other
+  /// value is read whole and gives none.
+  pub fn unsigned(self: &mut Self) -> Option<u64> {
+    return match move Walker.token(&mut self) {
+      JsonToken.Number { span } => {
+        let digits = JsonScanner.slice(&self.scanner, span)
+        let mut value: u64 = 0
+        let mut index: usize = 0
+        while index < digits.length {
+          if digits[index] < 48 || digits[index] > 57 || index > 18 {
+            return Option<u64>.none()
+          }
+          value = value * 10 + u8.toU64(digits[index] - 48)
+          index = index + 1
+        }
+        if digits.length == 0 {
+          return Option<u64>.none()
+        }
+        Option<u64>.some(value)
+      }
+      JsonToken.ObjectBegin => {
+        Walker.finish(&mut self)
+        Option<u64>.none()
+      }
+      JsonToken.ArrayBegin => {
+        Walker.finish(&mut self)
+        Option<u64>.none()
+      }
+      _ => Option<u64>.none()
+    }
+  }
+
+  /// Reads one value and returns it when it is a string. Any other value is read whole and gives
+  /// an absent text.
+  pub fn string(self: &mut Self) -> Text<'a> {
+    return match move Walker.token(&mut self) {
+      JsonToken.String { span, escaped } => Text<'a> {
+        raw: JsonScanner.slice(&self.scanner, span),
+        offset: span.offset,
+        escaped: escaped,
+      }
+      JsonToken.ObjectBegin => {
+        Walker.finish(&mut self)
+        Text<'a>.none()
+      }
+      JsonToken.ArrayBegin => {
+        Walker.finish(&mut self)
+        Text<'a>.none()
+      }
+      _ => Text<'a>.none()
+    }
+  }
+}

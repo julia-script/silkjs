@@ -1670,6 +1670,8 @@ function createLoader(host, builtins) {
       let result;
       try { result = host.evaluateModule(loaded.source, loaded.filename, true); }
       catch (cause) { host.rethrow(decorateModuleError(cause, resolved.filename)); }
+      // The exit check for an unsettled top-level await (bootstrap).
+      host.entryModule = { name: loaded.filename, source: loaded.source, promise: result };
       host.mainModuleEvaluated();
       if (result !== null && typeof result === 'object' && typeof result.then === 'function') {
         return ReflectApply(PromisePrototypeThen, result, [undefined, (cause) => { throw decorateModuleError(cause, resolved.filename); }]);

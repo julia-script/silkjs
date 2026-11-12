@@ -3,7 +3,9 @@
  * always starts on a 64-byte boundary. Its alignment moved with every
  * change to the code before it, and swung Crypto by about 15% at equal
  * instruction counts. Never called; retained against section GC.
- * WebAssembly code has no addresses to align, so that target gets nothing. */
+ * WebAssembly code has no addresses to align, so that target gets nothing.
+ * COFF has no ELF section flags, symbol types or sizes, so Windows gets the
+ * same block in a plain code section. */
 #if defined(__wasm__)
 typedef int silkjs_text_align_unused;
 #elif defined(__APPLE__)
@@ -12,6 +14,13 @@ __asm__(".section __TEXT,__text,regular,pure_instructions\n"
         ".globl _silkjs_text_align\n"
         ".no_dead_strip _silkjs_text_align\n"
         "_silkjs_text_align:\n"
+        ".fill 64,1,0xcc\n"
+        ".text\n");
+#elif defined(_WIN32)
+__asm__(".section .text$silkjs_text_align,\"xr\"\n"
+        ".p2align 6\n"
+        ".globl silkjs_text_align\n"
+        "silkjs_text_align:\n"
         ".fill 64,1,0xcc\n"
         ".text\n");
 #else
