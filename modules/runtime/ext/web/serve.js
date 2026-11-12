@@ -9,7 +9,7 @@ const host = require('internal/host');
 const { AsyncResource } = require('async_hooks');
 const { Response, readResponse, takeResponseText, responseState, serverRequest } = require('internal/web/fetch/message');
 const { headerList } = require('internal/web/fetch/headers');
-const { URL } = require('internal/web/url');
+const { URL } = require('internal/url');
 const { _memoryBytes: memoryBytes } = require('internal/web/blob');
 
 // net_native event kinds and statuses.

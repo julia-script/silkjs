@@ -37,21 +37,16 @@ function pair(result, syscall, path) {
   return result[0];
 }
 const v = require('internal/validators');
-const { AbortError, codes: { ERR_INVALID_ARG_TYPE, ERR_INVALID_ARG_VALUE, ERR_INVALID_FILE_URL_HOST, ERR_INVALID_FILE_URL_PATH, ERR_INVALID_URL_SCHEME, ERR_OUT_OF_RANGE } } = require('internal/errors');
+const { AbortError, codes: { ERR_INVALID_ARG_TYPE, ERR_INVALID_ARG_VALUE, ERR_OUT_OF_RANGE } } = require('internal/errors');
 // Legacy helpers for callers that state the expectation in words.
 function invalid(name, expected) { const e = new TypeError(`The "${name}" argument must be ${expected}`); e.code = 'ERR_INVALID_ARG_TYPE'; return e; }
 function range(name) { const e = new RangeError(`The value of "${name}" is out of range`); e.code = 'ERR_OUT_OF_RANGE'; return e; }
 function integer(value, name, min = 0, max = Number.MAX_SAFE_INTEGER) { v.validateInteger(value, name, min, max); return value; }
 // Node's getValidatedPath: a string, a Uint8Array or a file: URL, without null bytes.
+let urlToPath;
 function toPathIfFileURL(value) {
-  if (value == null || typeof value !== 'object' || value.href === undefined || value.protocol === undefined) return value;
-  if (value.protocol !== 'file:') { throw new ERR_INVALID_URL_SCHEME('file'); }
-  if (value.hostname !== '' && value.hostname !== 'localhost') throw new ERR_INVALID_FILE_URL_HOST(process.platform);
-  const pathname = value.pathname;
-  for (let n = 0; n < pathname.length; n++) {
-    if (pathname[n] === '%') { const third = pathname.codePointAt(n + 2) | 0x20; if (pathname[n + 1] === '2' && third === 102) throw new ERR_INVALID_FILE_URL_PATH('must not include encoded / characters'); }
-  }
-  return decodeURIComponent(pathname);
+  urlToPath ??= require('internal/url').toPathIfFileURL;
+  return urlToPath(value);
 }
 function path(value, name = 'path') {
   value = toPathIfFileURL(value);

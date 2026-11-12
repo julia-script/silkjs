@@ -1453,7 +1453,7 @@ function loop() {
 }
 const imageModules = ['fs', 'fs/promises', 'internal/fs_streams', 'internal/fs_utf8_stream', 'path', 'os',
   'events', 'stream', 'stream/promises', 'string_decoder', 'util', 'assert', 'console', 'net', 'tty', 'http',
-  'internal/tty/write', 'url', 'internal/web/url', 'internal/encoding', 'internal/abort_controller',
+  'internal/tty/write', 'url', 'internal/url', 'internal/encoding', 'internal/abort_controller',
   'internal/process/execution'];
 globalThis.__silkRuntime = {
   normalize(name, parent, attributes) { return loader.importKey(name, parent, attributes); },

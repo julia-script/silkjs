@@ -2,8 +2,12 @@
 
 // Parsing, canonicalization, token compilation and matching are supplied by the
 // pinned MIT urlpattern-polyfill; this boundary implements Node's WebIDL surface.
-const { URLPattern: Pattern } = require('internal/web/vendor/urlpattern');
-const { URL } = require('internal/web/url');
+// internal/url loads this module while it loads, so the matcher and URL load on first use.
+let Pattern, URL;
+function load() {
+  ({ URL } = require('internal/url'));
+  ({ URLPattern: Pattern } = require('internal/web/vendor/urlpattern'));
+}
 const patterns = new WeakMap();
 const components = ['hash', 'hostname', 'password', 'pathname', 'port', 'protocol', 'search', 'username'];
 const initMembers = ['baseURL', ...components];
@@ -49,10 +53,12 @@ function baseURL(value) {
 }
 function state(receiver) {
   const pattern = patterns.get(receiver);
-  if (!pattern) throw failure('ERR_INVALID_THIS', 'Value of "this" must be of type URLPattern');
+  // Node's URLPattern is a C++ wrapper, so a wrong receiver fails V8's signature check.
+  if (!pattern) throw new TypeError('Illegal invocation');
   return pattern;
 }
 function URLPattern(value = {}, base, opts) {
+  if (Pattern === undefined) load();
   if (!new.target) throw failure('ERR_CONSTRUCT_CALL_REQUIRED', 'Class constructor URLPattern cannot be invoked without new');
   const normalized = input(value);
   let baseValue, settings;

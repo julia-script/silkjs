@@ -63,7 +63,7 @@ class QueryReqWrap {}
 function isIP(value) { return typeof value === 'string' ? host.net('isIP', [value]) : 0; }
 // GetAddrInfo and QueryWrap::Send convert a hostname with ada::idna::to_ascii.
 function ascii(hostname) {
-  return /[^\x00-\x7f]/.test(hostname) ? require('internal/web/url').domainToASCII(hostname) : hostname;
+  return /[^\x00-\x7f]/.test(hostname) ? require('internal/url').domainToASCII(hostname) : hostname;
 }
 
 // getaddrinfo with ai_socktype SOCK_STREAM: one entry per address, in the order asked for.
