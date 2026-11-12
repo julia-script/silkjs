@@ -1,0 +1,357 @@
+//! ShadowRealm (TC39 proposal-shadowrealm): the constructor, evaluate, importValue and
+//! wrapped function exotic objects.
+//!
+//! The host installs the constructor into a realm with a class id it allocates
+//! (install), and creates each realm `new ShadowRealm()` asks for through
+//! EvalHooks.createShadowRealm, which runs HostInitializeShadowRealm.
+//!
+//! A ShadowRealm object boxes its realm's Function.prototype: a function keeps its realm
+//! alive and GetFunctionRealm finds the realm again. A wrapped function is a data
+//! function of its own realm capturing its target and that realm's Function.prototype.
+//! Errors crossing the boundary become TypeErrors of the receiving realm that keep
+//! only the original message, as V8 does.
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.core.effect { Effect }
+import silk.core.result { Result }
+import silk.core.option { Option }
+import silk.collections.list { List }
+import silk.num.f64
+import silk.num.u32
+import silk.num.i32
+import silk.mem.pointer { Pointer }
+import runtime_memory { AllocationObserver }
+import js_heap { HeapHeader }
+import js_value { ValueBits }
+import js_owned_value { Value, ValueRef, immediateRef, lendBits }
+import js_object_ref { ObjectRef }
+import js_realm { Realm, Arguments, lendRealm }
+import js_core_types { NativeFunctionId, BuiltinFamily, NativeCallProtocol, NativeErrorKind, ObjectPayload, OwnedAtom, StackFrame, JS_PROP_CONFIGURABLE }
+import js_gc { HeapHooks }
+import js_gc as gc
+import js_coercion_host { CoercionHooks }
+import js_call_host { CallHooks }
+import js_property_host { OwnPropertyHooks, GetPropertyHooks, HasPropertyHooks, OwnKeysHooks }
+import js_property_write_host { PropertyWriteHooks }
+import js_prototype_host { PrototypeHooks }
+import js_interrupt_host { InterruptHooks }
+import js_native_function_host { NativeFunctionHooks }
+import js_error_host { ErrorHooks }
+import js_eval_host { EvalHooks }
+import js_promise { PromiseHooks }
+import js_module_host { ModuleHostHooks }
+import js_parser_host { ModuleAttributeHooks }
+import js_intrinsic_properties { IntrinsicDefinitions }
+import js_intrinsic_properties as intrinsic
+import js_exceptions { JsException }
+import js_string_types { StringLengthError }
+import js_bigint { BigIntError }
+import js_strings { Strings }
+import js_atom_data as atoms
+import js_runtime_classes as runtimeClasses
+import js_constructor_ops as constructors
+import js_property_descriptors as descriptors
+import js_property_get as properties
+import js_property_mutations as mutations
+import js_native_functions as functions
+import js_eval as evaluation
+import js_eval_compile as compile
+import js_module_dynamic_import as imports
+import js_promise as promises
+import js_proxy_core as core
+import js_intl_realm as ops
+
+pub const CONSTRUCTOR: u32 = 0
+pub const EVALUATE: u32 = 1
+pub const IMPORT_VALUE: u32 = 2
+/// Data functions: a wrapped function, importValue's export getter and its rejection.
+pub const WRAPPED: u32 = 3
+pub const EXPORT_GETTER: u32 = 4
+pub const IMPORT_REJECTED: u32 = 5
+
+fn id(method: u32) -> NativeFunctionId { return NativeFunctionId.Builtin { family: BuiltinFamily.ShadowRealm, method: method } }
+
+/// Whether `function` is a wrapped function exotic object, whose realm is the one its
+/// second captured value (that realm's Function.prototype) belongs to.
+pub fn isWrapped(function: NativeFunctionId) -> bool {
+  return match function { NativeFunctionId.Builtin { family: BuiltinFamily.ShadowRealm, method } => method == WRAPPED _ => false }
+}
+
+effect fn defined<'a, H: CoercionHooks>(hooks: &mut H, realm: Realm<'a>,
+  outcome: Result<bool, OutOfMemoryError | StringLengthError | BigIntError | JsException>) -> () ! JsException ? &mut Allocator {
+  match move outcome {
+    Result<bool, OutOfMemoryError | StringLengthError | BigIntError | JsException>.Success { .. } => ()
+    Result<bool, OutOfMemoryError | StringLengthError | BigIntError | JsException>.Failure { error } => { return run core.materialize(&mut hooks, realm, move error) }
+  }
+}
+
+/// Installs `ShadowRealm` on realm's global object, with instances of class `classId`.
+pub effect fn install<'a, H: HeapHooks + OwnPropertyHooks + CoercionHooks + PropertyWriteHooks + IntrinsicDefinitions>(hooks: &mut H,
+  memory: &AllocationObserver, realm: Realm<'a>, classId: u32) -> () ! JsException ? &mut Allocator {
+  if !realm.isRegisteredClass(classId) {
+    let mut definition = runtimeClasses.emptyDefinition() definition.classId = classId
+    let registered = run Effect.result(realm.registerClass(classId, b"ShadowRealm", move definition))
+    match move registered {
+      Result<bool, OutOfMemoryError | StringLengthError>.Success { value } => { if !value { return run core.error(&mut hooks, realm, b"cannot register the ShadowRealm class") } }
+      Result<bool, OutOfMemoryError | StringLengthError>.Failure { error } => { return run core.materialize(&mut hooks, realm, move error) }
+    }
+  }
+  let magic = u32.toI32(classId)
+  let ctor = run unsafe intrinsic.constructor(&mut hooks, memory, realm, magic, b"ShadowRealm", id(CONSTRUCTOR), 0,
+    NativeCallProtocol.ConstructorOrFunctionMagic, magic, ValueBits.Undefined, Option<NativeFunctionId>.none(), Option<NativeFunctionId>.none(), 0)
+  realm.release(&mut hooks, move ctor)
+  let prototype = realm.classPrototype(classId)
+  let evaluate = unsafe Value.adoptBits(run functions.newFunction(&mut hooks, memory, realm, id(EVALUATE), b"evaluate", 1, NativeCallProtocol.GenericMagic, magic))
+  run ops.define(&mut hooks, realm, prototype, b"evaluate", move evaluate, 3)
+  let importValue = unsafe Value.adoptBits(run functions.newFunction(&mut hooks, memory, realm, id(IMPORT_VALUE), b"importValue", 2, NativeCallProtocol.GenericMagic, magic))
+  run ops.define(&mut hooks, realm, prototype, b"importValue", move importValue, 3)
+  let tag = run Effect.result(Strings.fromLatin1(b"ShadowRealm"))
+  let tagValue = match move tag {
+    Result<ValueBits, OutOfMemoryError | StringLengthError>.Success { value } => unsafe Value.adoptBits(value)
+    Result<ValueBits, OutOfMemoryError | StringLengthError>.Failure { error } => { return run core.materialize(&mut hooks, realm, move error) }
+  }
+  let tagged = run Effect.result(mutations.definePropertyValue(&mut hooks, realm, prototype, atoms.JS_ATOM_Symbol_toStringTag, move tagValue, JS_PROP_CONFIGURABLE))
+  run defined(&mut hooks, realm, move tagged)
+}
+
+/// The realm of a ShadowRealm object of class `classId`: its boxed Function.prototype's.
+fn boxed<'a>(object: ValueRef<'a>, classId: u32) -> Option<ValueRef<'a>> {
+  if !object.view().isObject() { return Option<ValueRef<'a>>.none() }
+  let anchor = () let data = ObjectRef.of(object).data(&anchor)
+  if data.classId() != classId { return Option<ValueRef<'a>>.none() }
+  return match &data.payload {
+    ObjectPayload.Boxed { value } => Option<ValueRef<'a>>.some(unsafe lendBits(&object, value))
+    _ => Option<ValueRef<'a>>.none()
+  }
+}
+effect fn shadowRealm<'a, H: CoercionHooks>(hooks: &mut H, realm: Realm<'a>, receiver: ValueRef<'a>, classId: u32) -> Realm<'a>
+  ! JsException ? &mut Allocator {
+  return match boxed(receiver, classId) {
+    Option<ValueRef<'a>>.Some { value } => run constructors.getFunctionRealm(&mut hooks, realm, value)
+    Option<ValueRef<'a>>.None => run core.error(&mut hooks, realm, b"Receiver is not a ShadowRealm")
+  }
+}
+
+/// The text a crossing error keeps: an object's `message`, or the thrown value as a string.
+effect fn message<'a, 'b, H: HeapHooks + OwnPropertyHooks + GetPropertyHooks + CoercionHooks>(hooks: &mut H, realm: Realm<'a>,
+  thrown: ValueRef<'b>) -> List<u8> ? &mut Allocator {
+  let mut text = Value.immediate(ValueBits.Undefined)
+  if thrown.view().isObject() {
+    let read = run Effect.result(properties.getProperty(&mut hooks, realm, thrown, atoms.JS_ATOM_message))
+    match move read {
+      Result<ValueBits, OutOfMemoryError | JsException>.Success { value } => { text = unsafe Value.adoptBits(value) }
+      Result<ValueBits, OutOfMemoryError | JsException>.Failure { .. } => { realm.discardException(&mut hooks) }
+    }
+  } else if !match thrown.view() { ValueBits.Symbol { .. } => true _ => false } { text = thrown.dup() }
+  if !text.view().isString() {
+    let converted = run Effect.result(ops.toString(&mut hooks, realm, text.borrow()))
+    text = match move converted {
+      Result<Value, JsException>.Success { value } => move value
+      Result<Value, JsException>.Failure { .. } => { realm.discardException(&mut hooks) Value.immediate(ValueBits.Undefined) }
+    }
+  }
+  if !text.view().isString() { return List<u8>.make() }
+  let bytes = run Effect.result(Strings.toUtf8(text.view(), false))
+  realm.release(&mut hooks, move text)
+  return match move bytes { Result<List<u8>, OutOfMemoryError>.Success { value } => move value Result<List<u8>, OutOfMemoryError>.Failure { .. } => List<u8>.make() }
+}
+/// Rethrows the pending exception in `receiving` as a new error of `kind` with its
+/// message. An uncatchable exception (a timeout or an interrupt) stays as it is.
+effect fn crossing<'a, 'b, H: HeapHooks + OwnPropertyHooks + GetPropertyHooks + CoercionHooks>(hooks: &mut H,
+  receiving: Realm<'a>, kind: NativeErrorKind) -> never ! JsException ? &mut Allocator {
+  let anchor = () let state = receiving.runtimeState(&anchor)
+  let uncatchable = state.currentExceptionIsUncatchable drop state
+  if uncatchable { fail JsException {} }
+  let thrown = receiving.takeException()
+  let text = run message(&mut hooks, receiving, thrown.borrow())
+  receiving.release(&mut hooks, move thrown)
+  return run hooks.throwError(receiving, kind, text.asSlice())
+}
+
+/// GetWrappedValue: a primitive passes as is, a callable becomes a wrapped function of
+/// `realm`, any other object is refused.
+effect fn wrappedValue<'a, 'b, H: HeapHooks + OwnPropertyHooks + GetPropertyHooks + CoercionHooks + PropertyWriteHooks>(hooks: &mut H,
+  memory: &AllocationObserver, realm: Realm<'a>, value: ValueRef<'b>) -> Value ! JsException ? &mut Allocator {
+  if !value.view().isObject() { return value.dup() }
+  if !hooks.isCallable(realm, value) { return run core.error(&mut hooks, realm, b"value passing a ShadowRealm boundary must be primitive or callable") }
+  return run wrap(&mut hooks, memory, realm, value)
+}
+/// WrappedFunctionCreate and CopyNameAndLength.
+effect fn wrap<'a, 'b, H: HeapHooks + OwnPropertyHooks + GetPropertyHooks + CoercionHooks + PropertyWriteHooks>(hooks: &mut H,
+  memory: &AllocationObserver, realm: Realm<'a>, target: ValueRef<'b>) -> Value ! JsException ? &mut Allocator {
+  let wrapped = unsafe Value.adoptBits(run functions.newDataFunction(&mut hooks, memory, realm, id(WRAPPED), 0, 0,
+    &[target.view(), realm.functionPrototype().view()]))
+  let copied = run Effect.result(copyNameAndLength(&mut hooks, realm, wrapped.borrow(), target))
+  match move copied {
+    Result<(), OutOfMemoryError | StringLengthError | BigIntError | JsException>.Success { .. } => { return move wrapped }
+    Result<(), OutOfMemoryError | StringLengthError | BigIntError | JsException>.Failure { error } => {
+      realm.release(&mut hooks, move wrapped)
+      // CopyNameAndLength's abrupt completions all become a TypeError.
+      let _pending = run Effect.catch<JsException>(core.materialize(&mut hooks, realm, move error), core.exceptionValue)
+      realm.discardException(&mut hooks)
+      return run core.error(&mut hooks, realm, b"cannot copy the name and length of a function passing a ShadowRealm boundary")
+    }
+  }
+}
+effect fn copyNameAndLength<'a, 'b, 'c, H: HeapHooks + OwnPropertyHooks + GetPropertyHooks + CoercionHooks + PropertyWriteHooks>(hooks: &mut H,
+  realm: Realm<'a>, wrapped: ValueRef<'b>, target: ValueRef<'c>) -> () ! OutOfMemoryError | StringLengthError | BigIntError | JsException ? &mut Allocator {
+  let mut length: f64 = 0.0
+  if run descriptors.hasOwnProperty(&mut hooks, realm, target, atoms.JS_ATOM_length) {
+    let targetLength = unsafe Value.adoptBits(run properties.getProperty(&mut hooks, realm, target, atoms.JS_ATOM_length))
+    if targetLength.view().isNumber() {
+      let number = targetLength.view().numericValue()
+      if number == f64.INFINITY { length = number }
+      else if number == -f64.INFINITY || f64.isNaN(number) { length = 0.0 }
+      else { length = f64.max(f64.trunc(number), 0.0) }
+    }
+    realm.release(&mut hooks, move targetLength)
+  }
+  let _length = run mutations.definePropertyValue(&mut hooks, realm, wrapped, atoms.JS_ATOM_length, Value.immediate(ValueBits.number(length)), JS_PROP_CONFIGURABLE)
+  let mut name = unsafe Value.adoptBits(run properties.getProperty(&mut hooks, realm, target, atoms.JS_ATOM_name))
+  if !name.view().isString() {
+    realm.release(&mut hooks, move name)
+    name = unsafe Value.adoptBits(run Strings.fromLatin1(b""))
+  }
+  let _name = run mutations.definePropertyValue(&mut hooks, realm, wrapped, atoms.JS_ATOM_name, move name, JS_PROP_CONFIGURABLE)
+}
+
+/// A wrapped function's [[Call]]: the arguments and receiver cross into the target's
+/// realm, the result back into the wrapped function's.
+effect fn callWrapped<'a, 's, H: HeapHooks + OwnPropertyHooks + GetPropertyHooks + CoercionHooks + PropertyWriteHooks + CallHooks>(hooks: &mut H,
+  memory: &AllocationObserver, realm: Realm<'a>, receiver: ValueRef<'a>, arguments: Arguments<'a>, captured: Arguments<'s>) -> ValueBits
+  ! JsException ? &mut Allocator {
+  let target = captured.get(0)
+  let callerRealm = run constructors.getFunctionRealm(&mut hooks, realm, captured.get(1))
+  let targetRealm = run constructors.getFunctionRealm(&mut hooks, realm, target)
+  let mut wrapped = List<Value>.make()
+  let mut views = List<ValueBits>.make()
+  let thisValue = run wrappedValue(&mut hooks, memory, targetRealm, receiver)
+  let mut index: usize = 0
+  while index < arguments.length() {
+    let converted = run Effect.result(wrappedValue(&mut hooks, memory, targetRealm, arguments.get(index)))
+    match move converted {
+      Result<Value, JsException>.Success { value } => {
+        let pushed = run Effect.result(views.append(value.view()))
+        let kept = run Effect.result(wrapped.append(move value))
+        let failed = match move pushed { Result<(), OutOfMemoryError>.Success { .. } => false Result<(), OutOfMemoryError>.Failure { .. } => true }
+        let lost = match move kept { Result<(), OutOfMemoryError>.Success { .. } => false Result<(), OutOfMemoryError>.Failure { .. } => true }
+        if failed || lost { drop thisValue drop wrapped return run hooks.throwOutOfMemory(realm) }
+      }
+      Result<Value, JsException>.Failure { error } => { drop thisValue drop wrapped fail move error }
+    }
+    index = index + 1
+  }
+  let result = run Effect.result(promises.call(&mut hooks, callerRealm, target, thisValue.borrow(), views.asSlice()))
+  drop thisValue drop wrapped
+  let returned = match move result {
+    Result<Value, JsException>.Success { value } => move value
+    Result<Value, JsException>.Failure { .. } => { return run crossing(&mut hooks, callerRealm, NativeErrorKind.Type) }
+  }
+  let crossed = run wrappedValue(&mut hooks, memory, callerRealm, returned.borrow())
+  callerRealm.release(&mut hooks, move returned)
+  return crossed.intoBits()
+}
+
+/// new ShadowRealm(): a fresh realm the host has initialized, boxed in a new object.
+effect fn construct<'a, H: HeapHooks + CoercionHooks + EvalHooks>(hooks: &mut H, memory: &AllocationObserver, realm: Realm<'a>,
+  newTarget: ValueRef<'a>, classId: u32) -> ValueBits ! JsException ? &mut Allocator {
+  if core.undefined(newTarget.view()) { return run core.error(&mut hooks, realm, b"Constructor ShadowRealm requires 'new'") }
+  let object = run constructors.create(&mut hooks, memory, realm, newTarget, classId)
+  let made = run Effect.result(hooks.createShadowRealm(realm))
+  let created = match move made {
+    Result<*mut HeapHeader, JsException>.Success { value } => value
+    Result<*mut HeapHeader, JsException>.Failure { error } => { realm.release(&mut hooks, move object) fail move error }
+  }
+  let inner = unsafe lendRealm(&created, created)
+  let anchor = inner.functionPrototype().dup()
+  unsafe gc.releaseHeader(&mut hooks, realm.runtime(), created)
+  let mut changed = () let data = ObjectRef.of(object.borrow()).dataMut(&mut changed)
+  data.payload = ObjectPayload.Boxed { value: anchor.intoBits() } drop data
+  return object.intoBits()
+}
+
+/// ShadowRealm.prototype.evaluate: PerformShadowRealmEval.
+effect fn evaluate<'a, H: HeapHooks + CoercionHooks + OwnPropertyHooks + GetPropertyHooks + HasPropertyHooks + OwnKeysHooks + PropertyWriteHooks + PrototypeHooks + InterruptHooks + NativeFunctionHooks + CallHooks + ErrorHooks + EvalHooks + PromiseHooks + ModuleHostHooks + ModuleAttributeHooks>(hooks: &mut H,
+  memory: &AllocationObserver, realm: Realm<'a>, receiver: ValueRef<'a>, source: ValueRef<'a>, classId: u32) -> ValueBits ! JsException ? &mut Allocator {
+  let evalRealm = run shadowRealm(&mut hooks, realm, receiver, classId)
+  if !source.view().isString() { return run core.error(&mut hooks, realm, b"ShadowRealm.prototype.evaluate: Script source must be a string") }
+  // A script, not eval code, in the shadow realm; an early error is a SyntaxError here.
+  let parsed = run Effect.result(evaluation.evaluateObject(&mut hooks, memory, evalRealm, evalRealm.globalObject(), source,
+    compile.TYPE_GLOBAL | compile.FLAG_COMPILE_ONLY, -1))
+  let compiled = match move parsed {
+    Result<ValueBits, JsException>.Success { value } => unsafe Value.adoptBits(value)
+    Result<ValueBits, JsException>.Failure { .. } => { return run crossing(&mut hooks, realm, NativeErrorKind.Syntax) }
+  }
+  let ran = run Effect.result(unsafe evaluation.execute(&mut hooks, memory, evalRealm, move compiled, evalRealm.globalObject(), Pointer.null<StackFrame>()))
+  let result = match move ran {
+    Result<Value, JsException>.Success { value } => move value
+    Result<Value, JsException>.Failure { .. } => { return run crossing(&mut hooks, realm, NativeErrorKind.Type) }
+  }
+  let crossed = run wrappedValue(&mut hooks, memory, realm, result.borrow())
+  realm.release(&mut hooks, move result)
+  return crossed.intoBits()
+}
+
+/// ShadowRealm.prototype.importValue: ShadowRealmImportValue.
+effect fn importValue<'a, H: HeapHooks + CoercionHooks + OwnPropertyHooks + GetPropertyHooks + HasPropertyHooks + OwnKeysHooks + PropertyWriteHooks + CallHooks + PromiseHooks + ModuleAttributeHooks>(hooks: &mut H,
+  memory: &AllocationObserver, realm: Realm<'a>, receiver: ValueRef<'a>, arguments: Arguments<'a>, classId: u32) -> ValueBits ! JsException ? &mut Allocator {
+  let evalRealm = run shadowRealm(&mut hooks, realm, receiver, classId)
+  let specifier = run ops.toString(&mut hooks, realm, arguments.get(0))
+  let exportName = arguments.get(1)
+  if !exportName.view().isString() { return run core.error(&mut hooks, realm, b"ShadowRealm.prototype.importValue: Export name must be a string") }
+  let inner = unsafe Value.adoptBits(run imports.realmImport(&mut hooks, memory, evalRealm, specifier.borrow()))
+  realm.release(&mut hooks, move specifier)
+  let anchor = realm.functionPrototype()
+  let fulfilled = run ops.dataFunctionSlots(&mut hooks, memory, realm, id(EXPORT_GETTER), 1, 0, &[exportName.view(), anchor.view()])
+  let rejected = run ops.dataFunctionSlots(&mut hooks, memory, realm, id(IMPORT_REJECTED), 1, 0, &[anchor.view()])
+  let capability = run promises.newCapability(&mut hooks, memory, realm, immediateRef(ValueBits.Undefined))
+  run promises.performThen(&mut hooks, realm, inner.borrow(), fulfilled.borrow(), rejected.borrow(), capability.resolve.borrow(), capability.reject.borrow())
+  drop inner drop fulfilled drop rejected
+  return capability.promise.intoBits()
+}
+/// importValue's fulfillment: the export, crossed into the importing realm.
+effect fn exportGetter<'a, 's, H: HeapHooks + OwnPropertyHooks + GetPropertyHooks + CoercionHooks + PropertyWriteHooks>(hooks: &mut H,
+  memory: &AllocationObserver, realm: Realm<'a>, arguments: Arguments<'a>, captured: Arguments<'s>) -> ValueBits ! JsException ? &mut Allocator {
+  let callerRealm = run constructors.getFunctionRealm(&mut hooks, realm, captured.get(1))
+  let namespace = arguments.get(0)
+  let interned = run Effect.result(callerRealm.internString(captured.get(0)))
+  let name = match move interned {
+    Result<OwnedAtom, OutOfMemoryError | StringLengthError>.Success { value } => move value
+    Result<OwnedAtom, OutOfMemoryError | StringLengthError>.Failure { error } => { return run core.materialize(&mut hooks, callerRealm, move error) }
+  }
+  let present = run Effect.result(descriptors.hasOwnProperty(&mut hooks, callerRealm, namespace, name.get()))
+  match move present {
+    Result<bool, OutOfMemoryError | JsException>.Success { value } => {
+      if !value { return run core.error(&mut hooks, callerRealm, b"ShadowRealm.prototype.importValue: the module has no such export") }
+    }
+    Result<bool, OutOfMemoryError | JsException>.Failure { error } => { return run core.materialize(&mut hooks, callerRealm, move error) }
+  }
+  let read = run Effect.result(properties.getProperty(&mut hooks, callerRealm, namespace, name.get()))
+  let value = match move read {
+    Result<ValueBits, OutOfMemoryError | JsException>.Success { value } => unsafe Value.adoptBits(value)
+    Result<ValueBits, OutOfMemoryError | JsException>.Failure { error } => { return run core.materialize(&mut hooks, callerRealm, move error) }
+  }
+  let crossed = run wrappedValue(&mut hooks, memory, callerRealm, value.borrow())
+  callerRealm.release(&mut hooks, move value)
+  return crossed.intoBits()
+}
+
+pub effect fn dispatch<'a, H: HeapHooks + CoercionHooks + OwnPropertyHooks + GetPropertyHooks + HasPropertyHooks + OwnKeysHooks + PropertyWriteHooks + PrototypeHooks + InterruptHooks + NativeFunctionHooks + CallHooks + ErrorHooks + EvalHooks + PromiseHooks + ModuleHostHooks + ModuleAttributeHooks>(hooks: &mut H,
+  memory: &AllocationObserver, realm: Realm<'a>, method: u32, receiver: ValueRef<'a>, arguments: Arguments<'a>, magic: i32) -> ValueBits ! JsException ? &mut Allocator {
+  let classId = i32.toU32(magic)
+  if method == CONSTRUCTOR { return run construct(&mut hooks, memory, realm, receiver, classId) }
+  if method == EVALUATE { return run evaluate(&mut hooks, memory, realm, receiver, arguments.get(0), classId) }
+  if method == IMPORT_VALUE { return run importValue(&mut hooks, memory, realm, receiver, arguments, classId) }
+  return Intrinsic.trap("invalid ShadowRealm method")
+}
+pub effect fn data<'a, 's, H: HeapHooks + CoercionHooks + OwnPropertyHooks + GetPropertyHooks + PropertyWriteHooks + CallHooks>(hooks: &mut H,
+  memory: &AllocationObserver, realm: Realm<'a>, method: u32, receiver: ValueRef<'a>, arguments: Arguments<'a>, captured: Arguments<'s>) -> ValueBits
+  ! JsException ? &mut Allocator {
+  if method == WRAPPED { return run callWrapped(&mut hooks, memory, realm, receiver, arguments, captured) }
+  if method == EXPORT_GETTER { return run exportGetter(&mut hooks, memory, realm, arguments, captured) }
+  if method == IMPORT_REJECTED {
+    let callerRealm = run constructors.getFunctionRealm(&mut hooks, realm, captured.get(0))
+    let text = run message(&mut hooks, callerRealm, arguments.get(0))
+    return run hooks.throwError(callerRealm, NativeErrorKind.Type, text.asSlice())
+  }
+  return Intrinsic.trap("invalid ShadowRealm data method")
+}

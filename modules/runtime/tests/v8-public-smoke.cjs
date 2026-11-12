@@ -128,8 +128,8 @@ async function snapshots(root) {
     for (const name of ['getHeapSpaceStatistics', 'getHeapCodeStatistics', 'getCppHeapStatistics', 'takeCoverage', 'stopCoverage'])
       assert.throws(() => v8[name](), { code: 'ERR_NOT_SUPPORTED' });
     assert.throws(() => v8.setFlagsFromString('--expose-gc'), { code: 'ERR_NOT_SUPPORTED' });
-    assert.throws(() => v8.startupSnapshot.addSerializeCallback(() => {}), { code: 'ERR_NOT_SUPPORTED' });
-    assert.equal(v8.startupSnapshot.isBuildingSnapshot(), false);
+    assert.throws(() => v8.startupSnapshot.addSerializeCallback(() => {}), { code: 'ERR_NOT_BUILDING_SNAPSHOT' });
+    assert.equal(v8.startupSnapshot.isBuildingSnapshot(), 0);
   }
 }
 async function promises(root) {

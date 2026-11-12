@@ -33,10 +33,8 @@ function native(op, args = []) {
   catch (cause) {
     if (typeof cause.errno !== 'number') throw cause;
     const message = cause.message.slice(cause.message.indexOf(': ') + 2, cause.message.lastIndexOf(', '));
-    const info = { errno: cause.errno, code: cause.code, message, syscall: cause.syscall };
-    const error = new Error(`A system error occurred: ${info.syscall} returned ${info.code} (${info.message})`);
-    Object.assign(error, { code: 'ERR_SYSTEM_ERROR', info, errno: info.errno, syscall: info.syscall });
-    throw error;
+    // Node's os.js throws ERR_SYSTEM_ERROR with the context the binding filled.
+    throw new (require('internal/errors').codes.ERR_SYSTEM_ERROR)({ errno: cause.errno, code: cause.code, message, syscall: cause.syscall });
   }
 }
 // Read on first use: a heap image may hold this module, loaded on another machine.

@@ -4,7 +4,9 @@ const host = require('internal/host');
 
 // Each realm owns its CallSite prototype. Shared ephemeron brands allow borrowed
 // CallSite methods and recaptured targets without retaining abandoned realms.
-function install(global) {
+// isolated: a ShadowRealm, which never falls back to the main realm's Error.prepareStackTrace
+// as a vm context does.
+function install(global, isolated = false) {
   const Error = global.Error;
   const Object = global.Object;
   const TypeError = global.TypeError;
@@ -210,7 +212,7 @@ function install(global) {
       if (override !== undefined) state.overrides.delete(error);
       let owner = Error;
       let prepare = override ?? owner.prepareStackTrace;
-      if (override === undefined && typeof prepare !== 'function' && rootError !== Error) {
+      if (override === undefined && typeof prepare !== 'function' && rootError !== Error && !isolated) {
         owner = rootError;
         prepare = owner.prepareStackTrace;
       }

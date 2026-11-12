@@ -1,7 +1,7 @@
 'use strict';
 
 const { Buffer } = require('buffer');
-const { URL } = require('internal/web/url');
+const { URL } = require('internal/url');
 const { AbortController, AbortSignal } = require('internal/path_events/event_target');
 const { Headers, immutable, parsedHeaders, scalar, byteString, token } = require('internal/web/fetch/headers');
 const body = require('internal/web/fetch/body');

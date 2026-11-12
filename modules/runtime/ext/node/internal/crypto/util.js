@@ -54,6 +54,13 @@ const {
   getPqcKeyTypes,
 } = require('internal/crypto/binding');
 
+const {
+  namespace: {
+    isBuildingSnapshot,
+    addSerializeCallback,
+  },
+} = require('internal/v8/startup_snapshot');
+
 const isFips = getFipsCrypto() === 1;
 
 const { getOptionValue } = require('internal/options');
@@ -115,6 +122,12 @@ function toBuf(val, encoding) {
 
 let _hashCache;
 let _macCache;
+if (isBuildingSnapshot()) {
+  addSerializeCallback(() => {
+    _hashCache = undefined;
+    _macCache = undefined;
+  });
+}
 
 function getHashCache() {
   while (_hashCache === undefined) {
@@ -139,6 +152,12 @@ function getMacCache() {
 function cachedArrayByFipsGeneration(fn, onRefresh) {
   let result;
   let generation;
+  if (isBuildingSnapshot()) {
+    addSerializeCallback(() => {
+      result = undefined;
+      generation = undefined;
+    });
+  }
 
   return () => {
     while (true) {

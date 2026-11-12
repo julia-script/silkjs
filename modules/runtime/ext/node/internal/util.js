@@ -54,6 +54,7 @@ const {
   SafeMap,
   SafeSet,
   SafeWeakMap,
+  SafeWeakRef,
   SymbolPrototypeGetDescription,
   StringPrototypeReplace,
   StringPrototypeToLowerCase,
@@ -104,6 +105,15 @@ function getDeprecationWarningEmitter(
       }
     }
   };
+}
+
+const isWindows = process.platform === 'win32';
+const isMacOS = process.platform === 'darwin';
+
+function spliceOne(list, index) {
+  for (; index + 1 < list.length; index++)
+    list[index] = list[index + 1];
+  list.pop();
 }
 
 function isPendingDeprecation() {
@@ -529,6 +539,39 @@ function getConstructorOf(obj) {
   return null;
 }
 
+class WeakReference {
+  #weak = null;
+  // eslint-disable-next-line no-unused-private-class-members
+  #strong = null;
+  #refCount = 0;
+  constructor(object) {
+    this.#weak = new SafeWeakRef(object);
+  }
+
+  incRef() {
+    this.#refCount++;
+    if (this.#refCount === 1) {
+      const derefed = this.#weak.deref();
+      if (derefed !== undefined) {
+        this.#strong = derefed;
+      }
+    }
+    return this.#refCount;
+  }
+
+  decRef() {
+    this.#refCount--;
+    if (this.#refCount === 0) {
+      this.#strong = null;
+    }
+    return this.#refCount;
+  }
+
+  get() {
+    return this.#weak.deref();
+  }
+}
+
 let validateUint32;
 function sleep(msec) {
   // Lazy-load to avoid a circular dependency.
@@ -540,6 +583,7 @@ function sleep(msec) {
 }
 
 module.exports = {
+  WeakReference,
   assertCrypto,
   sleep,
   assignFunctionName,
@@ -557,7 +601,10 @@ module.exports = {
   getLazy,
   getSystemErrorName,
   isError,
+  isMacOS,
+  spliceOne,
   isPendingDeprecation,
+  isWindows,
   join,
   kEmptyObject,
   kEnumerableProperty,
