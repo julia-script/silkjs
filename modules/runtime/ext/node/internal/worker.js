@@ -510,7 +510,9 @@ function install(proc = process, metadata = bootstrap()) {
   installed = true;
   if (!metadata) { proc.env = workerEnvironment(); return; }
   host.workerNative('envInit', [Object.entries(metadata.env || {}), metadata.shareEnv]);
-  host.fsTracking(metadata.trackUnmanagedFds);
+  // node_file.cc AddUnmanagedFd/RemoveUnmanagedFd warn through ProcessEmitWarning.
+  host.fsTracking(0, metadata.trackUnmanagedFds, (fd, closed) => proc.emitWarning(closed ?
+    `File descriptor ${fd} closed but not opened in unmanaged mode` : `File descriptor ${fd} opened in unmanaged mode twice`));
   require('internal/watch_mode/dependencies').initialize(
     filename => controlSend(control, { type: 'watch:dependency', filename }), metadata.watchReportDependencies === true);
   if (metadata.traceCategories) require('internal/trace_events').initializeWorker(metadata.traceCategories, metadata.name,
@@ -542,14 +544,26 @@ function install(proc = process, metadata = bootstrap()) {
     return cachedCwd;
   };
   proc.execArgv = metadata.execArgv;
-  for (const method of ['chdir', 'abort', 'setuid', 'setgid', 'seteuid', 'setegid', 'setgroups', 'initgroups']) {
-    if (typeof proc[method] === 'function') proc[method] = () => { throw clone().codedError('ERR_WORKER_UNSUPPORTED_OPERATION', `process.${method}() is not supported in workers`, Error); };
+  // Node's does_not_own_process_state.js and worker_thread.js.
+  const { unavailable } = require('internal/process/worker_thread_only');
+  for (const method of ['abort', 'chdir', 'initgroups', 'setgroups', 'setegid', 'seteuid', 'setgid', 'setuid']) {
+    if (typeof proc[method] === 'function') proc[method] = unavailable(`process.${method}()`);
   }
   const umask = proc.umask;
-  if (typeof umask === 'function') proc.umask = function(value) {
-    if (arguments.length) throw clone().codedError('ERR_WORKER_UNSUPPORTED_OPERATION', 'Setting process.umask() is not supported in workers', Error);
+  if (typeof umask === 'function') proc.umask = function wrappedUmask(mask) {
+    // process.umask() is a read-only operation in workers.
+    if (mask !== undefined) throw new (nodeErrors().codes.ERR_WORKER_UNSUPPORTED_OPERATION)('Setting process.umask()');
     return umask();
   };
+  // is_not_main_thread.js: the debugger and profiler signals belong to the main thread.
+  for (const name of ['_debugProcess', '_debugEnd', '_debugPause', '_startProfilerIdleNotifier', '_stopProfilerIdleNotifier']) delete proc[name];
+  // A main thread spawned by child_process with an IPC channel: its workers have none.
+  if (proc.env.NODE_CHANNEL_FD) {
+    Object.defineProperty(proc, 'channel', { __proto__: null, enumerable: false, get: unavailable('process.channel') });
+    Object.defineProperty(proc, 'connected', { __proto__: null, enumerable: false, get: unavailable('process.connected') });
+    proc.send = unavailable('process.send()');
+    proc.disconnect = unavailable('process.disconnect()');
+  }
   proc.exit = function(code = proc.exitCode || 0) {
     if (typeof code === 'string' && code.trim()) code = Number(code);
     if (!Number.isInteger(code)) throw clone().codedError('ERR_INVALID_ARG_TYPE', 'The code argument must be an integer');
