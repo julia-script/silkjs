@@ -203,8 +203,9 @@ const optionTypes = { kNoOp: 0, kV8Option: 1, kBoolean: 2, kInteger: 3, kUIntege
 const envVarSettings = { kAllowedInEnvvar: 0, kDisallowedInEnvvar: 1 };
 function getCLIOptionsInfo() {
   const options = new Map();
-  for (const [name, [type, allowedInEnvironment, defaultIsTrue]] of table.options) {
+  for (const [name, [type, allowedInEnvironment, defaultIsTrue, , , helpText]] of table.options) {
     options.set(name, {
+      helpText,
       type: optionTypes['k' + type],
       envVarSettings: allowedInEnvironment ? envVarSettings.kAllowedInEnvvar : envVarSettings.kDisallowedInEnvvar,
       defaultIsTrue,

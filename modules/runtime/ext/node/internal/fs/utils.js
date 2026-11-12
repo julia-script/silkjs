@@ -113,8 +113,20 @@ function traced(operation, call, self, args) {
   try { return Reflect.apply(call, self, args); }
   finally { trace.emit(kSyncCategory, name, 'E'); }
 }
+// Node's Environment::PrintSyncTrace for --trace-sync-io: host.traceSyncIO is set when
+// the event loop starts, and each sync call then prints up to 10 frames of its stack.
+function printSyncTrace() {
+  const frames = host.captureCallSites(10, native);
+  let text = `(node:${process.pid}) WARNING: Detected use of sync API\n`;
+  for (let index = 0; index < frames.length; index++) {
+    const { functionName, scriptName, lineNumber, columnNumber } = frames[index];
+    text += functionName ? `    at ${functionName} (${scriptName}:${lineNumber}:${columnNumber})\n` : `    at ${scriptName}:${lineNumber}:${columnNumber}\n`;
+  }
+  host.stderr.write(text);
+}
 function native(operation, args) {
   if (typeof host.fsSync !== 'function') throw error('ENOSYS', operation, typeof args[0] === 'string' ? args[0] : undefined);
+  if (host.traceSyncIO) printSyncTrace();
   if (!syncTracing) return host.fsSync(operation, args);
   return traced(operation, host.fsSync, host, [operation, args]);
 }
