@@ -156,7 +156,7 @@ server.listen(0, '127.0.0.1', async () => {
     assert.match(shared.stdout, /1 packages: 0 downloaded, 1 linked\n/);
     assert.ok(fs.existsSync(path.join(repo, 'sjs.lock')));
     assert.ok(!fs.existsSync(path.join(app, 'sjs.lock')));
-    assert.strictEqual(fs.readlinkSync(path.join(app, 'node_modules/@repo/lib')), '../../../lib');
+    assert.strictEqual(fs.readlinkSync(path.join(app, 'node_modules/@repo/lib')), '../../../../packages/lib');
     assert.ok(fs.existsSync(path.join(repo, 'node_modules/.sjs/worder@2.1.0')));
     const filtered = await run(path.join(repo, 'packages/lib'), ['add', '--filter', 'app', 'greeter'], directory);
     assert.strictEqual(filtered.status, 0, filtered.stderr);
