@@ -2,7 +2,7 @@
 
 const { Buffer } = require('buffer');
 const { Blob } = require('internal/web/blob');
-const { URLSearchParams } = require('internal/web/url');
+const { URLSearchParams } = require('internal/url');
 const { ReadableStream } = require('internal/web/streams');
 const { TextDecoder } = require('internal/encoding');
 const { FormData, encodeForm, parseForm, parseMIME } = require('internal/web/fetch/formdata');

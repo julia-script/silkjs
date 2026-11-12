@@ -1,11 +1,12 @@
 'use strict';
 // The argument handling follows Node's lib/fs.js (v24) function by function; the work goes
 // to the native fsSync and submitIO operations.
-const c = require('internal/fs_core');
+const c = require('internal/fs/utils');
+const { validateRmdirOptions, validateRmOptions, validateRmOptionsSync, isDirectoryError, realpathCacheKey, emitRecursiveRmdirWarning } = c;
 const p = require('path');
 const { Buffer, os, constants, Dirent, makeStats, makeStatFs } = c;
 const v = c.v;
-const { AbortError, codes: { ERR_FS_EISDIR, ERR_FS_FILE_TOO_LARGE, ERR_INVALID_ARG_VALUE } } = require('internal/errors');
+const { AbortError, codes: { ERR_FS_FILE_TOO_LARGE, ERR_INVALID_ARG_VALUE } } = require('internal/errors');
 const { validateBoolean, validateFunction, validateInteger, validateObject, validateOneOf, validateString, kValidateObjectAllowNullable } = v;
 const { bufferCodec } = c.host;
 const fs = module.exports;
@@ -88,11 +89,11 @@ fs.open = function open(path, flags, mode, callback) {
   if (arguments.length < 3) { callback = flags; flags = 'r'; mode = 0o666; }
   else if (typeof mode === 'function') { callback = mode; mode = 0o666; }
   else mode = c.mode(mode, 0o666);
-  const flagsNumber = c.flags(flags);
+  const flagsNumber = c.stringToFlags(flags);
   callback = makeCallback(callback);
   c.submit('open', [path, flagsNumber, mode], callback);
 };
-fs.openSync = function openSync(path, flags, mode) { return c.native('open', [c.path(path), c.flags(flags), c.mode(mode, 0o666)]); };
+fs.openSync = function openSync(path, flags, mode) { return c.native('open', [c.path(path), c.stringToFlags(flags), c.mode(mode, 0o666)]); };
 fs.openAsBlob = function openAsBlob(path, options = {}) {
   validateObject(options, 'options');
   const type = options.type || '';
@@ -279,48 +280,6 @@ fs.ftruncateSync = function ftruncateSync(fd, len = 0) {
   c.native('ftruncate', [fd, len < 0 ? 0 : len]);
 };
 
-// Node's validateRmdirOptions and validateRmOptions(Sync).
-const defaultRmdirOptions = { retryDelay: 100, maxRetries: 0, recursive: false };
-const defaultRmOptions = { recursive: false, force: false, retryDelay: 100, maxRetries: 0 };
-function validateRmdirOptions(options, defaults = defaultRmdirOptions) {
-  if (options === undefined) return defaults;
-  validateObject(options, 'options');
-  options = { ...defaults, ...options };
-  validateBoolean(options.recursive, 'options.recursive');
-  v.validateInt32(options.retryDelay, 'options.retryDelay', 0);
-  v.validateUint32(options.maxRetries, 'options.maxRetries');
-  return options;
-}
-function isDirectoryError(path) { return new ERR_FS_EISDIR({ code: 'EISDIR', message: 'is a directory', path, syscall: 'rm', errno: 21 }); }
-function validateRmOptionsSync(path, options, expectDir) {
-  options = validateRmdirOptions(options, defaultRmOptions);
-  validateBoolean(options.force, 'options.force');
-  if (!options.force || expectDir || !options.recursive) {
-    const info = fs.lstatSync(path, { throwIfNoEntry: !options.force });
-    const isDirectory = info !== undefined && info.isDirectory();
-    if (expectDir && !isDirectory) return false;
-    if (isDirectory && !options.recursive) throw isDirectoryError(path);
-  }
-  return options;
-}
-function validateRmOptions(path, options, expectDir, cb) {
-  options = validateRmdirOptions(options, defaultRmOptions);
-  validateBoolean(options.force, 'options.force');
-  fs.lstat(path, (err, info) => {
-    if (err) { if (options.force && err.code === 'ENOENT') return cb(null, options); return cb(err, options); }
-    if (expectDir && !info.isDirectory()) return cb(false);
-    if (info.isDirectory() && !options.recursive) return cb(isDirectoryError(path));
-    return cb(null, options);
-  });
-}
-let recursiveRmdirWarned;
-function emitRecursiveRmdirWarning() {
-  if (recursiveRmdirWarned === undefined) recursiveRmdirWarned = process.noDeprecation;
-  if (!recursiveRmdirWarned) {
-    process.emitWarning('In future versions of Node.js, fs.rmdir(path, { recursive: true }) will be removed. Use fs.rm(path, { recursive: true }) instead', 'DeprecationWarning', 'DEP0147');
-    recursiveRmdirWarned = true;
-  }
-}
 const retryable = new Set(['EBUSY', 'EMFILE', 'ENFILE', 'ENOTEMPTY', 'EPERM']);
 function removeSync(path, options) {
   for (let attempt = 0; ; attempt++) {
@@ -330,13 +289,13 @@ function removeSync(path, options) {
       if (info.isDirectory()) {
         if (!options.recursive) throw isDirectoryError(path);
         // Index loops over scandir: user code may have replaced the array iterator.
-        const names = c.native('scandir', [path]);
+        // Raw names: an entry whose name is not valid UTF-8 is removed too.
+        const names = c.native('scandir', [c.path(path), true]);
         for (let index = 0; index < names.length; index++) {
-          const name = names[index];
-          if (name !== '.' && name !== '..') removeSync(p.join(path, name), { ...options, maxRetries: 0 });
+          removeSync(c.rawEntryPath(path, names[index]), { ...options, maxRetries: 0 });
         }
-        c.native('rmdir', [path]);
-      } else c.native('unlink', [path]);
+        c.native('rmdir', [c.path(path)]);
+      } else c.native('unlink', [c.path(path)]);
       return;
     } catch (e) {
       if (options.force && e.code === 'ENOENT') return;
@@ -424,11 +383,12 @@ function readdirEntries(dir, o, recursive) {
   const queue = [dir];
   for (let i = 0; i < queue.length; i++) {
     const current = queue[i];
-    const names = c.native('scandir', [current]);
+    const raw = !recursive && c.rawNames(o.encoding);
+    const names = c.native('scandir', [current, raw]);
     for (let index = 0; index < names.length; index++) {
       const name = names[index];
       if (name === '.' || name === '..') continue;
-      const full = p.join(current, name);
+      const full = raw ? c.rawEntryPath(current, name) : p.join(current, name);
       const info = o.withFileTypes || recursive ? fs.lstatSync(full) : null;
       if (o.withFileTypes) output.push(new Dirent(c.encoded(name, o.encoding), info.mode, current));
       else output.push(c.encoded(recursive ? p.relative(dir, full) : name, o.encoding));
@@ -448,7 +408,7 @@ fs.readdir = function readdir(path, options, callback) {
   if (o.recursive != null) validateBoolean(o.recursive, 'options.recursive');
   c.submit('readdir', [path, o], (err, value) => {
     if (err) { callback(err); return; }
-    callback(null, value.map(entry => o.withFileTypes ? entry instanceof Dirent ? entry : new Dirent(c.encoded(entry.name, o.encoding), entry.mode, entry.parentPath === undefined ? path : entry.parentPath) : typeof entry === 'string' ? c.encoded(entry, o.encoding) : Buffer.from(entry)));
+    callback(null, value.map(entry => o.withFileTypes ? entry instanceof Dirent ? entry : new Dirent(c.encoded(entry.name, o.encoding), entry.mode, entry.parentPath === undefined ? path : entry.parentPath) : c.encoded(entry, o.encoding)));
   }, callback);
 };
 
@@ -595,7 +555,7 @@ fs.readFile = function readFile(path, options, callback) {
   const done = (err, value) => { if (err) { callback(err); return; } callback(null, encoding === null ? Buffer.from(value) : typeof value === 'string' ? value : Buffer.from(value).toString(encoding)); };
   if (isFd(path)) { c.submit('readFile', [path, { signal: o.signal, flag: 0 }], done, callback); return; }
   if (checkAborted(o.signal, callback)) return;
-  const flag = c.flags(o.flag, 'options.flag');
+  const flag = c.stringToFlags(o.flag, 'options.flag');
   c.submit('readFile', [c.path(path), { signal: o.signal, flag }], done, callback);
 };
 function writeFileOptions(options, flag) {
@@ -624,7 +584,7 @@ fs.writeFile = function writeFile(path, data, options, callback) {
     fs.open(path, o.flag, o.mode, (openErr, fd) => { if (openErr) callback(openErr); else writeAll(fd, false, data, 0, data.byteLength, o.signal, true, callback); });
     return;
   }
-  c.submit('writeFile', [c.path(path), data, { signal: o.signal, flush: false, flag: c.flags(o.flag), mode: c.mode(o.mode, 0o666) }], callback);
+  c.submit('writeFile', [c.path(path), data, { signal: o.signal, flush: false, flag: c.stringToFlags(o.flag), mode: c.mode(o.mode, 0o666) }], callback);
 };
 function writeAll(fd, isUserFd, buffer, offset, length, signal, flush, callback) {
   const finish = error => { if (isUserFd) callback(error); else fs.close(fd, err => callback(aggregateTwoErrors(err, error))); };
@@ -669,7 +629,6 @@ function encodeRealpathResult(result, options) {
   const asBuffer = Buffer.from(result);
   return options.encoding === 'buffer' ? asBuffer : asBuffer.toString(options.encoding);
 }
-const realpathCacheKey = Symbol('realpathCacheKey');
 fs.realpathSync = function realpathSync(path, options) {
   options = c.options(options);
   path = c.toPathIfFileURL(path);
@@ -786,7 +745,7 @@ fs.copyFile = function copyFile(src, dest, mode, callback) {
 fs.copyFileSync = function copyFileSync(src, dest, mode) {
   c.native('copyFile', [c.path(src, 'src'), c.path(dest, 'dest'), validMode(mode, 'copyFile')]);
 };
-const cp = () => require('internal/fs_cp');
+const cp = () => require('internal/fs/cp/cp');
 fs.cp = function cp_(src, dest, options, callback) {
   if (typeof options === 'function') { callback = options; options = undefined; }
   callback = makeCallback(callback);
@@ -801,7 +760,7 @@ fs.cpSync = function cpSync(src, dest, options) {
   cp().cpSyncFn(src, dest, options);
 };
 
-const { Dir, DirHandle, openDirHandle, FSWatcher, StatWatcher, watch, watchFile, unwatchFile } = require('internal/fs_handles');
+const { Dir, DirHandle, openDirHandle, FSWatcher, StatWatcher, watch, watchFile, unwatchFile } = require('internal/fs/dir');
 Object.assign(fs, { Dir, FSWatcher, StatWatcher, watch, watchFile, unwatchFile });
 fs.opendirSync = function opendirSync(path, options) {
   path = c.path(path); options = c.options(options, { encoding: 'utf8' });
@@ -821,7 +780,7 @@ for (const name of ['ReadStream', 'WriteStream', 'FileReadStream', 'FileWriteStr
     enumerable: true, configurable: true,
     get() {
       if (!streamConstructors.ReadStream) {
-        const { ReadStream, WriteStream } = require('internal/fs_streams');
+        const { ReadStream, WriteStream } = require('internal/fs/streams');
         Object.assign(streamConstructors, { ReadStream, WriteStream, FileReadStream: ReadStream, FileWriteStream: WriteStream });
       }
       return streamConstructors[name];
@@ -829,14 +788,14 @@ for (const name of ['ReadStream', 'WriteStream', 'FileReadStream', 'FileWriteStr
     set(value) { streamConstructors[name] = value; },
   });
 }
-fs.createReadStream = function createReadStream(path, options) { return new (require('internal/fs_streams').ReadStream)(path, options); };
-fs.createWriteStream = function createWriteStream(path, options) { return new (require('internal/fs_streams').WriteStream)(path, options); };
-Object.defineProperty(fs, 'Utf8Stream', { enumerable: true, configurable: true, get() { return require('internal/fs_utf8_stream'); } });
-fs.globSync = function globSync(pattern, options) { return new (require('internal/fs_glob').Glob)(pattern, options).globSync(); };
+fs.createReadStream = function createReadStream(path, options) { return new (require('internal/fs/streams').ReadStream)(path, options); };
+fs.createWriteStream = function createWriteStream(path, options) { return new (require('internal/fs/streams').WriteStream)(path, options); };
+Object.defineProperty(fs, 'Utf8Stream', { enumerable: true, configurable: true, get() { return require('internal/streams/fast-utf8-stream'); } });
+fs.globSync = function globSync(pattern, options) { return new (require('internal/fs/glob').Glob)(pattern, options).globSync(); };
 fs.glob = function glob(pattern, options, callback) {
   if (typeof options === 'function') { callback = options; options = undefined; }
   callback = makeCallback(callback);
-  const iterator = new (require('internal/fs_glob').Glob)(pattern, options).glob();
+  const iterator = new (require('internal/fs/glob').Glob)(pattern, options).glob();
   (async () => { const results = []; for await (const entry of iterator) results.push(entry); return results; })().then(results => callback(null, results), callback);
 };
 fs._toUnixTimestamp = c.time;

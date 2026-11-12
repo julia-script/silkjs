@@ -37,21 +37,16 @@ function pair(result, syscall, path) {
   return result[0];
 }
 const v = require('internal/validators');
-const { AbortError, codes: { ERR_INVALID_ARG_TYPE, ERR_INVALID_ARG_VALUE, ERR_INVALID_FILE_URL_HOST, ERR_INVALID_FILE_URL_PATH, ERR_INVALID_URL_SCHEME, ERR_OUT_OF_RANGE } } = require('internal/errors');
+const { AbortError, codes: { ERR_FS_EISDIR, ERR_INVALID_ARG_TYPE, ERR_INVALID_ARG_VALUE, ERR_OUT_OF_RANGE } } = require('internal/errors');
 // Legacy helpers for callers that state the expectation in words.
 function invalid(name, expected) { const e = new TypeError(`The "${name}" argument must be ${expected}`); e.code = 'ERR_INVALID_ARG_TYPE'; return e; }
 function range(name) { const e = new RangeError(`The value of "${name}" is out of range`); e.code = 'ERR_OUT_OF_RANGE'; return e; }
 function integer(value, name, min = 0, max = Number.MAX_SAFE_INTEGER) { v.validateInteger(value, name, min, max); return value; }
 // Node's getValidatedPath: a string, a Uint8Array or a file: URL, without null bytes.
+let urlToPath;
 function toPathIfFileURL(value) {
-  if (value == null || typeof value !== 'object' || value.href === undefined || value.protocol === undefined) return value;
-  if (value.protocol !== 'file:') { throw new ERR_INVALID_URL_SCHEME('file'); }
-  if (value.hostname !== '' && value.hostname !== 'localhost') throw new ERR_INVALID_FILE_URL_HOST(process.platform);
-  const pathname = value.pathname;
-  for (let n = 0; n < pathname.length; n++) {
-    if (pathname[n] === '%') { const third = pathname.codePointAt(n + 2) | 0x20; if (pathname[n + 1] === '2' && third === 102) throw new ERR_INVALID_FILE_URL_PATH('must not include encoded / characters'); }
-  }
-  return decodeURIComponent(pathname);
+  urlToPath ??= require('internal/url').toPathIfFileURL;
+  return urlToPath(value);
 }
 function path(value, name = 'path') {
   value = toPathIfFileURL(value);
@@ -61,7 +56,9 @@ function path(value, name = 'path') {
   }
   if (value instanceof Uint8Array) {
     if (value.includes(0)) throw new ERR_INVALID_ARG_VALUE(name, value, 'must be a string, Uint8Array, or URL without null bytes');
-    return Buffer.from(value.buffer, value.byteOffset, value.byteLength).toString();
+    const bytes = Buffer.from(value.buffer, value.byteOffset, value.byteLength);
+    // A name that is not valid UTF-8 goes to the native operations as its raw bytes.
+    return require('buffer').isUtf8(bytes) ? bytes.toString() : value.buffer.slice(value.byteOffset, value.byteOffset + value.byteLength);
   }
   throw new ERR_INVALID_ARG_TYPE(name, ['string', 'Buffer', 'URL'], value);
 }
@@ -78,7 +75,7 @@ function options(value, defaults) {
 }
 function assertEncoding(value) { if (value && !Buffer.isEncoding(value)) throw new ERR_INVALID_ARG_VALUE('encoding', value, 'is invalid encoding'); }
 function mode(value, fallback, name = 'mode') { return v.parseFileMode(value, name, fallback); }
-function flags(value, name = 'flags') {
+function stringToFlags(value, name = 'flags') {
   if (typeof value === 'number') { v.validateInt32(value, name); return value + 0; }
   if (value == null) return constants.O_RDONLY;
   const c = constants;
@@ -204,7 +201,19 @@ function encoding(value, fallback = 'utf8', bufferAllowed = false) {
   assertEncoding(value);
   return value;
 }
-function encoded(value, enc) { return enc === 'buffer' ? Buffer.from(value) : enc === 'utf8' || enc === 'utf-8' ? value : Buffer.from(value).toString(enc); }
+// A directory entry name in the requested encoding. Names arrive as strings, or as their raw
+// bytes (an ArrayBuffer) when rawNames(enc) asked scandir for them.
+function encoded(value, enc) {
+  if (typeof value !== 'string') { const bytes = Buffer.from(value); return enc === 'buffer' ? bytes : bytes.toString(enc); }
+  return enc === 'buffer' ? Buffer.from(value) : enc === 'utf8' || enc === 'utf-8' ? value : Buffer.from(value).toString(enc);
+}
+// Names that are not valid UTF-8 survive only as bytes, so every other encoding reads them raw.
+function rawNames(enc) { return enc != null && enc !== 'utf8' && enc !== 'utf-8' && String(enc).toLowerCase() !== 'utf8' && String(enc).toLowerCase() !== 'utf-8'; }
+// The path, as a Buffer, of a raw entry name inside a directory given as a string or bytes.
+function rawEntryPath(directory, name) {
+  const parent = Buffer.from(directory);
+  return Buffer.concat(parent[parent.length - 1] === 0x2f ? [parent, Buffer.from(name)] : [parent, Buffer.from('/'), Buffer.from(name)]);
+}
 function aborted(signal) { if (signal && signal.aborted) throw new AbortError(undefined, { cause: signal?.reason }); }
 // Node's Stats and BigIntStats (lib/internal/fs/utils.js): function constructors taking the
 // fields in order, with atime, mtime, ctime and birthtime as Dates made when first read.
@@ -282,4 +291,94 @@ function makeStatFs(value, bigint = false) {
 // A FileHandle's hold on its descriptor, taken by streams reading or writing through it.
 const kRef = Symbol('kRef');
 const kUnref = Symbol('kUnref');
-module.exports = { kRef, kUnref, host, os, std, Buffer, constants, error, fail, pair, invalid, range, integer, path, toPathIfFileURL, fd, options, assertEncoding, mode, flags, native, callback, promiseCallback, submit, time, bytes, position, validateOffsetLengthRead, validateOffsetLengthWrite, validateStringAfterArrayBufferView, bufferArray, encoding, encoded, aborted, Stats, BigIntStats, makeStats, Dirent, StatFs, makeStatFs, v };
+// Node's validateRmdirOptions and validateRmOptions(Sync).
+const defaultRmdirOptions = { retryDelay: 100, maxRetries: 0, recursive: false };
+const defaultRmOptions = { recursive: false, force: false, retryDelay: 100, maxRetries: 0 };
+function validateRmdirOptions(options, defaults = defaultRmdirOptions) {
+  if (options === undefined) return defaults;
+  v.validateObject(options, 'options');
+  options = { ...defaults, ...options };
+  v.validateBoolean(options.recursive, 'options.recursive');
+  v.validateInt32(options.retryDelay, 'options.retryDelay', 0);
+  v.validateUint32(options.maxRetries, 'options.maxRetries');
+  return options;
+}
+function isDirectoryError(path) { return new ERR_FS_EISDIR({ code: 'EISDIR', message: 'is a directory', path, syscall: 'rm', errno: 21 }); }
+function validateRmOptionsSync(path, options, expectDir) {
+  options = validateRmdirOptions(options, defaultRmOptions);
+  v.validateBoolean(options.force, 'options.force');
+  if (!options.force || expectDir || !options.recursive) {
+    const info = require('fs').lstatSync(path, { throwIfNoEntry: !options.force });
+    const isDirectory = info !== undefined && info.isDirectory();
+    if (expectDir && !isDirectory) return false;
+    if (isDirectory && !options.recursive) throw isDirectoryError(path);
+  }
+  return options;
+}
+function validateRmOptions(path, options, expectDir, cb) {
+  options = validateRmdirOptions(options, defaultRmOptions);
+  v.validateBoolean(options.force, 'options.force');
+  require('fs').lstat(path, (err, info) => {
+    if (err) { if (options.force && err.code === 'ENOENT') return cb(null, options); return cb(err, options); }
+    if (expectDir && !info.isDirectory()) return cb(false);
+    if (info.isDirectory() && !options.recursive) return cb(isDirectoryError(path));
+    return cb(null, options);
+  });
+}
+let recursiveRmdirWarned;
+function emitRecursiveRmdirWarning() {
+  if (recursiveRmdirWarned === undefined) recursiveRmdirWarned = process.noDeprecation;
+  if (!recursiveRmdirWarned) {
+    process.emitWarning('In future versions of Node.js, fs.rmdir(path, { recursive: true }) will be removed. Use fs.rm(path, { recursive: true }) instead', 'DeprecationWarning', 'DEP0147');
+    recursiveRmdirWarned = true;
+  }
+}
+const realpathCacheKey = Symbol('realpathCacheKey');
+
+// Node's getDirents and getDirent: readdir results with an unknown entry type are
+// completed with lstat, the others build their Dirent from the UV_DIRENT type.
+const kDirentModes = [0, 0o100000, 0o040000, 0o120000, 0o010000, 0o140000, 0o020000, 0o060000];
+function direntJoin(path, name) {
+  const isBytes = (value) => value instanceof Uint8Array;
+  if ((typeof path === 'string' || isBytes(path)) && name === undefined) return path;
+  if (typeof path === 'string' && isBytes(name)) return Buffer.concat([Buffer.from(require('path').join(path, require('path').sep)), name]);
+  if (typeof path === 'string' && typeof name === 'string') return require('path').join(path, name);
+  if (isBytes(path) && isBytes(name)) return Buffer.concat([path, Buffer.from(require('path').sep), name]);
+  throw new ERR_INVALID_ARG_TYPE('path', ['string', 'Buffer'], path);
+}
+function getDirent(path, name, type, callback) {
+  if (typeof callback === 'function') {
+    if (type === constants.UV_DIRENT_UNKNOWN) {
+      let filepath;
+      try { filepath = direntJoin(path, name); } catch (err) { callback(err); return; }
+      require('fs').lstat(filepath, (err, stats) => {
+        if (err) { callback(err); return; }
+        callback(null, new Dirent(name, stats.mode, path));
+      });
+    } else callback(null, new Dirent(name, kDirentModes[type], path));
+  } else if (type === constants.UV_DIRENT_UNKNOWN) {
+    return new Dirent(name, require('fs').lstatSync(direntJoin(path, name)).mode, path);
+  } else return new Dirent(name, kDirentModes[type], path);
+}
+function getDirents(path, { 0: names, 1: types }, callback) {
+  const len = names.length;
+  if (typeof callback !== 'function') {
+    for (let i = 0; i < len; i++) names[i] = getDirent(path, names[i], types[i]);
+    return names;
+  }
+  let toFinish = 0; let done = false;
+  const finish = (err, value) => { if (!done) { done = true; callback(err, value); } };
+  for (let i = 0; i < len; i++) {
+    if (types[i] !== constants.UV_DIRENT_UNKNOWN) { names[i] = new Dirent(names[i], kDirentModes[types[i]], path); continue; }
+    toFinish++;
+    getDirent(path, names[i], types[i], (err, dirent) => {
+      if (err) { finish(err); return; }
+      names[i] = dirent;
+      if (--toFinish === 0) finish(null, names);
+    });
+    if (done) return;
+  }
+  if (toFinish === 0) finish(null, names);
+}
+
+module.exports = { defaultRmOptions, validateRmdirOptions, validateRmOptions, validateRmOptionsSync, isDirectoryError, emitRecursiveRmdirWarning, realpathCacheKey, getDirent, getDirents, kRef, kUnref, host, os, std, Buffer, constants, error, fail, pair, invalid, range, integer, path, toPathIfFileURL, fd, options, assertEncoding, mode, stringToFlags, native, callback, promiseCallback, submit, time, bytes, position, validateOffsetLengthRead, validateOffsetLengthWrite, validateStringAfterArrayBufferView, bufferArray, encoding, encoded, rawNames, rawEntryPath, aborted, Stats, BigIntStats, makeStats, Dirent, StatFs, makeStatFs, v };

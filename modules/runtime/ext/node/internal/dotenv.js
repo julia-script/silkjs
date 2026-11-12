@@ -1,6 +1,6 @@
 'use strict';
 const { openSync, readFileSync, closeSync } = require('fs');
-const core = require('internal/fs_core');
+const core = require('internal/fs/utils');
 const { parseEnv } = require('internal/util_public/parse_env');
 const { Buffer } = require('buffer');
 const { isUint8Array } = require('util').types;

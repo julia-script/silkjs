@@ -17,7 +17,7 @@ function createTestFileList(patterns, cwd) {
   const hasUserSuppliedPattern = patterns.length > 0;
   const extensions = host.typeScriptMode ? 'js,mjs,cjs,ts,mts,cts' : 'js,mjs,cjs';
   if (!hasUserSuppliedPattern) patterns = [`**/{${kPatterns.join(',')}}.{${extensions}}`];
-  const { Glob } = require('internal/fs_glob');
+  const { Glob } = require('internal/fs/glob');
   const glob = new Glob(patterns, { __proto__: null, cwd, exclude: name => name === 'node_modules' });
   const results = glob.globSync();
   if (hasUserSuppliedPattern && results.length === 0 && glob.matchers.every(matcher => !matcher.hasMagic())) {

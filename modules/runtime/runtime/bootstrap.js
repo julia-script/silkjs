@@ -219,8 +219,23 @@ function systemError(errno, syscall, path, dest) {
   if (dest !== undefined) error.dest = dest;
   return error;
 }
+// libc's text for an errno, as node's ErrnoException (api/exceptions.cc) words it.
+host.strerror = number => rawStd.strerror(number);
 function pair(result, syscall, path) { if (result[1] !== 0) throw systemError(result[1], syscall, path); return result[0]; }
-host.cwd = () => pair(rawOS.getcwd(), 'getcwd');
+// node_process_methods.cc Cwd: a uv_cwd UVException, worded for a removed directory.
+host.cwd = () => {
+  const result = rawOS.getcwd();
+  if (result[1] === 0) return result[0];
+  const error = systemError(result[1], 'uv_cwd');
+  if (error.code === 'ENOENT') {
+    error.message = 'ENOENT: process.cwd failed with error ' + (errnoMessages.get(2) || rawStd.strerror(2)) +
+      ', the current working directory was likely removed without changing the working directory, uv_cwd';
+  }
+  throw error;
+};
+// Node's tryGetCwd (lib/internal/process/execution.js): getcwd fails once the
+// directory is removed, so names fall back to the executable's directory.
+host.tryGetCwd = () => { try { return host.cwd(); } catch { return host.path.dirname(process.execPath); } };
 host.realpath = path => pair(rawOS.realpath(path), 'realpath', path);
 function statResult(result, syscall, path) {
   const value = pair(result, syscall, path);
@@ -307,11 +322,11 @@ host.diagnostics = {
     return channels.hasSubscribers ? channels : undefined;
   },
 };
-host.nextTick = (callback, ...args) => {
+host.nextTick = function nextTick(callback, ...args) {
   if (typeof callback !== 'function') throw new (internalRequire('internal/errors').codes.ERR_INVALID_ARG_TYPE)('callback', 'function', callback);
   ticks.push(callback, args, resource('TickObject'));
 };
-host.queueMicrotask = callback => {
+host.queueMicrotask = function queueMicrotask(callback) {
   checkCallback(callback);
   const scope = resource('Microtask');
   try { native.enqueueMicrotask(() => invokeResource(scope, callback, undefined, [])); }
@@ -627,6 +642,21 @@ Object.assign(process, {
     enumerable: true, configurable: false,
   });
 }
+// node_process_object.cc DebugPortGetter/DebugPortSetter: the inspector port,
+// stored as an Int32 and range checked (a C++ THROW_ERR_OUT_OF_RANGE).
+{
+  let debugPort = 9229;
+  Object.defineProperty(process, 'debugPort', {
+    get() { return debugPort; },
+    set(value) {
+      const port = value | 0;
+      if ((port !== 0 && port < 1024) || port > 65535)
+        throw Object.assign(new RangeError('process.debugPort must be 0 or in range 1024 to 65535'), { code: 'ERR_OUT_OF_RANGE' });
+      debugPort = port;
+    },
+    enumerable: true, configurable: true,
+  });
+}
 Object.defineProperty(process, 'config', { writable: false });
 Object.defineProperty(process, 'allowedNodeEnvironmentFlags', {
   configurable: true, enumerable: true,
@@ -813,7 +843,7 @@ host.checkModuleRead = path => internalRequire('internal/permission').check('fs.
 const loader = internalRequire('internal/loader/loader').createLoader(host, publicBuiltins);
 host.loader = loader;
 host.vmCreateDefaultImporter = filename =>
-  native.compileFunction('(specifier, attributes) => import(specifier, { with: attributes })', filename);
+  native.compileFunction('(specifier, attributes, source) => source ? import.source(specifier) : import(specifier, { with: attributes })', filename);
 let builtinRequire;
 process.getBuiltinModule = function getBuiltinModule(id) {
   internalRequire('internal/validators').validateString(id, 'id');
@@ -857,7 +887,7 @@ function runPreloads(entry, loadImports = true) {
     internalRequire('internal/freeze_intrinsics')();
   }
   if (!loadImports || !importPreloads.length) return entry();
-  const name = host.path.join(host.cwd(), '[preload]');
+  const name = host.path.join(host.tryGetCwd(), '[preload]');
   let pending = Promise.resolve();
   for (const specifier of importPreloads) {
     pending = pending.then(() => native.compileFunction('import(' + JSON.stringify(specifier) + ')', name));
@@ -948,6 +978,9 @@ function runtimeFlag(arg) {
   if (arg === '--no-concurrent-array-buffer-sweeping') return true;
   // V8's flag to run without a JIT: this engine is an interpreter, so it always holds.
   if (arg === '--jitless') return true;
+  // V8 flags that turn on source phase imports and import attributes, which this
+  // engine always implements.
+  if (arg === '--js-source-phase-imports' || arg === '--harmony-import-attributes') return true;
   // Buffer.allocUnsafe memory is always zeroed here, which is what this flag asks for.
   if (arg === '--zero-fill-buffers') { host.zeroFillBuffers = true; return true; }
   if (arg === '--experimental-webstorage' || arg === '--no-experimental-webstorage') {
@@ -995,7 +1028,7 @@ function runtimeFlag(arg) {
   return false;
 }
 function installRuntimeOptions(args, entrypoints = [], preloadEntrypoints = true) {
-  const preloadParent = host.path.join(host.cwd(), '[preload]');
+  const preloadParent = host.path.join(host.tryGetCwd(), '[preload]');
   if (preloadEntrypoints) for (const [specifiers, mode] of [[requirePreloads, 'require'], [importPreloads, 'import']]) {
     for (const specifier of specifiers) {
       const resolved = loader.resolve(specifier, preloadParent, mode);
@@ -1021,7 +1054,7 @@ function installRuntimeOptions(args, entrypoints = [], preloadEntrypoints = true
     delete globalThis.CloseEvent;
   }
   if (host.experimentalWebStorage) internalRequire('internal/web/storage').install(globalThis, { localStorageFile: host.localStorageFile, inspect: !!host.experimentalStorageInspection });
-  if (host.experimentalStreamIter) { internalRequire('fs/promises'); internalRequire('internal/fs_iter').install(); }
+  if (host.experimentalStreamIter) { internalRequire('fs/promises'); internalRequire('internal/fs/iter').install(); }
   // http is in the heap image, whose global agent was made without this process's options.
   if (internalRequire('internal/options').getOptionValue('--use-env-proxy')) {
     const agent = internalRequire('_http_agent');
@@ -1034,7 +1067,7 @@ function installRuntimeOptions(args, entrypoints = [], preloadEntrypoints = true
   // inspector endpoint; opening here would steal that child's port.
   if (preloadEntrypoints) {
     const options = host.inspectorOptions;
-    process.debugPort = options?.port ?? 9229;
+    if (options?.port !== undefined) process.debugPort = options.port;
     process._breakFirstLine = !!options?.breakFirst;
     if (options?.enabled) inspectorBackend._start(options.port, options.host, options.wait, options.breakFirst);
     if (workerThreads.isMainThread) inspectorBackend._installProcess(process, options?.host, !host.disableSigusr1);
@@ -1074,8 +1107,8 @@ function runWorker() {
   const moduleEval = evaluate && (inputType?.startsWith('module') || (inputType === undefined && native.detectModuleSyntax(workerSource)));
   return runPreloads(() => {
     if (evaluate) {
-      if (moduleEval) return evaluateMain(workerSource, host.path.join(host.cwd(), '[eval1]'));
-      const name = host.path.join(host.cwd(), '[worker eval]');
+      if (moduleEval) return evaluateMain(workerSource, host.path.join(host.tryGetCwd(), '[eval1]'));
+      const name = host.path.join(host.tryGetCwd(), '[worker eval]');
       installCommonJSInputGlobals(name, '[worker eval]');
       armInspectorEntry();
       return native.compileFunction(workerSource, '[worker eval]', undefined, undefined, undefined, true);
@@ -1097,8 +1130,10 @@ function startRepl() {
   }, error => { if (error) console.error('REPL history:', error.message); });
 }
 function installCommonJSInputGlobals(filename, id) {
+  // Node's createModule (lib/internal/process/execution.js): lookup paths from the cwd.
   const module = new loader.Module(id);
   module.filename = filename;
+  module.paths = loader.Module._nodeModulePaths(host.tryGetCwd());
   globalThis.require = loader.requireFor(filename, module);
   globalThis.module = module; globalThis.exports = module.exports;
   globalThis.__filename = id; globalThis.__dirname = '.';
@@ -1417,7 +1452,7 @@ function run(restored = false) {
     const fromStdin = filename === undefined || filename === '-';
     if (!fromStdin && inputTypeSet) throw Object.assign(new Error('--input-type can only be used with string input via --eval, --print, or STDIN'), { code: 'ERR_INPUT_TYPE_NOT_ALLOWED' });
     const resolved = fromStdin ? null : loader.resolveMain(host.path.resolve(filename));
-    const name = fromStdin ? host.path.join(host.cwd(), '[stdin]') : resolved.filename;
+    const name = fromStdin ? host.path.join(host.tryGetCwd(), '[stdin]') : resolved.filename;
     const source = loader.cleanSource(fromStdin ? rawStd.in.readAsString() : host.Buffer.from(host.readFile(name)).toString('utf8'));
     const module = fromStdin ? inputType === 'module' || (!inputTypeSet && native.detectModuleSyntax(source)) : resolved.format === 'module';
     native.checkSyntax(module ? source : loader.Module.wrap(source), name, module);
@@ -1437,7 +1472,7 @@ function run(restored = false) {
     return startRepl();
   }
   if (expression !== undefined) {
-    const name = host.path.join(host.cwd(), '[eval]');
+    const name = host.path.join(host.tryGetCwd(), '[eval]');
     expression = prepareInput(expression, name, inputType, inputTypeSet);
     internalRequire('internal/modules/helpers').addBuiltinLibsToObject(globalThis, '<eval>');
     const code = !inputType.startsWith('module') && /\bcrypto\b/.test(expression) ?
@@ -1453,7 +1488,7 @@ function run(restored = false) {
   }
   if (filename === undefined || filename === '-') {
     let source = rawStd.in.readAsString();
-    const name = host.path.join(host.cwd(), '[stdin]');
+    const name = host.path.join(host.tryGetCwd(), '[stdin]');
     process._eval = source;
     source = prepareInput(source, name, inputType, inputTypeSet);
     if (inputType.startsWith('module') || (!inputTypeSet && native.detectModuleSyntax(source))) {
@@ -1551,9 +1586,9 @@ function loop() {
   }
   return Number(process.exitCode) || 0;
 }
-const imageModules = ['fs', 'fs/promises', 'internal/fs_streams', 'internal/fs_utf8_stream', 'path', 'os',
+const imageModules = ['fs', 'fs/promises', 'internal/fs/streams', 'internal/streams/fast-utf8-stream', 'path', 'os',
   'events', 'stream', 'stream/promises', 'string_decoder', 'util', 'assert', 'console', 'net', 'tty', 'http',
-  'internal/tty/write', 'url', 'internal/web/url', 'internal/encoding', 'internal/abort_controller',
+  'internal/tty/write', 'url', 'internal/url', 'internal/encoding', 'internal/abort_controller',
   'internal/process/execution'];
 globalThis.__silkRuntime = {
   normalize(name, parent, attributes) { return loader.importKey(name, parent, attributes); },

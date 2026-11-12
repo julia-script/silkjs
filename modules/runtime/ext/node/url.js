@@ -1,3 +1,5 @@
+// Adapted from Node.js v24.22.1 lib/url.js. internalBinding('url'), internalBinding('encoding_binding').toASCII and
+// isInsideNodeModules come from internal/url_binding and internal/inside_node_modules.
 // Copyright Joyent, Inc. and other Node contributors.
 //
 // Permission is hereby granted, free of charge, to any person obtaining a
@@ -24,6 +26,7 @@
 const {
   ArrayPrototypeJoin,
   Boolean,
+  Int8Array,
   ObjectAssign,
   ObjectKeys,
   StringPrototypeAt,
@@ -32,38 +35,28 @@ const {
   StringPrototypeReplaceAll,
   StringPrototypeSlice,
   decodeURIComponent,
-} = {
-  ArrayPrototypeJoin: Function.call.bind(Array.prototype.join),
-  Boolean: globalThis.Boolean, ObjectAssign: Object.assign, ObjectKeys: Object.keys,
-  StringPrototypeAt: Function.call.bind(String.prototype.at),
-  StringPrototypeCharCodeAt: Function.call.bind(String.prototype.charCodeAt),
-  StringPrototypeIndexOf: Function.call.bind(String.prototype.indexOf),
-  StringPrototypeReplaceAll: Function.call.bind(String.prototype.replaceAll),
-  StringPrototypeSlice: Function.call.bind(String.prototype.slice),
-  decodeURIComponent: globalThis.decodeURIComponent,
-};
+} = require('internal/per_context/primordials');
 
-const toASCII = (domain) => require('internal/host').urlIdnaToASCII(`${domain}`);
-const encodeStr = (value) => encodeURIComponent(value).replace(/%3A/gi, ':');
+const { URLPattern } = require('internal/web/urlpattern');
+const { toASCII } = require('internal/url_binding');
+const { encodeStr, hexTable } = require('internal/querystring');
 const querystring = require('querystring');
 
 const {
   ERR_INVALID_ARG_TYPE,
   ERR_INVALID_URL,
-} = {
-  ERR_INVALID_ARG_TYPE: require('internal/path_events/support').codes.ERR_INVALID_ARG_TYPE,
-  ERR_INVALID_URL: class extends TypeError {
-    constructor(input) { super('Invalid URL'); this.code = 'ERR_INVALID_URL'; this.input = input; }
-  },
-};
+} = require('internal/errors').codes;
 const {
   validateString,
   validateObject,
-} = require('internal/path_events/support');
+} = require('internal/validators');
 
-const { spliceOne } = require('internal/path_events/support');
+// This ensures setURLConstructor() is called before the native
+// URL::ToObject() method is used.
+const { spliceOne } = require('internal/util');
+const { isInsideNodeModules } = require('internal/inside_node_modules');
 
-// WHATWG URL implementation provided by internal/web/url.
+// WHATWG URL implementation provided by internal/url
 const {
   URL,
   URLSearchParams,
@@ -76,9 +69,9 @@ const {
   unsafeProtocol,
   hostlessProtocol,
   slashedProtocol,
-} = require('internal/web/url');
+} = require('internal/url');
 
-const bindingUrl = { format: require('internal/web/url').formatURL };
+const bindingUrl = require('internal/url_binding');
 
 // Original url.parse() API
 
@@ -109,36 +102,38 @@ const hostPattern = /^\/\/[^@/]+@[^@/]+/;
 const simplePathPattern = /^(\/\/?(?!\/)[^?\s]*)(\?[^\s]*)?$/;
 
 const hostnameMaxLen = 255;
-const CHAR_SPACE = 32;
-const CHAR_TAB = 9;
-const CHAR_CARRIAGE_RETURN = 13;
-const CHAR_LINE_FEED = 10;
-const CHAR_NO_BREAK_SPACE = 160;
-const CHAR_ZERO_WIDTH_NOBREAK_SPACE = 65279;
-const CHAR_HASH = 35;
-const CHAR_FORWARD_SLASH = 47;
-const CHAR_LEFT_SQUARE_BRACKET = 91;
-const CHAR_RIGHT_SQUARE_BRACKET = 93;
-const CHAR_LEFT_ANGLE_BRACKET = 60;
-const CHAR_RIGHT_ANGLE_BRACKET = 62;
-const CHAR_LEFT_CURLY_BRACKET = 123;
-const CHAR_RIGHT_CURLY_BRACKET = 125;
-const CHAR_QUESTION_MARK = 63;
-const CHAR_DOUBLE_QUOTE = 34;
-const CHAR_SINGLE_QUOTE = 39;
-const CHAR_PERCENT = 37;
-const CHAR_SEMICOLON = 59;
-const CHAR_BACKWARD_SLASH = 92;
-const CHAR_CIRCUMFLEX_ACCENT = 94;
-const CHAR_GRAVE_ACCENT = 96;
-const CHAR_VERTICAL_LINE = 124;
-const CHAR_AT = 64;
-const CHAR_COLON = 58;
+const {
+  CHAR_SPACE,
+  CHAR_TAB,
+  CHAR_CARRIAGE_RETURN,
+  CHAR_LINE_FEED,
+  CHAR_NO_BREAK_SPACE,
+  CHAR_ZERO_WIDTH_NOBREAK_SPACE,
+  CHAR_HASH,
+  CHAR_FORWARD_SLASH,
+  CHAR_LEFT_SQUARE_BRACKET,
+  CHAR_RIGHT_SQUARE_BRACKET,
+  CHAR_LEFT_ANGLE_BRACKET,
+  CHAR_RIGHT_ANGLE_BRACKET,
+  CHAR_LEFT_CURLY_BRACKET,
+  CHAR_RIGHT_CURLY_BRACKET,
+  CHAR_QUESTION_MARK,
+  CHAR_DOUBLE_QUOTE,
+  CHAR_SINGLE_QUOTE,
+  CHAR_PERCENT,
+  CHAR_SEMICOLON,
+  CHAR_BACKWARD_SLASH,
+  CHAR_CIRCUMFLEX_ACCENT,
+  CHAR_GRAVE_ACCENT,
+  CHAR_VERTICAL_LINE,
+  CHAR_AT,
+  CHAR_COLON,
+} = require('internal/constants');
 
 let urlParseWarned = false;
 
 function urlParse(url, parseQueryString, slashesDenoteHost) {
-  if (!urlParseWarned) {
+  if (!urlParseWarned && !isInsideNodeModules(4)) {
     urlParseWarned = true;
     process.emitWarning(
       '`url.parse()` behavior is not standardized and prone to ' +
@@ -625,11 +620,27 @@ function urlFormat(urlObject, options) {
   return Url.prototype.format.call(urlObject);
 }
 
+// These characters do not need escaping:
+// ! - . _ ~
+// ' ( ) * :
+// digits
+// alpha (uppercase)
+// alpha (lowercase)
+const noEscapeAuth = new Int8Array([
+  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // 0x00 - 0x0F
+  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // 0x10 - 0x1F
+  0, 1, 0, 0, 0, 0, 0, 1, 1, 1, 1, 0, 0, 1, 1, 0, // 0x20 - 0x2F
+  1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, // 0x30 - 0x3F
+  0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, // 0x40 - 0x4F
+  1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 1, // 0x50 - 0x5F
+  0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, // 0x60 - 0x6F
+  1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 1, 0, // 0x70 - 0x7F
+]);
 
 Url.prototype.format = function format() {
   let auth = this.auth || '';
   if (auth) {
-    auth = encodeStr(auth);
+    auth = encodeStr(auth, noEscapeAuth, hexTable);
     auth += '@';
   }
 
@@ -1027,6 +1038,7 @@ module.exports = {
 
   // WHATWG API
   URL,
+  URLPattern,
   URLSearchParams,
   domainToASCII,
   domainToUnicode,
@@ -1037,13 +1049,3 @@ module.exports = {
   fileURLToPathBuffer,
   urlToHttpOptions,
 };
-// urlpattern is loaded on first read; url is required during startup.
-Object.defineProperty(module.exports, 'URLPattern', {
-  get() {
-    const { URLPattern } = require('internal/web/urlpattern');
-    Object.defineProperty(module.exports, 'URLPattern', { value: URLPattern, writable: true, enumerable: true, configurable: true });
-    return URLPattern;
-  },
-  set(value) { Object.defineProperty(module.exports, 'URLPattern', { value, writable: true, enumerable: true, configurable: true }); },
-  enumerable: true, configurable: true,
-});

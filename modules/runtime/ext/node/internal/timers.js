@@ -80,8 +80,10 @@
 // uncaught (domains included) and returns whether the callback threw, so the
 // queues go on with the next callback where Node unwinds to the loop and calls
 // processTimers / processImmediate again; afterThrow keeps the order of Node's
-// nextTick draining across that restart. Context stores are not cleared from
-// fired timers: the runtime's resources own them.
+// nextTick draining across that restart. The context stores a timer keeps
+// (async_context_frame, or async_local_storage_context_symbol without frames)
+// are the ones its async resource runs with; removeStoresFromResource lets go
+// of both.
 
 const binding = require('internal/timers_binding');
 const {
@@ -90,6 +92,11 @@ const {
 } = binding;
 const host = require('internal/host');
 const { _createResource: createResource } = require('async_hooks');
+const {
+  symbols: {
+    async_local_storage_context_symbol,
+  },
+} = require('internal/async_hooks');
 
 const async_id_symbol = Symbol('asyncId');
 const trigger_async_id_symbol = Symbol('triggerId');
@@ -116,14 +123,47 @@ let debug = (...args) => {
   debug(...args);
 };
 
+const AsyncContextFrame = require('internal/async_context_frame');
+
+const async_context_frame = Symbol('kAsyncContextFrame');
+
+function removeStoresFromResource(resource) {
+  if (AsyncContextFrame.enabled) {
+    if (resource[async_context_frame] !== undefined) {
+      resource[async_context_frame] = undefined;
+    }
+  } else if (resource[async_local_storage_context_symbol] !== undefined) {
+    resource[async_local_storage_context_symbol] = undefined;
+  }
+  // The runtime's async resource holds the same stores for its callback scope.
+  const asyncResource = resource[kAsyncResource];
+  if (asyncResource !== undefined) {
+    asyncResource.stores = undefined;
+    asyncResource.scope = undefined;
+  }
+}
+
 function cleanTimer(timer) {
+  removeStoresFromResource(timer);
   timer._onTimeout = undefined;
   timer._timerArgs = undefined;
 }
 
 function cleanImmediate(immediate) {
+  removeStoresFromResource(immediate);
   immediate._onImmediate = undefined;
   immediate._argv = undefined;
+}
+
+function enqueueRemoveStoresFromResource(resource) {
+  host.enqueueMicrotask(() => removeStoresFromResource(resource));
+}
+
+function enqueueRemoveStoresIfNotReinserted(resource) {
+  host.enqueueMicrotask(() => {
+    if (!resource._idleNext && !resource._idlePrev)
+      removeStoresFromResource(resource);
+  });
 }
 
 // *Must* match Environment::ImmediateInfo::Fields in src/env.h.
@@ -165,6 +205,10 @@ function initAsyncResource(resource, type) {
   resource[async_id_symbol] = asyncResource.id;
   resource[trigger_async_id_symbol] = asyncResource.trigger;
   resource[kAsyncResource] = asyncResource;
+  if (AsyncContextFrame.enabled)
+    resource[async_context_frame] = asyncResource.stores;
+  else if (asyncResource.stores !== undefined)
+    resource[async_local_storage_context_symbol] = asyncResource.stores;
 }
 
 function emitDestroy(resource) {
@@ -521,7 +565,13 @@ function getTimerCallbacks(runNextTicks) {
       const argv = immediate._argv;
       afterThrow = host.invokeTimer(immediate[kAsyncResource], immediate._onImmediate,
                                     immediate, argv === undefined ? [] : argv);
-      cleanImmediate(immediate);
+      if (afterThrow) {
+        immediate._onImmediate = undefined;
+        immediate._argv = undefined;
+        enqueueRemoveStoresFromResource(immediate);
+      } else {
+        cleanImmediate(immediate);
+      }
 
       emitDestroy(immediate);
 
@@ -606,8 +656,8 @@ function getTimerCallbacks(runNextTicks) {
       }
 
       const args = timer._timerArgs;
-      afterThrow = host.invokeTimer(timer[kAsyncResource], timer._onTimeout, timer,
-                                    args === undefined ? [] : args);
+      const threw = afterThrow = host.invokeTimer(timer[kAsyncResource], timer._onTimeout, timer,
+                                                  args === undefined ? [] : args);
       if (timer._repeat && timer._idleTimeout !== -1) {
         timer._idleTimeout = timer._repeat;
         insert(timer, timer._idleTimeout, start);
@@ -615,7 +665,16 @@ function getTimerCallbacks(runNextTicks) {
         if (timer._destroyed) {
           timer._onTimeout = undefined;
           timer._timerArgs = undefined;
+          if (threw)
+            enqueueRemoveStoresIfNotReinserted(timer);
+          else
+            removeStoresFromResource(timer);
         } else {
+          if (threw)
+            enqueueRemoveStoresIfNotReinserted(timer);
+          else
+            removeStoresFromResource(timer);
+
           timer._destroyed = true;
 
           if (timer[kHasPrimitive])
@@ -698,6 +757,7 @@ module.exports = {
   kTimeout: Symbol('timeout'), // For hiding Timeouts on other internals.
   async_id_symbol,
   trigger_async_id_symbol,
+  async_context_frame,
   kAsyncResource,
   Timeout,
   Immediate,

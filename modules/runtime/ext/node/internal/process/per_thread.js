@@ -81,4 +81,7 @@ function _execve(execPath, args, envArray) {
   host.osNative('abort', []);
 }
 
-module.exports = { execve };
+// Node exports these from process at its first load.
+const { arch, platform, version } = process;
+
+module.exports = { arch, execve, platform, version };
