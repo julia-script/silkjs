@@ -1,5 +1,7 @@
+// Adapted from Node.js v24.22.1 lib/internal/async_context_frame.js. Copyright Node.js
+// contributors. MIT license (see vendor/node-api/LICENSE).
 'use strict';
-// Node's lib/internal/async_context_frame.js over the runtime's async context.
+// Node's module over the runtime's async context.
 // The frame is the context's stores map, the one AsyncLocalStorage reads when
 // --async-context-frame is on (the default).
 const host = require('internal/host');
