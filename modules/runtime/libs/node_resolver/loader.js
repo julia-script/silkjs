@@ -1394,7 +1394,7 @@ function createLoader(host, builtins) {
       return mock.format === 'builtin' || mock.format === 'commonjs' || mock.format === 'commonjs-typescript'
         ? mockCommonJS(mock, mock.filename, null) : mock.exports;
     },
-    startHookWorker() { return require('./hooks_worker').start(bridge, builtins.get('worker_threads')); },
+    startHookWorker() { return require('./hooks_worker').start(bridge, builtins.get('worker_threads'), builtins.get('internal/worker')); },
     enterHookWorker: hooks.enterWorker,
     addAsyncHooks: hooks.addAsync,
     importConditions: () => conditions('import'),
