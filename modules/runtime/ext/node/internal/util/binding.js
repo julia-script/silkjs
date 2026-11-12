@@ -99,6 +99,7 @@ function getCallerLocation() {
 }
 
 module.exports = {
+  isInsideNodeModules: require('internal/inside_node_modules').isInsideNodeModules,
   getCallerLocation,
   privateSymbols,
   sleep,

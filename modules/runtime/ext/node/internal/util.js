@@ -410,12 +410,15 @@ function deprecateInstantiation(target, code, ...args) {
 // of an error that has one, once.
 function decorateErrorStack(err) {
   const { privateSymbols: { arrow_message_private_symbol, decorated_private_symbol } } = require('internal/util/binding');
-  if (!(isError(err) && err.stack) || err[decorated_private_symbol])
+  const host = require('internal/host');
+  if (!(isError(err) && err.stack) || err[decorated_private_symbol] || host.decoratedErrors.has(err))
     return;
-  const arrow = err[arrow_message_private_symbol];
+  // The runtime keeps the arrow of a compile error (AppendExceptionLine) in host.errorArrows.
+  const arrow = err[arrow_message_private_symbol] ?? host.errorArrows.get(err);
   if (arrow) {
     err.stack = arrow + err.stack;
     err[decorated_private_symbol] = true;
+    host.decoratedErrors.add(err);
   }
 }
 
@@ -636,7 +639,63 @@ function sleep(msec) {
   require('internal/util/binding').sleep(msec);
 }
 
+// From lib/internal/util.js.
+// Returns the number of ones in the binary representation of the decimal
+// number.
+function countBinaryOnes(n) {
+  // Count the number of bits set in parallel, which is faster than looping
+  n = n - ((n >>> 1) & 0x55555555);
+  n = (n & 0x33333333) + ((n >>> 2) & 0x33333333);
+  return ((n + (n >>> 4) & 0xF0F0F0F) * 0x1010101) >>> 24;
+}
+
+function getCIDR(address, netmask, family) {
+  let ones = 0;
+  let split = '.';
+  let range = 10;
+  let groupLength = 8;
+  let hasZeros = false;
+  let lastPos = 0;
+
+  if (family === 'IPv6') {
+    split = ':';
+    range = 16;
+    groupLength = 16;
+  }
+
+  for (let i = 0; i < netmask.length; i++) {
+    if (netmask[i] !== split) {
+      if (i + 1 < netmask.length) {
+        continue;
+      }
+      i++;
+    }
+    const part = netmask.slice(lastPos, i);
+    lastPos = i + 1;
+    if (part !== '') {
+      if (hasZeros) {
+        if (part !== '0') {
+          return null;
+        }
+      } else {
+        const binary = Number.parseInt(part, range);
+        const binaryOnes = countBinaryOnes(binary);
+        ones += binaryOnes;
+        if (binaryOnes !== groupLength) {
+          if (binary.toString(2).includes('01')) {
+            return null;
+          }
+          hasZeros = true;
+        }
+      }
+    }
+  }
+
+  return `${address}/${ones}`;
+}
+
 module.exports = {
+  getCIDR,
   WeakReference,
   assertCrypto,
   sleep,
