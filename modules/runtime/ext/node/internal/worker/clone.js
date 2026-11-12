@@ -102,7 +102,6 @@ class CloneSerializer extends Serializer {
       throw cloneError('Object that needs transfer was found in message but not listed in transferList');
     }
     if (isDOMException(value)) return true;
-    if (host.types.isSlidingWindowHistogram?.(value)) throw cloneError();
     if (abort.isTransferable(value)) return true;
     if (isCryptoKey(value) || isKeyObject(value) || host.types.isX509Certificate?.(value)) return true;
     if (host.types.isStorage?.(value) || host.types.isEventSource?.(value)) return true;
@@ -187,6 +186,9 @@ class CloneSerializer extends Serializer {
     }
     if (portHooks?.isPort(value)) {
       const id = this.ports.indexOf(value);
+      // As in Node, a closed or detached port has no native handle left: it is
+      // no longer a host object the serializer knows.
+      if (id < 0 && portHooks.detached(value)) throw cloneError('Cannot clone object of unsupported type.');
       if (id < 0) throw cloneError('Object that needs transfer was found in message but not listed in transferList');
       this.writeUint32(0);
       this.writeUint32(id);
@@ -335,8 +337,8 @@ function prepare(value, list, source) {
     } else if (fileHandles(false)?.is(item)) {
       handleFds.push(fileHandles(false).check(item));
       handles.push(item);
-    } else if (host.types.isSlidingWindowHistogram?.(item)) {
-      // markTransferMode(histogram, false, false): neither cloneable nor transferable.
+    } else if (jsTransferable.getTransferMode(item) !== undefined) {
+      // markTransferMode(object, false, false): neither cloneable nor transferable.
       throw cloneError();
     } else throw codedError('ERR_INVALID_TRANSFER_OBJECT', 'Found invalid object in transferList');
   }
@@ -354,6 +356,8 @@ function prepare(value, list, source) {
       for (let at = 0; at < others.length; at++) {
         const other = others[at];
         if (portHooks?.isPort(other)) {
+          // Node skips a nested port without a handle; serialization then rejects it if referenced.
+          if (portHooks.detached(other)) continue;
           ports.push(other);
           ids.push(portHooks.id(other));
         } else if (isJSTransferable(other) && !transferred.has(other)) {

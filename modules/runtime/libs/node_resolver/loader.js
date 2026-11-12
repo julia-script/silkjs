@@ -1081,6 +1081,7 @@ function createLoader(host, builtins) {
     const allowAsync = !!parent && moduleAsyncModes.get(parent) === true;
     return loadResolved(resolve(request, parent, 'require', undefined, undefined, !!isMain, allowAsync), parent, !!isMain, allowAsync);
   };
+  const defaultModuleLoad = Module._load;
   Module._initPaths = () => {
     const windows = process.platform === 'win32';
     const home = process.env[windows ? 'USERPROFILE' : 'HOME'];
@@ -1345,6 +1346,8 @@ function createLoader(host, builtins) {
       return load(specifier);
     }
     function load(specifier) {
+      // Module.prototype.require goes through Module._load, so a replaced one sees every require.
+      if (Module._load !== defaultModuleLoad) return Module._load(specifier, parent || cache[filename], false);
       probed = null;
       // Unlike the node: form, ordinary builtin names can be overridden through
       // require.cache, matching Node's documented builtin cache behavior.
@@ -1440,7 +1443,7 @@ function createLoader(host, builtins) {
       return mock.format === 'builtin' || mock.format === 'commonjs' || mock.format === 'commonjs-typescript'
         ? mockCommonJS(mock, mock.filename, null) : mock.exports;
     },
-    startHookWorker() { return require('./hooks_worker').start(bridge, builtins.get('worker_threads')); },
+    startHookWorker() { return require('./hooks_worker').start(bridge, builtins.get('worker_threads'), builtins.get('internal/worker')); },
     enterHookWorker: hooks.enterWorker,
     addAsyncHooks: hooks.addAsync,
     importConditions: () => conditions('import'),

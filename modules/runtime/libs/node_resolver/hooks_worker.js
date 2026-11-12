@@ -8,7 +8,7 @@ function packError(error) {
   }
   return { loaderError: true, name: error.name, message: error.message, stack: error.stack, properties };
 }
-function start(bridge, threads) {
+function start(bridge, threads, worker) {
   const { port, signal } = threads.workerData;
   threads.isInternalThread = true;
   bridge.enterHookWorker();
@@ -29,7 +29,7 @@ function start(bridge, threads) {
     } catch (error) { response = { id, failed: true, error: packError(error) }; }
     // process.exit() cancels the isolate; its interruption is not a hook
     // rejection that user code in the requesting thread can catch.
-    if (threads._exitRequested) return;
+    if (worker._exitRequested) return;
     try { port.postMessage(response); }
     catch (error) { port.postMessage({ id, failed: true, error: packError(error) }); }
     finally { Atomics.add(signal, 0, 1); Atomics.notify(signal, 0); }
