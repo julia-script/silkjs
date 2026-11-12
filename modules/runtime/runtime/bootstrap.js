@@ -960,7 +960,8 @@ Object.defineProperty(globalThis, '__silkModuleBridge', { value: loader.bridge }
 let mainModuleName;
 let inspectorStartupArmed = false;
 function armInspectorEntry() {
-  if (inspectorStartupArmed || !host.inspectorOptions?.enabled || !host.inspectorOptions.breakFirst) return;
+  if (inspectorStartupArmed) return;
+  if (!(host.inspectorOptions?.enabled && host.inspectorOptions.breakFirst) && !inspectorBackend._breakFirstLine()) return;
   inspectorStartupArmed = true;
   inspectorBackend._armStartup();
 }

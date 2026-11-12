@@ -9,6 +9,14 @@ const contexts = new Map();
 const tokens = new Map();
 const listeners = new Set();
 const contextListeners = new Set();
+const destroyListeners = new Set();
+// V8 reports a context destroyed when its global is collected (the vm sandbox
+// holds it): the registry notifies with the entry, which holds no sandbox.
+const collected = new FinalizationRegistry(entry => {
+  contexts.delete(entry.id);
+  tokens.delete(entry.token);
+  for (const listener of destroyListeners) listener(entry);
+});
 let nextId = 2;
 // Node names the main context after the process title (argv0 at start) and pid, a worker's after its thread id.
 function mainName() {
@@ -26,6 +34,7 @@ function register(sandbox, handle, options = {}) {
   bySandbox.set(sandbox, entry);
   contexts.set(id, new WeakRef(sandbox));
   tokens.set(entry.token, new WeakRef(sandbox));
+  collected.register(sandbox, { id, token: entry.token, uniqueId: entry.uniqueId });
   // Context creation must precede deferred scriptParsed events for this realm.
   for (const listener of contextListeners) listener(entry);
   for (const listener of listeners) listener(entry);
@@ -58,4 +67,4 @@ function resolve(id, uniqueId) {
 function description(context) {
   return { id: context.id, name: context === main ? mainName() : context.name, origin: context.origin, uniqueId: context.uniqueId, auxData: { isDefault: context.id === 1 } };
 }
-module.exports = { register, get, list, resolve, fromToken, description, subscribe: (listener, first = false) => (first ? contextListeners : listeners).add(listener) };
+module.exports = { register, get, list, resolve, fromToken, description, subscribe: (listener, first = false) => (first ? contextListeners : listeners).add(listener), onDestroyed: listener => destroyListeners.add(listener) };

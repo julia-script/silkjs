@@ -54,8 +54,8 @@ const kBindings = {
   performance: () => require('internal/performance_binding'),
   trace_events: () => require('internal/trace_events_binding'),
   util: () => require('internal/util/binding'),
-  // inspector_agent.cc: registerAsyncHook and the asyncTask* calls.
-  inspector: () => require('internal/inspector_async'),
+  // inspector_agent.cc: registerAsyncHook, the asyncTask* calls, isEnabled and url.
+  inspector: () => require('internal/inspector_binding'),
   timers: () => require('internal/timers_binding'),
   tls_wrap: () => require('internal/tls/binding'),
   uv: () => require('internal/uv_binding'),
