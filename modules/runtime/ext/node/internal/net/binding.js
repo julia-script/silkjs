@@ -56,8 +56,14 @@ const streamBaseState = new Int32Array(5);
 // Small corked writes (a frame header and its payload) go out as one copy and one system call.
 const kJoinLimit = 65536;
 
+// Node's stream and request wraps are BaseObjects, so V8's serializer hands them
+// to _writeHostObject: the emulated ones are branded for the same check.
+const bindingObjects = new WeakSet();
+host.types.isStreamBindingObject = value => bindingObjects.has(value);
+
 class WriteWrap {
   constructor() {
+    bindingObjects.add(this);
     this.handle = null;
     this.oncomplete = null;
     this.callback = null;
@@ -71,6 +77,7 @@ class WriteWrap {
 
 class ShutdownWrap {
   constructor() {
+    bindingObjects.add(this);
     this.handle = null;
     this.oncomplete = null;
     this.callback = null;
@@ -79,6 +86,7 @@ class ShutdownWrap {
 
 class TCPConnectWrap {
   constructor() {
+    bindingObjects.add(this);
     this.oncomplete = null;
     this.address = undefined;
     this.port = undefined;
@@ -89,6 +97,7 @@ class TCPConnectWrap {
 
 class PipeConnectWrap {
   constructor() {
+    bindingObjects.add(this);
     this.oncomplete = null;
     this.address = undefined;
   }
@@ -103,6 +112,7 @@ function statusOf(error) {
 class StreamHandle {
   #owner = undefined;
   constructor(transport) {
+    bindingObjects.add(this);
     this.reading = false;
     this.onread = null;
     this.onconnection = null;

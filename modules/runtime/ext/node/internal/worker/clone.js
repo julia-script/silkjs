@@ -187,6 +187,9 @@ class CloneSerializer extends Serializer {
     }
     if (portHooks?.isPort(value)) {
       const id = this.ports.indexOf(value);
+      // As in Node, a closed or detached port has no native handle left: it is
+      // no longer a host object the serializer knows.
+      if (id < 0 && portHooks.detached(value)) throw cloneError('Cannot clone object of unsupported type.');
       if (id < 0) throw cloneError('Object that needs transfer was found in message but not listed in transferList');
       this.writeUint32(0);
       this.writeUint32(id);
@@ -207,7 +210,8 @@ class CloneSerializer extends Serializer {
       this.writeRawBytes(data.bytes);
       return;
     }
-    this._fail(value);
+    // node_messaging.cc: a host object that is neither cloneable nor transferable.
+    throw cloneError('Cannot clone object of unsupported type.');
   }
 }
 CloneSerializer.prototype._getDataCloneError = function(message) { return cloneError(message); };
@@ -347,6 +351,8 @@ function prepare(value, list, source) {
       const extra = typeof item[jsTransferable.kTransferList] === 'function' ? item[jsTransferable.kTransferList]() : [];
       for (const other of extra || []) {
         if (portHooks?.isPort(other)) {
+          // Node skips a nested port without a handle; serialization then rejects it if referenced.
+          if (portHooks.detached(other)) continue;
           ports.push(other);
           ids.push(portHooks.id(other));
         } else if (isJSTransferable(other) && !transferred.has(other)) {

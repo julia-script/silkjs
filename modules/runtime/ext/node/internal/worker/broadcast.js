@@ -30,8 +30,9 @@ class BroadcastChannel extends EventTarget {
   }
   get name() { return state(this).name; }
   postMessage(value) {
-    if (arguments.length === 0) throw new ERR_MISSING_ARGS('message');
+    // Node checks the receiver first.
     const data = state(this);
+    if (arguments.length === 0) throw new ERR_MISSING_ARGS('message');
     if (data.closed) throw new DOMException('BroadcastChannel is closed.', 'InvalidStateError');
     const prepared = clone.prepare(value);
     host.workerNative('broadcastPost', [data.endpoint, prepared.bytes, prepared.shared, prepared.buffers]);

@@ -89,7 +89,17 @@ function sleep(msec) {
   Atomics.wait(sleepCell, 0, 0, msec);
 }
 
+// node_util.cc GetCallerLocation: [line, column, script name] of the caller of the JS
+// function that called this one (V8 stack frames 0 and 1), or undefined without two frames.
+function getCallerLocation() {
+  const frames = host.captureCallSites(2, getCallerLocation);
+  if (frames.length !== 2) return undefined;
+  const frame = frames[1];
+  return [frame.lineNumber, frame.columnNumber, frame.scriptName];
+}
+
 module.exports = {
+  getCallerLocation,
   privateSymbols,
   sleep,
   ALL_PROPERTIES,

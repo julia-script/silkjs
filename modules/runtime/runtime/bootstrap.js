@@ -21,6 +21,8 @@ const moduleHas = Map.prototype.has.bind(modules);
 const moduleSet = Map.prototype.set.bind(modules);
 const moduleDelete = Map.prototype.delete.bind(modules);
 const stringStartsWith = Function.prototype.call.bind(String.prototype.startsWith);
+const promiseThen = Function.prototype.call.bind(Promise.prototype.then);
+const promiseReject = Promise.reject.bind(Promise);
 const stringEndsWith = Function.prototype.call.bind(String.prototype.endsWith);
 const stringSlice = Function.prototype.call.bind(String.prototype.slice);
 const stringIndexOf = Function.prototype.call.bind(String.prototype.indexOf);
@@ -547,6 +549,8 @@ const performanceMilestones = {
   nodeStart: 0, v8Start: native.engineStartTime - startTime, environment: native.environmentTime - startTime,
   bootstrapComplete: -1, loopStart: -1, loopExit: -1,
 };
+// markBootstrapComplete of Node's internal/process/pre_execution, for main entries that prepare later.
+host.markBootstrapComplete = () => { performanceMilestones.bootstrapComplete = native.now() - startTime; };
 let initialNativeIdleTime = 0;
 const loopListeners = new Set();
 host.performanceStartTime = startTime;
@@ -614,8 +618,19 @@ function reallyExit(code) {
   if (moduleHas('internal/compile_cache')) internalRequire('internal/compile_cache').flushAtExit();
   internalRequire('internal/startup_controls').traceExit(code, 0, reallyExit);
   if (moduleHas('internal/heap_prof')) internalRequire('internal/heap_prof').finish();
+  if (moduleHas('internal/profiler_binding')) internalRequire('internal/profiler_binding').finish();
   rawStd.exit(code);
 }
+// Node's process_methods binding: process.chdir and process.cwd call through
+// it at each call, so a replaced method takes effect as in Node.
+const processMethods = host.processMethods = {
+  cwd: host.cwd,
+  chdir(directory) {
+    const code = rawOS.chdir(directory);
+    // Node reports the directory it was in as the path and the target as dest.
+    if (code < 0) throw systemError(code, 'chdir', host.cwd(), directory);
+  },
+};
 Object.assign(process, {
   argv: native.argv.slice(), argv0: native.argv[0], execArgv: [], execPath: native.osNative('execPath', []),
   version: 'v' + nodeVersion, versions: componentVersions(), config: buildConfig(),
@@ -625,12 +640,10 @@ Object.assign(process, {
     sourceUrl: `https://nodejs.org/download/release/v${nodeVersion}/node-v${nodeVersion}.tar.gz`,
     headersUrl: `https://nodejs.org/download/release/v${nodeVersion}/node-v${nodeVersion}-headers.tar.gz`,
   }, stdout: host.stdout, stderr: host.stderr,
-  cwd: host.cwd,
+  cwd() { return processMethods.cwd(); },
   chdir(directory) {
     internalRequire('internal/validators').validateString(directory, 'directory');
-    const code = rawOS.chdir(directory);
-    // Node reports the directory it was in as the path and the target as dest.
-    if (code < 0) throw systemError(code, 'chdir', host.cwd(), directory);
+    processMethods.chdir(directory);
   },
   nextTick: host.nextTick, uptime: () => (native.now() - startTime) / 1000,
   hrtime(previous) { const nanoseconds = native.nowNanoseconds(); const value = [Number(nanoseconds / 1000000000n), Number(nanoseconds % 1000000000n)]; if (previous !== undefined) { if (!Array.isArray(previous)) throw new (internalRequire('internal/errors').codes.ERR_INVALID_ARG_TYPE)('time', 'Array', previous); if (previous.length !== 2) throw new (internalRequire('internal/errors').codes.ERR_OUT_OF_RANGE)('time', 2, previous.length); value[0] -= previous[0]; value[1] -= previous[1]; if (value[1] < 0) { value[0]--; value[1] += 1000000000; } } return value; },
@@ -728,9 +741,21 @@ host.activeResources = () => {
   names.push(...native.workerNative('activeResources', []));
   return names;
 };
+// lib/internal/async_hooks.js fatalError: the error's stack, or for a value
+// without one, a stack captured here under "Error: <value>".
+function asyncHookFatalText(error) {
+  try {
+    if (typeof error?.stack === 'string') return error.stack;
+    const holder = {};
+    Error.captureStackTrace(holder, host.asyncHookFatal);
+    const lines = String(holder.stack).split('\n');
+    lines[0] = `Error: ${String(error)}`;
+    return lines.join('\n');
+  } catch { return error; }
+}
 host.asyncHookFatal = error => {
   try { internalRequire('internal/process_report').onFatalError(error); }
-  finally { native.asyncHookFatal(error); }
+  finally { native.asyncHookFatal(asyncHookFatalText(error)); }
 };
 internalRequire('internal/process_native').install(process);
 Object.defineProperty(process, 'sourceMapsEnabled', {
@@ -778,7 +803,7 @@ host.watch = (filename, options, callback) => {
 Object.defineProperty(globalThis, 'WebAssembly', {
   value: internalRequire('internal/web/wasm').WebAssembly, writable: true, configurable: true,
 });
-const workerThreads = internalRequire('worker_threads');
+const workerThreads = internalRequire('internal/worker');
 const workerBootstrap = workerThreads._bootstrap();
 if (workerThreads.isMainThread) {
   internalRequire('internal/process_signals').install(process);
@@ -916,7 +941,7 @@ function evaluateMain(source, name) {
   return native.evaluateModule(source, name, true);
 }
 const requirePreloads = [], importPreloads = [], loaderPreloads = [];
-function runPreloads(entry, loadImports = true) {
+function runPreloads(entry, loadImports = true, loadRequires = true) {
   // Before any preload: Node applies it when the context is made.
   if (host.disableProto !== undefined) disableProto(globalThis);
   if (host.disallowCodeGeneration) native.vmSetCodeGeneration(undefined, false);
@@ -926,7 +951,7 @@ function runPreloads(entry, loadImports = true) {
     const base = internalRequire('url').pathToFileURL(host.cwd() + host.path.sep).href;
     for (const specifier of loaderPreloads) loader.Module.register(specifier, base);
   }
-  loader.Module._preloadModules(requirePreloads);
+  if (loadRequires) loader.Module._preloadModules(requirePreloads);
   if (host.frozenIntrinsics) {
     process.emitWarning('Frozen intristics is an experimental feature and might change at any time', 'ExperimentalWarning');
     internalRequire('internal/freeze_intrinsics')();
@@ -984,9 +1009,6 @@ function runtimeFlag(arg) {
   // built-ins (see publicBuiltins.listed).
   if (arg === '--expose-internals') { host.exposeInternals = true; return true; }
   if (arg === '--disable-sigusr1') { host.disableSigusr1 = true; return true; }
-  if (arg === '--test-update-snapshots' || arg === '--no-test-update-snapshots') {
-    host.testUpdateSnapshots = arg === '--test-update-snapshots'; return true;
-  }
   if (arg === '--trace-events-enabled') { (host.traceOptions ||= {}).enabled = true; return true; }
   if (arg.startsWith('--trace-event-categories=')) { (host.traceOptions ||= {}).categories = arg.slice(25); return true; }
   if (arg.startsWith('--trace-event-file-pattern=')) { (host.traceOptions ||= {}).filePattern = arg.slice(27); return true; }
@@ -1052,9 +1074,6 @@ function runtimeFlag(arg) {
   if (arg === '--experimental-vm-modules' || arg === '--no-experimental-vm-modules') {
     host.experimentalVmModules = arg === '--experimental-vm-modules'; return true;
   }
-  if (arg === '--experimental-test-module-mocks' || arg === '--no-experimental-test-module-mocks') {
-    host.experimentalTestModuleMocks = arg === '--experimental-test-module-mocks'; return true;
-  }
   if (arg === '--experimental-storage-inspection' || arg === '--no-experimental-storage-inspection') {
     host.experimentalStorageInspection = arg === '--experimental-storage-inspection'; return true;
   }
@@ -1091,6 +1110,8 @@ function installRuntimeOptions(args, entrypoints = [], preloadEntrypoints = true
   // Only a heap-prof option loads internal/heap_prof, and without one there is nothing to start.
   const heapProfileProblem = moduleHas('internal/heap_prof') ? internalRequire('internal/heap_prof').start() : undefined;
   if (heapProfileProblem) return cliError(heapProfileProblem);
+  // NODE_V8_COVERAGE: counts from the start, written when the process ends (inspector_profiler.cc).
+  if (process.env.NODE_V8_COVERAGE) internalRequire('internal/profiler_binding').startFromEnvironment(process.env.NODE_V8_COVERAGE);
   if (host.enableSourceMaps || moduleHas('internal/source_maps')) process.setSourceMapsEnabled(!!host.enableSourceMaps);
   host.typeScriptMode = host.transformTypes ? 'transform' : host.stripTypes === false ? false : 'strip';
   host.initialExecArgv = process.execArgv.slice();
@@ -1333,12 +1354,12 @@ function run(restored = false) {
     process._exiting = false; process.exitCode = undefined; process.execArgv.length = 0;
   }
   if (native.seaNative(0)) return internalRequire('internal/sea').runMain(native.argv.slice(1), runtimeFlag, installRuntimeOptions, runPreloads, loadRuntimeEnvironment);
-  // The environment as the process got it, before any environment file: only a
-  // watch supervisor needs it, so it is copied only when a file is about to load.
-  let startupEnvironment;
   // A script path first means no flags, so no environment file to look for:
   // the option tables load only for flags or NODE_OPTIONS.
   const flags = native.argv.length < 2 || native.argv[1].charCodeAt(0) === 45;
+  // The environment as the process got it, before any environment file: only the
+  // snapshot process needs it, so it is copied only when a file is about to load.
+  let startupEnvironment;
   if (flags) loadRuntimeEnvironment(native.argv.slice(1), () => { startupEnvironment = { ...process.env }; });
   let environment = [], environmentEntries = [];
   if (process.env.NODE_OPTIONS) {
@@ -1362,35 +1383,23 @@ function run(restored = false) {
   process.execArgv.push(...parsed.execArgv);
   let expression, print = false, inputType = 'commonjs';
   let filename, interactive = false, testMode = false, inputTypeSet = false, check = false;
-  let watchMode = false, watchPreserveOutput = false, watchKillSignal = 'SIGTERM', runName;
+  let watchMode = false, runName;
   let buildSnapshot = false, snapshotBlob, snapshotConfig;
-  const watchPaths = [];
-  const testOptions = {}, reporterNames = [], destinations = [];
+  let testCoverage = false;
   const afterMain = result => interactive ? result && typeof result.then === 'function' ? result.then(startRepl) : startRepl() : result;
-  const testOptionNames = {
-    '--test-concurrency': 'concurrency', '--test-timeout': 'timeout', '--test-isolation': 'isolation',
-    '--experimental-test-isolation': 'isolation', '--test-random-seed': 'randomSeed',
-    '--test-rerun-failures': 'rerunFailuresFilePath', '--test-global-setup': 'globalSetupPath',
-    '--experimental-test-tag-filter': 'testTagFilters',
-    '--test-name-pattern': 'testNamePatterns', '--test-skip-pattern': 'testSkipPatterns',
-    '--test-shard': 'shard', '--test-reporter': 'reporter', '--test-reporter-destination': 'destination',
-    '--test-coverage-include': 'coverageIncludeGlobs', '--test-coverage-exclude': 'coverageExcludeGlobs',
-    '--test-coverage-lines': 'lineCoverage', '--test-coverage-branches': 'branchCoverage', '--test-coverage-functions': 'functionCoverage',
-  };
   // Options apply in order, NODE_OPTIONS first. Names are canonical: the
   // option table has expanded aliases and short forms.
-  for (const entry of environmentEntries.concat(parsed.entries)) {
+  // getOptionValue reads the options no handler below keeps (internal/options).
+  host.cliOptionEntries = environmentEntries.concat(parsed.entries);
+  for (const entry of host.cliOptionEntries) {
     const { name, value } = entry;
     switch (name) {
       case '--watch': watchMode = value; continue;
-      case '--watch-preserve-output': watchPreserveOutput = value; continue;
-      case '--watch-path': watchPaths.push(value); continue;
-      case '--watch-kill-signal': watchKillSignal = value; continue;
       case '--run': runName = value; continue;
       case '--build-snapshot': buildSnapshot = value; continue;
       case '--build-snapshot-config': snapshotConfig = value; continue;
       case '--snapshot-blob': snapshotBlob = value; continue;
-      case '--experimental-test-coverage': testOptions.coverage = value; continue;
+      case '--experimental-test-coverage': testCoverage = value; continue;
       // Loaded before parsing, by loadRuntimeEnvironment.
       case '--env-file': case '--env-file-if-exists': continue;
       case '--experimental-sea-config': sea.prepare(value); return;
@@ -1403,29 +1412,11 @@ function run(restored = false) {
       case '--interactive': interactive = value; continue;
       case '--check': check = value; continue;
       case '--test': testMode = value; continue;
-      case '--test-only': testOptions.only = value; continue;
-      case '--test-force-exit': testOptions.forceExit = value; continue;
-      case '--test-randomize': testOptions.randomize = value; continue;
       case '--version': host.stdout.write('silkjsruntime 0.1.0 (QuickJS; Node 24 target)\n'); return;
       case '--help': host.stdout.write(HELP_TEXT); return;
     }
-    const option = testOptionNames[name];
-    if (option !== undefined) {
-      if (option === 'reporter') reporterNames.push(value);
-      else if (option === 'destination') destinations.push(value);
-      else if (option === 'testNamePatterns' || option === 'testSkipPatterns' || option === 'testTagFilters') (testOptions[option] ||= []).push(value);
-      else if (option === 'coverageIncludeGlobs' || option === 'coverageExcludeGlobs') (testOptions[option] ||= []).push(value);
-      else if (option === 'lineCoverage' || option === 'branchCoverage' || option === 'functionCoverage') {
-        const threshold = Number(value);
-        if (value === '' || !Number.isInteger(threshold) || threshold < 0 || threshold > 100)
-          return cliError(name + ' must be an integer between 0 and 100');
-        testOptions[option] = threshold;
-      }
-      else if (option === 'shard') {
-        const [index, total] = value.split('/').map(Number); testOptions.shard = { index, total };
-      } else testOptions[option] = option === 'concurrency' || option === 'timeout' || option === 'randomSeed' ? Number(value) : value;
-      continue;
-    }
+    // The test runner and the watch supervisor read their options with getOptionValue, as Node's do.
+    if (name.startsWith('--test-') || name.startsWith('--experimental-test-') || name.startsWith('--watch-')) continue;
     // Node keeps both in its table only to reject them.
     if (entry.name === '--debug' || entry.name === '--debug-brk')
       return cliError('`node --debug` and `node --debug-brk` are invalid. Please use `node --inspect` and `node --inspect-brk` instead.');
@@ -1491,7 +1482,8 @@ function run(restored = false) {
   if (check && testMode) return cliError('either --test or --check can be used, not both');
   if (testMode && (expression !== undefined || interactive || inputTypeSet))
     return cliError('--test cannot be combined with eval, interactive, or input-type');
-  if (expression === undefined && filename !== undefined && filename !== '-' && !testMode)
+  // Node's watch supervisor keeps argv[1] as given (prepareMainThreadExecution without expandArgv1).
+  if (expression === undefined && filename !== undefined && filename !== '-' && !testMode && !watchMode)
     process.argv[1] = host.path.resolve(filename);
   const entrypoints = [];
   // The main script as resolved before any preload ran.
@@ -1500,21 +1492,14 @@ function run(restored = false) {
     early = loader.resolveMain(host.path.resolve(filename));
     entrypoints.push(early.filename);
   }
+  // With --test, --watch is the test runner's own watch mode (run({ watch })), as in Node.
+  if (testMode) watchMode = false;
   installRuntimeOptions(environment.concat(process.execArgv), entrypoints, !watchMode);
-  if (watchMode) {
-    const supervisor = internalRequire('internal/watch_mode/watch_mode');
-    return supervisor.start({
-      args: supervisor.withoutWatchOptions(process.execArgv).concat(process.argv.length > 1 ? ['--', ...process.argv.slice(1)] : []),
-      paths: watchPaths, preserveOutput: watchPreserveOutput, killSignal: watchKillSignal,
-      envFiles: internalRequire('internal/options').environmentFiles(native.argv.slice(1)), env: startupEnvironment ?? { ...process.env },
-    });
-  }
-  host.testCoverageOptions = testOptions;
-  host.testReporters = { names: reporterNames, destinations };
-  if (testOptions.coverage && !testMode && !check) {
-    host.testCoverageStart();
-    host.testCoveragePrestarted = true;
-  }
+  if (watchMode) return internalRequire('internal/main/watch_mode');
+  // Counts start before user code; the harness's setupCoverage then finds coverage active.
+  if (testCoverage && !testMode && !check) internalRequire('internal/profiler_binding').startCoverage();
+  // Node's internal/main/test_runner loads the -r modules itself (not with isolation none).
+  if (testMode) return runPreloads(() => internalRequire('internal/main/test_runner'), true, false);
   return runPreloads(() => {
   if (check) {
     const fromStdin = filename === undefined || filename === '-';
@@ -1529,9 +1514,6 @@ function run(restored = false) {
     try { native.checkSyntax(wrapped, scriptName, module); }
     catch (error) { host.attachArrow(error, scriptName, source, wrapped.indexOf(source)); throw error; }
     return;
-  }
-  if (testMode) {
-    return internalRequire('internal/main/test_runner').runTestRunner(testOptions, args.slice(index), reporterNames, destinations);
   }
   // As node.cc, ask whether descriptor 0 is a terminal without making process.stdin:
   // that stream would make the descriptor nonblocking before a piped script is read.
@@ -1646,6 +1628,7 @@ function loop() {
   invoke(emitProcessEvent, undefined, ['exit']);
   inspectorBackend._atExit();
   if (moduleHas('internal/heap_prof')) internalRequire('internal/heap_prof').finish();
+  if (moduleHas('internal/profiler_binding')) internalRequire('internal/profiler_binding').finish();
   if (moduleHas('internal/compile_cache')) internalRequire('internal/compile_cache').flushAtExit();
   if (snapshotState.building) {
     // What is left becomes the blob: no serialize callback, and no garbage.
@@ -1667,6 +1650,32 @@ globalThis.__silkRuntime = {
   load(name, attributes) { return loader.loadESM(name, attributes).source; },
   moduleSource(name, parent, attributes) { return loader.moduleSource(name, parent, attributes); },
   moduleError(name, error) { loader.moduleEvaluationError(name, error); },
+  // Node's ModuleLoader.import runs under tracingChannel('module.import').tracePromise:
+  // the engine has queued the load, and the promise import() returns is the traced one.
+  importTrace(specifier, referrer, promise) {
+    const channels = host.diagnostics.tracing('module.import');
+    if (channels === undefined) return promise;
+    const parentURL = typeof referrer === 'string' ? (/^[A-Za-z][A-Za-z\d+.-]*:/.test(referrer) ? referrer : fileHref(referrer)) : undefined;
+    const context = { __proto__: null, parentURL, url: specifier };
+    const { end, asyncStart, asyncEnd, error } = channels;
+    const resolve = result => {
+      context.result = result;
+      asyncStart.publish(context);
+      asyncEnd.publish(context);
+      return result;
+    };
+    const reject = cause => {
+      context.error = cause;
+      error.publish(context);
+      asyncStart.publish(context);
+      asyncEnd.publish(context);
+      return promiseReject(cause);
+    };
+    return channels.start.runStores(context, () => {
+      try { return promiseThen(promise, resolve, reject); }
+      finally { end.publish(context); }
+    });
+  },
   registerSource(filename, source, metadata) {
     host.registerSource(filename, source, { ...metadata, owner: metadata });
     if (!metadata.generated && typeof filename === 'string') {
