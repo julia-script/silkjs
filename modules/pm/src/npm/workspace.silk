@@ -1,0 +1,389 @@
+//! A workspace: the project at the root and the packages its `workspaces` field names, which
+//! are installed together and can depend on each other.
+//!
+//! `workspaces` in the root `package.json` is a list of patterns for package directories, such
+//! as `packages/*`, or an object with that list under `packages`. A directory is a package of
+//! the workspace when a pattern matches its path, no pattern with a leading `!` does, and it has
+//! a `package.json`. Directories named `node_modules` are never looked into. A project without
+//! the field is a workspace of one.
+
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.collections.bytes { Bytes }
+import silk.collections.list { List }
+import silk.collections.slice { Slice }
+import silk.core.option { Option }
+import silk.text.glob { Dots, Pattern }
+import npm.manifest { Manifest }
+import pkg.files { Listed, list, readOptional }
+import pkg.text { compare, same, startsWith }
+
+/// The file a project lists its dependencies in.
+pub const MANIFEST: &'static [u8] = b"package.json"
+
+/// One package of a workspace.
+pub struct Member {
+  /// The directory of the package relative to the root, with `/` between segments; `.` for the
+  /// root project itself.
+  pub path: Bytes,
+  /// Its `package.json`.
+  pub manifest: Manifest,
+}
+
+/// The packages that are installed together.
+pub struct Workspace {
+  home: Bytes,
+  members: List<Member>,
+}
+
+/// Why a workspace could not be read.
+pub struct WorkspaceError {
+  /// A short description for people.
+  pub message: string<'static>,
+  /// What it is about: a path or a package name.
+  pub subject: Bytes,
+}
+
+/// A workspace and the package of it that a directory is.
+pub struct Located {
+  pub workspace: Workspace,
+  /// The index of the package in [`Workspace.all`].
+  pub member: usize,
+}
+
+effect fn stop(message: string<'static>, subject: &[u8]) -> never ! WorkspaceError | OutOfMemoryError ? &mut Allocator {
+  fail WorkspaceError { message: message, subject: run Bytes.copy(subject) }
+}
+
+effect fn join(directory: &[u8], name: &[u8]) -> Bytes ! OutOfMemoryError ? &mut Allocator {
+  let mut path = run Bytes.copy(directory)
+  if same(name, b".") == false {
+    run path.append(b"/")
+    run path.append(name)
+  }
+  return move path
+}
+
+// The manifest in `directory`, or none when the directory has no `package.json`.
+effect fn manifestIn(directory: &[u8]) -> Option<Manifest> ! WorkspaceError | OutOfMemoryError ? &mut Allocator {
+  let path = run join(directory, MANIFEST)
+  let text = match move run readOptional(Bytes.asSlice(&path)) {
+    Option.Some { value } => move value
+    Option.None => { return Option<Manifest>.none() }
+  }
+  return match move run Manifest.parse(Bytes.asSlice(&text)) {
+    Option.Some { value } => Option<Manifest>.some(move value)
+    Option.None => { run stop("this package.json is not valid:", Bytes.asSlice(&path)) }
+  }
+}
+
+// One pattern of `workspaces`, compiled.
+struct Rule {
+  whole: Pattern,
+  // The patterns of the first segment, the first two, and so on, up to `open` segments.
+  prefixes: List<Pattern>,
+  // How many segments the pattern has.
+  segments: usize,
+  // How many segments come before the first `**`; `segments` when there is none.
+  open: usize,
+}
+
+// A pattern as paths are written here: without `./` before it or `/` after it.
+fn plain(pattern: &[u8]) -> &[u8] {
+  let mut start: usize = 0
+  while start + 1 < pattern.length && pattern[start] == 46 && pattern[start + 1] == 47 {
+    start = start + 2
+  }
+  let mut end = pattern.length
+  while end > start && pattern[end - 1] == 47 {
+    end = end - 1
+  }
+  return Slice.view<u8>(pattern, start, end - start)
+}
+
+effect fn compile(pattern: &[u8]) -> Rule ! OutOfMemoryError ? &mut Allocator {
+  let mut rule = Rule { whole: run Pattern.makeBytes(pattern), prefixes: List<Pattern>.make(), segments: 0, open: 0 }
+  let mut opened = false
+  let mut start: usize = 0
+  let mut index: usize = 0
+  while index <= pattern.length {
+    if index == pattern.length || pattern[index] == 47 {
+      let segment = Slice.view<u8>(pattern, start, index - start)
+      let mut stars = false
+      let mut at: usize = 0
+      while at + 1 < segment.length {
+        if segment[at] == 42 && segment[at + 1] == 42 {
+          stars = true
+        }
+        at = at + 1
+      }
+      if stars {
+        opened = true
+      }
+      if opened == false {
+        run rule.prefixes.append(run Pattern.makeBytes(Slice.view<u8>(pattern, 0, index)))
+        rule.open = rule.open + 1
+      }
+      rule.segments = rule.segments + 1
+      start = index + 1
+    }
+    index = index + 1
+  }
+  return move rule
+}
+
+// The first `count` segments of `path`.
+fn head(path: &[u8], count: usize) -> &[u8] {
+  let mut seen: usize = 0
+  let mut index: usize = 0
+  while index < path.length {
+    if path[index] == 47 {
+      seen = seen + 1
+      if seen == count {
+        return Slice.view<u8>(path, 0, index)
+      }
+    }
+    index = index + 1
+  }
+  return path
+}
+
+// Whether a directory below `path`, which has `depth` segments, could match the rule.
+effect fn leadsOn(rule: &Rule, path: &[u8], depth: usize) -> bool ! OutOfMemoryError ? &mut Allocator {
+  if depth >= rule.segments && rule.open == rule.segments {
+    return false
+  }
+  let known = if depth < rule.open { depth } else { rule.open }
+  if known == 0 {
+    return true
+  }
+  let matched = run Pattern.matchesBytes(&List<Pattern>.asSlice(&rule.prefixes)[known - 1], head(path, known), Dots.Hide)
+  return matched.matches
+}
+
+effect fn matchesAny(rules: &[Rule], path: &[u8]) -> bool ! OutOfMemoryError ? &mut Allocator {
+  let mut index: usize = 0
+  while index < rules.length {
+    let matched = run Pattern.matchesBytes(&rules[index].whole, path, Dots.Hide)
+    if matched.matches {
+      return true
+    }
+    index = index + 1
+  }
+  return false
+}
+
+// Looks through the directories below `path` of the root for packages, and adds their paths to
+// `found`. `path` is empty for the root itself and has `depth` segments.
+effect fn search(root: &[u8], path: &[u8], depth: usize, included: &[Rule], excluded: &[Rule], found: &mut List<Bytes>) -> ()
+  ! OutOfMemoryError ? &mut Allocator {
+  let mut onward = false
+  let mut index: usize = 0
+  while index < included.length {
+    if run leadsOn(&included[index], path, depth) {
+      onward = true
+    }
+    index = index + 1
+  }
+  if onward == false {
+    return ()
+  }
+  let directory = if depth == 0 { run Bytes.copy(root) } else { run join(root, path) }
+  let entries = match move run list(Bytes.asSlice(&directory)) {
+    Option.None => { return () }
+    Option.Some { value } => move value
+  }
+  let all = List<Listed>.asSlice(&entries)
+  index = 0
+  while index < all.length {
+    let name = Bytes.asSlice(&all[index].name)
+    let enter = all[index].directory && all[index].link == false && same(name, b"node_modules") == false
+    index = index + 1
+    if enter == false {
+      continue
+    }
+    let mut below = run Bytes.copy(path)
+    if depth > 0 {
+      run below.append(b"/")
+    }
+    run below.append(name)
+    let inside = Bytes.asSlice(&below)
+    if (run matchesAny(included, inside)) && (run matchesAny(excluded, inside)) == false {
+      let mut manifest = run join(root, inside)
+      run manifest.append(b"/")
+      run manifest.append(MANIFEST)
+      if Option.isSome(&run readOptional(Bytes.asSlice(&manifest))) {
+        run found.append(run Bytes.copy(inside))
+      }
+    }
+    run search(root, inside, depth + 1, included, excluded, &mut found)
+  }
+}
+
+// The indices of `paths` in the order of the paths.
+effect fn ordered(paths: &[Bytes]) -> List<usize> ! OutOfMemoryError ? &mut Allocator {
+  let mut order = List<usize>.make()
+  let mut index: usize = 0
+  while index < paths.length {
+    let mut at = index
+    run order.append(index)
+    let places = List<usize>.asMutSlice(&mut order)
+    while at > 0 && compare(Bytes.asSlice(&paths[places[at - 1]]), Bytes.asSlice(&paths[index])) > 0 {
+      places[at] = places[at - 1]
+      at = at - 1
+    }
+    places[at] = index
+    index = index + 1
+  }
+  return move order
+}
+
+impl Workspace {
+  /// A workspace of the one project `manifest`, in the directory `root`.
+  pub effect fn single(root: &[u8], manifest: Manifest) -> Workspace ! OutOfMemoryError ? &mut Allocator {
+    let mut members = List<Member>.make()
+    run members.append(Member { path: run Bytes.copy(b"."), manifest: move manifest })
+    return Workspace { home: run Bytes.copy(root), members: move members }
+  }
+
+  /// Adds the package `manifest` in the directory `path` of the root, after the others.
+  pub effect fn add(self: &mut Self, path: &[u8], manifest: Manifest) -> () ! OutOfMemoryError ? &mut Allocator {
+    run self.members.append(Member { path: run Bytes.copy(path), manifest: move manifest })
+  }
+
+  /// Puts `manifest` in the place of the manifest of package `index`.
+  pub fn replace(self: &mut Self, index: usize, manifest: Manifest) -> () {
+    let members = List<Member>.asMutSlice(&mut self.members)
+    members[index].manifest = move manifest
+    return ()
+  }
+
+  /// The directory of the root project.
+  pub fn root(self: &Self) -> &[u8] {
+    return Bytes.asSlice(&self.home)
+  }
+
+  /// The packages: the root project first, and then the others ordered by path.
+  pub fn all(self: &Self) -> &[Member] {
+    return List<Member>.asSlice(&self.members)
+  }
+
+  /// The index of the package named `name`.
+  pub fn named(self: &Self, name: &[u8]) -> Option<usize> {
+    let all = Workspace.all(self)
+    let mut index: usize = 0
+    while index < all.length {
+      let manifest = &all[index].manifest
+      if name.length > 0 && same(Manifest.text(manifest, manifest.name), name) {
+        return Option<usize>.some(index)
+      }
+      index = index + 1
+    }
+    return Option<usize>.none()
+  }
+
+  /// The index of the package in the directory `path` of the root.
+  pub fn at(self: &Self, path: &[u8]) -> Option<usize> {
+    let all = Workspace.all(self)
+    let mut index: usize = 0
+    while index < all.length {
+      if same(Bytes.asSlice(&all[index].path), path) {
+        return Option<usize>.some(index)
+      }
+      index = index + 1
+    }
+    return Option<usize>.none()
+  }
+
+  /// The directory of package `index`.
+  pub effect fn directory(self: &Self, index: usize) -> Bytes ! OutOfMemoryError ? &mut Allocator {
+    return run join(Bytes.asSlice(&self.home), Bytes.asSlice(&Workspace.all(self)[index].path))
+  }
+
+  /// Reads the workspace whose root project is in the directory `root`.
+  ///
+  /// # Errors
+  ///
+  /// - [`WorkspaceError`] when the root has no `package.json`, when a `package.json` is not
+  ///   valid, or when two packages have the same name.
+  pub effect fn load(root: &[u8]) -> Workspace ! WorkspaceError | OutOfMemoryError ? &mut Allocator {
+    let manifest = match move run manifestIn(root) {
+      Option.Some { value } => move value
+      Option.None => { run stop("there is no package.json in", root) }
+    }
+    let mut included = List<Rule>.make()
+    let mut excluded = List<Rule>.make()
+    let patterns = Manifest.allWorkspaces(&manifest)
+    let mut index: usize = 0
+    while index < patterns.length {
+      let pattern = Manifest.text(&manifest, patterns[index])
+      if pattern.length > 0 && pattern[0] == 33 {
+        run excluded.append(run compile(plain(Slice.view<u8>(pattern, 1, pattern.length - 1))))
+      } else if plain(pattern).length > 0 {
+        run included.append(run compile(plain(pattern)))
+      }
+      index = index + 1
+    }
+    let mut workspace = run Workspace.single(root, move manifest)
+    if List<Rule>.length(&included) == 0 {
+      return move workspace
+    }
+    let mut found = List<Bytes>.make()
+    run search(root, b"", 0, List<Rule>.asSlice(&included), List<Rule>.asSlice(&excluded), &mut found)
+    let paths = List<Bytes>.asSlice(&found)
+    let order = run ordered(paths)
+    index = 0
+    while index < paths.length {
+      let path = Bytes.asSlice(&paths[List<usize>.get(&order, index)])
+      let directory = run join(root, path)
+      match move run manifestIn(Bytes.asSlice(&directory)) {
+        Option.None => {}
+        Option.Some { value: member } => {
+          if Option.isSome(&Workspace.named(&workspace, Manifest.text(&member, member.name))) {
+            run stop("two packages of the workspace have the name", Manifest.text(&member, member.name))
+          }
+          run Workspace.add(&mut workspace, path, move member)
+        }
+      }
+      index = index + 1
+    }
+    return move workspace
+  }
+
+  /// Finds the workspace that the package in `directory` belongs to: the directory itself when
+  /// its `package.json` has `workspaces`, else the nearest directory above whose workspace has
+  /// it as a package, and else the directory alone. Only an absolute `directory` is looked
+  /// above.
+  ///
+  /// # Errors
+  ///
+  /// - [`WorkspaceError`] as for [`Workspace.load`].
+  pub effect fn locate(directory: &[u8]) -> Located ! WorkspaceError | OutOfMemoryError ? &mut Allocator {
+    let own = match move run manifestIn(directory) {
+      Option.Some { value } => move value
+      Option.None => { run stop("there is no package.json in", directory) }
+    }
+    if Manifest.allWorkspaces(&own).length == 0 && startsWith(directory, b"/") {
+      let mut end = directory.length
+      while end > 1 {
+        end = end - 1
+        if directory[end] != 47 {
+          continue
+        }
+        let above = Slice.view<u8>(directory, 0, end)
+        let outer = match move run manifestIn(above) {
+          Option.Some { value } => move value
+          Option.None => { continue }
+        }
+        if Manifest.allWorkspaces(&outer).length == 0 {
+          continue
+        }
+        let workspace = run Workspace.load(above)
+        match Workspace.at(&workspace, Slice.view<u8>(directory, end + 1, directory.length - end - 1)) {
+          Option.Some { value: member } => { return Located { workspace: move workspace, member: member } }
+          Option.None => {}
+        }
+      }
+    }
+    return Located { workspace: run Workspace.load(directory), member: 0 }
+  }
+}
