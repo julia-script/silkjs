@@ -21,6 +21,8 @@ const moduleHas = Map.prototype.has.bind(modules);
 const moduleSet = Map.prototype.set.bind(modules);
 const moduleDelete = Map.prototype.delete.bind(modules);
 const stringStartsWith = Function.prototype.call.bind(String.prototype.startsWith);
+const promiseThen = Function.prototype.call.bind(Promise.prototype.then);
+const promiseReject = Promise.reject.bind(Promise);
 const stringEndsWith = Function.prototype.call.bind(String.prototype.endsWith);
 const stringSlice = Function.prototype.call.bind(String.prototype.slice);
 const stringIndexOf = Function.prototype.call.bind(String.prototype.indexOf);
@@ -128,6 +130,8 @@ define('internal/host', module => { module.exports = host; });
 const ProcessConstructor = { process: function () {} }.process;
 const process = Object.create(ProcessConstructor.prototype);
 internalRequire('internal/error_stack').install(globalThis);
+// QuickJS's InternalError is no Node global; the engine still throws its errors.
+delete globalThis.InternalError;
 let warnedTransformTypes = false;
 host.stripTypeScriptModuleTypes = (source, filename, sourceURL = filename) => {
   const transform = host.typeScriptMode === 'transform';
@@ -166,7 +170,8 @@ function disableProto(global) {
     Object.defineProperty(prototype, '__proto__', { get: thrower, set: thrower, enumerable: false, configurable: true });
   }
 }
-host.initializeRealmBuiltins = (handle, global, wasmCodeGeneration) => {
+host.initializeRealmBuiltins = (handle, global, wasmCodeGeneration, isolated = false) => {
+  delete global.InternalError;
   if (host.disableProto !== undefined) disableProto(global);
   const cache = new Map();
   const bridge = {
@@ -194,7 +199,7 @@ host.initializeRealmBuiltins = (handle, global, wasmCodeGeneration) => {
     factory(module, module.exports, load, process);
     return module.exports;
   }
-  load('internal/error_stack').install(global);
+  load('internal/error_stack').install(global, isolated);
   Object.defineProperty(global, 'WebAssembly', {
     value: load('internal/web/wasm').WebAssembly, writable: true, configurable: true,
   });
@@ -727,9 +732,21 @@ host.activeResources = () => {
   names.push(...native.workerNative('activeResources', []));
   return names;
 };
+// lib/internal/async_hooks.js fatalError: the error's stack, or for a value
+// without one, a stack captured here under "Error: <value>".
+function asyncHookFatalText(error) {
+  try {
+    if (typeof error?.stack === 'string') return error.stack;
+    const holder = {};
+    Error.captureStackTrace(holder, host.asyncHookFatal);
+    const lines = String(holder.stack).split('\n');
+    lines[0] = `Error: ${String(error)}`;
+    return lines.join('\n');
+  } catch { return error; }
+}
 host.asyncHookFatal = error => {
   try { internalRequire('internal/process_report').onFatalError(error); }
-  finally { native.asyncHookFatal(error); }
+  finally { native.asyncHookFatal(asyncHookFatalText(error)); }
 };
 internalRequire('internal/process_native').install(process);
 Object.defineProperty(process, 'sourceMapsEnabled', {
@@ -919,6 +936,7 @@ function runPreloads(entry, loadImports = true) {
   // Before any preload: Node applies it when the context is made.
   if (host.disableProto !== undefined) disableProto(globalThis);
   if (host.disallowCodeGeneration) native.vmSetCodeGeneration(undefined, false);
+  if (host.experimentalShadowRealm) internalRequire('internal/shadow_realm').enable();
   // --experimental-loader: each one is module.register(specifier, cwd) before any preload.
   if (loadImports && loaderPreloads.length) {
     const base = internalRequire('url').pathToFileURL(host.cwd() + host.path.sep).href;
@@ -1042,6 +1060,10 @@ function runtimeFlag(arg) {
   if (arg.startsWith('--experimental-package-map=')) { host.packageMap = arg.slice(27); return true; }
   if (arg.startsWith('--experimental-loader=') || arg.startsWith('--loader=')) {
     loaderPreloads.push(arg.slice(arg.indexOf('=') + 1)); return true;
+  }
+  if (arg === '--experimental-shadow-realm' || arg === '--no-experimental-shadow-realm' ||
+      arg === '--harmony-shadow-realm' || arg === '--no-harmony-shadow-realm') {
+    host.experimentalShadowRealm = !arg.startsWith('--no-'); return true;
   }
   if (arg === '--experimental-vm-modules' || arg === '--no-experimental-vm-modules') {
     host.experimentalVmModules = arg === '--experimental-vm-modules'; return true;
@@ -1236,6 +1258,7 @@ const HELP_TEXT = `Usage: silkjsruntime [options] [script.js] [arguments]
   --experimental-eventsource
   --experimental-webstorage, --localstorage-file=PATH
   --experimental-stream-iter
+  --experimental-shadow-realm, --no-experimental-shadow-realm
   --experimental-vm-modules, --no-experimental-vm-modules
   --experimental-test-module-mocks, --no-experimental-test-module-mocks
   --trace-events-enabled
@@ -1660,6 +1683,32 @@ globalThis.__silkRuntime = {
   load(name, attributes) { return loader.loadESM(name, attributes).source; },
   moduleSource(name, parent, attributes) { return loader.moduleSource(name, parent, attributes); },
   moduleError(name, error) { loader.moduleEvaluationError(name, error); },
+  // Node's ModuleLoader.import runs under tracingChannel('module.import').tracePromise:
+  // the engine has queued the load, and the promise import() returns is the traced one.
+  importTrace(specifier, referrer, promise) {
+    const channels = host.diagnostics.tracing('module.import');
+    if (channels === undefined) return promise;
+    const parentURL = typeof referrer === 'string' ? (/^[A-Za-z][A-Za-z\d+.-]*:/.test(referrer) ? referrer : fileHref(referrer)) : undefined;
+    const context = { __proto__: null, parentURL, url: specifier };
+    const { end, asyncStart, asyncEnd, error } = channels;
+    const resolve = result => {
+      context.result = result;
+      asyncStart.publish(context);
+      asyncEnd.publish(context);
+      return result;
+    };
+    const reject = cause => {
+      context.error = cause;
+      error.publish(context);
+      asyncStart.publish(context);
+      asyncEnd.publish(context);
+      return promiseReject(cause);
+    };
+    return channels.start.runStores(context, () => {
+      try { return promiseThen(promise, resolve, reject); }
+      finally { end.publish(context); }
+    });
+  },
   registerSource(filename, source, metadata) {
     host.registerSource(filename, source, { ...metadata, owner: metadata });
     if (!metadata.generated && typeof filename === 'string') {
