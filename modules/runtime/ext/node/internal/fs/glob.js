@@ -41,7 +41,7 @@ const validateBoolean = (value, name) => { if (typeof value !== 'boolean') throw
 const validateObject = (value, name) => { if (value === null || typeof value !== 'object' || Array.isArray(value)) throw core.invalid(name, 'an object'); };
 const validateString = (value, name) => { if (typeof value !== 'string') throw core.invalid(name, 'a string'); };
 const validateStringArray = (value, name) => { if (!Array.isArray(value)) throw core.invalid(name, 'an array of strings'); value.forEach((entry, i) => validateString(entry, `${name}[${i}]`)); };
-class DirentFromStats extends core.Dirent { constructor(name, stat, parentPath) { super(name, stat.mode, parentPath); } }
+const { DirentFromStats } = core;
 class ERR_INVALID_ARG_TYPE extends TypeError { constructor(name, type) { super(`The "${name}" argument must be ${type}`); this.code = 'ERR_INVALID_ARG_TYPE'; } }
 const hideStackFrames = fn => fn;
 const assert = require('assert');

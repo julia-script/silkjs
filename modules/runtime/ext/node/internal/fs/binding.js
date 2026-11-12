@@ -62,6 +62,85 @@ function call(req, syncOp, syncArgs, asyncOp, asyncArgs, result = x => x) {
   });
 }
 const same = (req, op, args, result) => call(req, op, args, op, args, result);
+// A promise request owns its stat array (FSReqPromise's stats_field_array_); the others share statValues.
+const statResult = (req, bigint) => value => {
+  const array = fillStats(value, bigint);
+  return req === kUsePromises ? array.slice(0, kFsStatsFieldsNumber) : array;
+};
+
+// The sync calls node_file.cc takes a ctx for: an error fills ctx (errno, code, syscall) instead of throwing.
+function withCtx(ctx, fn) {
+  if (ctx === undefined) return fn();
+  try { return fn(); } catch (error) {
+    ctx.errno = error.errno; ctx.code = error.code; ctx.syscall = error.syscall;
+    if (error.path !== undefined) ctx.path = error.path;
+    return undefined;
+  }
+}
+
+// node_file.cc's FileHandle: owns its descriptor, and one never closed is closed on
+// garbage collection, which warns from an unref'ed immediate (DEP0137 once per process).
+let gcCloseWarned = false;
+const gcCloser = new FinalizationRegistry((fd) => {
+  try { c.native('close', [fd]); } catch {}
+  setImmediate(() => {
+    process.emitWarning(`Closing file descriptor ${fd} on garbage collection`);
+    if (gcCloseWarned) return;
+    gcCloseWarned = true;
+    process.emitWarning('Closing a FileHandle object on garbage collection is deprecated. ' +
+      'Please close FileHandle objects explicitly using FileHandle.prototype.close(). ' +
+      'In the future, an error will be thrown if a file descriptor is closed during garbage collection.',
+    'DeprecationWarning', 'DEP0137');
+  }).unref();
+});
+class FileHandle {
+  constructor(fd) {
+    this.fd = fd;
+    if (fd !== -1) gcCloser.register(this, fd, this);
+  }
+  getAsyncId() { return -1; }
+  // The descriptor leaves the handle, which no longer closes it.
+  releaseFD() {
+    const fd = this.fd;
+    this.fd = -1;
+    gcCloser.unregister(this);
+    return fd;
+  }
+  close() {
+    const fd = this.releaseFD();
+    return new Promise((resolve, reject) => {
+      c.submit('close', [fd], c.promiseCallback((err) => err ? reject(err) : resolve(), 2));
+    });
+  }
+}
+
+const kIoMaxLength = 2 ** 31 - 1;
+// Most files fit in this buffer: read into it until a read returns 0, then decode at the
+// size read. A reader takes it, so a nested read gets its own.
+let readBuffer = null;
+function readAllUtf8(fd) {
+  const { Buffer } = c;
+  const buffer = readBuffer || Buffer.allocUnsafeSlow(65536); readBuffer = null;
+  try {
+    let chunks = null, held = 0, total = 0;
+    for (;;) {
+      if (held === buffer.length) { (chunks ??= []).push(Buffer.from(buffer)); held = 0; }
+      const count = c.fail(c.os.read(fd, buffer.buffer, buffer.byteOffset + held, buffer.length - held), 'read');
+      if (count === 0) break;
+      held += count; total += count;
+      if (total > kIoMaxLength) throw new (require('internal/errors').codes.ERR_FS_FILE_TOO_LARGE)(total);
+    }
+    if (chunks === null) return buffer.utf8Slice(0, held);
+    if (held !== 0) chunks.push(Buffer.from(buffer.subarray(0, held)));
+    return Buffer.concat(chunks, total).utf8Slice();
+  } finally { readBuffer = buffer; }
+}
+function transferSync(operation, fd, buffer, offset, length, position) {
+  if (position !== null) return c.native(operation === 'read' ? 'pread' : 'pwrite', [fd, buffer.buffer, buffer.byteOffset + offset, length, position]);
+  return c.fail(c.os[operation](fd, buffer.buffer, buffer.byteOffset + offset, length), operation);
+}
+// Node passes -1 (or null) for the current position.
+const position = value => value === -1 || value === -1n || value == null ? null : value;
 const encode = encoding => value => c.encoded(value, encoding);
 
 const binding = {
@@ -97,8 +176,43 @@ const binding = {
     const fill = value => value === undefined ? undefined : fillStats(value, bigint);
     return call(req, 'stat', [path, { bigint: !!bigint, throwIfNoEntry }], 'stat', [path, { bigint: !!bigint, throwIfNoEntry }], fill);
   },
-  lstat(path, bigint, req) { return same(req, 'lstat', [path, { bigint: !!bigint }], value => fillStats(value, bigint)); },
-  fstat(fd, bigint, req) { return same(req, 'fstat', [fd, { bigint: !!bigint }], value => fillStats(value, bigint)); },
+  lstat(path, bigint, req) { return same(req, 'lstat', [path, { bigint: !!bigint }], statResult(req, bigint)); },
+  fstat(fd, bigint, req, shouldNotThrow) {
+    if (req === undefined && shouldNotThrow) {
+      try { return fillStats(c.native('fstat', [fd, { bigint: !!bigint }]), bigint); } catch { return undefined; }
+    }
+    return same(req, 'fstat', [fd, { bigint: !!bigint }], statResult(req, bigint));
+  },
+  openFileHandle(path, flags, mode, req, ctx) {
+    if (req === undefined) return withCtx(ctx, () => new FileHandle(c.native('open', [path, flags, mode])));
+    return same(req, 'open', [path, flags, mode], fd => new FileHandle(fd));
+  },
+  FileHandle,
+  read(fd, buffer, offset, length, pos, req) {
+    pos = position(pos);
+    if (req === undefined) return transferSync('read', fd, buffer, offset, length, pos);
+    return same(req, 'read', [fd, buffer, offset, length, pos]);
+  },
+  // node_file.cc ReadFileUtf8: open (unless given a descriptor), read to the end, close.
+  readFileUtf8(path, flags) {
+    const isUserFd = typeof path === 'number';
+    const fd = isUserFd ? path : c.native('open', [path, flags, 0o666]);
+    try {
+      const info = c.native('fstat', [fd, { bigint: false }]);
+      if ((info.mode & 0o170000) === 0o100000 && info.size > kIoMaxLength) throw new (require('internal/errors').codes.ERR_FS_FILE_TOO_LARGE)(info.size);
+      return readAllUtf8(fd);
+    } finally { if (!isUserFd) c.native('close', [fd]); }
+  },
+  // node_file.cc WriteFileUtf8: open (unless given a descriptor), write all of data, close.
+  writeFileUtf8(path, data, flags, mode) {
+    const isUserFd = typeof path === 'number';
+    const fd = isUserFd ? path : c.native('open', [path, flags, mode]);
+    try {
+      const bytes = c.Buffer.from(data, 'utf8');
+      let offset = 0;
+      while (offset < bytes.byteLength) offset += transferSync('write', fd, bytes, offset, bytes.byteLength - offset, null);
+    } finally { if (!isUserFd) c.native('close', [fd]); }
+  },
   statfs(path, bigint, req) { return same(req, 'statfs', [path, { bigint: !!bigint }], value => fillStatFs(value, bigint)); },
 };
 
