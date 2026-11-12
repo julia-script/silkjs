@@ -50,7 +50,7 @@ function setupChannel(target, fd, mode = 'json', onClose) {
     set: require('util').deprecate(value => { target.channel = value; }, '_channel is deprecated. Use ChildProcess.channel instead.', 'DEP0129'),
   });
   target.connected = true;
-  const changed = name => { if (name === 'message' || name === 'disconnect') process.nextTick(refState); };
+  const changed = name => { if (name === 'message' || name === 'disconnect') process.nextTick(refState); process.nextTick(flushPending); };
   target.on('newListener', changed);
   target.on('removeListener', changed);
   function complete(error) {
@@ -62,15 +62,21 @@ function setupChannel(target, fd, mode = 'json', onClose) {
     target.removeListener('newListener', changed); target.removeListener('removeListener', changed);
     const unsent = queue; queue = [];
     for (const item of unsent) {
-      if (item.transfer) native('closeFd', [item.transfer.fd]);
+      if (item.transfer) { native('closeFd', [item.transfer.fd]); if (item.transfer.type === 'net.BoundSocket') item.transfer.handle.close(); }
       if (item.callback) process.nextTick(item.callback, error || failure('ERR_IPC_CHANNEL_CLOSED', 'Channel closed'));
     }
     if (pendingHandle) {
       native('closeFd', [pendingHandle.fd]);
-      if (!pendingHandle.options.keepOpen && pendingHandle.type === 'net.Socket') pendingHandle.handle.destroy();
+      releaseSent(pendingHandle);
     }
     pendingHandle = null;
     process.nextTick(() => { target.emit('disconnect'); if (onClose) onClose(); resource.emitDestroy(); });
+  }
+  // After the handle's send ends: Node's net.Socket postSend destroys a socket sent without
+  // keepOpen, and net.BoundSocket's closeHandleAfterAck closes the detached TCP handle.
+  function releaseSent(transfer) {
+    if (transfer.type === 'net.Socket' && !transfer.options.keepOpen) transfer.handle.destroy();
+    else if (transfer.type === 'net.BoundSocket') transfer.handle.close();
   }
   function encode(value) {
     if (!codec) return Buffer.from(JSON.stringify(value) + '\n');
@@ -109,8 +115,24 @@ function setupChannel(target, fd, mode = 'json', onClose) {
     const buffer = encode(value);
     queue.splice(queue[0]?.offset ? 1 : 0, 0, { buffer, offset: 0, fd: -1, control: true }); bytes += buffer.length; flush();
   }
+  // Node's setupChannel handleMessage/emit: each message is its own tick, so a throwing
+  // listener does not stop the rest, and a 'message' without listeners waits for one.
+  let pendingMessages = [];
+  function emit(event, value, handle) {
+    if (event === 'internalMessage' || target.listenerCount('message')) { target.emit(event, value, handle); return; }
+    pendingMessages.push([event, value, handle]);
+  }
+  function flushPending() {
+    if (closed || !target.listenerCount('message') || !pendingMessages.length) return;
+    const messages = pendingMessages; pendingMessages = [];
+    for (let i = 0; i < messages.length; i++) Reflect.apply(target.emit, target, messages[i]);
+  }
+  function handleMessage(value, handle, internal) {
+    if (closed) return;
+    process.nextTick(emit, internal ? 'internalMessage' : 'message', value, handle);
+  }
   function deliver(value, handle) {
-    target.emit(value && typeof value.cmd === 'string' && value.cmd.startsWith('NODE_') ? 'internalMessage' : 'message', value, handle);
+    handleMessage(value, handle, value !== null && typeof value === 'object' && typeof value.cmd === 'string' && value.cmd.length > 5 && value.cmd.startsWith('NODE_'));
   }
   // A TCP or pipe handle over a received descriptor, or null after reporting the failure.
   function openHandle(passed, server) {
@@ -136,11 +158,11 @@ function setupChannel(target, fd, mode = 'json', onClose) {
             queue.splice(queue[0]?.offset ? 1 : 0, 0, { buffer, offset: 0, fd: transfer.fd, transfer }); bytes += buffer.length;
           } else {
             native('closeFd', [transfer.fd]);
-            if (!transfer.options.keepOpen && transfer.type === 'net.Socket') transfer.handle.destroy();
+            releaseSent(transfer);
           }
         } else if (transfer) {
           native('closeFd', [transfer.fd]);
-          if (!transfer.options.keepOpen && transfer.type === 'net.Socket') transfer.handle.destroy();
+          releaseSent(transfer);
         }
         flush(); return;
       }
@@ -174,6 +196,12 @@ function setupChannel(target, fd, mode = 'json', onClose) {
           const socket = require('dgram').createSocket(value.dgramType || 'udp4');
           socket.once('error', error => target.emit('error', error));
           socket.bind({ fd: passed, exclusive: true }, () => deliver(value.msg, socket));
+        } else if (value.type === 'net.BoundSocket') {
+          const handle = openHandle(passed, false);
+          if (!handle) return;
+          const boundSocket = new net._TransferredBoundSocket();
+          boundSocket[require('internal/worker/js_transferable').kDeserialize]({ handle });
+          deliver(value.msg, boundSocket);
         } else if (value.type === 'net.Native') {
           // Like Node's handleConversion: a raw TCP or pipe handle (cluster) arrives as a handle.
           const handle = openHandle(passed, false);
@@ -191,9 +219,9 @@ function setupChannel(target, fd, mode = 'json', onClose) {
         } else { native('closeFd', [passed]); target.emit('error', failure('ERR_INVALID_HANDLE_TYPE', `Unsupported IPC handle ${value.type}`)); }
         return;
       }
-      target.emit('internalMessage', value); return;
+      handleMessage(value, undefined, true); return;
     }
-    target.emit('message', value);
+    handleMessage(value, undefined, false);
   }
   function parse() {
     while (input.length) {
@@ -254,6 +282,13 @@ function setupChannel(target, fd, mode = 'json', onClose) {
     if (handle instanceof net.Socket) { type = 'net.Socket'; handleFD = handle._transport?.call('fileno'); }
     else if (handle instanceof net.Server) { type = 'net.Server'; handleFD = handle._transport?.call('fileno'); }
     else if (handle instanceof require('dgram').Socket) { type = 'dgram.Socket'; handleFD = handle[require('internal/dgram').kStateSymbol].handle?.fd; }
+    else if (handle instanceof net.BoundSocket) {
+      // Pipe binds cannot be sent; a TCP bind detaches its handle through the worker
+      // transfer protocol, which also throws when it is no longer transferable.
+      if (handle.isPipe) throw codedError(TypeError, 'ERR_INVALID_HANDLE_TYPE', 'This handle type cannot be sent');
+      handle = handle[require('internal/worker/js_transferable').kTransfer]().data.handle;
+      type = 'net.BoundSocket'; handleFD = handle.fd;
+    }
     else if (require('internal/net/binding').isStreamHandle(handle)) { type = 'net.Native'; handleFD = handle.fd; }
     else if (handle instanceof require('internal/dgram').UDP) { type = 'dgram.Native'; handleFD = handle.fd; }
     else throw codedError(TypeError, 'ERR_INVALID_HANDLE_TYPE', 'This handle type cannot be sent');
@@ -279,7 +314,17 @@ function setupChannel(target, fd, mode = 'json', onClose) {
     // Hold an independent descriptor until ACK, including time spent behind backpressure.
     handleFD = host.net('duplicateFd', [handleFD]);
     if (handleFD < 0) throw failure(native('errorName', [handleFD]), 'Cannot duplicate IPC handle');
-    if (type === 'net.Socket' && !options.keepOpen) handle.pause();
+    if (type === 'net.Socket' && !options.keepOpen) {
+      handle.pause();
+      // handleConversion['net.Socket'].send: stop the timeout and release an HTTP
+      // connection's parser and response, which now belong to the receiver.
+      handle.setTimeout(0);
+      const { freeParser, HTTPParser } = require('_http_common');
+      if (handle.parser && handle.parser instanceof HTTPParser) {
+        freeParser(handle.parser, null, handle);
+        if (handle._httpMessage) handle._httpMessage.detachSocket(handle);
+      }
+    }
     const transfer = { handle, fd: handleFD, options, type, message: envelope, retries: 0 };
     queue.push({ buffer, offset: 0, fd: handleFD, callback, transfer }); bytes += buffer.length;
     flush(); refState(); return bytes < 131072;

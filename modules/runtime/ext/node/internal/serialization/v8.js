@@ -576,8 +576,9 @@ class DefaultSerializer extends Serializer {
     if (!ArrayBuffer.isView(value)) throw new this._getDataCloneError(`Unserializable host object: ${require('internal/util/inspect').inspect(value)}`);
     host.getArrayBufferViewFlags(value);
     const info = viewInfo(value);
-    // Buffer is a Uint8Array subclass in Silk; require the true view brand first.
-    const index = info.index === 1 && Buffer.isBuffer(value) ? 10 : info.index;
+    // lib/v8.js classifies by the view's constructor against the stable Buffer, so a
+    // Buffer with another constructor is that view and any view constructed as Buffer is one.
+    const index = value.constructor === Buffer ? 10 : info.index;
     this.writeUint32(index); this.writeUint32(info.length);
     this.writeRawBytes(new Uint8Array(info.buffer, info.offset, info.length));
   }
@@ -612,7 +613,8 @@ class IPCDeserializer extends DefaultDeserializer {
     const tag = this._uint32();
     if (tag === 0) return super._readHostObject();
     if (tag === 1) return this.readValue();
-    invalid();
+    // node_ipc_serdes.cc accepts only the two tags its serializer writes.
+    throw new (require('internal/errors').codes.ERR_INVALID_STATE)(`Unknown host object tag ${tag}`);
   }
 }
 function encode(value, Ctor) { const serializer = new Ctor(); serializer.writeHeader(); serializer.writeValue(value); return serializer.releaseBuffer(); }

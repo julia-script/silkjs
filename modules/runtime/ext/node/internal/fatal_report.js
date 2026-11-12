@@ -45,6 +45,16 @@ function fileLine(name, line) {
 function arrow(error, fromPromise, scriptName, lineOffset = 0, columnOffset = 0, scriptSource = undefined) {
   const where = site(error, fromPromise);
   if (where === undefined || typeof where.name !== 'string' || !where.name || !(where.line > 0)) return undefined;
+  // Under --enable-source-maps the line comes from the original source.
+  if (host.builtinLoaded('internal/source_maps')) {
+    const maps = require('internal/source_maps');
+    if (maps.getSourceMapsSupport().enabled) {
+      try {
+        const mapped = maps.errorSource(where.name, where.line, where.column - 1);
+        if (typeof mapped === 'string') return mapped;
+      } catch {}
+    }
+  }
   let text = where.text;
   if (typeof text !== 'string' && typeof scriptSource === 'string' && where.name === scriptName) {
     text = scriptSource.split(/\r\n|[\n\r\u2028\u2029]/)[where.line - lineOffset - 1];
