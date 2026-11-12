@@ -6,6 +6,8 @@ const v = require('internal/validators');
 const { AbortError, codes: { ERR_FS_WATCH_QUEUE_OVERFLOW, ERR_INVALID_ARG_TYPE, ERR_INVALID_ARG_VALUE } } = require('internal/errors');
 const { EventEmitter } = require('events');
 const kFSWatchStart = Symbol('kFSWatchStart');
+// errors.js uvErrmapGet, as Node's FSWatcher names a failed status.
+const uvName = status => require('internal/errors').uvErrmapGet(status)?.[0] ?? `Unknown system error ${status}`;
 
 function isRegExp(value) { return Object.prototype.toString.call(value) === '[object RegExp]'; }
 function validateIgnoreOptionElement(value, name) {
@@ -42,20 +44,31 @@ class FSWatcher extends EventEmitter {
     filename = c.path(filename, 'filename');
     validateIgnoreOption(ignore, 'options.ignore');
     this._ignoreMatcher = createIgnoreMatcher(ignore);
-    if (typeof c.host.watch !== 'function') throw c.error('ENOSYS', 'watch', filename);
-    try {
-      this._handle = c.host.watch(filename, { persistent, recursive, encoding }, (err, eventType, name) => {
-        if (this._closed) return;
-        if (err) { if (this._handle) { this._handle.close(); this._handle = null; } err.filename = filename; this.emit('error', err); return; }
-        if (name != null && this._ignoreMatcher && this._ignoreMatcher(name)) return;
-        this.emit('change', eventType, name == null ? null : typeof name === 'string' ? c.encoded(name, encoding) : encoding === 'buffer' ? c.Buffer.from(name) : c.Buffer.from(name).toString(encoding));
-      });
-    } catch (error) {
-      if (!throwIfNoEntry && error.code === 'ENOENT') return;
+    // lib/internal/fs/watchers.js: an FSEvent handle reports changes to its owner.
+    const { FSEvent } = require('internal/fs/fs_event_wrap');
+    const handle = new FSEvent();
+    handle.onchange = (status, eventType, name) => {
+      if (this._closed) return;
+      if (status < 0) {
+        if (this._handle) { this._handle.close(); this._handle = null; }
+        const error = c.error(uvName(status), 'watch', undefined, undefined, status);
+        error.filename = filename;
+        this.emit('error', error);
+        return;
+      }
+      if (name != null && this._ignoreMatcher && this._ignoreMatcher(name)) return;
+      this.emit('change', eventType, name);
+    };
+    const status = handle.start(filename, persistent, recursive, encoding);
+    if (status !== 0) {
+      handle.close();
+      const code = uvName(status);
+      if (!throwIfNoEntry && code === 'ENOENT') return;
+      const error = c.error(code, 'watch', filename, undefined, status);
       error.filename = filename;
       throw error;
     }
-    if (!persistent) this._handle.unref();
+    this._handle = handle;
   }
   close() {
     if (this._closed) return;

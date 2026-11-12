@@ -62,9 +62,11 @@ function endCoverage() {
   stopCoverage();
 }
 
-// NODE_V8_COVERAGE at startup: collect from the start and write when the process ends.
+// NODE_V8_COVERAGE at startup (pre_execution.js setupCoverageHooks): collect from the
+// start, with the module source maps, and write when the process ends.
 function startFromEnvironment(directory) {
   setCoverageDirectory(require('path').resolve(directory));
+  setSourceMapCacheGetter(require('internal/source_maps').sourceMapCacheToObject);
   startCoverage();
 }
 

@@ -268,8 +268,9 @@ class ChildProcess extends EventEmitter {
 }
 
 // Node's spawn_sync.spawn(options) on the native host. options.stdio holds getValidStdio
-// entries; an entry's input (stdin's, here) is written to the child.
-function spawnSync(options) {
+// entries; an entry's input (stdin's, here) is written to the child. The result's error is
+// an errno, as the binding gives it.
+function spawn(options) {
   const stdio = options.stdio;
   const input = stdio[0]?.input;
   const exactInput = input == null ? new ArrayBuffer(0) : input.buffer.slice(input.byteOffset, input.byteOffset + input.byteLength);
@@ -291,6 +292,13 @@ function spawnSync(options) {
     result = { status: raw[3] ? null : raw[2], signal: raw[3] ? signalName(raw[3]) ?? null : null, output, pid: raw[1] };
     if (raw[0]) result.error = raw[0];
   }
+  return result;
+}
+const spawn_sync = { spawn };
+
+// lib/internal/child_process.js spawnSync.
+function spawnSync(options) {
+  const result = spawn_sync.spawn(options);
   if (result.output && options.encoding && options.encoding !== 'buffer') {
     for (let i = 0; i < result.output.length; i++) {
       if (!result.output[i]) continue;
@@ -308,6 +316,7 @@ function spawnSync(options) {
 }
 
 module.exports = {
+  spawn_sync,
   ChildProcess,
   kChannelHandle,
   setupChannel,

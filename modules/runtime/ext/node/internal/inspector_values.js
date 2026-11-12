@@ -6,7 +6,25 @@ const quote = JSON.stringify;
 const own = Function.prototype.call.bind(Object.prototype.hasOwnProperty);
 function protocolError(code, message) { return Object.assign(new Error(message), { protocolCode: code }); }
 function unsupported(method) { throw protocolError(-32601, `'${method}' wasn't found`); }
-function inspect(value, limit) { return limit === undefined ? native(9, value) : native(9, value, limit); }
+function inspect(value, limit) {
+  const info = limit === undefined ? native(9, value) : native(9, value, limit);
+  if (host.isInterceptor(value)) interceptedProperties(value, info, limit === undefined ? Infinity : limit);
+  return info;
+}
+// A host interceptor object (process.env, Storage) has its properties only behind
+// its handlers. V8's value mirrors call named interceptors, so these are asked too.
+function interceptedProperties(value, info, limit) {
+  const properties = [];
+  let keys;
+  try { keys = Reflect.ownKeys(value); } catch { return; }
+  for (const name of keys) {
+    if (properties.length >= limit) { info.overflow = true; break; }
+    let property;
+    try { property = Reflect.getOwnPropertyDescriptor(value, name); } catch { continue; }
+    if (property !== undefined) properties.push({ name, ...property });
+  }
+  info.properties = properties;
+}
 // V8 RemoteObject className/description/subtype (src/inspector/value-mirror.cc),
 // computed only through brand checks, own data descriptors and built-in getters
 // so describing a value never runs user code.

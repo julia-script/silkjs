@@ -26,7 +26,7 @@ const { DatabaseSync } = require('internal/sqlite/database');
 const { Buffer } = require('buffer');
 const host = require('internal/host');
 const states = new WeakMap();
-host.types.isStorage = host.isStorage;
+host.types.isStorage = value => states.has(value);
 const schema = `
 PRAGMA encoding = 'UTF-16le';
 PRAGMA busy_timeout = 3000;
@@ -209,7 +209,7 @@ function create(path, isLocalStorage, inspect) {
   const s = { path, db: undefined, statements: new Map(), symbols: new Map(), isLocalStorage, inspected: inspect };
   // A native exotic is necessary: Storage accepts non-configurable descriptors
   // but continues reporting configurable properties, unlike an ECMAScript Proxy.
-  const result = host.createStorage(target, {
+  const result = host.createInterceptor(target, {
     get(target, key, receiver) {
       if (inherited(target, key)) return Reflect.get(target, key, receiver);
       const value = load(s, key);

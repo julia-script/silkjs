@@ -96,6 +96,14 @@ unsafe extern "C" fn chmod(path: *const u8, mode: u32) -> i32
 unsafe extern "C" fn if_nametoindex(name: *const u8) -> u32
 // `listen` is also the name of the Silk listener call, so the system call has another name.
 unsafe extern "C" fn listenDescriptor(fd: i32, backlog: i32) -> i32 as "listen"
+// `socket` and `bind` are names of Silk calls too.
+unsafe extern "C" fn socketDescriptor(domain: i32, kind: i32, protocol: i32) -> i32 as "socket"
+@foreign(noCapture: .("address"))
+unsafe extern "C" fn bindDescriptor(fd: i32, address: *const u8, length: u32) -> i32 as "bind"
+@foreign(noCapture: .("address"))
+unsafe extern "C" fn connectDescriptor(fd: i32, address: *const u8, length: u32) -> i32 as "connect"
+@foreign(noCapture: .("path"))
+unsafe extern "C" fn unlink(path: *const u8) -> i32
 
 // The size of one read, and the most reads, accepts or receives of one handle in one poll.
 const CHUNK: usize = 65536
@@ -219,7 +227,9 @@ struct Handle {
   path: List<u8>, pathIsLocal: bool, chmodFlags: i32, terminal: Option<TerminalMode>, closeEvent: *mut Event,
   peer: ?*mut Peer, exchange: ?*mut Exchange, dirty: bool, nextDirty: ?*mut Handle,
   // A UDP descriptor adopted from another process (a cluster worker's): its queue is shared.
-  sharedQueue: bool
+  sharedQueue: bool,
+  // A pipe that bound its socket file removes it when it closes, as libuv does.
+  unlinkOnClose: bool
 }
 // A WebSocket connection whose frames this module reads and writes (see the WebSocket section).
 // `output` holds frames not yet given to the socket. A handle with output (a peer's frames or an
@@ -311,7 +321,7 @@ unsafe effect fn create(state: *mut State, kind: i32, callback: ValueBits, socke
     firstWrite: Pointer.null<Write>(), lastWrite: Pointer.null<Write>(), shutdownToken: 0, shutdownPending: false, writeShut: false,
     local: Option<Endpoint>.none(), flags: 0, noDelay: false, keepAlive: false, keepAliveDelay: 0,
     path: List<u8>.make(), pathIsLocal: false, chmodFlags: 0, terminal: Option<TerminalMode>.none(), closeEvent: closeEvent,
-    peer: Pointer.null<Peer>(), exchange: Pointer.null<Exchange>(), dirty: false, nextDirty: Pointer.null<Handle>(), sharedQueue: false
+    peer: Pointer.null<Peer>(), exchange: Pointer.null<Exchange>(), dirty: false, nextDirty: Pointer.null<Handle>(), sharedQueue: false, unlinkOnClose: false
   })
   unsafe Pointer.put<Event>(closeEvent, event(handle, CLOSED, 0, 0))
   let s2 = unsafe Pointer.borrowMut<(), State>(&mut anchor, state) s2.handles = handle s2.slots.set(slot, handle)
@@ -358,6 +368,11 @@ unsafe fn stop(handle: *mut Handle, reset: bool) -> () {
     let _ignored = unsafe setsockopt(fd, solSocket(), option, unsafe Intrinsic.pointerReinterpret<*const i32, *const u8>(Pointer.fromRef<i32>(&linger[0])), 8)
   }
   match &h2.socket { Socket.Raw { fd: adopted } => { let _ignored = unsafe closeDescriptor(adopted) } _ => {} }
+  if h2.unlinkOnClose {
+    h2.unlinkOnClose = false
+    let mut name: [u8; 256] = [0; 256] let path = h2.path.asSlice()
+    if path.length > 0 && path.length < 256 && path[0] != 0 { let mut i: usize = 0 while i < path.length { name[i] = path[i] i = i + 1 } let _removed = unsafe unlink(Pointer.fromRef<u8>(&name[0])) }
+  }
   // Dropping a Silk socket closes it.
   h2.socket = Socket.Empty
   let writes = h2.firstWrite h2.firstWrite = Pointer.null<Write>() h2.lastWrite = Pointer.null<Write>()
@@ -513,6 +528,12 @@ unsafe fn finishConnect(handle: *mut Handle) -> () {
         Result<ConnectProgress, NativeSocketError>.Success { value } => { if value == ConnectProgress.InProgress { done = false } }
         Result<ConnectProgress, NativeSocketError>.Failure { error } => { code = socketStatus(error) }
       }
+    }
+    // A pipe descriptor's connect (connectRawPipe) finished: SO_ERROR holds its result.
+    Socket.Raw { fd } => {
+      let mut failure: i32 = 0 let mut size: u32 = 4
+      if unsafe getsockopt(fd, solSocket(), errorOption(), unsafe Intrinsic.pointerReinterpret<*mut i32, *mut u8>(Pointer.fromMutRef<i32>(&mut failure)), Pointer.fromMutRef<u32>(&mut size)) != 0 { code = currentStatus() }
+      else { code = 0 - failure }
     }
     _ => { code = EBADF() }
   }
@@ -1540,16 +1561,23 @@ unsafe effect fn endpointValue<'m, S: EngineServices>(engine: &mut Engine<'m, S>
   match move result { Result<(), OutOfMemoryError | JsException>.Success { .. } => { return object } Result<(), OutOfMemoryError | JsException>.Failure { error } => { unsafe owners.release(&mut engine, context, object) fail move error } }
 }
 // Decodes a native socket address: an IP endpoint, or the path of a Unix socket into `path`.
-unsafe effect fn decodeAddress(storage: &[u8; 128], length: u32, path: &mut List<u8>) -> Option<Endpoint> ? &mut Allocator {
+// The IPv4 or IPv6 endpoint of a socket address, or none for another family.
+fn decodeEndpoint(storage: &[u8; 128]) -> Option<Endpoint> {
   let mut family: i32 = 0
   static if Intrinsic.targetOperatingSystem() == "darwin" { family = u8.toI32(storage[1]) } else { family = u8.toI32(storage[0]) + u8.toI32(storage[1]) * 256 }
   let port = Port.fromU16(u8.toU16(storage[2]) * 256 + u8.toU16(storage[3]))
-  let mut inet6: i32 = 10 static if Intrinsic.targetOperatingSystem() == "darwin" { inet6 = 30 }
   if family == 2 { return Option<Endpoint>.some(Endpoint.make(IpAddress.V4 { value: Ipv4Address.fromOctets([storage[4], storage[5], storage[6], storage[7]]) }, port)) }
-  if family == inet6 {
+  if family == familyInet6() {
     let mut octets: [u8; 16] = [0; 16] let mut i: usize = 0 while i < 16 { octets[i] = storage[8 + i] i = i + 1 }
     return Option<Endpoint>.some(Endpoint.make(IpAddress.V6 { value: Ipv6Address.fromOctets(octets) }, port))
   }
+  return Option<Endpoint>.none()
+}
+unsafe effect fn decodeAddress(storage: &[u8; 128], length: u32, path: &mut List<u8>) -> Option<Endpoint> ? &mut Allocator {
+  let found = decodeEndpoint(&storage)
+  if Option<Endpoint>.isSome(&found) { return found }
+  let mut family: i32 = 0
+  static if Intrinsic.targetOperatingSystem() == "darwin" { family = u8.toI32(storage[1]) } else { family = u8.toI32(storage[0]) + u8.toI32(storage[1]) * 256 }
   if family == 1 {
     let mut i: usize = 2 let end = if u32.toUsize(length) < 128 { u32.toUsize(length) } else { 128 }
     while i < end && storage[i] != 0 { let pushed = run Effect.result(path.append(storage[i])) drop pushed i = i + 1 }
@@ -1577,11 +1605,15 @@ unsafe effect fn addressOf<'m, S: EngineServices>(engine: &mut Engine<'m, S>, co
       let result = if peer { run Effect.result(NativeUdpSocket.peerEndpoint(&socket)) } else { run Effect.result(NativeUdpSocket.localEndpoint(&socket)) }
       match move result { Result<Endpoint, DatagramError>.Success { value } => { found = Option<Endpoint>.some(value) } Result<Endpoint, DatagramError>.Failure { error } => { code = datagramStatus(move error) } }
     }
+    // A pipe reports the path it bound or connected to, as given (an abstract name too).
     Socket.Raw { fd } => {
-      let mut storage: [u8; 128] = [0; 128] let mut length: u32 = 128
-      let pointer = Pointer.fromMutRef<u8>(&mut storage[0])
-      let result = if peer { unsafe getpeername(fd, pointer, Pointer.fromMutRef<u32>(&mut length)) } else { unsafe getsockname(fd, pointer, Pointer.fromMutRef<u32>(&mut length)) }
-      if result != 0 { code = currentStatus() } else { found = run unsafe decodeAddress(&storage, length, &mut path) if Option<Endpoint>.isSome(&found) { isPath = false } }
+      if h.kind == PIPE && h.pathIsLocal != peer && h.path.length() > 0 { run path.appendSlice(h.path.asSlice()) }
+      else {
+        let mut storage: [u8; 128] = [0; 128] let mut length: u32 = 128
+        let pointer = Pointer.fromMutRef<u8>(&mut storage[0])
+        let result = if peer { unsafe getpeername(fd, pointer, Pointer.fromMutRef<u32>(&mut length)) } else { unsafe getsockname(fd, pointer, Pointer.fromMutRef<u32>(&mut length)) }
+        if result != 0 { code = currentStatus() } else { found = run unsafe decodeAddress(&storage, length, &mut path) if Option<Endpoint>.isSome(&found) { isPath = false } }
+      }
     }
     // A TCP socket bound for a connect binds when the connect starts: until then it reports
     // the address it asked for, as getsockname does after libuv's eager bind.
@@ -1766,6 +1798,130 @@ effect fn systemSocketPath(path: &[u8], out: &mut List<u8>) -> bool ! OutOfMemor
     Result<Bytes, HostInputError | OutOfMemoryError>.Failure { .. } => { return false }
   }
 }
+fn errorOption() -> i32 { static if Intrinsic.targetOperatingSystem() == "darwin" { return 4103 } else { return 4 } }
+fn familyInet6() -> i32 { static if Intrinsic.targetOperatingSystem() == "darwin" { return 30 } else { return 10 } }
+// Writes the family field of a socket address: Darwin has a length byte before it.
+fn putFamily(out: &mut [u8; 128], family: i32, length: u32) -> () {
+  static if Intrinsic.targetOperatingSystem() == "darwin" { out[0] = u32.toU8(length) out[1] = i32.toU8(family) } else { out[0] = i32.toU8(family % 256) out[1] = i32.toU8(family / 256) }
+}
+// A sockaddr_in or sockaddr_in6 for `endpoint`, and its length.
+fn encodeEndpoint(endpoint: Endpoint, out: &mut [u8; 128]) -> u32 {
+  let port = u16.toI32(Port.value(&Endpoint.port(&endpoint)))
+  match Endpoint.address(&endpoint) {
+    IpAddress.V4 { value } => {
+      let octets = Ipv4Address.octets(&value)
+      putFamily(&mut out, 2, 16) out[2] = i32.toU8(port / 256) out[3] = i32.toU8(port % 256)
+      let mut i: usize = 0 while i < 4 { out[4 + i] = octets[i] i = i + 1 }
+      return 16
+    }
+    IpAddress.V6 { value } => {
+      let octets = Ipv6Address.octets(&value)
+      putFamily(&mut out, familyInet6(), 28) out[2] = i32.toU8(port / 256) out[3] = i32.toU8(port % 256)
+      let mut i: usize = 0 while i < 16 { out[8 + i] = octets[i] i = i + 1 }
+      return 28
+    }
+  }
+}
+// A sockaddr_un for `path` as given (the kernel resolves a relative path), and its length; 0 when
+// the path does not fit, which libuv's UV_PIPE_NO_TRUNCATE reports as EINVAL. A path that starts
+// with a NUL byte is a Linux abstract socket name: it is not NUL-terminated.
+fn encodeUnix(path: &[u8], out: &mut [u8; 128]) -> u32 {
+  let mut room: usize = 108 static if Intrinsic.targetOperatingSystem() == "darwin" { room = 104 }
+  let abstract = path.length > 0 && path[0] == 0
+  let needed = if abstract { path.length } else { path.length + 1 }
+  if path.length == 0 || needed > room { return 0 }
+  let length = usize.toU32(2 + needed)
+  putFamily(&mut out, 1, length)
+  let mut i: usize = 0 while i < path.length { out[2 + i] = path[i] i = i + 1 }
+  return length
+}
+unsafe fn rawSocket(family: i32) -> i32 {
+  let fd = unsafe socketDescriptor(family, 1, 0)
+  if fd < 0 { return currentStatus() }
+  let code = unsafe setBlocking(fd, false) if code < 0 { let _ignored = unsafe closeDescriptor(fd) return code }
+  let _ignored = unsafe fcntl(fd, 2, 1)
+  return fd
+}
+unsafe fn intOption(fd: i32, level: i32, option: i32, value: i32) -> i32 {
+  if unsafe setsockopt(fd, level, option, unsafe Intrinsic.pointerReinterpret<*const i32, *const u8>(Pointer.fromRef<i32>(&value)), 4) != 0 { return currentStatus() }
+  return 0
+}
+// uv_tcp_bind: the socket is made and bound at once (SO_REUSEADDR, IPV6_V6ONLY and SO_REUSEPORT
+// as the flags ask), so bind errors, the bound port and the descriptor are known synchronously.
+// A listen then listens on this descriptor; a connect starts from the bound address.
+unsafe fn bindTcp(handle: *mut Handle, endpoint: Endpoint, flags: i32) -> i32 {
+  let mut anchor = () let h = unsafe Pointer.borrowMut<(), Handle>(&mut anchor, handle)
+  match &h.socket { Socket.Empty => {} _ => { return EINVAL() } }
+  if h.connecting || Option<Endpoint>.isSome(&h.local) { return EINVAL() }
+  let v4 = IpAddress.isV4(&Endpoint.address(&endpoint))
+  let fd = unsafe rawSocket(if v4 { 2 } else { familyInet6() }) if fd < 0 { return fd }
+  let mut reuse: i32 = 2 static if Intrinsic.targetOperatingSystem() == "darwin" { reuse = 4 }
+  let mut code = unsafe intOption(fd, solSocket(), reuse, 1)
+  if code == 0 && !v4 { let mut only: i32 = 26 static if Intrinsic.targetOperatingSystem() == "darwin" { only = 27 } code = unsafe intOption(fd, 41, only, if (flags & 1) != 0 { 1 } else { 0 }) }
+  if code == 0 && (flags & 2) != 0 { let mut port: i32 = 15 static if Intrinsic.targetOperatingSystem() == "darwin" { port = 512 } code = unsafe intOption(fd, solSocket(), port, 1) }
+  if code == 0 {
+    let mut storage: [u8; 128] = [0; 128] let length = encodeEndpoint(endpoint, &mut storage)
+    if unsafe bindDescriptor(fd, Pointer.fromRef<u8>(&storage[0]), length) != 0 { code = currentStatus() }
+  }
+  if code != 0 { let _ignored = unsafe closeDescriptor(fd) return code }
+  // The bound address, with the port the system chose for port 0.
+  let mut bound: [u8; 128] = [0; 128] let mut size: u32 = 128
+  let mut local = endpoint
+  if unsafe getsockname(fd, Pointer.fromMutRef<u8>(&mut bound[0]), Pointer.fromMutRef<u32>(&mut size)) == 0 {
+    match decodeEndpoint(&bound) { Option<Endpoint>.Some { value } => { local = value } Option<Endpoint>.None => {} }
+  }
+  h.socket = Socket.Raw { fd: fd } h.local = Option<Endpoint>.some(local) h.flags = flags
+  return 0
+}
+// uv_pipe_bind: binds the socket file (or abstract name) now. The listen that follows listens
+// on this descriptor; the file is removed when the handle closes.
+unsafe effect fn bindPipe(handle: *mut Handle, path: &[u8]) -> i32 ! OutOfMemoryError ? &mut Allocator {
+  let mut anchor = () let h = unsafe Pointer.borrowMut<(), Handle>(&mut anchor, handle)
+  match &h.socket { Socket.Empty => {} _ => { return EINVAL() } }
+  if h.connecting || (h.pathIsLocal && h.path.length() > 0) { return EINVAL() }
+  let mut storage: [u8; 128] = [0; 128] let length = encodeUnix(path, &mut storage)
+  if length == 0 { return EINVAL() }
+  let fd = unsafe rawSocket(1) if fd < 0 { return fd }
+  if unsafe bindDescriptor(fd, Pointer.fromRef<u8>(&storage[0]), length) != 0 {
+    // uv_pipe_bind2 reports a missing directory as EACCES, as on Windows.
+    let mut code = currentStatus() if code == -2 { code = EACCES() }
+    let _ignored = unsafe closeDescriptor(fd) return code
+  }
+  h.socket = Socket.Raw { fd: fd } h.path.clear() run h.path.appendSlice(path) h.pathIsLocal = true
+  h.unlinkOnClose = path[0] != 0
+  return 0
+}
+// uv_pipe_chmod on the bound socket file: the read and write bits for everyone are added.
+unsafe fn chmodPipe(handle: *mut Handle) -> i32 {
+  let anchor = () let h = unsafe Pointer.borrow<(), Handle>(&anchor, handle)
+  if h.chmodFlags == 0 || !h.pathIsLocal { return 0 }
+  let mut name: [u8; 256] = [0; 256] let path = h.path.asSlice()
+  if path.length == 0 || path.length >= 256 || path[0] == 0 { return 0 }
+  let mut i: usize = 0 while i < path.length { name[i] = path[i] i = i + 1 }
+  let mut mode: u32 = 384
+  if (h.chmodFlags & 1) != 0 { mode = mode | 292 }
+  if (h.chmodFlags & 2) != 0 { mode = mode | 146 }
+  if unsafe chmod(Pointer.fromRef<u8>(&name[0]), mode) != 0 { return currentStatus() }
+  return 0
+}
+// A connect of a pipe descriptor the runtime holds (an adopted or bound one), as uv_pipe_connect.
+unsafe effect fn connectRawPipe(handle: *mut Handle, path: &[u8]) -> i32 ! OutOfMemoryError ? &mut Allocator {
+  let mut anchor = () let h = unsafe Pointer.borrowMut<(), Handle>(&mut anchor, handle)
+  let fd = match &h.socket { Socket.Raw { fd } => fd _ => { return EINVAL() } }
+  let mut storage: [u8; 128] = [0; 128] let length = encodeUnix(path, &mut storage)
+  // The bound file stays: it is the client's own address, not the peer's.
+  h.unlinkOnClose = false h.path.clear() run h.path.appendSlice(path) h.pathIsLocal = false
+  let mut code: i32 = 0
+  if length == 0 { code = EINVAL() }
+  else if unsafe connectDescriptor(fd, Pointer.fromRef<u8>(&storage[0]), length) != 0 { code = currentStatus() }
+  if code == EAGAIN() || code == status(115, 36) { h.connecting = true drop h unsafe refresh(handle) return 0 }
+  drop h
+  // A pipe reports every connect result to its callback.
+  unsafe notify(handle, CONNECTED, code, 0)
+  if code == 0 { unsafe flush(handle) }
+  unsafe refresh(handle)
+  return 0
+}
 // A passive listen only makes the listening socket, for other processes to accept on.
 unsafe effect fn listenNow(handle: *mut Handle, backlog: i32, passive: bool) -> i32 ! OutOfMemoryError ? &mut Allocator {
   let mut anchor = () let h = unsafe Pointer.borrowMut<(), Handle>(&mut anchor, handle)
@@ -1778,7 +1934,12 @@ unsafe effect fn listenNow(handle: *mut Handle, backlog: i32, passive: bool) -> 
   h.passive = passive
   let clamped = if backlog < 1 { 1 } else { if backlog > 65535 { 65535 } else { backlog } }
   match &h.socket {
-    Socket.Raw { fd } => { if unsafe listenDescriptor(fd, clamped) != 0 { return currentStatus() } h.listening = true drop h unsafe refresh(handle) return 0 }
+    Socket.Raw { fd } => {
+      if unsafe listenDescriptor(fd, clamped) != 0 { return currentStatus() }
+      h.listening = true let pipe = h.kind == PIPE drop h
+      let code = if pipe { unsafe chmodPipe(handle) } else { 0 }
+      unsafe refresh(handle) return code
+    }
     Socket.Empty => {}
     _ => { return EINVAL() }
   }
@@ -1794,25 +1955,35 @@ unsafe effect fn listenNow(handle: *mut Handle, backlog: i32, passive: bool) -> 
     Result<Listener, NativeSocketError>.Success { value } => { h.socket = Socket.Server { listener: move value } }
     Result<Listener, NativeSocketError>.Failure { error } => { return socketStatus(error) }
   }
-  h.listening = true h.pathIsLocal = true
-  if h.kind == PIPE && h.chmodFlags != 0 {
-    let mut name: [u8; 256] = [0; 256] let path = h.path.asSlice()
-    if path.length < 256 {
-      let mut i: usize = 0 while i < path.length { name[i] = path[i] i = i + 1 }
-      let mut mode: u32 = 384
-      if (h.chmodFlags & 1) != 0 { mode = mode | 292 }
-      if (h.chmodFlags & 2) != 0 { mode = mode | 146 }
-      if unsafe chmod(Pointer.fromRef<u8>(&name[0]), mode) != 0 { let code = currentStatus() drop h unsafe refresh(handle) return code }
-    }
-  }
-  drop h unsafe refresh(handle)
-  return 0
+  h.listening = true h.pathIsLocal = true let pipe = h.kind == PIPE
+  if pipe { h.unlinkOnClose = h.path.length() > 0 && h.path.asSlice()[0] != 0 }
+  drop h
+  let code = if pipe { unsafe chmodPipe(handle) } else { 0 }
+  unsafe refresh(handle)
+  return code
 }
 unsafe effect fn connectNow<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, handle: *mut Handle, args: &Scope) -> i32 ! OutOfMemoryError | JsException ? &mut Allocator {
   let name = run text.text(&mut engine, unsafe lendRealm(&context, context), unsafe lendFor(args.values[1]))
   let mut anchor = () let h = unsafe Pointer.borrowMut<(), Handle>(&mut anchor, handle)
-  match &h.socket { Socket.Empty => {} _ => { return EINVAL() } }
-  if h.connecting { return EINVAL() }
+  if h.connecting || h.listening { return EINVAL() }
+  match &h.socket {
+    // A pipe connects a socket of its own, so the path goes to the kernel as given (relative,
+    // abstract, or too long for sun_path, which is EINVAL as in libuv).
+    Socket.Empty => {
+      if h.kind == PIPE {
+        let fd = unsafe rawSocket(1) if fd < 0 { return fd }
+        h.socket = Socket.Raw { fd: fd } drop h
+        return run unsafe connectRawPipe(handle, name.asSlice())
+      }
+    }
+    Socket.Raw { fd } => {
+      if h.kind == PIPE { drop h return run unsafe connectRawPipe(handle, name.asSlice()) }
+      // A bound TCP socket connects from its bound address: the connect makes the socket.
+      if h.kind != TCP || Option<Endpoint>.isNone(&h.local) { return EINVAL() }
+      let _ignored = unsafe closeDescriptor(fd) h.socket = Socket.Empty
+    }
+    _ => { return EINVAL() }
+  }
   let kind = h.kind
   let options = match ConnectOptions.make(h.noDelay, 1) { Result<ConnectOptions, ConnectOptionsError>.Success { value } => value Result<ConnectOptions, ConnectOptionsError>.Failure { .. } => ConnectOptions.defaults() }
   let result = if h.kind == PIPE {
@@ -2099,13 +2270,17 @@ unsafe effect fn operation<'m, S: EngineServices>(engine: &mut Engine<'m, S>, co
   if eq(op, b"chmod") {
     let entry = unsafe Pointer.borrowMut<(), Handle>(&mut anchor, handle)
     entry.chmodFlags = (if number(args.values[1]) != 0 { 1 } else { 0 }) + (if number(args.values[2]) != 0 { 2 } else { 0 })
+    // A bound or listening pipe changes its file now; one not bound yet does when it listens.
+    let bound = match &entry.socket { Socket.Empty => false _ => true } drop entry
+    if bound { return ValueBits.Int { value: unsafe chmodPipe(handle) } }
     return ValueBits.Int { value: 0 }
   }
   if eq(op, b"open") {
     if kind == TTY { return ValueBits.Int { value: ENOTSUP() } }
     let adopted = number(args.values[1])
     let entry = unsafe Pointer.borrowMut<(), Handle>(&mut anchor, handle)
-    match &entry.socket { Socket.Empty => {} _ => { return ValueBits.Int { value: EINVAL() } } }
+    // uv_pipe_open on the descriptor a bind already made is a no-op (net re-opens a bound pipe).
+    match &entry.socket { Socket.Empty => {} Socket.Raw { fd: bound } => { if bound == adopted { return ValueBits.Int { value: 0 } } return ValueBits.Int { value: EINVAL() } } _ => { return ValueBits.Int { value: EINVAL() } } }
     // A cluster worker gets its UDP descriptor from the primary.
     if udp {
       let opened = run Effect.result(unsafe NativeUdpSocket.adopt(adopted, if kind == UDP6 { Family.V6 } else { Family.V4 }))
@@ -2146,17 +2321,10 @@ unsafe effect fn operation<'m, S: EngineServices>(engine: &mut Engine<'m, S>, co
     let flags = number(args.values[3])
     if kind == PIPE {
       if eq(op, b"udpConnect") { return ValueBits.Int { value: EINVAL() } }
-      let entry = unsafe Pointer.borrowMut<(), Handle>(&mut anchor, handle)
-      entry.path.clear() run entry.path.appendSlice(name.asSlice()) entry.pathIsLocal = true
-      return ValueBits.Int { value: 0 }
+      return ValueBits.Int { value: run unsafe bindPipe(handle, name.asSlice()) }
     }
     let endpoint = match makeEndpoint(name.asSlice(), number(args.values[2])) { Option<Endpoint>.Some { value } => value Option<Endpoint>.None => { return ValueBits.Int { value: EINVAL() } } }
-    if kind == TCP {
-      // The socket is made by the listen or connect that follows, which binds it.
-      let entry = unsafe Pointer.borrowMut<(), Handle>(&mut anchor, handle)
-      entry.local = Option<Endpoint>.some(endpoint) entry.flags = flags
-      return ValueBits.Int { value: 0 }
-    }
+    if kind == TCP { return ValueBits.Int { value: unsafe bindTcp(handle, endpoint, flags) } }
     let opened = unsafe datagramSocket(handle) if opened < 0 { return ValueBits.Int { value: opened } }
     let entry = unsafe Pointer.borrowMut<(), Handle>(&mut anchor, handle)
     let socket = match &mut entry.socket { Socket.Datagram { socket } => &mut socket _ => { return ValueBits.Int { value: EBADF() } } }
