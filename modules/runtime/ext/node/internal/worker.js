@@ -30,6 +30,13 @@ const workers = new Map();
 const workerStates = new WeakMap();
 let environmentData = new Map();
 let control = null;
+// Node's cwd counter: the main thread counts its chdir calls in shared memory,
+// so a worker's process.cwd() reads the directory again only after one. The
+// counter is made with the first worker; a worker passes on the one it got.
+const AtomicsAdd = Atomics.add;
+const AtomicsLoad = Atomics.load;
+let cwdCounter;
+let sharedCwdCounter;
 let bootstrapResult;
 let installed = false;
 let exitRequested = false;
@@ -38,6 +45,13 @@ const stdioCallbacks = new Map();
 const controlRefs = new WeakMap();
 const readableAcks = new WeakMap();
 const info = host.workerNative('info', []);
+if (info.isMainThread) {
+  const originalChdir = process.chdir;
+  process.chdir = function(path) {
+    originalChdir(path);
+    if (cwdCounter) AtomicsAdd(cwdCounter, 0, 1);
+  };
+}
 
 function workerState(worker) {
   const state = workerStates.get(worker);
@@ -280,7 +294,8 @@ class Worker extends EventEmitter {
       state.user.on('message', value => state.resource.runInAsyncScope(this.emit, this, 'message', value));
       state.user.on('messageerror', error => state.resource.runInAsyncScope(this.emit, this, 'messageerror', error));
       state.user.unref();
-      controlChannel.port1.postMessage({ type: messageTypes.LOAD_SCRIPT, workerData: config.options.workerData,
+      if (info.isMainThread) cwdCounter ??= new Uint32Array(new SharedArrayBuffer(4));
+      controlChannel.port1.postMessage({ type: messageTypes.LOAD_SCRIPT, cwdCounter: cwdCounter || sharedCwdCounter, workerData: config.options.workerData,
         environmentData: Array.from(environmentData), parentPort: userChannel.port2,
         options: config.metadata }, [userChannel.port2, ...list]);
       state.id = host.workerNative('startWorker', [JSON.stringify(config.metadata), ports().id(controlChannel.port2), Math.floor(config.metadata.resourceLimits.stackSizeMb * 1048576), config.metadata.name]);
@@ -412,6 +427,7 @@ function bootstrap() {
   const data = initial.message;
   environmentData = new Map();
   assignEnvironmentData(new Map(data.environmentData));
+  sharedCwdCounter = data.cwdCounter;
   // As Node's worker_thread main: the public module gets this thread's ports and data.
   const workerThreads = require('worker_threads');
   workerThreads.parentPort = data.parentPort;
@@ -502,6 +518,17 @@ function install(proc = process, metadata = bootstrap()) {
   for (const [name, value] of Object.entries({ stdin, stdout, stderr })) Object.defineProperty(proc, name, { value, configurable: true, enumerable: true });
   proc.env = workerEnvironment();
   proc.openStdin = () => { proc.stdin.resume(); return proc.stdin; };
+  let cachedCwd = '';
+  let lastCounter = -1;
+  const originalCwd = proc.cwd;
+  proc.cwd = function() {
+    const currentCounter = AtomicsLoad(sharedCwdCounter, 0);
+    if (currentCounter === lastCounter)
+      return cachedCwd;
+    lastCounter = currentCounter;
+    cachedCwd = originalCwd();
+    return cachedCwd;
+  };
   proc.execArgv = metadata.execArgv;
   for (const method of ['chdir', 'abort', 'setuid', 'setgid', 'seteuid', 'setegid', 'setgroups', 'initgroups']) {
     if (typeof proc[method] === 'function') proc[method] = () => { throw clone().codedError('ERR_WORKER_UNSUPPORTED_OPERATION', `process.${method}() is not supported in workers`, Error); };
