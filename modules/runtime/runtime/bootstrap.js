@@ -1030,6 +1030,11 @@ function runtimeFlag(arg) {
   // Read before the bootstrap runs (worker.silk snapshotWanted): without a snapshot the
   // start skips the heap image and runs the bootstrap itself.
   if (arg === '--node-snapshot' || arg === '--no-node-snapshot') return true;
+  // V8's optimizing tiers (Sparkplug, Maglev, Turbofan) and their switches. The engine
+  // is an interpreter with no compiler tiers, so turning one on or off changes nothing,
+  // as these V8 flags change nothing under --jitless. Spellings as V8 parses them:
+  // --no-x, --nox, and _ for -.
+  if (/^--(no-?)?(maglev|turbofan|sparkplug|opt|concurrent[-_]recompilation|always[-_]osr|use[-_]osr)$/.test(arg)) return true;
   // Node maps its code to large pages on request; this binary does not, which Node
   // reports as its ENOTSUP result (src/large_pages/node_large_page.cc).
   if (arg.startsWith('--use-largepages=')) {
