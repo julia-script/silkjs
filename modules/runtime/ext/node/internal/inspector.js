@@ -15,6 +15,7 @@ let nextSession = 1;
 let nextException = 1;
 let waiting = false;
 let workerWaitConsumed = false;
+let workerBreakFirst = false;
 const {
   ERR_INSPECTOR_ALREADY_ACTIVATED, ERR_INSPECTOR_CLOSED, ERR_INSPECTOR_NOT_ACTIVE, ERR_INSPECTOR_NOT_AVAILABLE, ERR_INSPECTOR_NOT_WORKER,
 } = require('internal/errors').codes;
@@ -30,7 +31,7 @@ function contextFor(params) {
 }
 // V8's CommandLineAPIScope over the global of the context an evaluation runs in.
 function withCommandLineAPI(session, context) {
-  const global = native(8, 'this', context.handle, false, 0);
+  const global = native(8, 'this', context.handle, false, undefined);
   if (global.status !== 'success') return () => {};
   const { commandLineAPI, install } = require('internal/inspector_command_line');
   return install(global.value, commandLineAPI(session, context.id, consoleBridge));
@@ -91,7 +92,7 @@ function runtime(session, method, params) {
       const context = contextFor(params);
       const restore = params.includeCommandLineAPI ? withCommandLineAPI(session, context) : undefined;
       let result;
-      try { result = native(8, params.expression, context.handle, !!params.throwOnSideEffect, params.timeout || 0); }
+      try { result = native(8, params.expression, context.handle, !!params.throwOnSideEffect, params.timeout); }
       finally { if (restore) restore(); }
       return evaluation(session, result, { ...params, _context: context });
     }
@@ -107,11 +108,11 @@ function runtime(session, method, params) {
         if (!argument || typeof argument !== 'object') throw protocolError(-32602, 'Invalid parameters: arguments');
         return session.values.argument(argument);
       });
-      const compiled = native(8, `(${params.functionDeclaration}\n)`, context.handle, !!params.throwOnSideEffect, params.timeout || 0);
+      const compiled = native(8, `(${params.functionDeclaration}\n)`, context.handle, !!params.throwOnSideEffect, params.timeout);
       if (compiled.status !== 'success') return evaluation(session, compiled, params);
       if (typeof compiled.value !== 'function') throw protocolError(-32000, 'Given expression does not evaluate to a function');
       const options = { ...params, _context: context, objectGroup: params.objectGroup === undefined && receiverEntry ? receiverEntry.group : params.objectGroup };
-      return evaluation(session, native(13, compiled.value, receiver, args, context.handle, !!params.throwOnSideEffect, params.timeout || 0), options);
+      return evaluation(session, native(13, compiled.value, receiver, args, context.handle, !!params.throwOnSideEffect, params.timeout), options);
     }
     case 'Runtime.getProperties':
       protocolParams(params, 'objectId', 'string'); return session.values.properties(params.objectId, params);
@@ -276,10 +277,14 @@ function contextsDestroyed() {
 }
 // Node's Agent::WaitForDisconnect, run after the 'exit' event while the inspector is active.
 function atExit() {
-  if (native(10) !== 0 || (!url() && sessions.size === 0)) return;
-  if (remoteSessions()) host.writeStartupDiagnostic('Waiting for the debugger to disconnect...\n');
+  // A worker's contexts end with its thread, before NodeWorker detaches its sessions.
+  const worker = native(10) !== 0;
+  if (!worker && !url() && sessions.size === 0) return;
+  if (!worker && remoteSessions()) host.writeStartupDiagnostic('Waiting for the debugger to disconnect...\n');
   for (const session of [...sessions.values()]) if (session.notifyDisconnect) { session.emit('NodeRuntime.waitingForDisconnect', {}); exitRetained = true; }
   if (!exitRetained) contextsDestroyed();
+  // Node's worker Agent::WaitForDisconnect: the thread stays until those sessions detach.
+  if (worker) { while (exitRetained) native(4, 10); return; }
   while (url() && remoteSessions()) native(4, 10);
 }
 function close() {
@@ -326,7 +331,8 @@ function waitWorker() {
 }
 function waitForWorkerStart() {
   if (native(10) === 0 || workerWaitConsumed) return;
-  if (native(18)) { check(); waitWorker(); }
+  // As Node's Agent::Start: a worker its parent waits on also breaks on its first line.
+  if (native(18)) { check(); workerBreakFirst = true; waitWorker(); }
   else native(0, onNative);
 }
 function start(port, hostname, wait, breakFirst) {
@@ -444,4 +450,4 @@ if (native(10) === 0) {
   // Native state does not come with a heap image: a start from one registers again.
   host.onHydrate(() => { native(0, onNative); });
 }
-module.exports = { connect, open, close, url, waitForDebugger, _start: start, _atExit: atExit, _installProcess: installProcess, _waitForWorker: waitForWorkerStart, _armStartup: armStartup, broadcast, console: consoleBridge.console, emitConsole: consoleBridge.emitConsole, putNetworkResource: network.put };
+module.exports = { connect, open, close, url, waitForDebugger, _start: start, _atExit: atExit, _installProcess: installProcess, _waitForWorker: waitForWorkerStart, _armStartup: armStartup, _breakFirstLine: () => workerBreakFirst, broadcast, console: consoleBridge.console, emitConsole: consoleBridge.emitConsole, putNetworkResource: network.put };

@@ -1,7 +1,7 @@
 'use strict';
 
 const native = require('internal/host').inspectorNative;
-const { protocolError, unsupported } = require('internal/inspector_values');
+const { protocolError, unsupported, scopeType } = require('internal/inspector_values');
 const createHash = algorithm => require('crypto').createHash(algorithm);
 const contexts = require('internal/inspector_contexts');
 const pendingScripts = new Map();
@@ -109,8 +109,8 @@ function frames(session, source) {
     const grouped = new Map();
     const context = contexts.fromToken(frame.contextToken);
     for (const binding of native(30, frame.callFrameId)) {
-      if (binding.kind === 0) continue;
-      const type = binding.kind === 3 ? 'closure' : binding.isLocal ? 'local' : 'block';
+      const type = scopeType(binding);
+      if (type === undefined) continue;
       const key = `${type}:${type === 'block' ? binding.scope : ''}:${binding.depth}`;
       let scope = grouped.get(key);
       if (!scope) {
@@ -119,7 +119,7 @@ function frames(session, source) {
       }
       if (!scope.scope.includes(binding.scope)) scope.scope.push(binding.scope);
     }
-    const scopeChain = Array.from(grouped.values(), scope => ({ type: scope.type, object: session.values.scope(frame.callFrameId, scope.scope, scope.depth, context) }));
+    const scopeChain = Array.from(grouped.values(), scope => ({ type: scope.type, object: session.values.scope(frame.callFrameId, scope.scope, scope.depth, context, scope.type) }));
     scopeChain.push({ type: 'global', object: session.values.remote(frame.global, 'backtrace', false, false, context) });
     return { callFrameId: frame.callFrameId, functionName: frame.functionName, location: locationOnly(frame.location), url: scriptURLs.get(frame.location.scriptId) ?? '', scopeChain, this: session.values.remote(frame.this, 'backtrace', false, false, context) };
   });
@@ -143,7 +143,7 @@ function paused(payload) {
       if (!breakpoint.locations.some(location => location.scriptId === source[0].location.scriptId && location.lineNumber === source[0].location.lineNumber && location.columnNumber === source[0].location.columnNumber)) continue;
       if (breakpoint.condition) {
         conditional = true;
-        const result = native(29, source[0].callFrameId, breakpoint.condition, false, 0);
+        const result = native(29, source[0].callFrameId, breakpoint.condition, false, undefined);
         if (result.status !== 'success' || !result.value) continue;
       }
       hits.push(id);
@@ -290,7 +290,7 @@ function dispatch(session, method, params) {
         const context = frame && contexts.fromToken(frame.contextToken);
         const restore = context ? session.commandLineAPI(context) : undefined;
         let result;
-        try { result = native(29, params.callFrameId, params.expression, !!params.throwOnSideEffect, params.timeout || 0); }
+        try { result = native(29, params.callFrameId, params.expression, !!params.throwOnSideEffect, params.timeout); }
         finally { if (restore) restore(); }
         return session.evaluation(result, params);
       }
