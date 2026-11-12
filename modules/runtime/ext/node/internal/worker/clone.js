@@ -110,7 +110,6 @@ class CloneSerializer extends Serializer {
     }
     if (isNativeWrap(value)) throw cloneError('Cannot clone object of unsupported type.');
     if (isDOMException(value)) return true;
-    if (host.types.isSlidingWindowHistogram?.(value)) throw cloneError();
     if (abort.isTransferable(value)) return true;
     if (isCryptoKey(value) || isKeyObject(value) || host.types.isX509Certificate?.(value)) return true;
     if (host.types.isStorage?.(value) || host.types.isEventSource?.(value)) return true;
@@ -125,8 +124,8 @@ class CloneSerializer extends Serializer {
     return true;
   }
   _writeViewExtents(info) {
-    for (const value of [info.offset, info.length])
-      this.writeUint64(Math.floor(value / 0x100000000), value % 0x100000000);
+    this.writeUint64(Math.floor(info.offset / 0x100000000), info.offset % 0x100000000);
+    this.writeUint64(Math.floor(info.length / 0x100000000), info.length % 0x100000000);
   }
   _getSharedArrayBufferId(value) {
     if (this.sharedIds.has(value)) return this.sharedIds.get(value);
@@ -320,7 +319,10 @@ function prepare(value, list, source) {
   const signals = new Map();
   const transferred = new Map();
   const handles = [];
-  for (const item of transferList(list)) {
+  // Index loops and Map#forEach: user code may have replaced the iterators (Node's primordials).
+  const items = transferList(list);
+  for (let position = 0; position < items.length; position++) {
+    const item = items[position];
     if (seen.has(item)) throw cloneError(`Transfer list contains duplicate ${portHooks?.isPort(item) ? 'MessagePort' : 'ArrayBuffer'}`);
     seen.add(item);
     if (isMarkedAsUntransferable(item)) throw cloneError('Object is marked as untransferable.');
@@ -338,8 +340,8 @@ function prepare(value, list, source) {
       signals.set(item, undefined);
     } else if (isJSTransferable(item)) {
       transferred.set(item, undefined);
-    } else if (host.types.isSlidingWindowHistogram?.(item)) {
-      // markTransferMode(histogram, false, false): neither cloneable nor transferable.
+    } else if (jsTransferable.getTransferMode(item) !== undefined) {
+      // markTransferMode(object, false, false): neither cloneable nor transferable.
       throw cloneError();
     } else throw codedError('ERR_INVALID_TRANSFER_OBJECT', 'Found invalid object in transferList');
   }
@@ -348,11 +350,14 @@ function prepare(value, list, source) {
     // them, then describe themselves for the receiving side.
     // The extra objects may be JS transferables themselves (a TransformStream
     // moves its readable and writable sides); those join the queue.
-    const pending = Array.from(transferred.keys());
+    const pending = [];
+    transferred.forEach((_, item) => { pending.push(item); });
     for (let index = 0; index < pending.length; index++) {
       const item = pending[index];
       const extra = typeof item[jsTransferable.kTransferList] === 'function' ? item[jsTransferable.kTransferList]() : [];
-      for (const other of extra || []) {
+      const others = extra || [];
+      for (let at = 0; at < others.length; at++) {
+        const other = others[at];
         if (fileHandles(false)?.isNative(other)) {
           handles.push(other);
         } else if (portHooks?.isPort(other)) {
@@ -366,11 +371,11 @@ function prepare(value, list, source) {
         } else throw codedError('ERR_INVALID_TRANSFER_OBJECT', 'Found invalid object in transferList');
       }
     }
-    for (const signal of signals.keys()) {
+    signals.forEach((_, signal) => {
       const record = abort.prepareTransfer(signal);
       signals.set(signal, record);
       if (record.port) { ports.push(record.port); ids.push(portHooks.id(record.port)); }
-    }
+    });
     const serializer = new CloneSerializer(ports, shared, buffers, signals, transferred);
     serializer.handles = fileHandles(false) ? handles : null;
     buffers.forEach((buffer, index) => serializer.transferArrayBuffer(index, buffer));
@@ -393,27 +398,29 @@ function prepare(value, list, source) {
     for (let i = 0; i < ports.length; i++) {
       if (isMarkedAsUntransferable(ports[i]) || portHooks.id(ports[i]) !== ids[i]) throw cloneError('MessagePort changed during serialization.');
     }
-    for (const signal of signals.keys()) {
+    signals.forEach((_, signal) => {
       if (isMarkedAsUntransferable(signal)) throw cloneError('Object is marked as untransferable.');
-    }
-    for (const buffer of buffers) {
+    });
+    for (let at = 0; at < buffers.length; at++) {
+      const buffer = buffers[at];
       if (isMarkedAsUntransferable(buffer)) throw cloneError('Object is marked as untransferable.');
       if (host.wasmNative('isMemoryBuffer', buffer)) throw cloneError('WebAssembly memory buffers cannot be transferred.');
       try { new Uint8Array(buffer); } catch { throw cloneError('An ArrayBuffer was detached during serialization.'); }
     }
     return { bytes: serializer.releaseBuffer(), buffers, shared, ports: ids, moved: ports, signals, handles };
   } catch (error) {
-    for (const record of signals.values()) if (record) abort.rollbackTransfer(record);
+    signals.forEach(record => { if (record) abort.rollbackTransfer(record); });
     throw error;
   }
 }
 function rollback(prepared) {
-  for (const record of prepared.signals?.values() || []) abort.rollbackTransfer(record);
+  prepared.signals?.forEach(record => abort.rollbackTransfer(record));
 }
 function commit(prepared) {
-  for (const port of prepared.moved) portHooks.detach(port);
-  for (const handle of prepared.handles || []) fileHandles(false).detach(handle);
-  for (const record of prepared.signals?.values() || []) abort.commitTransfer(record);
+  for (let at = 0; at < prepared.moved.length; at++) portHooks.detach(prepared.moved[at]);
+  const handles = prepared.handles || [];
+  for (let at = 0; at < handles.length; at++) fileHandles(false).detach(handles[at]);
+  prepared.signals?.forEach(record => abort.commitTransfer(record));
 }
 function post(id, value, list) {
   const prepared = prepare(value, list, id);
@@ -439,7 +446,7 @@ function decode(envelope, realm, ports) {
     }
     return value;
   }
-  catch (error) { for (const port of deserializer.ports) portHooks.close(port); throw error; }
+  catch (error) { for (let at = 0; at < deserializer.ports.length; at++) portHooks.close(deserializer.ports[at]); throw error; }
 }
 function structuredClone(value, options) {
   if (arguments.length === 0) throw codedError('ERR_MISSING_ARGS', 'The "value" argument must be specified');
