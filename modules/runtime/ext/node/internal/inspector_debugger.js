@@ -95,7 +95,7 @@ function scriptParsed(script) {
     session.emit('Debugger.scriptParsed', script);
     const data = state(session);
     for (const [id, breakpoint] of data.breakpoints) {
-      if (!matches(breakpoint, script)) continue;
+      if (breakpoint.debugCommand || !matches(breakpoint, script)) continue;
       const locations = resolve(breakpoint, script);
       if (!locations.length) continue;
       breakpoint.locations.push(...locations);
@@ -138,7 +138,7 @@ function paused(payload) {
     const data = state(session);
     if (data.skip) continue;
     const hits = [];
-    let conditional = false;
+    let conditional = false, debugCommand = false;
     if (source.length && data.active) for (const [id, breakpoint] of data.breakpoints) {
       if (!breakpoint.locations.some(location => location.scriptId === source[0].location.scriptId && location.lineNumber === source[0].location.lineNumber && location.columnNumber === source[0].location.columnNumber)) continue;
       if (breakpoint.condition) {
@@ -146,19 +146,22 @@ function paused(payload) {
         const result = native(29, source[0].callFrameId, breakpoint.condition, false, undefined);
         if (result.status !== 'success' || !result.value) continue;
       }
-      hits.push(id);
+      // debug(fn) pauses with its own reason and is not a protocol breakpoint.
+      if (breakpoint.debugCommand) debugCommand = true;
+      else hits.push(id);
     }
-    if (conditional && hits.length === 0 && payload.reason !== 'exception') continue;
+    if (conditional && hits.length === 0 && !debugCommand && payload.reason !== 'exception') continue;
     // Blackboxed scripts are stepped through and their debugger statements ignored;
     // an explicit breakpoint there still stops.
-    if (hits.length === 0 && payload.reason !== 'exception' && source.length && data.blackbox.length) {
+    if (hits.length === 0 && !debugCommand && payload.reason !== 'exception' && source.length && data.blackbox.length) {
       const url = scriptURLs.get(source[0].location.scriptId) ?? '';
       if (data.blackbox.some(pattern => pattern.test(url))) continue;
     }
     delivered = true;
     // The pause --inspect-brk arms (V8's schedulePauseOnNextStatement from Node's
     // agent) reports 'Break on start'.
-    const reason = stepped && hits.length === 0 && payload.reason !== 'exception' ? 'step'
+    const reason = debugCommand && payload.reason !== 'exception' ? 'debugCommand'
+      : stepped && hits.length === 0 && payload.reason !== 'exception' ? 'step'
       : startup && hits.length === 0 && (!payload.reason || payload.reason === 'other') ? 'Break on start' : payload.reason || 'other';
     const asyncStackTrace = data.asyncDepth > 0 ? asyncTasks().asyncStackTrace(data.asyncDepth) : undefined;
     session.emit('Debugger.paused', { callFrames: frames(session, source), reason, hitBreakpoints: hits, ...(asyncStackTrace && { asyncStackTrace }) });
@@ -247,7 +250,7 @@ function dispatch(session, method, params) {
       if (method === 'Debugger.setBreakpoint') {
         const [first] = breakpoint.locations;
         for (const other of data.breakpoints.values()) {
-          if (other.scriptId !== undefined && other.locations.some(location => location.scriptId === first.scriptId && location.lineNumber === first.lineNumber && location.columnNumber === first.columnNumber)) throw exists();
+          if (other.scriptId !== undefined && !other.debugCommand && other.locations.some(location => location.scriptId === first.scriptId && location.lineNumber === first.lineNumber && location.columnNumber === first.columnNumber)) throw exists();
         }
       }
       const id = `${session.id}:${nextBreakpoint++}`;
@@ -308,4 +311,24 @@ contexts.subscribe(context => {
   pendingScripts.delete(context.token);
   for (const script of pending) scriptParsed(script);
 });
-module.exports = { dispatch, close, paused, scriptParsed, armStartup, resourceURL };
+// The command line API's debug(fn, condition) and undebug(fn): a breakpoint at the
+// function's entry that pauses with reason 'debugCommand', as V8's
+// (V8Debugger::setBreakpointFor with kDebugCommandBreakpointSource).
+function debugFunction(session, fn, condition) {
+  if (typeof fn !== 'function') return;
+  undebugFunction(session, fn);
+  const location = native(32, fn);
+  if (!location) return;
+  const data = state(session);
+  data.breakpoints.set(`debugCommand:${nextBreakpoint++}`, { debugCommand: true, target: fn, scriptId: location.scriptId,
+    lineNumber: location.lineNumber, columnNumber: location.columnNumber, condition: condition === undefined ? '' : String(condition), locations: [location] });
+  if (data.active && enabled.has(session)) native(24, location.scriptId, location.pc);
+}
+function undebugFunction(session, fn) {
+  const data = state(session);
+  let removed = false;
+  for (const [id, breakpoint] of data.breakpoints) if (breakpoint.debugCommand && breakpoint.target === fn) { data.breakpoints.delete(id); removed = true; }
+  if (removed) rebuild();
+}
+
+module.exports = { dispatch, close, paused, scriptParsed, armStartup, resourceURL, debugFunction, undebugFunction };

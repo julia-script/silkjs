@@ -34,6 +34,8 @@ function commandLineAPI(session, contextId, consoleBridge) {
       }
       inspectRequested(object, { queryObjects: true });
     },
+    debug(fn, condition) { require('internal/inspector_debugger').debugFunction(session, fn, condition); },
+    undebug(fn) { require('internal/inspector_debugger').undebugFunction(session, fn); },
     get $_() { return session.lastEvaluationResult; },
     // Node never adds inspected objects (addInspectedObject).
     $0: undefined, $1: undefined, $2: undefined, $3: undefined, $4: undefined,

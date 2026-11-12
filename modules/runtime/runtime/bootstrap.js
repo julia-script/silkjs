@@ -108,7 +108,7 @@ const plainPath = /^\/[A-Za-z0-9\/._~+@=,-]*$/;
 const dotSegment = /\/\.\.?(?:\/|$)/;
 const fileHref = path => host.platform !== 'win32' && plainPath.test(path) && !dotSegment.test(path)
   ? 'file://' + path : internalRequire('url').pathToFileURL(path).href;
-const inspectorNativeOperations = Array.from({ length: 32 }, (_, index) => native['inspectorNative' + index]);
+const inspectorNativeOperations = Array.from({ length: 33 }, (_, index) => native['inspectorNative' + index]);
 const reflectApply = Reflect.apply;
 host.inspectorNative = (operation, ...args) => reflectApply(inspectorNativeOperations[operation], undefined, args);
 host.inspectorEntry = wrapper => host.inspectorNative(15, wrapper);
