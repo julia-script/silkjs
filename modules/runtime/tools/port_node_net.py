@@ -49,7 +49,9 @@ COMMON = [
     ("internalBinding('pipe_wrap')", "require('internal/net/binding').pipe_wrap"),
     ("internalBinding('stream_wrap')", "require('internal/net/binding').stream_wrap"),
     ("internalBinding('tty_wrap')", "require('internal/net/binding').tty_wrap"),
-    ("internalBinding('uv')", "require('internal/net/binding').uv"),
+    ("internalBinding('uv')", "require('internal/uv_binding')"),
+    ("internalBinding('js_stream')", "require('internal/net/binding').js_stream"),
+    ("internalBinding('cares_wrap')", "require('internal/dns/cares_wrap')"),
     ("require('internal/util/debuglog').debuglog", "require('util').debuglog"),
     ("require('internal/events/abort_listener')", "require('events')"),
     ("require('internal/util/types')", "require('util').types"),
@@ -58,6 +60,22 @@ COMMON = [
 ]
 
 ADAPT = {
+    'lib/internal/dns/utils.js': [
+        ("""const {
+  namespace: {
+    addSerializeCallback,
+    addDeserializeCallback,
+    isBuildingSnapshot,
+  },
+} = require('internal/v8/startup_snapshot');""",
+         """// silkjs: the runtime builds no user-land startup snapshot, so nothing is ever serialized.
+const isBuildingSnapshot = () => false;
+const addSerializeCallback = () => {};
+const addDeserializeCallback = () => {};"""),
+        ("\nmodule.exports = {",
+         "\n// silkjs: Node runs this in pre-execution; dns loads on first use, after the options.\n"
+         "initializeDns();\n\nmodule.exports = {"),
+    ],
     'lib/internal/cluster/primary.js': [
         ("const { getInspectPort, isUsingInspector } = require('internal/util/inspector');",
          """// silkjs: getInspectPort and isUsingInspector of Node's internal/util/inspector.
@@ -133,7 +151,7 @@ let autoSelectFamilyAttemptTimeoutDefault;"""),
          "    autoSelectFamily = getDefaultAutoSelectFamily();"),
         ("    autoSelectFamilyAttemptTimeout = autoSelectFamilyAttemptTimeoutDefault;",
          "    autoSelectFamilyAttemptTimeout = getDefaultAutoSelectFamilyAttemptTimeout();"),
-        ("const { convertIpv6StringToBuffer } = internalBinding('cares_wrap');\n",
+        ("const { convertIpv6StringToBuffer } = require('internal/dns/cares_wrap');\n",
          "// silkjs: cares_wrap's convertIpv6StringToBuffer, over the BlockList parser.\n"
          "const convertIpv6StringToBuffer = (ip) => require('internal/socketaddress').parseAddress(ip, 6);\n"),
         ("const { queueMicrotask } = require('internal/process/task_queues');\n", ""),
@@ -240,6 +258,13 @@ def main():
         'lib/internal/cluster/utils.js': 'internal/cluster/utils.js',
         'lib/internal/cluster/worker.js': 'internal/cluster/worker.js',
         'lib/internal/linkedlist.js': 'internal/linkedlist.js',
+        'lib/internal/js_stream_socket.js': 'internal/js_stream_socket.js',
+        'lib/_stream_wrap.js': '_stream_wrap.js',
+        'lib/dns.js': 'dns.js',
+        'lib/dns/promises.js': 'dns/promises.js',
+        'lib/internal/dns/utils.js': 'internal/dns/utils.js',
+        'lib/internal/dns/promises.js': 'internal/dns/promises.js',
+        'lib/internal/dns/callback_resolver.js': 'internal/dns/callback_resolver.js',
     }
     for rel, dest in targets.items():
         path = os.path.join(out, dest)

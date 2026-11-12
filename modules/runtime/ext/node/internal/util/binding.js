@@ -74,6 +74,14 @@ function getExternalValue(value) {
   throw error;
 }
 
+// Node's privateSymbols are V8 private symbols, invisible to reflection. Here
+// they are ordinary symbols shared by the modules that read and write them.
+const privateSymbols = {
+  __proto__: null,
+  arrow_message_private_symbol: Symbol('node:arrowMessage'),
+  decorated_private_symbol: Symbol('node:decorated'),
+};
+
 // uv_sleep: blocks the thread for msec milliseconds without running the loop.
 let sleepCell;
 function sleep(msec) {
@@ -82,6 +90,7 @@ function sleep(msec) {
 }
 
 module.exports = {
+  privateSymbols,
   sleep,
   ALL_PROPERTIES,
   ONLY_ENUMERABLE,

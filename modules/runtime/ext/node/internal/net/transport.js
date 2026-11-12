@@ -1,5 +1,6 @@
 'use strict';
 
+const { ArrayPrototypeConcat } = require('internal/per_context/primordials');
 const host = require('internal/host');
 const { AsyncResource, asyncWrapProviders } = require('async_hooks');
 const { Buffer } = require('buffer');
@@ -54,7 +55,8 @@ class Transport {
     }
     live.add(this);
   }
-  call(operation, ...args) { return host.net(operation, [this.id, ...args]); }
+  // concat, not spread: user code may have replaced Array.prototype[Symbol.iterator].
+  call(operation, ...args) { return host.net(operation, ArrayPrototypeConcat([this.id], args)); }
   // A stream handle that an HTTP parser can consume directly (Node's StreamBase).
   get isStreamBase() { return true; }
   getAsyncId() { return this.resource.asyncId(); }

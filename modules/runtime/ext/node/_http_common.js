@@ -24,9 +24,9 @@
 
 const { setImmediate } = require('timers');
 
-const { methods, allMethods, HTTPParser } = require('internal/http/native-parser');
+const parserBinding = require('internal/http/native-parser');
+const { methods, allMethods, HTTPParser } = parserBinding;
 const { getOptionValue } = require('internal/options');
-const insecureHTTPParser = getOptionValue('--insecure-http-parser');
 
 const FreeList = require('internal/freelist');
 const incoming = require('_http_incoming');
@@ -160,7 +160,9 @@ function parserOnMessageComplete() {
 
 
 const parsers = new FreeList('parsers', 1000, function parsersCb() {
-  const parser = new HTTPParser();
+  // Looked up per parser: this module is in the heap image, so it loads before user
+  // code that replaces internalBinding('http_parser').HTTPParser, as Node's lazy load allows.
+  const parser = new parserBinding.HTTPParser();
 
   cleanParser(parser);
 
@@ -303,6 +305,8 @@ function prepareError(err, parser, rawPacket) {
 let warnedLenient = false;
 
 function isLenient() {
+  // Read on each use: http is in the heap image, built without this process's flags.
+  const insecureHTTPParser = getOptionValue('--insecure-http-parser');
   if (insecureHTTPParser && !warnedLenient) {
     warnedLenient = true;
     process.emitWarning('Using insecure HTTP parsing');

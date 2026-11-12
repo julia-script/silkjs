@@ -68,7 +68,7 @@ const {
   UV_ENOTCONN,
   UV_ECANCELED,
   UV_ETIMEDOUT,
-} = require('internal/net/binding').uv;
+} = require('internal/uv_binding');
 // silkjs: cares_wrap's convertIpv6StringToBuffer, over the BlockList parser.
 const convertIpv6StringToBuffer = (ip) => require('internal/socketaddress').parseAddress(ip, 6);
 

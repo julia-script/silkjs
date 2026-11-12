@@ -30,6 +30,7 @@ const {
   ArrayPrototypeSort,
   Error,
   ErrorCaptureStackTrace,
+  FunctionPrototypeCall,
   FunctionPrototypeSymbolHasInstance,
   ObjectDefineProperties,
   ObjectDefineProperty,
@@ -42,13 +43,24 @@ const {
   Promise,
   ReflectApply,
   ReflectConstruct,
+  RegExpPrototypeGetDotAll,
+  RegExpPrototypeGetGlobal,
+  RegExpPrototypeGetHasIndices,
+  RegExpPrototypeGetIgnoreCase,
+  RegExpPrototypeGetMultiline,
+  RegExpPrototypeGetSource,
+  RegExpPrototypeGetSticky,
+  RegExpPrototypeGetUnicode,
   SafeMap,
   SafeSet,
+  SafeWeakMap,
   SymbolPrototypeGetDescription,
   StringPrototypeReplace,
   StringPrototypeToLowerCase,
   Symbol,
   SymbolFor,
+  SymbolReplace,
+  SymbolSplit,
 } = require('internal/per_context/primordials');
 
 const { isNativeError, isPromise } = require('util/types');
@@ -384,6 +396,57 @@ function deprecateInstantiation(target, code, ...args) {
   return ReflectConstruct(target, args);
 }
 
+// Prefixes the arrow (the source line and caret of a compile error) to the stack
+// of an error that has one, once.
+function decorateErrorStack(err) {
+  const { privateSymbols: { arrow_message_private_symbol, decorated_private_symbol } } = require('internal/util/binding');
+  if (!(isError(err) && err.stack) || err[decorated_private_symbol])
+    return;
+  const arrow = err[arrow_message_private_symbol];
+  if (arrow) {
+    err.stack = arrow + err.stack;
+    err[decorated_private_symbol] = true;
+  }
+}
+
+// RegExp methods from another realm, so user changes to this realm's RegExp
+// prototype (lastIndex accessors, a replaced exec) cannot run.
+let internalGlobal;
+function getInternalGlobal() {
+  if (internalGlobal == null) {
+    const { runInNewContext } = require('vm');
+    internalGlobal = runInNewContext('this', undefined, { contextName: 'internal' });
+  }
+  return internalGlobal;
+}
+function SideEffectFreeRegExpPrototypeExec(regex, string) {
+  const { RegExp: RegExpFromAnotherRealm } = getInternalGlobal();
+  return FunctionPrototypeCall(RegExpFromAnotherRealm.prototype.exec, regex, string);
+}
+const crossRealmRegexes = new SafeWeakMap();
+function getCrossRealmRegex(regex) {
+  const cached = crossRealmRegexes.get(regex);
+  if (cached) return cached;
+  let flagString = '';
+  if (RegExpPrototypeGetHasIndices(regex)) flagString += 'd';
+  if (RegExpPrototypeGetGlobal(regex)) flagString += 'g';
+  if (RegExpPrototypeGetIgnoreCase(regex)) flagString += 'i';
+  if (RegExpPrototypeGetMultiline(regex)) flagString += 'm';
+  if (RegExpPrototypeGetDotAll(regex)) flagString += 's';
+  if (RegExpPrototypeGetUnicode(regex)) flagString += 'u';
+  if (RegExpPrototypeGetSticky(regex)) flagString += 'y';
+  const { RegExp: RegExpFromAnotherRealm } = getInternalGlobal();
+  const crossRealmRegex = new RegExpFromAnotherRealm(RegExpPrototypeGetSource(regex), flagString);
+  crossRealmRegexes.set(regex, crossRealmRegex);
+  return crossRealmRegex;
+}
+function SideEffectFreeRegExpPrototypeSymbolReplace(regex, string, replacement) {
+  return getCrossRealmRegex(regex)[SymbolReplace](string, replacement);
+}
+function SideEffectFreeRegExpPrototypeSymbolSplit(regex, string, limit = undefined) {
+  return getCrossRealmRegex(regex)[SymbolSplit](string, limit);
+}
+
 // Node builds this from internalBinding('string_decoder').encodings.
 const encodingsMap = { __proto__: null, ascii: 0, utf8: 1, base64: 2, utf16le: 3, latin1: 4, hex: 5, buffer: 6, base64url: 7 };
 
@@ -482,6 +545,7 @@ module.exports = {
   assignFunctionName,
   customInspectSymbol: SymbolFor('nodejs.util.inspect.custom'),
   customPromisifyArgs: kCustomPromisifyArgsSymbol,
+  decorateErrorStack,
   deprecate,
   deprecateInstantiation,
   deprecateProperty,
@@ -502,6 +566,9 @@ module.exports = {
   normalizeEncoding,
   once,
   pendingDeprecate,
+  SideEffectFreeRegExpPrototypeExec,
+  SideEffectFreeRegExpPrototypeSymbolReplace,
+  SideEffectFreeRegExpPrototypeSymbolSplit,
   promisify,
   removeColors,
   setOwnProperty,
