@@ -21,6 +21,8 @@ const moduleHas = Map.prototype.has.bind(modules);
 const moduleSet = Map.prototype.set.bind(modules);
 const moduleDelete = Map.prototype.delete.bind(modules);
 const stringStartsWith = Function.prototype.call.bind(String.prototype.startsWith);
+const promiseThen = Function.prototype.call.bind(Promise.prototype.then);
+const promiseReject = Promise.reject.bind(Promise);
 const stringEndsWith = Function.prototype.call.bind(String.prototype.endsWith);
 const stringSlice = Function.prototype.call.bind(String.prototype.slice);
 const stringIndexOf = Function.prototype.call.bind(String.prototype.indexOf);
@@ -1667,6 +1669,32 @@ globalThis.__silkRuntime = {
   load(name, attributes) { return loader.loadESM(name, attributes).source; },
   moduleSource(name, parent, attributes) { return loader.moduleSource(name, parent, attributes); },
   moduleError(name, error) { loader.moduleEvaluationError(name, error); },
+  // Node's ModuleLoader.import runs under tracingChannel('module.import').tracePromise:
+  // the engine has queued the load, and the promise import() returns is the traced one.
+  importTrace(specifier, referrer, promise) {
+    const channels = host.diagnostics.tracing('module.import');
+    if (channels === undefined) return promise;
+    const parentURL = typeof referrer === 'string' ? (/^[A-Za-z][A-Za-z\d+.-]*:/.test(referrer) ? referrer : fileHref(referrer)) : undefined;
+    const context = { __proto__: null, parentURL, url: specifier };
+    const { end, asyncStart, asyncEnd, error } = channels;
+    const resolve = result => {
+      context.result = result;
+      asyncStart.publish(context);
+      asyncEnd.publish(context);
+      return result;
+    };
+    const reject = cause => {
+      context.error = cause;
+      error.publish(context);
+      asyncStart.publish(context);
+      asyncEnd.publish(context);
+      return promiseReject(cause);
+    };
+    return channels.start.runStores(context, () => {
+      try { return promiseThen(promise, resolve, reject); }
+      finally { end.publish(context); }
+    });
+  },
   registerSource(filename, source, metadata) {
     host.registerSource(filename, source, { ...metadata, owner: metadata });
     if (!metadata.generated && typeof filename === 'string') {
