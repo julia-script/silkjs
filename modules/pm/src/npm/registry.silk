@@ -1,17 +1,23 @@
-//! Talks to an npm registry: fetches the metadata of a package and its tarballs.
+//! Talks to an npm registry: fetches the metadata of packages and their tarballs.
 //!
-//! Metadata is asked for in the abbreviated install format, which leaves out everything an
-//! install does not need. Credentials come from the [`Npmrc`] and go only to URLs below the path
-//! they were set for.
+//! [`Registry`] is the service the resolver and the installer ask. [`NetworkRegistry`] provides
+//! it over HTTP: requests of one call run at the same time, metadata is asked for in the
+//! abbreviated install format, which leaves out everything an install does not need, and
+//! credentials come from the [`Npmrc`] and go only to URLs below the path they were set for.
 
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.collections.bytes { Bytes }
+import silk.collections.list { List }
 import silk.collections.slice { Slice }
+import silk.core.effect { Effect }
 import silk.core.option { Option }
+import silk.core.ownership { Copy }
 import silk.core.result { Result }
 import silk.http.client { Http, HttpError, Request, Response }
+import silk.http.client_native { NativeHttp }
 import silk.text.string { String }
 import npm.npmrc { Npmrc }
+import pkg.names { Names }
 
 /// What a registry request failed with, apart from the transport errors of the HTTP client.
 pub enum RegistryErrorKind {
@@ -23,14 +29,20 @@ pub enum RegistryErrorKind {
   Status,
   /// The URL is not valid text.
   Url,
+  /// The request did not get an answer: the network, TLS, a timeout.
+  Transport,
 }
 
 /// A failed registry request.
 pub struct RegistryError {
   pub kind: RegistryErrorKind,
-  /// The response status, or 0 when no request was sent.
+  /// The response status, or 0 when there was no response.
   pub status: u16,
+  /// A short description for people.
+  pub message: string<'static>,
 }
+
+impl Copy for RegistryError {}
 
 /// The largest metadata document that is accepted.
 const METADATA_LIMIT: usize = 268435456
@@ -58,48 +70,146 @@ pub effect fn packumentUrl(registry: &[u8], name: &[u8]) -> Bytes ! OutOfMemoryE
   return move url
 }
 
-effect fn text(bytes: &[u8]) -> string ! RegistryError {
-  return match move String.fromUtf8(bytes) {
-    Result.Success { value } => move value
-    Result.Failure {..} => { fail RegistryError { kind: RegistryErrorKind.Url, status: 0 } }
-  }
+/// Where package metadata and tarballs come from.
+pub service Registry {
+  /// Fetches the metadata documents of the packages `ids` names in `names`. The results are in
+  /// the order of `ids`.
+  ///
+  /// # Errors
+  ///
+  /// - `OutOfMemoryError` if the `Allocator` fails. The failure of one fetch is its result.
+  effect fn documents(names: &Names, ids: &[usize]) -> List<Result<Bytes, RegistryError>>
+    ! OutOfMemoryError ? &mut Registry | &mut Allocator
+  /// Fetches the tarballs at `urls`. The results are in the order of `urls`. The bytes are not
+  /// checked; the caller holds the integrity values.
+  ///
+  /// # Errors
+  ///
+  /// - `OutOfMemoryError` if the `Allocator` fails. The failure of one fetch is its result.
+  effect fn tarballs(urls: &[Bytes]) -> List<Result<Bytes, RegistryError>>
+    ! OutOfMemoryError ? &mut Registry | &mut Allocator
 }
 
-effect fn get(config: &Npmrc, url: &[u8], accept: string, limit: usize) -> Bytes
-  ! RegistryError | HttpError | OutOfMemoryError ? &mut Http | &mut Allocator {
-  let credentials = run Npmrc.authorization(config, url)
-  let mut request = Request.get(run text(url)).maxBodyBytes(limit)
-  run request.header("accept", accept)
-  match &credentials {
-    Option.None => {}
-    Option.Some { value } => {
-      run request.header("authorization", run text(Bytes.asSlice(&value)))
+/// The [`Registry`] over HTTP, with the registries and credentials of an [`Npmrc`].
+pub struct NetworkRegistry<'c> {
+  config: Npmrc,
+  http: NativeHttp<'c>,
+}
+
+const METADATA_ACCEPT: string<'static> = "application/vnd.npm.install-v1+json; q=1.0, application/json; q=0.8"
+
+fn failure(kind: RegistryErrorKind, message: string<'static>) -> RegistryError {
+  return RegistryError { kind: kind, status: 0, message: message }
+}
+
+// Turns one HTTP result into the body or a registry error.
+fn settle(result: Result<Response, HttpError>) -> Result<Bytes, RegistryError> {
+  return match move result {
+    Result.Failure { error } => Result<Bytes, RegistryError>.failResult(failure(RegistryErrorKind.Transport, error.message))
+    Result.Success { value: response } => {
+      let status = Response.status(&response)
+      if status >= 200 && status <= 299 {
+        Result<Bytes, RegistryError>.succeed(Response.intoBody(move response))
+      } else if status == 404 {
+        Result<Bytes, RegistryError>.failResult(RegistryError { kind: RegistryErrorKind.NotFound, status: status, message: "the registry has no such package" })
+      } else if status == 401 || status == 403 {
+        Result<Bytes, RegistryError>.failResult(RegistryError { kind: RegistryErrorKind.Unauthorized, status: status, message: "the registry refused the credentials" })
+      } else {
+        Result<Bytes, RegistryError>.failResult(RegistryError { kind: RegistryErrorKind.Status, status: status, message: "the registry answered with an error status" })
+      }
     }
   }
-  let response = run Http.send(move request)
-  let status = Response.status(&response)
-  if status >= 200 && status <= 299 {
-    return Response.intoBody(move response)
-  }
-  let kind = if status == 404 {
-    RegistryErrorKind.NotFound
-  } else if status == 401 || status == 403 {
-    RegistryErrorKind.Unauthorized
-  } else {
-    RegistryErrorKind.Status
-  }
-  fail RegistryError { kind: kind, status: status }
 }
 
-/// Fetches the metadata document of the package `name` from the registry the settings give it.
-pub effect fn fetchPackument(config: &Npmrc, name: &[u8]) -> Bytes
-  ! RegistryError | HttpError | OutOfMemoryError ? &mut Http | &mut Allocator {
-  let url = run packumentUrl(Npmrc.registryFor(config, name), name)
-  return run get(config, Bytes.asSlice(&url), "application/vnd.npm.install-v1+json; q=1.0, application/json; q=0.8", METADATA_LIMIT)
+// Sends one GET per URL at the same time. A URL that is not valid text fails alone.
+effect fn getAll(config: &Npmrc, urls: &[Bytes], accept: string<'static>, limit: usize) -> List<Result<Bytes, RegistryError>>
+  ! OutOfMemoryError ? &mut Http | &mut Allocator {
+  let mut credentials = List<Bytes>.make()
+  let mut index: usize = 0
+  while index < urls.length {
+    let found = run Npmrc.authorization(config, Bytes.asSlice(&urls[index]))
+    match move found {
+      Option.None => { run credentials.append(Bytes.make()) }
+      Option.Some { value } => { run credentials.append(move value) }
+    }
+    index = index + 1
+  }
+  let headers = List<Bytes>.asSlice(&credentials)
+  let mut requests = List<Request<'_>>.make()
+  // Which URL each request is for; the others failed before being sent.
+  let mut sent = List<usize>.make()
+  index = 0
+  while index < urls.length {
+    match String.fromUtf8(Bytes.asSlice(&urls[index])) {
+      Result.Failure {..} => {}
+      Result.Success { value: url } => {
+        let mut request = Request.get(url).maxBodyBytes(limit)
+        run request.header("accept", accept)
+        if Bytes.length(&headers[index]) > 0 {
+          match String.fromUtf8(Bytes.asSlice(&headers[index])) {
+            Result.Failure {..} => {}
+            Result.Success { value: header } => { run request.header("authorization", header) }
+          }
+        }
+        run requests.append(move request)
+        run sent.append(index)
+      }
+    }
+    index = index + 1
+  }
+  let mut answers = run Http.sendAll(move requests)
+  // Results come back in request order; put them back in URL order, from the end.
+  let mut reversed = List<Result<Bytes, RegistryError>>.make()
+  index = urls.length
+  while index > 0 {
+    index = index - 1
+    let last = List<usize>.length(&sent)
+    if last > 0 && List<usize>.get(&sent, last - 1) == index {
+      drop List<usize>.pop(&mut sent)
+      match move List<Result<Response, HttpError>>.pop(&mut answers) {
+        Option.Some { value } => { run reversed.append(settle(move value)) }
+        Option.None => { run reversed.append(Result<Bytes, RegistryError>.failResult(failure(RegistryErrorKind.Transport, "the request was not sent"))) }
+      }
+    } else {
+      run reversed.append(Result<Bytes, RegistryError>.failResult(failure(RegistryErrorKind.Url, "the URL is not valid text")))
+    }
+  }
+  let mut ordered = List<Result<Bytes, RegistryError>>.make()
+  while true {
+    match move List<Result<Bytes, RegistryError>>.pop(&mut reversed) {
+      Option.None => { break }
+      Option.Some { value } => { run ordered.append(move value) }
+    }
+  }
+  return move ordered
 }
 
-/// Fetches the tarball at `url`. The bytes are not checked here; the caller holds the integrity.
-pub effect fn fetchTarball(config: &Npmrc, url: &[u8]) -> Bytes
-  ! RegistryError | HttpError | OutOfMemoryError ? &mut Http | &mut Allocator {
-  return run get(config, url, "*/*", TARBALL_LIMIT)
+impl<'c> NetworkRegistry<'c> {
+  /// A registry client with these settings, sending through `http`.
+  pub fn make(config: Npmrc, http: NativeHttp<'c>) -> NetworkRegistry<'c> {
+    return NetworkRegistry<'c> { config: move config, http: move http }
+  }
+
+  effect fn documents(self: &mut Self, names: &Names, ids: &[usize]) -> List<Result<Bytes, RegistryError>>
+    ! OutOfMemoryError ? &mut Allocator {
+    let mut urls = List<Bytes>.make()
+    let mut index: usize = 0
+    while index < ids.length {
+      let name = Names.bytes(names, ids[index])
+      run urls.append(run packumentUrl(Npmrc.registryFor(&self.config, name), name))
+      index = index + 1
+    }
+    return run getAll(&self.config, List<Bytes>.asSlice(&urls), METADATA_ACCEPT, METADATA_LIMIT)
+      |> Effect.provideMut<Http>(&mut self.http)
+  }
+
+  effect fn tarballs(self: &mut Self, urls: &[Bytes]) -> List<Result<Bytes, RegistryError>>
+    ! OutOfMemoryError ? &mut Allocator {
+    return run getAll(&self.config, urls, "*/*", TARBALL_LIMIT) |> Effect.provideMut<Http>(&mut self.http)
+  }
+}
+
+impl<'c> Registry for NetworkRegistry<'c> {
+  documents: NetworkRegistry.documents
+  tarballs: NetworkRegistry.tarballs
 }
