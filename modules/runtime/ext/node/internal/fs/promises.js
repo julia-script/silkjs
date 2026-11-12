@@ -11,7 +11,9 @@ const { Buffer } = require('buffer');
 const v = c.v;
 const { AbortError, codes: { ERR_FS_EISDIR, ERR_FS_FILE_TOO_LARGE, ERR_INVALID_ARG_TYPE, ERR_INVALID_ARG_VALUE, ERR_INVALID_STATE, ERR_METHOD_NOT_IMPLEMENTED, ERR_OUT_OF_RANGE } } = require('internal/errors');
 const { validateAbortSignal, validateBoolean, validateInteger, validateObject, validateOneOf, kValidateObjectAllowNullable } = v;
-const { constants, kRef, kUnref, makeStats, makeStatFs, Dirent } = c;
+const { constants, kRef, kUnref, makeStats, makeStatFs, Dirent, validateReadFileBufferOptions, getReadFileBuffer, getReadFileBufferByteLengthName } = c;
+const fsBinding = require('internal/fs/binding');
+const { kUsePromises } = fsBinding;
 const promises = {};
 const kMaxUserId = 2 ** 32 - 1;
 const kIoMaxLength = 2 ** 31 - 1;
@@ -44,25 +46,14 @@ function aggregateTwoErrors(inner, outer) {
 }
 function checkAborted(signal) { if (signal?.aborted) throw new AbortError(undefined, { cause: signal?.reason }); }
 
-// Node's native FileHandle closes a descriptor that its object never closed, and then
-// warns from an unref'ed immediate, with the DEP0137 deprecation once per process.
-let gcCloseWarned = false;
-const gcCloser = new FinalizationRegistry((fd) => {
-  try { fs.closeSync(fd); } catch {}
-  setImmediate(() => {
-    process.emitWarning(`Closing file descriptor ${fd} on garbage collection`);
-    if (gcCloseWarned) return;
-    gcCloseWarned = true;
-    process.emitWarning('Closing a FileHandle object on garbage collection is deprecated. ' +
-      'Please close FileHandle objects explicitly using FileHandle.prototype.close(). ' +
-      'In the future, an error will be thrown if a file descriptor is closed during garbage collection.',
-    'DeprecationWarning', 'DEP0137');
-  }).unref();
-});
+// The binding FileHandle owns the descriptor: one whose object was never closed is
+// closed on garbage collection, with Node's warnings.
+const kNative = Symbol('kNative');
 function releaseFd(handle) {
   const fd = handle[kFd];
   handle[kFd] = -1;
-  gcCloser.unregister(handle);
+  handle[kNative]?.releaseFD();
+  handle[kNative] = undefined;
   return fd;
 }
 
@@ -72,7 +63,7 @@ class FileHandle extends EventEmitter {
   constructor(fd) {
     super();
     this[kFd] = fd === undefined ? -1 : fd;
-    if (this[kFd] !== -1) gcCloser.register(this, this[kFd], this);
+    this[kNative] = this[kFd] === -1 ? undefined : new fsBinding.FileHandle(this[kFd]);
     this[kRefs] = 1;
     this[kClosePromise] = null;
     markTransferMode(this, false, true);
@@ -172,7 +163,7 @@ class FileHandle extends EventEmitter {
   [kDeserialize]({ handle }) {
     this[kHandle] = handle;
     this[kFd] = handle.fd;
-    gcCloser.register(this, handle.fd, this);
+    this[kNative] = new fsBinding.FileHandle(handle.fd);
   }
   [kRef]() { this[kRefs]++; }
   [kUnref]() {
@@ -242,34 +233,22 @@ async function writeFileHandle(filehandle, data, signal, encoding) {
     data = new Uint8Array(data.buffer, data.byteOffset + bytesWritten, data.byteLength - bytesWritten);
   } while (remaining > 0);
 }
-function validateReadFileBufferOptions(options) {
-  const { buffer } = options;
-  if (buffer !== undefined && typeof buffer !== 'function' && !ArrayBuffer.isView(buffer)) throw new ERR_INVALID_ARG_TYPE('options.buffer', ['Buffer', 'TypedArray', 'DataView', 'Function'], buffer);
-}
-function getReadFileBuffer(options, size) {
-  let { buffer } = options;
-  if (typeof buffer === 'function') { buffer = options.buffer(size); v.validateBuffer(buffer, 'options.buffer()'); }
-  if (buffer === undefined) return undefined;
-  if (!Buffer.isBuffer(buffer)) buffer = Buffer.from(buffer.buffer, buffer.byteOffset, buffer.byteLength);
-  if (size > buffer.byteLength) throw new ERR_INVALID_ARG_VALUE(typeof options.buffer === 'function' ? 'options.buffer().byteLength' : 'options.buffer.byteLength', buffer.byteLength, `is smaller than the file size of ${size} bytes`);
-  return buffer;
-}
 async function readFileHandleWithUserBuffer(filehandle, options, size) {
   const signal = options?.signal; const encoding = options?.encoding;
   const buffer = getReadFileBuffer(options, size);
-  const byteLengthName = typeof options.buffer === 'function' ? 'options.buffer().byteLength' : 'options.buffer.byteLength';
+  const byteLengthName = getReadFileBufferByteLengthName(options);
   let totalRead = 0;
   while (totalRead < buffer.byteLength) {
     checkAborted(signal);
     const length = size === 0 ? buffer.byteLength - totalRead : Math.min(size - totalRead, kReadFileBufferLength);
-    const bytesRead = (await binding('read', [filehandle.fd, buffer, totalRead, length, null])) ?? 0;
+    const bytesRead = (await fsBinding.read(filehandle.fd, buffer, totalRead, length, -1, kUsePromises)) ?? 0;
     totalRead += bytesRead;
     if (bytesRead === 0 || totalRead === size) { const result = buffer.subarray(0, totalRead); return encoding ? result.toString(encoding) : result; }
   }
   if (size === 0) {
     checkAborted(signal);
     const extraBuffer = Buffer.allocUnsafeSlow(1);
-    const bytesRead = (await binding('read', [filehandle.fd, extraBuffer, 0, 1, null])) ?? 0;
+    const bytesRead = (await fsBinding.read(filehandle.fd, extraBuffer, 0, 1, -1, kUsePromises)) ?? 0;
     if (bytesRead !== 0) throw new ERR_INVALID_ARG_VALUE(byteLengthName, buffer.byteLength, 'is too small to contain the entire file');
   }
   return encoding ? buffer.toString(encoding) : buffer.subarray(0, totalRead);
@@ -278,10 +257,10 @@ async function readFileHandle(filehandle, options) {
   const signal = options?.signal; const encoding = options?.encoding;
   const decoder = encoding && new (require('string_decoder').StringDecoder)(encoding);
   checkAborted(signal);
-  const statFields = await binding('fstat', [filehandle.fd, { bigint: false }]);
+  const statFields = await fsBinding.fstat(filehandle.fd, false, kUsePromises);
   checkAborted(signal);
   let size = 0; let length = 0;
-  if ((statFields.mode & 0o170000) === 0o100000) { size = statFields.size; length = encoding ? Math.min(size, kReadFileBufferLength) : size; }
+  if ((statFields[1/* mode */] & 0o170000) === 0o100000) { size = statFields[8/* size */]; length = encoding ? Math.min(size, kReadFileBufferLength) : size; }
   if (length === 0) length = kReadFileUnknownBufferLength;
   if (size > kIoMaxLength) throw new ERR_FS_FILE_TOO_LARGE(size);
   if (options.buffer !== undefined) return readFileHandleWithUserBuffer(filehandle, options, size);
@@ -292,7 +271,7 @@ async function readFileHandle(filehandle, options) {
   for (;;) {
     checkAborted(signal);
     if (chunkedRead) length = Math.min(size - totalRead, kReadFileBufferLength);
-    const bytesRead = (await binding('read', [filehandle.fd, buffer, offset, length, null])) ?? 0;
+    const bytesRead = (await fsBinding.read(filehandle.fd, buffer, offset, length, -1, kUsePromises)) ?? 0;
     totalRead += bytesRead;
     if (bytesRead === 0 || totalRead === size || (bytesRead !== buffer.length && !chunkedRead && !noSize)) {
       const singleRead = bytesRead === totalRead;
@@ -431,7 +410,7 @@ async function readdir(path, options) {
   path = c.path(path);
   const encoding = c.encoding(options.encoding, 'utf8', true);
   const value = await binding('readdir', [path, { ...options, encoding }]);
-  return value.map(entry => options.withFileTypes ? entry instanceof Dirent ? entry : new Dirent(c.encoded(entry.name, encoding), entry.mode, entry.parentPath === undefined ? path : entry.parentPath) : c.encoded(entry, encoding));
+  return value.map(entry => options.withFileTypes ? entry instanceof Dirent ? entry : new Dirent(c.encoded(entry.name, encoding), c.modeType(entry.mode), entry.parentPath === undefined ? path : entry.parentPath) : c.encoded(entry, encoding));
 }
 async function readlink(path, options) {
   options = c.options(options);

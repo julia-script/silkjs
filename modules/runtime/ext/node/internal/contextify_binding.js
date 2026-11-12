@@ -17,4 +17,9 @@ function stopSigintWatchdog() {
   return !!host.workerNative('stopSigintWatch', [guards.pop()]);
 }
 
-module.exports = { startSigintWatchdog, stopSigintWatchdog };
+// Whether any active watchdog has recorded a SIGINT.
+function watchdogHasPendingSigint() {
+  return guards.length !== 0 && host.workerNative('sigintWatchPending', []);
+}
+
+module.exports = { startSigintWatchdog, stopSigintWatchdog, watchdogHasPendingSigint };

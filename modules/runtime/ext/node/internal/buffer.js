@@ -32,6 +32,7 @@ const {
   },
 } = require('internal/errors');
 const { validateNumber } = require('internal/validators');
+const host = require('internal/host');
 const {
   asciiSlice,
   base64Slice,
@@ -1095,6 +1096,8 @@ function markAsUntransferable(obj) {
   if ((typeof obj !== 'object' && typeof obj !== 'function') || obj === null)
     return;  // This object is a primitive and therefore already untransferable.
   untransferable.add(obj);
+  // An ArrayBuffer also gets V8's detach key, so transfer() refuses it too.
+  host.markUntransferable(obj);
 }
 
 // This simply checks if the object is marked as untransferable and doesn't

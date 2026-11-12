@@ -373,6 +373,8 @@ function getOptionValue(name) {
     case '--localstorage-file': return host.localStorageFile;
     case '--experimental-print-required-tla': return !!host.printRequiredTLA;
     case '--insecure-http-parser': return !!host.insecureHTTPParser;
+    case '--dns-result-order': return host.dnsResultOrder ?? '';
+    case '--extra-info-on-fatal-exception': return host.extraInfoOnFatalException !== false;
     case '--max-http-header-size': return host.maxHTTPHeaderSize ?? 16 * 1024;
     case '--experimental-import-text': return !!host.importText;
     case '--strip-types': return !!host.typeScriptMode;
