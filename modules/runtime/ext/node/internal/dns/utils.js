@@ -60,10 +60,13 @@ const IANA_DNS_PORT = 53;
 const IPv6RE = /^\[([^[\]]*)\]/;
 const addrSplitRE = /(^.+?)(?::(\d+))?$/;
 
-// silkjs: the runtime builds no user-land startup snapshot, so nothing is ever serialized.
-const isBuildingSnapshot = () => false;
-const addSerializeCallback = () => {};
-const addDeserializeCallback = () => {};
+const {
+  namespace: {
+    addSerializeCallback,
+    addDeserializeCallback,
+    isBuildingSnapshot,
+  },
+} = require('internal/v8/startup_snapshot');
 
 function validateTimeout(options) {
   let { timeout = -1 } = { ...options };
