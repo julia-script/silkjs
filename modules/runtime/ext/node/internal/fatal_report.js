@@ -12,9 +12,11 @@ function site(error, fromPromise) {
   if (!fromPromise) {
     const thrown = host.captureCallSites(-4, error);
     // Its column counts in the script's own text, before any column offset.
-    // A script without a name (an eval) is V8's "<anonymous_script>" in the message.
+    // An eval's code is V8's "<anonymous_script>" in the message, or the name its
+    // sourceURL comment gives, which its frames show.
     if (thrown !== undefined) {
-      const name = thrown[0] === '' && typeof thrown[3] === 'string' ? '<anonymous_script>' : thrown[0];
+      let name = thrown[0];
+      if ((name === '' || name === '<input>') && typeof thrown[3] === 'string') name = evalScriptName(error) || '<anonymous_script>';
       return { name, line: thrown[1], column: thrown[2], text: thrown[3], textColumn: true };
     }
   }
@@ -31,6 +33,12 @@ function site(error, fromPromise) {
   const frame = require('internal/error_stack').origin(error);
   if (frame === undefined) return undefined;
   return { name: frame.scriptName, line: frame.lineNumber, column: frame.columnNumber, text: undefined };
+}
+function evalScriptName(error) {
+  if (error === null || typeof error !== 'object') return undefined;
+  try { void error.stack; } catch { return undefined; }
+  const frame = require('internal/error_stack').origin(error);
+  return frame?.isEval && frame.scriptMetadata?.sourceURL ? frame.scriptName : undefined;
 }
 // The line'th line of the script a frame names, read from its file.
 function fileLine(name, line) {
@@ -82,8 +90,10 @@ function inspected(error) {
   let originalStack;
   try { originalStack = error.stack; } catch { return undefined; }
   const { inspect } = require('util');
+  // afterInspector: colors where shouldColorize(process.stderr) says so (FORCE_COLOR
+  // among others), or by inspect's default.
   let colors = inspect.defaultOptions.colors;
-  try { colors = colors || (process.stderr.isTTY === true && process.stderr.hasColors?.() === true); } catch {}
+  try { colors = require('internal/util/colors').shouldColorize(process.stderr) || colors; } catch {}
   try {
     return inspect(error, { colors, customInspect: false, depth: Math.max(inspect.defaultOptions.depth, 5) });
   } catch {
