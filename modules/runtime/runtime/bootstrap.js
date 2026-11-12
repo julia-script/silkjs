@@ -102,7 +102,9 @@ host.startupSnapshot = {
 host.rethrow = value => { native.captureCallSites(-5, value); };
 host.builtinLoaded = moduleHas;
 // Whether a built-in id (public or internal) exists, loaded or not: Node's BuiltinModule.exists.
-host.builtinExists = Map.prototype.has.bind(factories);
+// This bootstrap is one, as Node's internal/bootstrap modules are.
+const hasFactory = Map.prototype.has.bind(factories);
+host.builtinExists = id => id === 'internal/bootstrap/silk' || hasFactory(id);
 // Source maps are off until something loads the module to switch them on, so
 // registering a source before that only matters when coverage wants every map.
 host.registerSource = (filename, source, metadata) => {
@@ -1005,9 +1007,7 @@ function armInspectorEntry() {
 }
 // execution.js getEvalModuleUrl: an --eval or stdin module is [evalN] under the cwd's URL.
 let evalIndex = 0;
-function evalModuleURL() {
-  return `${internalRequire('url').pathToFileURL(host.tryGetCwd())}/[eval${++evalIndex}]`;
-}
+function evalModuleURL() { return `${internalRequire('url').pathToFileURL(host.tryGetCwd())}/[eval${++evalIndex}]`; }
 function evaluateMain(source, name) {
   mainModuleName = name;
   armInspectorEntry();
