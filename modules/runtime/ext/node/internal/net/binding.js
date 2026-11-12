@@ -228,7 +228,8 @@ class StreamHandle {
     this._transport.shutdown(error => {
       const status = statusOf(error);
       if (sync) { result = status === 0 ? 1 : status; return; }
-      if (typeof req.oncomplete === 'function') req.oncomplete(status);
+      // StreamBase AfterShutdown: oncomplete(status, handle, error).
+      if (typeof req.oncomplete === 'function') req.oncomplete(status, this, undefined);
     });
     sync = false;
     // 1 tells net.js that the shutdown already finished, like UV_ENOTCONN.
@@ -278,7 +279,7 @@ class StreamHandle {
       completed = true;
       this._pendingWrites?.delete(complete);
       this.writeQueueSize -= bytes;
-      if (typeof wrap.oncomplete === 'function') wrap.oncomplete(status);
+      if (typeof wrap.oncomplete === 'function') wrap.oncomplete(status, this, undefined);
       else wrap.writeStatus = status;
     };
     const done = error => {
@@ -514,6 +515,17 @@ class TCP extends NativeStreamHandle {
   getTypeOfService() {
     const tos = this._call('typeOfService', -1);
     return tos;
+  }
+  // TCPWrap::TransferForMessaging: the receiving thread gets a duplicate of the descriptor, and
+  // this handle closes once the message is posted (the duplicate keeps the socket open).
+  _duplicateForTransfer() {
+    const fd = this.fd;
+    if (fd < 0) return uv.UV_EBADF;
+    return host.net('duplicateFd', [fd]);
+  }
+  _finishTransfer() {
+    this.reading = false;
+    this.close(() => {});
   }
   reset(callback) {
     if (this._closeCallback !== null || !this._transport) return 0;

@@ -1,6 +1,6 @@
 'use strict';
 const { Buffer } = require('buffer');
-const { native, NativeSecureContext } = require('internal/tls/context');
+const { native, NativeSecureContext, answerFor, answering } = require('internal/tls/context');
 const { codes } = require('internal/errors');
 
 // OpenSSL failures become TLS errors; anything else, such as an exception thrown
@@ -37,6 +37,7 @@ class TLSTransport {
     try {
       if (options.ALPNProtocols?.length) native(options.isServer ? 'serverALPN' : 'setALPN', this.id, options.ALPNProtocols);
       if (!options.isServer && options.session) native('setSession', this.id, options.session);
+      if (!options.isServer && options.requestOCSP) native('requestOCSP', this.id);
     } catch (err) { native('release', this.id); this.id = 0; throw err; }
     carrier.on('data', chunk => {
       if (this.closing || !this.id) return;
@@ -69,6 +70,10 @@ class TLSTransport {
     if (this.closing) return;
     if (this.id) {
       try { const data = Buffer.from(op('drain', this.id)); if (data.length) this.alert = data; } catch {}
+      // As TLSWrap::ClearOut, an established session flushes the alert before onerror:
+      // the socket may stay open (a server whose 'error' listener keeps it) and the peer
+      // must still learn why.
+      if (this.alert && this.ready && this.carrier.writable && !this.carrier.writableEnded) { this.carrier.write(this.alert); this.alert = null; }
     }
     this.socket._onTLSError(err);
   }
@@ -102,21 +107,49 @@ class TLSTransport {
         if (context !== null && typeof context === 'object' && !(context instanceof NativeSecureContext)) {
           this.fail(new TypeError('Invalid SNI context')); return;
         }
-        try {
-          op('select', this.id, context instanceof NativeSecureContext ? context._id : 0);
-          this.selectALPN();
-        } catch (failure) { if (!(failure instanceof Failure)) throw failure; this.socket.destroy(failure.cause); return; }
-        if (this.closing) return;
-        this.selecting = false; this.carrier.resume(); this.pump();
+        this.requestOCSP(context instanceof NativeSecureContext ? context : null);
       });
     };
-    if (servername && this.socket._SNICallback) this.socket._SNICallback(servername, done);
-    else done(null, null);
+    // As Node's loadSNI, a throwing SNICallback destroys the socket.
+    try {
+      if (servername && this.socket._SNICallback) this.socket._SNICallback(servername, done);
+      else done(null, null);
+    } catch (err) { this.socket.destroy(err); }
+  }
+  // Node's requestOCSP: a server with 'OCSPRequest' listeners answers a client's
+  // status_request before the certificate callback returns; the staple is sent by
+  // the status callback OpenSSL runs after it.
+  requestOCSP(context) {
+    const server = this.socket.server;
+    if (!server || server.listenerCount('OCSPRequest') === 0 || !op('ocspRequested', this.id)) { this.certificateDone(context); return; }
+    const ctx = context || this.socket._secureContext.context;
+    let once = false;
+    const onOCSP = (err, response) => {
+      if (once) { this.socket.destroy(new codes.ERR_MULTIPLE_CALLBACK()); return; }
+      once = true;
+      if (err) { this.socket.destroy(err); return; }
+      if (this.closing || !this.id) { this.socket.destroy(new codes.ERR_SOCKET_CLOSED()); return; }
+      if (response) op('setOCSPResponse', this.id, response);
+      this.certificateDone(context);
+    };
+    try { server.emit('OCSPRequest', ctx.getCertificate(), ctx.getIssuer(), onOCSP); }
+    catch (err) { this.socket.destroy(err); }
+  }
+  // TLSWrap::CertCbDone.
+  certificateDone(context) {
+    if (this.closing) return;
+    try {
+      op('select', this.id, context ? context._id : 0);
+      this.selectALPN();
+    } catch (failure) { if (!(failure instanceof Failure)) throw failure; this.socket.destroy(failure.cause); return; }
+    if (this.closing) return;
+    this.selecting = false; this.carrier.resume(); this.pump();
   }
   // Node's SelectALPNCallback with an ALPNCallback: its choice, or a fatal
   // no_application_protocol alert when it returns undefined.
   selectALPN() {
-    if (!this.options.isServer || !this.socket._hasALPNCallback()) return;
+    if (!this.options.isServer || !this.socket._hasALPNCallback() || this.alpnSelected) return;
+    this.alpnSelected = true;
     const offered = Buffer.from(op('offeredALPN', this.id));
     if (!offered.length) return;
     const selected = this.socket._callALPNCallback(offered);
@@ -124,17 +157,50 @@ class TLSTransport {
     if (selected === undefined) op('rejectALPN', this.id);
     else op('serverALPN', this.id, Buffer.concat([Buffer.from([selected.length]), Buffer.from(selected, 'latin1')]));
   }
+  // With an ALPNCallback, a TLS 1.3 ClientHello waits until JS chose (see clientHelloDone).
+  enableALPNCallback() { if (this.id) op('enableALPNCallback', this.id); }
+  // TLSWrap::EnablePskCallback: handler is onPskServerCallback(identity, maxPskLen) or
+  // onPskClientCallback(hint, maxPskLen, maxIdentityLen).
+  enablePsk(handler) {
+    this.pskHandler = handler; answerFor(this.id, this);
+    op('enablePsk', this.id);
+  }
+  setPskIdentityHint(hint) {
+    try { op('pskHint', this.id, hint); return true; } catch (failure) { if (!(failure instanceof Failure)) throw failure; return false; }
+  }
+  answer(kind, text, a, b) {
+    if (this.closing || !this.pskHandler) return null;
+    if (kind === 1) {
+      const psk = this.pskHandler(text, a);
+      return psk == null ? null : Buffer.from(psk.buffer, psk.byteOffset, psk.byteLength);
+    }
+    const ret = this.pskHandler(text, a, b);
+    if (ret == null) return null;
+    const identity = Buffer.from(ret.identity), psk = Buffer.from(ret.psk.buffer, ret.psk.byteOffset, ret.psk.byteLength);
+    const out = Buffer.alloc(2 + identity.length + psk.length);
+    out.writeUInt16BE(identity.length, 0); identity.copy(out, 2); psk.copy(out, 2 + identity.length);
+    return out;
+  }
   enableKeylog() { this.keylog = true; op('enableKeylog', this.id); }
   enableSessionCallbacks() { this.sessionCallbacks = true; op('enableSessionCallbacks', this.id); }
   // Node's EmitClientHello, from a fresh stack as TLSWrap schedules it.
   awaitClientHello() {
     if (this.helloWaiting) return;
     this.helloWaiting = true; this.carrier.pause();
+    if (!this.sessionCallbacks) {
+      setImmediate(() => { if (!this.closing && this.id) this.clientHelloDone(); });
+      return;
+    }
     const hello = { sessionId: Buffer.from(op('helloSessionId', this.id)), tlsTicket: !!op('helloTicket', this.id) };
     setImmediate(() => { if (!this.closing && this.id) this.socket._onClientHello(hello); });
   }
   clientHelloDone() {
     if (!this.helloWaiting || this.closing || !this.id) return;
+    // SelectALPNCallback runs as OpenSSL parses a TLS 1.3 hello, before SNI's certificate step.
+    if (op('helloALPN', this.id)) {
+      this.selectALPN();
+      if (this.closing || !this.id) return;
+    }
     op('clientHelloDone', this.id);
     this.helloWaiting = false; this.carrier.resume(); this.pump();
   }
@@ -198,6 +264,9 @@ class TLSTransport {
     this.pumping = true;
     try {
       if (!this.ready) {
+        // A client that writes before TLSSocket#_start (a bare new TLSSocket() that
+        // connects) starts its handshake, as SSL_write does inside TLSWrap::DoWrite.
+        if (!this.initiated && this.writes.some(item => item.data.length)) this.initiated = true;
         if (!this.initiated) { this.shutdown_(); return; }
         const status = op('handshake', this.id);
         // As in TLSWrap, the handshake-done callback runs before the final flight is
@@ -207,6 +276,14 @@ class TLSTransport {
         if (status === 4) { this.chooseCertificate(); return; }
         if (status === 11) { this.awaitClientHello(); return; }
         if (status !== 1) { this.shutdown_(); return; }
+        // Node's client status callback runs while OpenSSL reads the server's flight,
+        // before the client's Finished leaves: 'OCSPResponse' may still destroy it.
+        if (!this.options.isServer && this.options.requestOCSP && !this.ocspEmitted) {
+          this.ocspEmitted = true;
+          const response = Buffer.from(op('ocspResponse', this.id));
+          this.socket.emit('OCSPResponse', response.length ? response : null);
+          if (this.closing || !this.id) return;
+        }
         this.ready = true;
         this.handshakeCompletions = op('handshakeCompletions', this.id);
         this.socket._onHandshakeDone();
@@ -275,7 +352,7 @@ class TLSTransport {
   // Node's TLSWrap::DestroySSL: the session goes away before the socket does.
   destroySSL() {
     if (!this.id) return;
-    op('release', this.id); this.id = 0;
+    answering.delete(this.id); op('release', this.id); this.id = 0;
     for (const item of this.writes.splice(0)) item.callback(canceled());
   }
   write(data, callback) {
@@ -298,10 +375,12 @@ class TLSTransport {
   finish() {
     if (this.closed) return;
     this.closed = true; this.closing = true;
-    if (this.id) { native('release', this.id); this.id = 0; }
+    if (this.id) { answering.delete(this.id); native('release', this.id); this.id = 0; }
     for (const item of this.writes.splice(0)) item.callback(canceled());
     const done = this.pendingShutdown; this.pendingShutdown = null; if (done) done(null);
-    this.onEvent?.(6, 0);
+    // HandleWrap::OnClose runs from libuv's close callback, after the ticks queued so far: a
+    // socket destroyed with an error emits 'error' before 'close'.
+    process.nextTick(() => this.onEvent?.(6, 0));
   }
   close(reset = false) {
     if (this.closing) return 0;

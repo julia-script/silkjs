@@ -63,6 +63,7 @@ const kEnableTrace = Symbol('enableTrace');
 const kPskCallback = Symbol('pskcallback');
 const kPskIdentityHint = Symbol('pskidentityhint');
 const kALPNCallback = Symbol('alpncallback');
+const kPreAborted = Symbol('kPreAborted');
 const kDisableRenegotiation = Symbol('disable-renegotiation');
 
 // X509_V_ERR_* names, as ncrypto's X509Pointer::ErrorCode spells them.
@@ -107,8 +108,7 @@ function TLSSocket(socket, opts) {
   this[kIsVerified] = false;
   this[kPendingSession] = null;
   this.encrypted = true;
-  this.lastHandshakeTime = 0;
-  this.handshakes = 0;
+  this[kPreAborted] = !!options.signal?.aborted;
   net.Socket.call(this, {
     allowHalfOpen: socket ? socket.allowHalfOpen : options.allowHalfOpen,
     highWaterMark: options.highWaterMark,
@@ -150,7 +150,16 @@ TLSSocket.prototype._init = function(socket, handle, reinitializing = false) {
   // As net's reinitializeHandle: the old handle closes before the new one takes over.
   if (reinitializing) this._handle?.close();
   this._attachTransport(this._tls);
+  // Node's _wrapHandle: the TLSWrap is socket.ssl and keeps the context it was made with.
+  this.ssl = this._handle;
+  this._handle._secureContext = this._secureContext;
+  // TLSWrap::VerifyError, for callers of a bare new TLSSocket() that check it themselves.
+  this._handle.verifyError = () => this._verifyError();
+  // onhandshakestart counts renegotiations on the TLSWrap.
+  this._handle.lastHandshakeTime = 0;
+  this._handle.handshakes = 0;
   if (this._requestCert || this._rejectUnauthorized) native('verifyMode', this._tls.id, this._requestCert, this._rejectUnauthorized);
+  if (!reinitializing) this.on('close', onSocketCloseDestroySSL);
   // Only report keylog lines once there is a 'keylog' listener.
   if (this.listenerCount('newListener', keylogNewListener) === 0) this.on('newListener', keylogNewListener);
   if (options.isServer) {
@@ -163,6 +172,7 @@ TLSSocket.prototype._init = function(socket, handle, reinitializing = false) {
   if (options.isServer && options.ALPNCallback) {
     validateFunction(options.ALPNCallback, 'options.ALPNCallback');
     this[kALPNCallback] = options.ALPNCallback;
+    this._tls.enableALPNCallback();
   }
   const keylog = tlsOptions.getOptionValue('--tls-keylog');
   if (keylog && !reinitializing) {
@@ -183,7 +193,17 @@ TLSSocket.prototype._init = function(socket, handle, reinitializing = false) {
     validateFunction(options.SNICallback, 'options.SNICallback');
     this._SNICallback = options.SNICallback;
   }
-  if (options.pskCallback) validateFunction(options.pskCallback, 'pskCallback');
+  if (options.pskCallback) {
+    validateFunction(options.pskCallback, 'pskCallback');
+    this[kPskCallback] = options.pskCallback;
+    this._tls.enablePsk(options.isServer ? onPskServerCallback.bind(this) : onPskClientCallback.bind(this));
+    if (options.pskIdentityHint) {
+      validateString(options.pskIdentityHint, 'options.pskIdentityHint');
+      // TLSWrap::SetPskIdentityHint: a hint OpenSSL refuses fails the socket.
+      if (!this._tls.setPskIdentityHint(options.pskIdentityHint))
+        this._onTLSError(Object.assign(new Error('Failed to set PSK identity hint'), { code: 'ERR_TLS_PSK_SET_IDENTITY_HINT_FAILED' }));
+    }
+  }
   if (options.handshakeTimeout > 0) this.setTimeout(options.handshakeTimeout, this._handleTimeout);
   if (socket instanceof net.Socket) {
     this.connecting = socket.connecting || socket._connected === false;
@@ -192,10 +212,16 @@ TLSSocket.prototype._init = function(socket, handle, reinitializing = false) {
   }
   if (socket) socket.on('error', err => this._emitTLSError(err));
   else if (!reinitializing) this.connecting = true;
+  // An options.signal that was already aborted destroyed the socket in the stream
+  // constructor, before it had a handle to close.
+  // (net.Socket's initSocketHandle then undoes destroyed, as in Node): it never connects,
+  // and its carrier goes away unconnected.
+  if (this[kPreAborted] && !reinitializing) { this.connecting = false; if (!socket) this._parent.destroy(); }
 };
 TLSSocket.prototype.connect = function(...args) {
   const [options, cb] = net._normalizeArgs(args);
   if (cb) this.once('connect', cb);
+  if (this[kPreAborted]) return this;
   this.connecting = true;
   // The TLS socket listens to options.signal itself; aborting it destroys the parent too.
   try { this._parent.connect({ ...options, allowHalfOpen: true, signal: undefined }); } catch (err) { this.destroy(); throw err; }
@@ -225,7 +251,49 @@ TLSSocket.prototype._onTLSError = function(err) {
   else if (this._tlsOptions.isServer && this._rejectUnauthorized && /peer did not return a certificate/.test(err.message)) this.destroy();
   else this._emitTLSError(err);
 };
+// A single-use context (tls.connect without keepAlive) belongs to its socket: Node frees it
+// here, not when a handle closes, since autoSelectFamily retries share it across handles.
+function closeSingleUseContext(secureContext) {
+  if (secureContext && secureContext.singleUse && secureContext.context !== null) {
+    secureContext.context.close();
+    secureContext.context = null;
+  }
+}
+// Node's onPskServerCallback and onPskClientCallback: OpenSSL waits for the answer;
+// anything wrong destroys the socket and answers nothing.
+function onPskServerCallback(identity, maxPskLen) {
+  try {
+    const ret = this[kPskCallback](this, identity);
+    if (ret == null) return undefined;
+    let psk;
+    if (ArrayBuffer.isView(ret)) psk = ret;
+    else {
+      if (typeof ret !== 'object') throw invalidArgType('ret', ['Object', 'Buffer', 'TypedArray', 'DataView'], ret);
+      psk = ret.psk;
+      validateBuffer(psk, 'psk');
+    }
+    if (psk.length > maxPskLen) throw invalidArgValue('psk', psk, `Pre-shared key exceeds ${maxPskLen} bytes`);
+    return psk;
+  } catch (err) { this.destroy(err); return undefined; }
+}
+function onPskClientCallback(hint, maxPskLen, maxIdentityLen) {
+  try {
+    const ret = this[kPskCallback](hint);
+    if (ret == null) return undefined;
+    validateObject(ret, 'ret');
+    validateBuffer(ret.psk, 'psk');
+    if (ret.psk.length > maxPskLen) throw invalidArgValue('psk', ret.psk, `Pre-shared key exceeds ${maxPskLen} bytes`);
+    validateString(ret.identity, 'identity');
+    if (Buffer.byteLength(ret.identity) > maxIdentityLen) throw invalidArgValue('identity', ret.identity, `PSK identity exceeds ${maxIdentityLen} bytes`);
+    return { psk: ret.psk, identity: ret.identity };
+  } catch (err) { this.destroy(err); return undefined; }
+}
+// Node's onSocketCloseDestroySSL: the session and a single-use context go away
+// from the immediate queue once the socket closed.
+function onSocketCloseDestroySSL() { setImmediate(destroySSL, this); }
+function destroySSL(self) { self._destroySSL(); }
 TLSSocket.prototype._destroySSL = function() {
+  closeSingleUseContext(this._secureContext);
   if (!this._tls?.id) return;
   this._tls.destroySSL();
   this[kPendingSession] = null;
@@ -254,12 +322,14 @@ TLSSocket.prototype._callALPNCallback = function(protocolsBuffer) {
 };
 // Node's onhandshakestart: limits how often a client may renegotiate.
 TLSSocket.prototype._onHandshakeStart = function(now) {
-  const { lastHandshakeTime } = this;
-  this.lastHandshakeTime = now;
+  const handle = this._handle;
+  if (!handle) return;
+  const { lastHandshakeTime } = handle;
+  handle.lastHandshakeTime = now;
   if (lastHandshakeTime === 0) return;
-  if ((now - lastHandshakeTime) >= tlsExports.CLIENT_RENEG_WINDOW * 1000) this.handshakes = 1;
-  else this.handshakes++;
-  if (this.handshakes > tlsExports.CLIENT_RENEG_LIMIT) {
+  if ((now - lastHandshakeTime) >= tlsExports.CLIENT_RENEG_WINDOW * 1000) handle.handshakes = 1;
+  else handle.handshakes++;
+  if (handle.handshakes > tlsExports.CLIENT_RENEG_LIMIT) {
     this._emitTLSError(new codes.ERR_TLS_SESSION_ATTACK());
     return;
   }

@@ -42,6 +42,12 @@ function isNativeWrap(value) {
   if (host.builtinLoaded('internal/net/binding') && value instanceof require('internal/net/binding').stream_wrap.LibuvStreamWrap) return true;
   return host.builtinLoaded('internal/dgram') && value instanceof require('internal/dgram').UDP;
 }
+// A TCP handle that a net.Server, net.Socket or net.BoundSocket lists in its kTransferList moves
+// to the receiving thread (TCPWrap::TransferForMessaging): its descriptor travels, duplicated at
+// serialization and closed on this side once the message is posted.
+function isTransferableNetHandle(value) {
+  return host.builtinLoaded('internal/net/binding') && value instanceof require('internal/net/binding').tcp_wrap.TCP;
+}
 // postMessage(value, transferList) takes an iterable, or an options object whose transfer
 // member is one, with Node's messages for each.
 function iterable(value, name) {
@@ -72,6 +78,8 @@ class CloneSerializer extends Serializer {
     this.signals = signals;
     this.pendingSignals = [];
     this.handles = null;
+    this.netHandles = [];
+    this.netDescriptors = [];
     this.modules = new WeakMap();
     this.memories = new WeakMap();
   }
@@ -100,6 +108,7 @@ class CloneSerializer extends Serializer {
   }
   _isHostObject(value) {
     if (this.transferred.has(value)) return true;
+    if (this.netHandles.includes(value)) return true;
     const mode = jsTransferable.getTransferMode(value);
     if (mode !== undefined) {
       // A JS cloneable (Node's BaseObject::kCloneable) is written from its [kClone]().
@@ -185,6 +194,15 @@ class CloneSerializer extends Serializer {
       this.writeRawBytes(bytes);
       return;
     }
+    if (this.netHandles.includes(value)) {
+      const fd = value._duplicateForTransfer();
+      if (fd < 0) throw cloneError('Cannot clone object of unsupported type.');
+      this.netDescriptors.push(fd);
+      this.writeUint32(13);
+      this.writeUint32(value._type);
+      this.writeUint32(fd);
+      return;
+    }
     if (this.handles && fileHandles(false)?.isNative(value)) {
       if (!this.handles.includes(value)) throw cloneError('Object that needs transfer was found in message but not listed in transferList');
       this.writeUint32(11);
@@ -257,6 +275,19 @@ class CloneDeserializer extends Deserializer {
       }
       return fileHandles(true).create(fd);
     }
+    if (tag === 13) {
+      const type = this.readUint32();
+      const fd = this.readUint32();
+      if (this.realm) {
+        host.processNative('closeFd', [fd]);
+        throw codedError('ERR_MESSAGE_TARGET_CONTEXT_UNAVAILABLE', 'A native object cannot be received in the target context', Error);
+      }
+      const { TCP } = require('internal/net/binding').tcp_wrap;
+      const handle = new TCP(type);
+      const err = handle.open(fd);
+      if (err) { host.processNative('closeFd', [fd]); throw cloneError('Unsupported host object.'); }
+      return handle;
+    }
     if (tag === 12) {
       const object = jsTransferable.createDeserializedObject(this.readValue());
       object[jsTransferable.kDeserialize](this.readValue());
@@ -319,6 +350,7 @@ function prepare(value, list, source) {
   const signals = new Map();
   const transferred = new Map();
   const handles = [];
+  const netHandles = [];
   // Index loops and Map#forEach: user code may have replaced the iterators (Node's primordials).
   const items = transferList(list);
   for (let position = 0; position < items.length; position++) {
@@ -345,6 +377,7 @@ function prepare(value, list, source) {
       throw cloneError();
     } else throw codedError('ERR_INVALID_TRANSFER_OBJECT', 'Found invalid object in transferList');
   }
+  let serializer;
   try {
     // JS transferables name the extra objects (MessagePorts) that move with
     // them, then describe themselves for the receiving side.
@@ -360,6 +393,8 @@ function prepare(value, list, source) {
         const other = others[at];
         if (fileHandles(false)?.isNative(other)) {
           handles.push(other);
+        } else if (isTransferableNetHandle(other)) {
+          if (!netHandles.includes(other)) netHandles.push(other);
         } else if (portHooks?.isPort(other)) {
           // Node skips a nested port without a handle; serialization then rejects it if referenced.
           if (portHooks.detached(other)) continue;
@@ -376,8 +411,9 @@ function prepare(value, list, source) {
       signals.set(signal, record);
       if (record.port) { ports.push(record.port); ids.push(portHooks.id(record.port)); }
     });
-    const serializer = new CloneSerializer(ports, shared, buffers, signals, transferred);
+    serializer = new CloneSerializer(ports, shared, buffers, signals, transferred);
     serializer.handles = fileHandles(false) ? handles : null;
+    serializer.netHandles = netHandles;
     buffers.forEach((buffer, index) => serializer.transferArrayBuffer(index, buffer));
     serializer.writeHeader();
     serializer.writeValue(value);
@@ -407,19 +443,26 @@ function prepare(value, list, source) {
       if (host.wasmNative('isMemoryBuffer', buffer)) throw cloneError('WebAssembly memory buffers cannot be transferred.');
       try { new Uint8Array(buffer); } catch { throw cloneError('An ArrayBuffer was detached during serialization.'); }
     }
-    return { bytes: serializer.releaseBuffer(), buffers, shared, ports: ids, moved: ports, signals, handles };
+    return { bytes: serializer.releaseBuffer(), buffers, shared, ports: ids, moved: ports, signals, handles, netHandles, netDescriptors: serializer.netDescriptors };
   } catch (error) {
     signals.forEach(record => { if (record) abort.rollbackTransfer(record); });
+    if (serializer) closeDescriptors(serializer.netDescriptors);
     throw error;
   }
 }
+function closeDescriptors(fds) {
+  for (let at = 0; at < fds.length; at++) host.processNative('closeFd', [fds[at]]);
+}
 function rollback(prepared) {
   prepared.signals?.forEach(record => abort.rollbackTransfer(record));
+  closeDescriptors(prepared.netDescriptors || []);
 }
 function commit(prepared) {
   for (let at = 0; at < prepared.moved.length; at++) portHooks.detach(prepared.moved[at]);
   const handles = prepared.handles || [];
   for (let at = 0; at < handles.length; at++) fileHandles(false).detach(handles[at]);
+  const netHandles = prepared.netHandles || [];
+  for (let at = 0; at < netHandles.length; at++) netHandles[at]._finishTransfer();
   prepared.signals?.forEach(record => abort.commitTransfer(record));
 }
 function post(id, value, list) {
