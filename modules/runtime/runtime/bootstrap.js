@@ -975,6 +975,12 @@ function runPreloads(entry, loadImports = true, loadRequires = true) {
   if (host.experimentalShadowRealm) internalRequire('internal/shadow_realm').enable();
   // --experimental-loader: each one is module.register(specifier, cwd) before any preload.
   if (loadImports && loaderPreloads.length) {
+    // createModuleLoader's warning, with the --import that does the same.
+    const readable = text => encodeURIComponent(text).replace(/'/g, '%27').replace(/%22/g, '"').replace(/%2F/ig, '/');
+    process.emitWarning('`--experimental-loader` may be removed in the future; instead use `register()`:\n' +
+      `--import 'data:text/javascript,import { register } from "node:module"; import { pathToFileURL } from "node:url"; ${
+        loaderPreloads.map(specifier => `register(${readable(JSON.stringify(specifier))}, pathToFileURL("./"))`).join('; ')};'`,
+      'ExperimentalWarning');
     const base = internalRequire('url').pathToFileURL(host.cwd() + host.path.sep).href;
     for (const specifier of loaderPreloads) loader.Module.register(specifier, base);
   }
@@ -1049,6 +1055,11 @@ function runtimeFlag(arg) {
     return true;
   }
   if (arg === '--disable-sigusr1') { host.disableSigusr1 = true; return true; }
+  if (arg.startsWith('--trace-require-module=')) {
+    const mode = arg.slice('--trace-require-module='.length);
+    if (mode !== 'all' && mode !== 'no-node-modules') { cliError('invalid value for --trace-require-module'); return true; }
+    host.traceRequireModule = mode; return true;
+  }
   if (arg === '--trace-events-enabled') { (host.traceOptions ||= {}).enabled = true; return true; }
   if (arg.startsWith('--trace-event-categories=')) { (host.traceOptions ||= {}).categories = arg.slice(25); return true; }
   if (arg.startsWith('--trace-event-file-pattern=')) { (host.traceOptions ||= {}).filePattern = arg.slice(27); return true; }
