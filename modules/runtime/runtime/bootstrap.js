@@ -1334,7 +1334,8 @@ function run() {
   if (check && testMode) return cliError('either --test or --check can be used, not both');
   if (testMode && (expression !== undefined || interactive || inputTypeSet))
     return cliError('--test cannot be combined with eval, interactive, or input-type');
-  if (expression === undefined && filename !== undefined && filename !== '-' && !testMode)
+  // Node's watch supervisor keeps argv[1] as given (prepareMainThreadExecution without expandArgv1).
+  if (expression === undefined && filename !== undefined && filename !== '-' && !testMode && !watchMode)
     process.argv[1] = host.path.resolve(filename);
   const entrypoints = [];
   // The main script as resolved before any preload ran.
