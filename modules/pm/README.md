@@ -7,15 +7,17 @@ development.
 
 ```sh
 silk test --root src/tests.silk     # the unit tests
-silk run -- fetch is-odd '^3'       # resolve, download, check and unpack one package
+silk run -- install                 # install the package.json of the working directory
 ```
 
-`pm fetch` writes to the store at `$SILKJS_STORE`, or `~/.silkjs/store`.
+`pm install` resolves the dependencies against the registry, downloads what the store at
+`$SILKJS_STORE` (or `~/.silkjs/store`) does not have, and links an isolated `node_modules`: each
+package once under `node_modules/.sjs`, with its dependencies as sibling links.
 
 ## Layout
 
 - `src/pkg` knows nothing about npm: versions and ranges, the content-addressable store,
-  integrity checks, a one-pass JSON walker. A package manager for another ecosystem can use it
+  integrity checks, name interning, file linking, a one-pass JSON walker. A package manager for another ecosystem can use it
   as is.
-- `src/npm` is what is specific to the npm ecosystem: registry metadata, the registry client and
-  `.npmrc`.
+- `src/npm` is what is specific to the npm ecosystem: manifests, registry metadata, the registry
+  client, `.npmrc`, the resolver and the `node_modules` layout.
