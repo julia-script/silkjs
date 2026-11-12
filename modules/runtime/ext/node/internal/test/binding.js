@@ -37,6 +37,13 @@ const kBindings = {
   stream_wrap: () => net().stream_wrap,
   js_stream: () => net().js_stream,
   cares_wrap: () => require('internal/dns/cares_wrap'),
+  // node_process_methods.cc: process.chdir and process.cwd call through these.
+  process_methods: () => require('internal/host').processMethods,
+  // node_worker.cc: this thread's identity and its control port.
+  worker: () => {
+    const { isMainThread, isInternalThread, threadId, getEnvMessagePort } = require('internal/worker');
+    return { isMainThread, isInternalThread, threadId, getEnvMessagePort };
+  },
   udp_wrap: () => {
     const { UDP, UV_UDP_IPV6ONLY, UV_UDP_REUSEADDR, UV_UDP_REUSEPORT } = require('internal/dgram');
     return { UDP, constants: { UV_UDP_IPV6ONLY, UV_UDP_REUSEADDR, UV_UDP_REUSEPORT } };

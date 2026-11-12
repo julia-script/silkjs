@@ -158,7 +158,7 @@ function createNapiAdapter(host) {
       if (process.domain && require('domain')._handleException(error)) return true;
       try { require('internal/startup_controls').handleUncaught(error, 'uncaughtException'); return true; }
       catch (uncaught) {
-        const workers = require('worker_threads');
+        const workers = require('internal/worker');
         if (!workers.isMainThread) {
           try { workers._reportError(uncaught); }
           finally { workers._requestExit(1); }
