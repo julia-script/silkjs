@@ -7,6 +7,8 @@
 //! package asked for, which is how a later install knows whether the file still matches the
 //! `package.json` files, and what that resolved to: a package as `name@version`, or another
 //! package of the workspace as `link:` and its directory.
+//! `catalogs`, when the root project has any, records their ranges, as a `catalog:` dependency
+//! changes with them.
 //! `packages` has one entry per node of the graph, named `name@version`, with where its tarball
 //! is, its digest, what its dependencies resolved to (`links`), and the few manifest fields an
 //! install reads: `bin`, `os`, `cpu`, `libc` and `hasInstallScript`. A package that is used with
@@ -19,7 +21,7 @@ import silk.collections.list { List }
 import silk.collections.slice { Slice }
 import silk.core.option { Option }
 import silk.core.ownership { Copy }
-import npm.manifest { DEVELOPMENT, Manifest, OPTIONAL, PRODUCTION, Span }
+import npm.manifest { CatalogEntry, DEVELOPMENT, Manifest, OPTIONAL, PRODUCTION, Span }
 import npm.resolve { Edge, Graph }
 import npm.workspace { Workspace }
 import pkg.json_walk { Text, Walker }
@@ -157,6 +159,54 @@ effect fn writeSpecs(out: &mut Bytes, field: &[u8], root: &Manifest, kind: u8) -
   run out.append(b"}")
 }
 
+// The name of a catalog as the lockfile writes it.
+fn catalogName<'m>(root: &'m Manifest, entry: CatalogEntry) -> &'m [u8] {
+  let name = Manifest.text(root, entry.catalog)
+  if name.length == 0 {
+    return b"default"
+  }
+  return name
+}
+
+// Writes `"catalogs":{"default":{"name":"range"},…},` and a line end when the root project has
+// catalogs, sorted by catalog and then by name.
+effect fn writeCatalogs(out: &mut Bytes, root: &Manifest) -> () ! OutOfMemoryError ? &mut Allocator {
+  let entries = Manifest.allCatalogs(root)
+  if entries.length == 0 {
+    return ()
+  }
+  let mut labels = List<Bytes>.make()
+  let mut index: usize = 0
+  while index < entries.length {
+    let mut label = run Bytes.copy(catalogName(root, entries[index]))
+    run label.append(b"\n")
+    run label.append(Manifest.text(root, entries[index].name))
+    run labels.append(move label)
+    index = index + 1
+  }
+  let order = run sorted(List<Bytes>.asSlice(&labels))
+  run out.append(b"\"catalogs\":{")
+  index = 0
+  while index < entries.length {
+    let entry = entries[List<usize>.get(&order, index)]
+    let opens = index == 0 || same(catalogName(root, entries[List<usize>.get(&order, index - 1)]), catalogName(root, entry)) == false
+    if opens {
+      if index > 0 {
+        run out.append(b"},")
+      }
+      run appendString(&mut out, catalogName(root, entry))
+      run out.append(b":{")
+    } else {
+      run out.append(b",")
+    }
+    run appendString(&mut out, Manifest.text(root, entry.name))
+    run out.append(b":")
+    run appendString(&mut out, Manifest.text(root, entry.spec))
+    index = index + 1
+  }
+  run out.append(b"}},\n")
+}
+
 /// The lockfile text for `workspace` resolved to `graph`.
 pub effect fn write(workspace: &Workspace, graph: &Graph) -> Bytes ! OutOfMemoryError ? &mut Allocator {
   let mut keys = List<Bytes>.make()
@@ -179,7 +229,9 @@ pub effect fn write(workspace: &Workspace, graph: &Graph) -> Bytes ! OutOfMemory
   let none: [Edge; 0] = []
 
   let mut out = Bytes.make()
-  run out.append(b"{\n\"lockfileVersion\":1,\n\"importers\":{\n")
+  run out.append(b"{\n\"lockfileVersion\":1,\n")
+  run writeCatalogs(&mut out, &members[0].manifest)
+  run out.append(b"\"importers\":{\n")
   index = 0
   while index < members.length {
     let member = &members[List<usize>.get(&places, index)]
@@ -299,7 +351,17 @@ pub struct Lock {
   asked: List<Asked>,
   // Per importer of the graph: the name its package had, or an empty place.
   names: List<Place>,
+  catalogs: List<Shared>,
 }
+
+// An entry of a catalog when the lockfile was written.
+struct Shared {
+  catalog: Place,
+  name: Place,
+  spec: Place,
+}
+
+impl Copy for Shared {}
 
 effect fn keep(text: &mut Bytes, value: &Text<'_>) -> Place ! OutOfMemoryError ? &mut Allocator {
   let start = Bytes.length(&text)
@@ -361,6 +423,7 @@ impl Lock {
     let mut asked = List<Asked>.make()
     let mut links = List<Link>.make()
     let mut names = List<Place>.make()
+    let mut catalogs = List<Shared>.make()
     // The package keys in file order; the number of a key is the index of its node.
     let mut keys = Names.make()
     // The keys without what tells nodes apart; the number of one is the index of its package.
@@ -378,6 +441,32 @@ impl Lock {
             version = match Walker.unsigned(&mut walker) {
               Option.Some { value } => value
               Option.None => 0
+            }
+          } else if same(name, b"catalogs") {
+            if Walker.enterObject(&mut walker) {
+              while true {
+                match move Walker.key(&mut walker) {
+                  Option.None => { break }
+                  Option.Some { value: catalog } => {
+                    let label = run keep(&mut text, &catalog)
+                    if Walker.enterObject(&mut walker) == false {
+                      Walker.reject(&mut walker)
+                      continue
+                    }
+                    while true {
+                      match move Walker.key(&mut walker) {
+                        Option.None => { break }
+                        Option.Some { value: entry } => {
+                          let spec = Walker.string(&mut walker)
+                          let namePlace = run keep(&mut text, &entry)
+                          let specPlace = run keep(&mut text, &spec)
+                          run catalogs.append(Shared { catalog: label, name: namePlace, spec: specPlace })
+                        }
+                      }
+                    }
+                  }
+                }
+              }
             }
           } else if same(name, b"importers") {
             if Walker.enterObject(&mut walker) {
@@ -556,15 +645,16 @@ impl Lock {
       }
       index = index + 1
     }
-    return Option<Lock>.some(Lock { graph: move graph, text: move text, asked: move asked, names: move names })
+    return Option<Lock>.some(Lock { graph: move graph, text: move text, asked: move asked, names: move names, catalogs: move catalogs })
   }
 
   /// Takes the graph out of the lock.
   pub fn intoGraph(self: Self) -> Graph {
-    let Lock { graph, text, asked, names } = move self
+    let Lock { graph, text, asked, names, catalogs } = move self
     drop text
     drop asked
     drop names
+    drop catalogs
     return move graph
   }
 
@@ -575,6 +665,30 @@ impl Lock {
     let members = Workspace.all(workspace)
     if members.length != Graph.importerCount(&self.graph) {
       return false
+    }
+    // The catalogs of the root project are the ones the file was written with.
+    let root = &members[0].manifest
+    let entries = Manifest.allCatalogs(root)
+    let shared = List<Shared>.asSlice(&self.catalogs)
+    if entries.length != shared.length {
+      return false
+    }
+    let mut entry: usize = 0
+    while entry < entries.length {
+      let mut found = false
+      let mut each: usize = 0
+      while each < shared.length {
+        if same(view(&self.text, shared[each].catalog), catalogName(root, entries[entry]))
+          && same(view(&self.text, shared[each].name), Manifest.text(root, entries[entry].name))
+          && same(view(&self.text, shared[each].spec), Manifest.text(root, entries[entry].spec)) {
+          found = true
+        }
+        each = each + 1
+      }
+      if found == false {
+        return false
+      }
+      entry = entry + 1
     }
     let mut wanted: usize = 0
     let mut member: usize = 0
