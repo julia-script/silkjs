@@ -9,6 +9,7 @@ import platform
 import shutil
 import struct
 import subprocess
+import sys
 import tempfile
 import tomllib
 from embed import ROOT, generate
@@ -113,9 +114,13 @@ def embed_heap_image(output):
     runtime still works: each start runs the bootstrap. That is what an executable that
     cannot run here gets. Stripping the executable afterwards removes the image.
 
+    An executable that runs but fails to write its image, or a layout start that fails,
+    is a bug in the runtime (a bootstrap that reads the environment while the image
+    warms, a start that throws): the build fails, rather than ship an executable whose
+    every start runs the bootstrap.
+
     A start copies each image page it writes, so the image is laid out by the pages
-    starts write (lay_out_heap_image); an image that cannot be laid out is used as the
-    bootstrap left it.
+    starts write (lay_out_heap_image).
     """
     if platform.system() != 'Linux':
         return
@@ -127,8 +132,10 @@ def embed_heap_image(output):
         finally:
             shutil.rmtree(work, ignore_errors=True)
         write_heap_image(output, image, layout)
-    except (OSError, subprocess.CalledProcessError) as error:
-        print(f'Heap image not embedded ({error}); every start will run the bootstrap')
+    except subprocess.CalledProcessError as error:
+        sys.exit(f'Heap image not built ({error}); see the error above')
+    except OSError as error:
+        print(f'Heap image not embedded: the executable cannot run here ({error}); every start will run the bootstrap')
         return
     data = image.read_bytes()
     append_heap_image(output, data)
@@ -164,7 +171,7 @@ def lay_out_heap_image(output, work):
     of the image hands out the same. A first image keeps every block where the
     bootstrap puts it, and the pages its starts write name the candidates; a second
     puts each candidate alone on its pages, and the pages written then name the
-    blocks. None when the starts cannot be profiled here."""
+    blocks."""
     def written(layout, name):
         image = work / (name + '.bin')
         write_heap_image(output, image, layout)
@@ -179,18 +186,17 @@ def lay_out_heap_image(output, work):
             # Output to a file and to a pipe take different paths.
             for output_to in (subprocess.DEVNULL, subprocess.PIPE):
                 profile = work / (name + '.ids')
-                subprocess.run([str(executable), start.name], cwd=HEAP_IMAGE_STARTS, check=True,
-                               env={'SILKJS_HEAP_IMAGE_PROFILE': str(profile)},
-                               stdin=subprocess.DEVNULL, stdout=output_to, stderr=subprocess.DEVNULL)
+                result = subprocess.run([str(executable), start.name], cwd=HEAP_IMAGE_STARTS,
+                                        env={'SILKJS_HEAP_IMAGE_PROFILE': str(profile)},
+                                        stdin=subprocess.DEVNULL, stdout=output_to, stderr=subprocess.PIPE)
+                if result.returncode != 0:
+                    sys.stderr.buffer.write(result.stderr)
+                    raise subprocess.CalledProcessError(result.returncode, result.args)
                 data = profile.read_bytes()
                 ids.update(struct.unpack(f'<{len(data) // 8}Q', data))
         return ids
-    try:
-        candidates = written((set(), 'pack'), 'plain')
-        written_ids = written((candidates, 'probe'), 'probe') & candidates
-    except (OSError, subprocess.CalledProcessError) as error:
-        print(f'Heap image not laid out ({error})')
-        return None
+    candidates = written((set(), 'pack'), 'plain')
+    written_ids = written((candidates, 'probe'), 'probe') & candidates
     print(f'Heap image: {len(written_ids)} of {len(candidates)} candidate blocks written by a start')
     return written_ids, 'pack'
 

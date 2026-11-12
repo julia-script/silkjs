@@ -16,7 +16,7 @@ const REQUEST_SPECIFIER = 0;
 const kInstantiated = 2;
 
 function fileHref(filename) { return require('url').pathToFileURL(filename).href; }
-function asURL(name) { return /^[A-Za-z][A-Za-z\d+.-]*:/.test(name) ? name : fileHref(name); }
+function asURL(name) { return host.hasURLScheme(name) ? name : fileHref(name); }
 
 function moduleSource(filename, format) {
   const source = host.readText(filename);

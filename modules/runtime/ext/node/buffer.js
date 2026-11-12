@@ -25,6 +25,7 @@
 // internalBinding('buffer') operations come from internal/buffer_binding.
 
 const host = require('internal/host');
+const { bufferCodec } = host;
 const {
   byteLengthUtf8,
   compare: _compare,
@@ -897,6 +898,12 @@ Buffer.prototype.copy =
 // This behaves neither like String nor Uint8Array in that we set start/end
 // to their upper/lower bounds if the value passed is out of range.
 Buffer.prototype.toString = function toString(encoding, start, end) {
+  // utf8 with integer offsets (or none) decodes natively; the codec declines
+  // with undefined anything the generic path below must handle.
+  if (encoding === 'utf8' || encoding === undefined) {
+    const text = bufferCodec(8, this, start === undefined ? 0 : start, end === undefined ? 4294967295 : end);
+    if (text !== undefined) return text;
+  }
   if (arguments.length === 0) {
     return utf8Slice(this, 0, this.length);
   }
