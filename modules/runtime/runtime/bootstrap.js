@@ -942,6 +942,7 @@ function evaluateMain(source, name) {
 }
 const requirePreloads = [], importPreloads = [], loaderPreloads = [];
 function runPreloads(entry, loadImports = true, loadRequires = true) {
+  if (host.configFile) process.emitWarning('--experimental-config-file is an experimental feature and might change at any time', 'ExperimentalWarning');
   // Before any preload: Node applies it when the context is made.
   if (host.disableProto !== undefined) disableProto(globalThis);
   if (host.disallowCodeGeneration) native.vmSetCodeGeneration(undefined, false);
@@ -989,7 +990,10 @@ function runtimeFlag(arg) {
     host.stripTypes = !arg.startsWith('--no-'); return true;
   }
   if (arg === '--experimental-transform-types' || arg === '--no-experimental-transform-types') {
-    host.transformTypes = arg === '--experimental-transform-types'; return true;
+    // Implies("--experimental-transform-types", "--experimental-strip-types"): a later --no- still wins.
+    host.transformTypes = arg === '--experimental-transform-types';
+    if (host.transformTypes) host.stripTypes = true;
+    return true;
   }
   if (arg === '--insecure-http-parser' || arg === '--no-insecure-http-parser') {
     host.insecureHTTPParser = arg === '--insecure-http-parser'; return true;
@@ -1008,6 +1012,13 @@ function runtimeFlag(arg) {
   // Node's BuiltinModule.exposeInternals: user code may load the internal/*
   // built-ins (see publicBuiltins.listed).
   if (arg === '--expose-internals') { host.exposeInternals = true; return true; }
+  // Read at startup by internal/config_file; pre_execution only warns.
+  if (arg.startsWith('--experimental-config-file=')) { host.configFile = true; return true; }
+  // node.cc: the per-process --title sets the process title before any script runs.
+  if (arg.startsWith('--title=')) {
+    if (workerThreads.isMainThread) internalRequire('internal/process/title').set(arg.slice('--title='.length));
+    return true;
+  }
   if (arg === '--disable-sigusr1') { host.disableSigusr1 = true; return true; }
   if (arg === '--trace-events-enabled') { (host.traceOptions ||= {}).enabled = true; return true; }
   if (arg.startsWith('--trace-event-categories=')) { (host.traceOptions ||= {}).categories = arg.slice(25); return true; }
@@ -1113,7 +1124,7 @@ function installRuntimeOptions(args, entrypoints = [], preloadEntrypoints = true
   // NODE_V8_COVERAGE: counts from the start, written when the process ends (inspector_profiler.cc).
   if (process.env.NODE_V8_COVERAGE) internalRequire('internal/profiler_binding').startFromEnvironment(process.env.NODE_V8_COVERAGE);
   if (host.enableSourceMaps || moduleHas('internal/source_maps')) process.setSourceMapsEnabled(!!host.enableSourceMaps);
-  host.typeScriptMode = host.transformTypes ? 'transform' : host.stripTypes === false ? false : 'strip';
+  host.typeScriptMode = host.stripTypes === false ? false : host.transformTypes ? 'transform' : 'strip';
   host.initialExecArgv = process.execArgv.slice();
   host.workerRuntimeArgs = args.slice();
   if (host.exposeGC) {
@@ -1357,16 +1368,25 @@ function run(restored = false) {
   // A script path first means no flags, so no environment file to look for:
   // the option tables load only for flags or NODE_OPTIONS.
   const flags = native.argv.length < 2 || native.argv[1].charCodeAt(0) === 45;
+  // NODE_OPTIONS in the environment is preferred over a config file's (node.cc).
+  const environmentOptions = process.env.NODE_OPTIONS;
   // The environment as the process got it, before any environment file: only the
   // snapshot process needs it, so it is copied only when a file is about to load.
   let startupEnvironment;
   if (flags) loadRuntimeEnvironment(native.argv.slice(1), () => { startupEnvironment = { ...process.env }; });
+  const args = native.argv.slice(1);
+  // --experimental-config-file: read before NODE_OPTIONS, rewriting its bare forms in args.
+  const config = flags && args.some(arg => arg.startsWith('--experimental-config-file') || arg.startsWith('--experimental-default-config-file'))
+    ? internalRequire('internal/config_file').read(args) : undefined;
+  if (config?.errors.length) return cliError(config.errors);
+  let nodeOptions = process.env.NODE_OPTIONS;
+  if (config && environmentOptions === undefined) nodeOptions = config.nodeOptions + (nodeOptions === undefined ? '' : ' ' + nodeOptions);
   let environment = [], environmentEntries = [];
-  if (process.env.NODE_OPTIONS) {
+  if (nodeOptions) {
     let parsed;
     try {
       const options = internalRequire('internal/options');
-      environment = options.parseEnvironment(process.env.NODE_OPTIONS);
+      environment = options.parseEnvironment(nodeOptions);
       parsed = options.parseArguments(environment, true);
     } catch (error) {
       return cliError(error.message);
@@ -1375,7 +1395,13 @@ function run(restored = false) {
     environment.length = parsed.index;
     environmentEntries = parsed.entries;
   }
-  const args = native.argv.slice(1);
+  // A config file's namespace flags come after NODE_OPTIONS and before the command line.
+  if (config?.namespaceFlags.length) {
+    const parsed = internalRequire('internal/options').parseArguments(config.namespaceFlags, false);
+    if (parsed.error !== undefined) return cliError(parsed.error);
+    environment = environment.concat(config.namespaceFlags.slice(0, parsed.index));
+    environmentEntries = environmentEntries.concat(parsed.entries);
+  }
   // Without flags the parser and its option table stay unloaded.
   const parsed = flags ? internalRequire('internal/options').parseArguments(args, false) : { entries: [], execArgv: [], index: 0 };
   if (parsed.error !== undefined) return cliError(parsed.error);
