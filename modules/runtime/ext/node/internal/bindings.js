@@ -87,6 +87,11 @@ const kBindings = {
   spawn_sync: () => require('internal/child_process').spawn_sync,
   zlib: () => require('internal/compression/handle'),
   builtins: () => builtins(),
+  // node_options.cc: the option table, by type and by environment setting.
+  options: () => {
+    const { optionTypes, envVarSettings, getCLIOptionsInfo } = require('internal/options');
+    return { types: optionTypes, envSettings: envVarSettings, getCLIOptionsInfo };
+  },
   udp_wrap: () => {
     const { UDP, UV_UDP_IPV6ONLY, UV_UDP_REUSEADDR, UV_UDP_REUSEPORT } = require('internal/dgram');
     return { UDP, constants: { UV_UDP_IPV6ONLY, UV_UDP_REUSEADDR, UV_UDP_REUSEPORT } };
