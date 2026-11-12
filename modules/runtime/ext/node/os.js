@@ -28,25 +28,28 @@ function integer(value, name, min = -2147483648, max = 2147483647) {
   validateInteger(value, name, min, max);
   return value;
 }
-function native(op, args = []) {
-  try { return host.osNative(op, args); }
-  catch (cause) {
-    if (typeof cause.errno !== 'number') throw cause;
-    const message = cause.message.slice(cause.message.indexOf(': ') + 2, cause.message.lastIndexOf(', '));
-    // Node's os.js throws ERR_SYSTEM_ERROR with the context the binding filled.
-    throw new (require('internal/errors').codes.ERR_SYSTEM_ERROR)({ errno: cause.errno, code: cause.code, message, syscall: cause.syscall });
-  }
+// lib/os.js: each call reads the binding's function then, so a patched binding is used.
+const binding = require('internal/os_binding');
+function systemError(ctx) {
+  // Node's os.js throws ERR_SYSTEM_ERROR with the context the binding filled.
+  return new (require('internal/errors').codes.ERR_SYSTEM_ERROR)(ctx);
+}
+function checked(name, ...args) {
+  const ctx = {};
+  const result = binding[name](...args, ctx);
+  if (result === undefined) throw systemError(ctx);
+  return result;
 }
 // Read on first use: a heap image may hold this module, loaded on another machine.
 let unameFields;
-const uname = () => unameFields ||= native('uname');
+const uname = () => unameFields ||= checked('getOSInformation');
 function arch() { return host.arch; }
 function platform() { return host.platform; }
-function availableParallelism() { return native('availableParallelism'); }
-function freemem() { return native('freemem'); }
-function totalmem() { return native('totalmem'); }
-function hostname() { return native('hostname'); }
-function homedir() { return native('homedir'); }
+function availableParallelism() { return binding.getAvailableParallelism(); }
+function freemem() { return binding.getFreeMem(); }
+function totalmem() { return binding.getTotalMem(); }
+function hostname() { return checked('getHostname'); }
+function homedir() { return checked('getHomeDirectory'); }
 function tmpdir() {
   // Node's POSIX precedence differs from uv_os_tmpdir (which only uses TMPDIR).
   let path = process.env.TMPDIR || process.env.TMP || process.env.TEMP || '/tmp';
@@ -54,26 +57,29 @@ function tmpdir() {
   return path;
 }
 function type() { return uname()[0]; }
-function release() { return uname()[1]; }
-function version() { return uname()[2]; }
+function version() { return uname()[1]; }
+function release() { return uname()[2]; }
 function machine() { return uname()[3]; }
-function uptime() { return native('uptime'); }
-const byteOrder = new Uint8Array(new Uint16Array([0x0102]).buffer)[0] === 1 ? 'BE' : 'LE';
-function endianness() { return byteOrder; }
-function loadavg() { return native('loadavg'); }
+function uptime() { return checked('getUptime'); }
+function endianness() { return binding.isBigEndian ? 'BE' : 'LE'; }
+function loadavg() {
+  const values = [0, 0, 0];
+  binding.getLoadAvg(values);
+  return values;
+}
 function cpus() {
-  const data = native('cpus');
+  const data = binding.getCPUs();
   const result = [];
   for (let i = 0; i < data.length; i += 7)
     result.push({ model: data[i], speed: data[i + 1], times: { user: data[i + 2], nice: data[i + 3], sys: data[i + 4], idle: data[i + 5], irq: data[i + 6] } });
   return result;
 }
 function networkInterfaces() {
-  const data = native('networkInterfaces');
+  const data = checked('getInterfaceAddresses');
   const result = {};
   for (let i = 0; i < data.length; i += 7) {
     const name = data[i];
-    const family = data[i + 3] === 4 ? 'IPv4' : 'IPv6';
+    const family = data[i + 3];
     const entry = { address: data[i + 1], netmask: data[i + 2], family, mac: data[i + 4], internal: data[i + 5], cidr: require('internal/util').getCIDR(data[i + 1], data[i + 2], family) };
     if (data[i + 6] !== -1) entry.scopeid = data[i + 6];
     if (Object.prototype.hasOwnProperty.call(result, name)) result[name].push(entry);
@@ -81,20 +87,15 @@ function networkInterfaces() {
   }
   return result;
 }
-function getPriority(pid) { return native('getPriority', [integer(pid === undefined ? 0 : pid, 'pid')]); }
+function getPriority(pid) { return checked('getPriority', integer(pid === undefined ? 0 : pid, 'pid')); }
 function setPriority(pid, priority) {
   if (priority === undefined) { priority = pid; pid = 0; }
-  native('setPriority', [integer(pid, 'pid'), integer(priority, 'priority', -20, 19)]);
+  integer(pid, 'pid'); integer(priority, 'priority', -20, 19);
+  const ctx = {};
+  if (binding.setPriority(pid, priority, ctx) !== 0) throw systemError(ctx);
 }
 function userInfo(options) {
-  let encoding = options && typeof options === 'object' ? options.encoding : undefined;
-  // os.userInfo uses Node's native ParseEncoding, which defaults unknown and
-  // non-string encodings to UTF-8 rather than Buffer's throwing validation.
-  encoding = typeof encoding === 'string' ? encoding.split('\0', 1)[0].toLowerCase() : 'utf8';
-  if (encoding !== 'buffer' && !Buffer.isEncoding(encoding)) encoding = 'utf8';
-  const data = native('userInfo');
-  const convert = value => value === null ? null : encoding === 'buffer' ? Buffer.from(value) : Buffer.from(value).toString(encoding);
-  return { uid: data[0], gid: data[1], username: convert(data[2]), homedir: convert(data[3]), shell: convert(data[4]) };
+  return checked('getUserInfo', options);
 }
 // These are platform ABI constants, not sampled system state. Linux values are
 // the asm-generic errno/signal ABI used by the supported x64/arm64 targets.
