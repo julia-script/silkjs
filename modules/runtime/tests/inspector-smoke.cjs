@@ -324,7 +324,7 @@ if (!isMainThread) {
     });
     stage('NodeWorker auto-wait enable');
     await post(session, 'NodeWorker.enable', { waitForDebuggerOnStart: true });
-    const attached = notification('NodeWorker.attachedToWorker', params => params.workerInfo.title === 'inspector-auto-wait');
+    const attached = notification('NodeWorker.attachedToWorker', params => /^\[worker \d+\] inspector-auto-wait$/.test(params.workerInfo.title));
     const pausedWorker = observeWorker(new Worker('globalThis.workerRan = true; require("node:worker_threads").parentPort.postMessage("worker-released"); setInterval(() => {}, 1000);', { eval: true, name: 'inspector-auto-wait', execArgv: [] }), 'auto-wait');
     const released = new Promise((resolve, reject) => { pausedWorker.once('message', resolve); pausedWorker.once('error', reject); });
     try {
@@ -352,7 +352,7 @@ if (!isMainThread) {
     } finally { stage('worker without auto-wait termination'); await unpausedWorker.terminate(); }
     await post(session, 'NodeWorker.enable', { waitForDebuggerOnStart: false });
     stage('NodeWorker termination attachment');
-    const terminateAttach = notification('NodeWorker.attachedToWorker', params => params.workerInfo.title === 'inspector-terminate');
+    const terminateAttach = notification('NodeWorker.attachedToWorker', params => /^\[worker \d+\] inspector-terminate$/.test(params.workerInfo.title));
     const terminatingWorker = observeWorker(new Worker('setInterval(() => {}, 1000);', { eval: true, name: 'inspector-terminate', execArgv: [] }), 'terminate');
     try {
       const info = await terminateAttach;
