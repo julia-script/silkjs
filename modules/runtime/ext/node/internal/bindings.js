@@ -65,6 +65,11 @@ const kBindings = {
   stream_wrap: () => net().stream_wrap,
   js_stream: () => net().js_stream,
   cares_wrap: () => require('internal/dns/cares_wrap'),
+  // node_ipc_serdes.cc: the 'advanced' child_process IPC codec.
+  ipc_serdes: () => {
+    const { serializeIPC, deserializeIPC } = require('internal/serialization/v8');
+    return { serialize: value => serializeIPC(value), deserialize: bytes => deserializeIPC(bytes) };
+  },
   // node_process_methods.cc: process.chdir and process.cwd call through these.
   process_methods: () => require('internal/host').processMethods,
   // node_worker.cc: this thread's identity and its control port.
