@@ -75,7 +75,7 @@ def generate(debug=True, environment=None):
     # Builtin sources stay out of the bootstrap script so that startup does not lex them
     # as string literals; the bootstrap reads each one from the native table on first use.
     identity = cache_build_identity(source + ''.join(names) + ''.join(factories), debug, manifest, engine, environment)
-    entry = (imports + f"globalThis.__silkNative.compileBuiltin({len(names)}, 'silk:bootstrap')(stdNamespace, osNamespace);\n")
+    entry = (imports + f"globalThis.__silkNative.compileBuiltin({len(names)}, 'node:internal/bootstrap/silk')(stdNamespace, osNamespace);\n")
     output = ROOT / 'src/runtime/embedded.silk'
     output.parent.mkdir(parents=True, exist_ok=True)
 

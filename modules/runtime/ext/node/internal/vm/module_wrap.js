@@ -5,7 +5,7 @@
 // what Node's C++ wrap keeps: the url, the linked requests, the resolve cache that
 // coalesces requests by specifier and attributes, and the module source object.
 const host = require('internal/host');
-const { contextData, error, syntaxDiagnostic, terminationErrors, run } = require('internal/vm');
+const { contextData, error, syntaxDiagnostic, terminationErrors, run, writeCache, readCache } = require('internal/vm');
 const { codes: { ERR_MODULE_LINK_MISMATCH,
   ERR_VM_DYNAMIC_IMPORT_CALLBACK_MISSING, ERR_VM_DYNAMIC_IMPORT_CALLBACK_MISSING_FLAG } } = require('internal/errors');
 
@@ -53,6 +53,7 @@ class ModuleWrap {
   #linkedRequests;
   #linked = false;
   #sourceObject;
+  #source;
   #terminated = false;
 
   // new ModuleWrap(url, context, sourceText, lineOffset, columnOffset, cachedData)
@@ -67,11 +68,18 @@ class ModuleWrap {
       for (let i = 0; i < source.length; i++) host.vmModule(ADD_EXPORT, this.#handle, source[i]);
       this.#linked = true;
     } else {
-      try { this.#handle = host.vmModule(COMPILE, source, url, realm && realm.handle, lineOffset, columnOffset); }
-      catch (cause) { syntaxDiagnostic(cause, source, url, lineOffset, columnOffset); }
-      // The engine has no bytecode cache for modules (createCachedData says so), so
-      // no cachedData can match this source: V8 rejects such a cache the same way.
-      if (cachedData !== undefined) throw error('ERR_VM_MODULE_CACHED_DATA_REJECTED', 'cachedData buffer was rejected', Error);
+      // cachedData built for other source text, or by another build, is rejected as
+      // V8 rejects it; a valid one that lacks debugger metadata compiles the source.
+      if (cachedData !== undefined) {
+        this.#handle = readCache(cachedData, source, 2, (buffer, offset, length) =>
+          host.vmModule(COMPILE, source, url, realm && realm.handle, lineOffset, columnOffset, buffer, offset, length));
+        if (this.#handle === undefined) throw error('ERR_VM_MODULE_CACHED_DATA_REJECTED', 'cachedData buffer was rejected', Error);
+      }
+      if (this.#handle == null) {
+        try { this.#handle = host.vmModule(COMPILE, source, url, realm && realm.handle, lineOffset, columnOffset); }
+        catch (cause) { syntaxDiagnostic(cause, source, url, lineOffset, columnOffset); }
+      }
+      this.#source = source;
       const count = host.vmModule(REQUEST_COUNT, this.#handle);
       for (let i = 0; i < count; i++) {
         const attributes = Object.freeze(Object.assign(Object.create(null), host.vmModule(REQUEST, this.#handle, i, REQUEST_ATTRIBUTES)));
@@ -201,9 +209,7 @@ class ModuleWrap {
     return this.#sourceObject;
   }
 
-  createCachedData() {
-    throw error('ERR_NOT_IMPLEMENTED', 'vm module cached data is not supported by this runtime', Error);
-  }
+  createCachedData() { return writeCache(this.#handle, this.#source, 2); }
 
   // internal/modules/esm/utils registerModule for a vm module: the host callbacks
   // for its import.meta and its dynamic import().

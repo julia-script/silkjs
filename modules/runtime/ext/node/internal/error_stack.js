@@ -1,6 +1,7 @@
 'use strict';
 
 const host = require('internal/host');
+const { getPrototypeOf: ReflectGetPrototypeOf, getOwnPropertyDescriptor: ReflectGetOwnPropertyDescriptor } = Reflect;
 
 // Each realm owns its CallSite prototype. Shared ephemeron brands allow borrowed
 // CallSite methods and recaptured targets without retaining abandoned realms.
@@ -93,7 +94,9 @@ function install(global, isolated = false) {
     }
     return filename;
   }
-  function stringify(frame) {
+  // V8's SerializeJSStackFrame: an async stack trace frame is "async " then the frame.
+  function stringify(frame) { return frame.isAsync ? 'async ' + stringifyFrame(frame) : stringifyFrame(frame); }
+  function stringifyFrame(frame) {
     const name = frame.functionName;
     const place = location(frame);
     if (frame.isConstructor) return 'new ' + (name || '<anonymous>') + ' (' + place + ')';
@@ -127,7 +130,7 @@ function install(global, isolated = false) {
     getLineNumber() { return coordinate(record(this).lineNumber); },
     getMethodName() { return methodName(record(this)); },
     getPosition() { return position(record(this)); },
-    // Synchronous capture does not invent V8 asynchronous continuation frames.
+    // Promise.all continuations are not walked: no frame is one.
     getPromiseIndex() { record(this); return null; },
     getScriptNameOrSourceURL() { const frame = record(this); return frame.scriptName || (frame.isEval ? undefined : null); },
     getScriptHash() {
@@ -138,7 +141,7 @@ function install(global, isolated = false) {
     },
     getThis() { return record(this).receiver; },
     getTypeName() { return typeName(record(this)); },
-    isAsync() { record(this); return false; },
+    isAsync() { return record(this).isAsync; },
     isConstructor() { return record(this).isConstructor; },
     isEval() { return record(this).isEval; },
     isNative() { return record(this).isNative; },
@@ -149,6 +152,23 @@ function install(global, isolated = false) {
   for (const name of Object.keys(methods)) define(CallSite.prototype, name, {
     value: methods[name], writable: true, configurable: true,
   });
+  // V8 looks the method name up when the stack is formatted, not when it is
+  // captured: a property that no longer holds the function (an Immediate's
+  // _onImmediate, cleared after its call) names no method.
+  let types;
+  function currentMethod(name, fn, receiver) {
+    if (typeof name !== 'string' || name === '' || name[0] === '[' || typeof fn !== 'function' ||
+      receiver === null || (typeof receiver !== 'object' && typeof receiver !== 'function')) return name;
+    types ??= require('util/types');
+    for (let object = receiver; object !== null; object = ReflectGetPrototypeOf(object)) {
+      if (types.isProxy(object)) return name;
+      const descriptor = ReflectGetOwnPropertyDescriptor(object, name);
+      if (descriptor !== undefined) {
+        return descriptor.value === fn || descriptor.get === fn || descriptor.set === fn ? name : null;
+      }
+    }
+    return null;
+  }
   function fromNative(raw) {
     return {
       functionName: raw[10] ? raw[8] ? 'eval' : '' : raw[0],
@@ -158,9 +178,9 @@ function install(global, isolated = false) {
       isConstructor: raw[7], isEval: raw[8], isNative: raw[9] && !raw[17], isScript: raw[10],
       enclosingLineNumber: raw[16]?.enclosingLineNumber ?? raw[11],
       enclosingColumnNumber: raw[16]?.enclosingColumnNumber ?? raw[12],
-      typeName: raw[13], methodName: raw[14], isToplevel: raw[15],
+      typeName: raw[13], methodName: currentMethod(raw[14], raw[22], raw[21]), isToplevel: raw[15],
       scriptMetadata: raw[16],
-      sourceLineNumber: raw[18], sourceColumnNumber: raw[19],
+      sourceLineNumber: raw[18], sourceColumnNumber: raw[19], isAsync: raw[20] === true,
     };
   }
   function defaultFormat(error, frames, sites) {

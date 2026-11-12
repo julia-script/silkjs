@@ -15,10 +15,11 @@ import silk.num.u8
 import dtoa { Dtoa }
 import js_heap { HeapCell, HeapHeader }
 import js_value { ValueBits }
-import js_owned_value { Value }
+import js_owned_value { Value, lendBits }
+import js_promise as promise
 import js_vm_activation as activation
 import js_vm_state { frameLocals }
-import js_core_types { NO_PC, ContextState, RuntimeState, ObjectData, ObjectPayload, NativeFunctionId, ShapeData, PropertySlot, StackFrame, FunctionBytecode, FunctionDebugInfo, JS_MODE_BACKTRACE_BARRIER, JS_MODE_STRICT, hostScriptMetadataView }
+import js_core_types { AsyncFrame, JS_MODE_ASYNC, NO_PC, ContextState, RuntimeState, ObjectData, ObjectPayload, NativeFunctionId, ShapeData, PropertySlot, StackFrame, FunctionBytecode, FunctionDebugInfo, JS_MODE_BACKTRACE_BARRIER, JS_MODE_STRICT, hostScriptMetadataView }
 import js_string_types { StringOwner, StringLengthError }
 import js_strings { Strings }
 import js_primitives { EqualityMode, equal }
@@ -50,9 +51,62 @@ pub struct FrameSnapshot {
   pub isConstructor: bool,
   pub enclosingLineNumber: i32,
   pub enclosingColumnNumber: i32,
-  pub isEval: bool
+  pub isEval: bool,
+  /// A frame of the async stack trace: a suspended async function awaiting.
+  pub isAsync: bool,
+  /// The receiver and function a method name was found for, even in strict code:
+  /// V8 looks the name up again when the stack is formatted (error_stack.currentMethod).
+  pub methodReceiver: Value,
+  pub methodFunction: Value
 }
 
+/// The async function awaiting the promise that `node`'s own completion settles.
+unsafe fn asyncCaller(node: *mut HeapHeader) -> ?*mut HeapHeader {
+  let anchor = () let data = unsafe HeapCell.payload<AsyncFrame, ()>(&anchor, node)
+  if data.isCompleted { return Pointer.null<HeapHeader>() }
+  let resolve = data.resolvingFunctions[0].view() drop data
+  let caller = unsafe promise.awaitingFunction(unsafe lendBits(&anchor, resolve))
+  match Pointer.nonNullMut<HeapHeader>(caller) {
+    Option<*mut HeapHeader>.Some { value } => {
+      let awaiting = unsafe HeapCell.payload<AsyncFrame, ()>(&anchor, value)
+      if awaiting.isCompleted { return Pointer.null<HeapHeader>() }
+    }
+    _ => ()
+  }
+  return caller
+}
+/// The async function awaiting the promise `resolve` settles, when it is still suspended.
+unsafe fn reactionCaller(resolve: ValueBits) -> ?*mut HeapHeader {
+  if !resolve.isObject() { return Pointer.null<HeapHeader>() }
+  let anchor = ()
+  let caller = unsafe promise.awaitingFunction(unsafe lendBits(&anchor, resolve))
+  match Pointer.nonNullMut<HeapHeader>(caller) {
+    Option<*mut HeapHeader>.Some { value } => {
+      let awaiting = unsafe HeapCell.payload<AsyncFrame, ()>(&anchor, value)
+      if awaiting.isCompleted { return Pointer.null<HeapHeader>() }
+    }
+    _ => ()
+  }
+  return caller
+}
+unsafe fn asyncStackFrame(node: *mut HeapHeader) -> *mut StackFrame {
+  let mut anchor = () let data = unsafe HeapCell.payloadMut<AsyncFrame, ()>(&mut anchor, node)
+  return data.frame.address()
+}
+unsafe fn hostNative(callee: ValueBits) -> bool {
+  let anchor = ()
+  if let ValueBits.Object { reference } = callee {
+    let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, reference)
+    return match &data.payload {
+      ObjectPayload.NativeFunction { function: native } => match native.function {
+        NativeFunctionId.Host { .. } => true
+        _ => false
+      }
+      _ => false
+    }
+  }
+  return false
+}
 /// Undefined skipThrough captures from the current frame; an object excludes
 /// every frame through that exact function identity. An absent identity returns
 /// no frames. includeNative determines whether actual native frames count toward
@@ -63,16 +117,42 @@ pub unsafe effect fn capture(runtime: *mut HeapHeader, limit: usize,
   let anchor = ()
   let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, runtime)
   let mut pointer = state.currentStackFrame
+  let resumed = state.awaitResumed
+  let reaction = state.reactionResolve
   let empty = StringOwner.adopt(state.atoms.emptyString())
   drop state
   let mut frames = List<FrameSnapshot>.make()
   let mut skipping = skipThrough.isObject()
   let mut restricted = false
-  while !Pointer.isNull<StackFrame>(pointer) && frames.length() < limit {
+  // Node stacks continue past the synchronous frames as V8's async stack trace:
+  // from the async function an await settlement resumed, each async function
+  // awaiting the previous one's promise ("at async name").
+  let mut chain = Pointer.null<HeapHeader>()
+  let mut asyncFrame = false
+  while frames.length() < limit {
+    if Pointer.isNull<StackFrame>(pointer) {
+      if !includeNative { break }
+      // Past a generic reaction job's handler, the chain starts at the async
+      // function awaiting the promise that handler settles.
+      let caller = match Pointer.nonNullMut<HeapHeader>(chain) {
+        Option<*mut HeapHeader>.Some { value } => unsafe asyncCaller(value)
+        _ => unsafe reactionCaller(reaction)
+      }
+      let next = match Pointer.nonNullMut<HeapHeader>(caller) { Option<*mut HeapHeader>.Some { value } => value _ => { break } }
+      chain = next
+      pointer = unsafe asyncStackFrame(next)
+      asyncFrame = true
+    }
     let frame = unsafe Pointer.borrow<(), StackFrame>(&anchor,
       present(pointer))
-    if (frame.mode & u8.toU32(JS_MODE_BACKTRACE_BARRIER)) != 0 { break }
-    pointer = frame.previous
+    if !asyncFrame && (frame.mode & u8.toU32(JS_MODE_BACKTRACE_BARRIER)) != 0 {
+      pointer = Pointer.null<StackFrame>()
+      continue
+    }
+    // A suspended frame's previous link is stale: the chain gives the next one.
+    pointer = if asyncFrame { Pointer.null<StackFrame>() } else { frame.previous }
+    if !asyncFrame && includeNative && (frame.mode & u8.toU32(JS_MODE_ASYNC)) != 0 && !Pointer.isNull<HeapHeader>(resumed) &&
+      Pointer.address(frame.asyncOwner) == Pointer.address(resumed) { chain = resumed }
     if skipping {
       if unsafe equal(frame.currentFunction, skipThrough, EqualityMode.Strict) { skipping = false }
       continue
@@ -81,6 +161,8 @@ pub unsafe effect fn capture(runtime: *mut HeapHeader, limit: usize,
     let compiled = unsafe backtrace.bytecode(frame.currentFunction)
     let native = match &compiled { Option<*mut HeapHeader>.Some { .. } => false _ => true }
     if native && !includeNative { continue }
+    // An embedder's native is a V8 API callback, which Node stacks never show.
+    if native && unsafe hostNative(frame.currentFunction) { continue }
     restricted = restricted || (frame.mode & u8.toU32(JS_MODE_STRICT)) != 0
     let mut hasName = false
     let name = match unsafe backtrace.frameName(runtime, frame.currentFunction) {
@@ -104,7 +186,9 @@ pub unsafe effect fn capture(runtime: *mut HeapHeader, limit: usize,
       sourceLineNumber: 0, sourceColumnNumber: 0,
       function: Value.immediate(ValueBits.Undefined),
       receiver: Value.immediate(ValueBits.Undefined),
-      isConstructor: (unsafe activation.frameNewTarget(Pointer.fromRef<StackFrame>(frame))).isObject(), enclosingLineNumber: 0, enclosingColumnNumber: 0
+      isConstructor: !asyncFrame && (unsafe activation.frameNewTarget(Pointer.fromRef<StackFrame>(frame))).isObject(), enclosingLineNumber: 0, enclosingColumnNumber: 0,
+      isAsync: asyncFrame,
+      methodReceiver: Value.immediate(ValueBits.Undefined), methodFunction: Value.immediate(ValueBits.Undefined)
     }
     if native {
       if let ValueBits.Object { reference } = frame.currentFunction {
@@ -185,7 +269,13 @@ pub unsafe effect fn capture(runtime: *mut HeapHeader, limit: usize,
       }
       Option<*mut HeapHeader>.None => ()
     }
-    if includeNative { run unsafe presentation(runtime, frame.currentFunction, receiverBits, &mut snapshot) }
+    if includeNative {
+      run unsafe presentation(runtime, frame.currentFunction, receiverBits, &mut snapshot)
+      if Strings.length(snapshot.methodName.get()) != 0 {
+        snapshot.methodReceiver = unsafe Value.retain(receiverBits)
+        snapshot.methodFunction = unsafe Value.retain(frame.currentFunction)
+      }
+    }
     if restricted || native { receiverBits = ValueBits.Undefined }
     if snapshot.isScript { functionBits = ValueBits.Undefined }
     if includeNative {
@@ -198,6 +288,18 @@ pub unsafe effect fn capture(runtime: *mut HeapHeader, limit: usize,
   return move frames
 }
 
+unsafe fn functionObject(value: ValueBits) -> bool {
+  let anchor = ()
+  if let ValueBits.Object { reference } = value {
+    let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, reference)
+    return match &data.payload {
+      ObjectPayload.BytecodeFunction { .. } => true
+      ObjectPayload.NativeFunction { .. } => true
+      _ => false
+    }
+  }
+  return false
+}
 // Names are read from engine descriptors, never by running user getters/proxies.
 unsafe effect fn presentation(runtime: *mut HeapHeader, function: ValueBits, frameReceiver: ValueBits, snapshot: &mut FrameSnapshot) -> ()
   ! OutOfMemoryError | StringLengthError ? &mut Allocator {
@@ -212,6 +314,16 @@ unsafe effect fn presentation(runtime: *mut HeapHeader, function: ValueBits, fra
   let mut methodAtom: u32 = 0
   let mut ambiguous = false
   let mut foundType = false
+  // V8's GetTypeName: a function receiver (a static method's class) is named by
+  // its own name ("ok.rejects", "Module._load").
+  if !snapshot.isToplevel && unsafe functionObject(receiver) {
+    match unsafe backtrace.propertyString(receiver, atoms.JS_ATOM_name) {
+      Option<ValueBits>.Some { value: name } => {
+        if Strings.length(name) != 0 { snapshot.typeName = StringOwner.borrowed(name) foundType = true }
+      }
+      _ => ()
+    }
+  }
   while receiver.isObject() {
     let node = match receiver { ValueBits.Object { reference } => reference _ => Intrinsic.trap("frame receiver") }
     let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, node)

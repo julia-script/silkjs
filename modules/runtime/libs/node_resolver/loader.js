@@ -1425,8 +1425,27 @@ function createLoader(host, builtins) {
     return error('ERR_REQUIRE_CYCLE_MODULE', `Cannot require() ES Module ${filesystemName(filename)} in a cycle.${from}`);
   }
 
-  function asyncModuleError(filename, parent) {
-    return error('ERR_REQUIRE_ASYNC_MODULE', filesystemName(filename), parent, undefined);
+  // Node's throwIfAsyncGraph: under --experimental-print-required-tla the error lists
+  // the graph's top-level awaits, which the engine found as it parsed them.
+  function asyncModuleError(filename, parent, cause) {
+    const locations = [];
+    const sites = cause?.topLevelAwaits;
+    if (sites !== undefined && require('internal/options').getOptionValue('--experimental-print-required-tla')) {
+      const lines = new Map();
+      for (let index = 0; index < sites.length; index++) {
+        const { 0: name, 1: line, 2: column } = sites[index];
+        const url = asURL(keyName(name));
+        if (!lines.has(url)) {
+          let source;
+          try { source = text(filesystemName(url)).split(/\r?\n/); } catch { source = null; }
+          lines.set(url, source);
+        }
+        const source = lines.get(url);
+        if (source === null) continue;
+        locations[locations.length] = { __proto__: null, url, line, column, sourceLine: source[line - 1] };
+      }
+    }
+    return error('ERR_REQUIRE_ASYNC_MODULE', filesystemName(filename), parent, locations);
   }
 
   // Node's hint for a CommonJS global used in an ES module.
@@ -1453,8 +1472,43 @@ function createLoader(host, builtins) {
     try { source = text(filesystemName(url)); } catch (_) { return; }
     host.attachArrow(cause, url, cleanSource(source), 0);
   }
+  // Node's ModuleJob._instantiate: a named import a module asks of a CommonJS
+  // module that lacks it gets the hint to import the default export, with the import's
+  // braces as a destructuring when its source line (the link error's arrow line) has them.
+  function commonJSNamedExportHint(cause) {
+    if (cause === null || typeof cause !== 'object' || cause.name !== 'SyntaxError' || typeof cause.message !== 'string') return;
+    const match = /module '(.*)' does not provide an export named '(.+)'/.exec(cause.message);
+    if (match === null) return;
+    if (process.sourceMapsEnabled) return;
+    const site = host.captureCallSites(-4, cause);
+    // A link error's site spans the import name; its script is the importer.
+    if (site === undefined || site[4] === undefined || typeof site[0] !== 'string') return;
+    const parent = site[0];
+    const { 1: childSpecifier, 2: name } = match;
+    let format;
+    try { format = resolve(childSpecifier, filesystemName(parent), 'import').format; } catch { return; }
+    if (format !== 'commonjs') return;
+    let line = site[3];
+    if (typeof line !== 'string') {
+      try { line = cleanSource(text(filesystemName(parent))).split(/\r\n|[\n\r\u2028\u2029]/)[site[1] - 1]; } catch { line = undefined; }
+    }
+    const oneLineNamedImports = typeof line === 'string' ? /{.*}/.exec(line) : null;
+    const destructuringAssignment = oneLineNamedImports && String(oneLineNamedImports).replace(/\s+as\s+/g, ': ');
+    const previous = cause.message;
+    cause.message = `Named export '${name}' not found. The requested module` +
+      ` '${childSpecifier}' is a CommonJS module, which may not support` +
+      ' all module.exports as named exports.\nCommonJS modules can ' +
+      'always be imported via the default export, for example using:' +
+      `\n\nimport pkg from '${childSpecifier}';\n${
+        destructuringAssignment ? `const ${destructuringAssignment} = pkg;\n` : ''}`;
+    const stack = cause.stack;
+    const head = `SyntaxError: ${previous}`;
+    if (typeof stack === 'string' && stack.startsWith(head)) cause.stack = `SyntaxError: ${cause.message}${stack.slice(head.length)}`;
+  }
+
   function decorateModuleError(cause, filename) {
     moduleSyntaxArrow(cause);
+    commonJSNamedExportHint(cause);
     if (cause === null || typeof cause !== 'object' || cause.name !== 'ReferenceError') return cause;
     const match = /^(require|module|exports|__filename|__dirname) is not defined$/.exec(cause.message);
     if (!match) return cause;
@@ -1524,7 +1578,7 @@ function createLoader(host, builtins) {
     requiringESM++;
     try { namespace = host.requireModule(filename); }
     catch (cause) {
-      if (cause !== null && typeof cause === 'object' && cause.code === 'ERR_REQUIRE_ASYNC_MODULE') throw asyncModuleError(filename, module[kModuleParent]);
+      if (cause !== null && typeof cause === 'object' && cause.code === 'ERR_REQUIRE_ASYNC_MODULE') throw asyncModuleError(filename, module[kModuleParent], cause);
       if (cause !== null && typeof cause === 'object' && cause.code === 'ERR_REQUIRE_CYCLE_MODULE' && !importCycles.has(cause)) {
         // The engine names a request whose module an enclosing import still evaluates.
         if (typeof cause.specifier !== 'string') throw cycleError(filename, module[kModuleParent]);

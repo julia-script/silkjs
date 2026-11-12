@@ -2,22 +2,12 @@
 // vm creates realms, not a security boundary. Native handles own context/bytecode
 // edges; JavaScript keeps only weak associations with public sandbox objects.
 const host = require('internal/host');
-const { Buffer } = require('buffer');
 const { RegExpPrototypeExec } = require('internal/per_context/primordials');
-const { createHash } = require('crypto');
+const { ArrayBufferIsView } = require('internal/streams/iter/primordials');
 const {
-  ArrayBufferIsView, DataViewPrototypeGetBuffer, DataViewPrototypeGetByteOffset,
-  DataViewPrototypeGetByteLength, TypedArrayPrototypeGetBuffer,
-  TypedArrayPrototypeGetByteOffset, TypedArrayPrototypeGetByteLength, Uint8Array,
-} = require('internal/streams/iter/primordials');
-const { isDataView } = require('util/types');
-const {
-  contexts, error, invalid, contextData, isContext, syntaxDiagnostic, run,
+  contexts, error, invalid, contextData, isContext, syntaxDiagnostic, run, runBegin, runEnd, runFailure, rethrow, writeCache, readCache,
 } = require('internal/vm');
 const scripts = new WeakMap();
-const cacheMagic = Buffer.from('SILKVM01');
-const cacheIdentity = Buffer.from(host.cacheBuildIdentity, 'hex');
-const CACHE_HEADER = 120;
 const DONT_CONTEXTIFY = Symbol('vm_context_no_contextify');
 const USE_MAIN_CONTEXT_DEFAULT_LOADER = Symbol('vm_dynamic_import_main_context_default');
 const constants = Object.freeze(Object.assign(Object.create(null), { USE_MAIN_CONTEXT_DEFAULT_LOADER, DONT_CONTEXTIFY }));
@@ -135,8 +125,9 @@ function createContext(sandbox = {}, value) {
   require('internal/inspector_contexts').register(result, handle, config);
   return result;
 }
-function compileOptions(value, defaultFilename = 'evalmachine.<anonymous>') {
-  const opts = options(value, true);
+// A Script takes a filename string in place of options; compileFunction does not.
+function compileOptions(value, defaultFilename = 'evalmachine.<anonymous>', string = true) {
+  const opts = options(value, string);
   const filename = opts.filename === undefined ? defaultFilename : opts.filename;
   if (typeof filename !== 'string') throw invalid('options.filename', 'string', filename);
   const line = opts.lineOffset === undefined ? 0 : integer(opts.lineOffset, 'options.lineOffset', -2147483648, 2147483647);
@@ -157,51 +148,6 @@ function runOptions(value) {
   if (displayErrors !== undefined) boolean(displayErrors, 'options.displayErrors');
   boolean(breakOnSigint, 'options.breakOnSigint');
   return { timeout, breakOnSigint, displayErrors: displayErrors !== false };
-}
-function digest(value, encoding) { return createHash('sha256').update(value, encoding).digest(); }
-function writeCache(handle, source, kind) {
-  const payload = Buffer.from(host.vmWriteCache(handle));
-  const cache = Buffer.allocUnsafe(CACHE_HEADER + payload.byteLength);
-  cacheMagic.copy(cache, 0);
-  cache.writeUInt32LE(kind, 8);
-  cache.writeUInt32LE(0, 12);
-  cache.writeBigUInt64LE(BigInt(payload.byteLength), 16);
-  cacheIdentity.copy(cache, 24);
-  digest(source, 'utf16le').copy(cache, 56);
-  digest(payload).copy(cache, 88);
-  payload.copy(cache, CACHE_HEADER);
-  return cache;
-}
-function cachedHandle(value, source, filename, line, column, prefix = 0, kind = 0) {
-  let cache;
-  try {
-    // Snapshot before hashing: a SharedArrayBuffer writer must not race admission.
-    const view = isDataView(value) ?
-      new Uint8Array(DataViewPrototypeGetBuffer(value), DataViewPrototypeGetByteOffset(value), DataViewPrototypeGetByteLength(value)) :
-      new Uint8Array(TypedArrayPrototypeGetBuffer(value), TypedArrayPrototypeGetByteOffset(value), TypedArrayPrototypeGetByteLength(value));
-    cache = Buffer.from(view);
-  } catch (cause) {
-    if (cause instanceof TypeError || cause instanceof RangeError) return undefined;
-    throw cause;
-  }
-  if (cache.byteLength < CACHE_HEADER ||
-      !cache.subarray(0, 8).equals(cacheMagic) ||
-      cache.readUInt32LE(8) !== kind || cache.readUInt32LE(12) !== 0 ||
-      cache.readBigUInt64LE(16) !== BigInt(cache.byteLength - CACHE_HEADER) ||
-      !cache.subarray(24, 56).equals(cacheIdentity) ||
-      !cache.subarray(56, 88).equals(digest(source, 'utf16le')) ||
-      !cache.subarray(88, 120).equals(digest(cache.subarray(CACHE_HEADER)))) return undefined;
-  try {
-    return host.vmReadCache(cache.buffer, cache.byteOffset + CACHE_HEADER,
-      cache.byteLength - CACHE_HEADER, filename, line, column, prefix);
-  } catch (cause) {
-    // Checksums do not make externally supplied bytecode safe. The native reader
-    // independently validates operands, control flow, metadata and ownership.
-    // null: the cache is valid, but a debugger needs code compiled with metadata.
-    if (cause instanceof SyntaxError && cause.message === 'Silk script cache has no debugger metadata') return null;
-    if (cause instanceof SyntaxError || cause instanceof TypeError || cause instanceof RangeError) return undefined;
-    throw cause;
-  }
 }
 function validateImportCallback(callback, module = false) {
   if (callback !== undefined && typeof callback !== 'function' &&
@@ -236,7 +182,7 @@ class Script {
     const { opts, filename, line, column } = compileOptions(value);
     let handle;
     if (opts.cachedData !== undefined) {
-      handle = cachedHandle(opts.cachedData, source, filename, line, column);
+      handle = readCache(opts.cachedData, source, 0, (buffer, offset, length) => host.vmReadCache(buffer, offset, length, filename, line, column));
       this.cachedDataRejected = handle === undefined;
     }
     if (handle == null) handle = compile(source, filename, line, column);
@@ -261,7 +207,13 @@ class Script {
   runInThisContext(value) {
     const data = scriptData(this);
     const execution = runOptions(value);
-    return run(data.handle, execution, false, true, execution.displayErrors ? data : undefined);
+    const listeners = runBegin(execution.breakOnSigint, true);
+    let result;
+    // No finally: leaving through one would move the recorded throw site.
+    try { result = host.vmRun(data.handle, execution.timeout, false, execution.breakOnSigint); }
+    catch (cause) { runEnd(listeners); rethrow(cause, runFailure(cause, execution.timeout, execution.displayErrors ? data : undefined)); }
+    runEnd(listeners);
+    return result;
   }
   runInContext(contextifiedObject, value) {
     const data = scriptData(this);
@@ -273,7 +225,13 @@ class Script {
       host.vmSetImportModuleDynamically(handle, data.dynamicImport);
       data.realms.set(contextifiedObject, handle);
     }
-    return run(handle, execution, context.afterEvaluate, true, execution.displayErrors ? data : undefined);
+    const listeners = runBegin(execution.breakOnSigint, true);
+    let result;
+    // No finally: leaving through one would move the recorded throw site.
+    try { result = host.vmRun(handle, execution.timeout, context.afterEvaluate, execution.breakOnSigint); }
+    catch (cause) { runEnd(listeners); rethrow(cause, runFailure(cause, execution.timeout, execution.displayErrors ? data : undefined)); }
+    runEnd(listeners);
+    return result;
   }
   runInNewContext(sandbox, value) {
     // As in Node, the context takes its options under context-prefixed names.
@@ -316,8 +274,11 @@ function compileFunction(code, params = [], value) {
     if (typeof name !== 'string') throw invalid(`params[${i}]`, 'string', name);
     if (!/^[$_\p{ID_Start}][$\u200c\u200d_\p{ID_Continue}]*$/u.test(name)) throw new SyntaxError('Invalid function parameter name');
   }
-  const { opts, filename, line, column } = compileOptions(value, '');
-  const context = opts.parsingContext === undefined ? undefined : contextData(opts.parsingContext);
+  const { opts, filename, line, column } = compileOptions(value, '', false);
+  const parsing = opts.parsingContext;
+  if (parsing !== undefined && (parsing === null || typeof parsing !== 'object' || !contexts.has(parsing)))
+    throw invalid('options.parsingContext', 'Context', parsing);
+  const context = parsing === undefined ? undefined : contextData(parsing);
   const extensions = opts.contextExtensions === undefined ? [] : opts.contextExtensions;
   if (!Array.isArray(extensions)) throw invalid('options.contextExtensions', 'Array', extensions);
   for (let i = 0; i < extensions.length; i++) {
@@ -332,7 +293,8 @@ function compileFunction(code, params = [], value) {
   const prefix = source.length;
   source += `${code}\n};`;
   source += '}'.repeat(extensions.length) + '})';
-  let handle = opts.cachedData === undefined ? undefined : cachedHandle(opts.cachedData, source, filename, line, column, prefix, 1);
+  let handle = opts.cachedData === undefined ? undefined : readCache(opts.cachedData, source, 1,
+    (buffer, offset, length) => host.vmReadCache(buffer, offset, length, filename, line, column, prefix));
   const rejected = opts.cachedData !== undefined && handle === undefined;
   if (handle == null) {
     try { host.vmValidateFunctionBody(code, filename, context && context.handle); }
@@ -354,7 +316,30 @@ function compileFunction(code, params = [], value) {
   }
   return result;
 }
-module.exports = { Script, createContext, createScript, isContext, runInContext, runInNewContext, runInThisContext, compileFunction, constants };
+// V8's MeasureMemory result: native per-context estimates of the heap (profile op
+// measureMemory). Each range runs from the estimate to the whole heap.
+function measureMemory(options = {}) {
+  require('internal/util').emitExperimentalWarning('vm.measureMemory');
+  const { validateObject, validateOneOf } = require('internal/validators');
+  validateObject(options, 'options');
+  const { mode = 'summary', execution = 'default' } = options;
+  validateOneOf(mode, 'options.mode', ['summary', 'detailed']);
+  validateOneOf(execution, 'options.execution', ['default', 'eager']);
+  return new Promise(resolve => {
+    // A default measurement waits for the next task, as V8 waits for a scheduled GC.
+    const measure = () => {
+      const sizes = host.measureMemory(execution === 'eager');
+      const total = sizes[0];
+      const estimate = bytes => ({ jsMemoryEstimate: bytes, jsMemoryRange: [bytes, total] });
+      if (mode === 'summary') return resolve({ total: estimate(total) });
+      const other = [];
+      for (let i = 2; i < sizes.length; i++) other.push(estimate(sizes[i]));
+      resolve({ total: estimate(total), current: estimate(sizes[1]), other });
+    };
+    if (execution === 'eager') measure(); else setImmediate(measure);
+  });
+}
+module.exports = { Script, createContext, createScript, isContext, runInContext, runInNewContext, runInThisContext, compileFunction, measureMemory, constants };
 if (host.experimentalVmModules) {
   const { Module, SourceTextModule, SyntheticModule } = require('internal/vm/module');
   Object.assign(module.exports, { Module, SourceTextModule, SyntheticModule });

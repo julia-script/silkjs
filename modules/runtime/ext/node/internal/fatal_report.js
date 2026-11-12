@@ -12,7 +12,14 @@ function site(error, fromPromise) {
   if (!fromPromise) {
     const thrown = host.captureCallSites(-4, error);
     // Its column counts in the script's own text, before any column offset.
-    if (thrown !== undefined) return { name: thrown[0], line: thrown[1], column: thrown[2], text: thrown[3], textColumn: true };
+    // An eval's code is V8's "<anonymous_script>" in the message, or the name its
+    // sourceURL comment gives, which its frames show.
+    // A module link error spans its import name, which V8 underlines whole.
+    if (thrown !== undefined) {
+      let name = thrown[0];
+      if ((name === '' || name === '<input>') && typeof thrown[3] === 'string') name = evalScriptName(error) || '<anonymous_script>';
+      return { name, line: thrown[1], column: thrown[2], text: thrown[3], textColumn: true, length: thrown[4] };
+    }
   }
   if (error === null || typeof error !== 'object') return undefined;
   // A script that did not compile: V8's message points at the bad token.
@@ -27,6 +34,12 @@ function site(error, fromPromise) {
   const frame = require('internal/error_stack').origin(error);
   if (frame === undefined) return undefined;
   return { name: frame.scriptName, line: frame.lineNumber, column: frame.columnNumber, text: undefined };
+}
+function evalScriptName(error) {
+  if (error === null || typeof error !== 'object') return undefined;
+  try { void error.stack; } catch { return undefined; }
+  const frame = require('internal/error_stack').origin(error);
+  return frame?.isEval && frame.scriptMetadata?.sourceURL ? frame.scriptName : undefined;
 }
 // The line'th line of the script a frame names, read from its file.
 function fileLine(name, line) {
@@ -67,20 +80,26 @@ function arrow(error, fromPromise, scriptName, lineOffset = 0, columnOffset = 0,
   if (!(start >= 0) || start >= text.length) return result;
   let underline = '';
   for (let index = 0; index < start; index++) underline += text[index] === '\t' ? '\t' : ' ';
-  return result + underline + '^\n';
+  const span = where.length > 1 ? Math.min(where.length, text.length - start) : 1;
+  return result + underline + '^'.repeat(span) + '\n';
 }
 function stringOf(value) {
   try { return String(value); } catch { return '<toString() threw exception>'; }
 }
 // fatalExceptionStackEnhancers.afterInspector.
 function inspected(error) {
+  // Node's afterInspector reads the stack first: when that throws there is no trace.
+  let originalStack;
+  try { originalStack = error.stack; } catch { return undefined; }
   const { inspect } = require('util');
+  // afterInspector: colors where shouldColorize(process.stderr) says so (FORCE_COLOR
+  // among others), or by inspect's default.
   let colors = inspect.defaultOptions.colors;
-  try { colors = colors || (process.stderr.isTTY === true && process.stderr.hasColors?.() === true); } catch {}
+  try { colors = require('internal/util/colors').shouldColorize(process.stderr) || colors; } catch {}
   try {
     return inspect(error, { colors, customInspect: false, depth: Math.max(inspect.defaultOptions.depth, 5) });
   } catch {
-    try { return error.stack; } catch { return undefined; }
+    return originalStack;
   }
 }
 function format(error, fromPromise) {
@@ -88,7 +107,9 @@ function format(error, fromPromise) {
   const nativeError = object && require('util/types').isNativeError(error);
   let source;
   try {
-    if (!host.decoratedErrors.has(error)) source = host.errorArrows.get(error) ?? arrow(error, fromPromise);
+    // GetErrorSource prints an arrow the error was given (setArrowMessage) first.
+    const given = object ? error[host.privateSymbols.arrow_message_private_symbol] : undefined;
+    if (!host.decoratedErrors.has(error)) source = (typeof given === 'string' ? given : undefined) ?? host.errorArrows.get(error) ?? arrow(error, fromPromise);
   } catch {}
   let text = '';
   // AppendExceptionLine prints the source of anything but an error at once.
@@ -113,6 +134,8 @@ function format(error, fromPromise) {
     const program = require('path').basename(process.argv0 || 'node', '.exe') || 'node';
     text += '(Use `' + program + ' --trace-uncaught ...` to show where the exception was thrown)\n';
   }
+  // --no-extra-info-on-fatal-exception leaves out the version line.
+  if (host.extraInfoOnFatalException === false) return text;
   return text + '\nNode.js ' + process.version + '\n';
 }
 

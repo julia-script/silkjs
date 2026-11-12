@@ -131,8 +131,15 @@ function Console(options /* or: stdout, stderr, ignoreErrors = true */) {
 }
 
 // Binds a method to its console. The inspector sees each outermost call as type.
+// Node binds with Function.prototype.bind, whose frame no stack shows; trace
+// skips through the running trace wrapper instead, so it starts at its caller.
+let runningTrace;
 function bindMethod(method, receiver, type, name) {
-  const bound = { [name]: (...args) => inspectorConsole.call(type, args, receiver, method) }[name];
+  const bound = type === 'trace' ? { [name]: (...args) => {
+    const outer = runningTrace;
+    runningTrace = bound;
+    try { return inspectorConsole.call(type, args, receiver, method); } finally { runningTrace = outer; }
+  } }[name] : { [name]: (...args) => inspectorConsole.call(type, args, receiver, method) }[name];
   Object.defineProperty(bound, 'name', { value: name });
   return bound;
 }
@@ -383,7 +390,7 @@ const consoleMethods = {
   },
   trace: function trace(...args) {
     const err = { name: 'Trace', message: this[kFormatForStderr](args) };
-    Error.captureStackTrace(err, trace);
+    Error.captureStackTrace(err, runningTrace ?? trace);
     this.error(err.stack);
   },
   // https://console.spec.whatwg.org/#assert

@@ -57,31 +57,113 @@ function decorateErrorStack(cause, script) {
     host.decoratedErrors.add(cause);
   } catch {}
 }
-// display: the script (filename and offsets) whose errors are decorated, if any.
+// The SIGINT listeners a breakOnSigint run takes away until it ends, if any.
+function runBegin(breakOnSigint, wrapSignals) {
+  if (!breakOnSigint || !wrapSignals || process.listenerCount('SIGINT') === 0) return undefined;
+  const listeners = process.rawListeners('SIGINT');
+  process.removeAllListeners('SIGINT');
+  return listeners;
+}
+function runEnd(listeners) {
+  if (listeners) for (let i = 0; i < listeners.length; i++) process.addListener('SIGINT', listeners[i]);
+}
+// What a run that threw cause throws. display: the script (filename and offsets)
+// whose errors are decorated, if any.
+function runFailure(cause, timeout, display) {
+  if (cause && typeof cause.message === 'string' && cause.message.startsWith('ERR_SCRIPT_EXECUTION_TIMEOUT:')) {
+    return terminationError('ERR_SCRIPT_EXECUTION_TIMEOUT', `Script execution timed out${timeout ? ` after ${timeout}ms` : ''}`);
+  }
+  if (cause && typeof cause.message === 'string' && cause.message.startsWith('ERR_SCRIPT_EXECUTION_INTERRUPTED:')) {
+    return terminationError('ERR_SCRIPT_EXECUTION_INTERRUPTED', 'Script execution was interrupted by `SIGINT`');
+  }
+  if (cause && typeof cause.message === 'string' && cause.message.startsWith('ERR_CANNOT_WATCH_SIGINT:')) {
+    return error('ERR_CANNOT_WATCH_SIGINT', 'Cannot watch for SIGINT signals', Error);
+  }
+  if (display !== undefined) decorateErrorStack(cause, display);
+  return cause;
+}
+// The script's own error leaves as ContextifyScript's TryCatch::ReThrow does: the
+// message (and its arrow) stays where the script threw.
+function rethrow(cause, failure) {
+  if (failure === cause) host.rethrow(cause);
+  throw failure;
+}
+// Script methods call host.vmRun themselves between runBegin and runEnd: in Node
+// the run is ContextifyScript's native method, which no stack shows.
 function run(handle, { timeout, breakOnSigint }, afterEvaluate, wrapSignals = true, display = undefined) {
-  let listeners;
-  if (breakOnSigint && wrapSignals && process.listenerCount('SIGINT') > 0) {
-    listeners = process.rawListeners('SIGINT');
-    process.removeAllListeners('SIGINT');
-  }
-  try { return host.vmRun(handle, timeout, afterEvaluate, breakOnSigint); }
-  catch (cause) {
-    if (cause && typeof cause.message === 'string' && cause.message.startsWith('ERR_SCRIPT_EXECUTION_TIMEOUT:')) {
-      throw terminationError('ERR_SCRIPT_EXECUTION_TIMEOUT', `Script execution timed out${timeout ? ` after ${timeout}ms` : ''}`);
-    }
-    if (cause && typeof cause.message === 'string' && cause.message.startsWith('ERR_SCRIPT_EXECUTION_INTERRUPTED:')) {
-      throw terminationError('ERR_SCRIPT_EXECUTION_INTERRUPTED', 'Script execution was interrupted by `SIGINT`');
-    }
-    if (cause && typeof cause.message === 'string' && cause.message.startsWith('ERR_CANNOT_WATCH_SIGINT:')) {
-      throw error('ERR_CANNOT_WATCH_SIGINT', 'Cannot watch for SIGINT signals', Error);
-    }
-    if (display !== undefined) decorateErrorStack(cause, display);
-    throw cause;
-  } finally {
-    if (listeners) for (let i = 0; i < listeners.length; i++) process.addListener('SIGINT', listeners[i]);
-  }
+  const listeners = runBegin(breakOnSigint, wrapSignals);
+  let result;
+  try { result = host.vmRun(handle, timeout, afterEvaluate, breakOnSigint); }
+  catch (cause) { runEnd(listeners); rethrow(cause, runFailure(cause, timeout, display)); }
+  runEnd(listeners);
+  return result;
 }
 
+
+// The cache envelope: magic, kind, payload length, build identity, then SHA-256
+// digests of the source and the payload. Loaded on first use.
+let envelope;
+function cacheEnvelope() {
+  if (envelope === undefined) {
+    const { Buffer } = require('buffer');
+    envelope = { Buffer, magic: Buffer.from('SILKVM01'), identity: Buffer.from(host.cacheBuildIdentity, 'hex'), createHash: require('crypto').createHash };
+  }
+  return envelope;
+}
+const CACHE_HEADER = 120;
+function digest(value, encoding) { return cacheEnvelope().createHash('sha256').update(value, encoding).digest(); }
+function writeCache(handle, source, kind) {
+  const { Buffer, magic: cacheMagic, identity: cacheIdentity } = cacheEnvelope();
+  const payload = Buffer.from(host.vmWriteCache(handle));
+  const cache = Buffer.allocUnsafe(CACHE_HEADER + payload.byteLength);
+  cacheMagic.copy(cache, 0);
+  cache.writeUInt32LE(kind, 8);
+  cache.writeUInt32LE(0, 12);
+  cache.writeBigUInt64LE(BigInt(payload.byteLength), 16);
+  cacheIdentity.copy(cache, 24);
+  digest(source, 'utf16le').copy(cache, 56);
+  digest(payload).copy(cache, 88);
+  payload.copy(cache, CACHE_HEADER);
+  return cache;
+}
+// kind: 0 a Script, 1 a compileFunction body, 2 a SourceTextModule. read decodes
+// the payload into a handle.
+function readCache(value, source, kind, read) {
+  const { Buffer, magic: cacheMagic, identity: cacheIdentity } = cacheEnvelope();
+  const {
+    DataViewPrototypeGetBuffer, DataViewPrototypeGetByteOffset, DataViewPrototypeGetByteLength, TypedArrayPrototypeGetBuffer,
+    TypedArrayPrototypeGetByteOffset, TypedArrayPrototypeGetByteLength, Uint8Array,
+  } = require('internal/streams/iter/primordials');
+  const { isDataView } = require('util/types');
+  let cache;
+  try {
+    // Snapshot before hashing: a SharedArrayBuffer writer must not race admission.
+    const view = isDataView(value) ?
+      new Uint8Array(DataViewPrototypeGetBuffer(value), DataViewPrototypeGetByteOffset(value), DataViewPrototypeGetByteLength(value)) :
+      new Uint8Array(TypedArrayPrototypeGetBuffer(value), TypedArrayPrototypeGetByteOffset(value), TypedArrayPrototypeGetByteLength(value));
+    cache = Buffer.from(view);
+  } catch (cause) {
+    if (cause instanceof TypeError || cause instanceof RangeError) return undefined;
+    throw cause;
+  }
+  if (cache.byteLength < CACHE_HEADER ||
+      !cache.subarray(0, 8).equals(cacheMagic) ||
+      cache.readUInt32LE(8) !== kind || cache.readUInt32LE(12) !== 0 ||
+      cache.readBigUInt64LE(16) !== BigInt(cache.byteLength - CACHE_HEADER) ||
+      !cache.subarray(24, 56).equals(cacheIdentity) ||
+      !cache.subarray(56, 88).equals(digest(source, 'utf16le')) ||
+      !cache.subarray(88, 120).equals(digest(cache.subarray(CACHE_HEADER)))) return undefined;
+  try {
+    return read(cache.buffer, cache.byteOffset + CACHE_HEADER, cache.byteLength - CACHE_HEADER);
+  } catch (cause) {
+    // Checksums do not make externally supplied bytecode safe. The native reader
+    // independently validates operands, control flow, metadata and ownership.
+    // null: the cache is valid, but a debugger needs code compiled with metadata.
+    if (cause instanceof SyntaxError && cause.message === 'Silk script cache has no debugger metadata') return null;
+    if (cause instanceof SyntaxError || cause instanceof TypeError || cause instanceof RangeError) return undefined;
+    throw cause;
+  }
+}
 
 // makeContextifyScript of Node's lib/internal/vm.js, over the vm module's Script.
 // The runtime has no V8 code cache, so cachedData and produceCachedData are
@@ -98,6 +180,6 @@ function makeContextifyScript(code, filename, lineOffset, columnOffset, cachedDa
 }
 
 module.exports = {
-  contexts, error, invalid, contextData, isContext, syntaxDiagnostic, terminationErrors, terminationError, run,
-  kInternalImportModuleDynamically, makeContextifyScript,
+  contexts, error, invalid, contextData, isContext, syntaxDiagnostic, terminationErrors, terminationError, run, runBegin, runEnd, runFailure, rethrow,
+  kInternalImportModuleDynamically, makeContextifyScript, writeCache, readCache,
 };

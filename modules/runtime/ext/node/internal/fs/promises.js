@@ -3,7 +3,7 @@
 // FileHandle with its reference count, close promise and lock, and readFile/writeFile on
 // a handle. The work goes to the native submitIO operations as Promise requests.
 const fs = require('fs');
-const { ArrayPrototypeConcat, ReflectApply } = require('internal/per_context/primordials');
+const { ArrayPrototypeConcat, ErrorCaptureStackTrace, PromisePrototypeThen, PromiseReject, ReflectApply } = require('internal/per_context/primordials');
 const c = require('internal/fs/utils');
 const p = require('path');
 const { EventEmitter } = require('events');
@@ -11,7 +11,9 @@ const { Buffer } = require('buffer');
 const v = c.v;
 const { AbortError, codes: { ERR_FS_EISDIR, ERR_FS_FILE_TOO_LARGE, ERR_INVALID_ARG_TYPE, ERR_INVALID_ARG_VALUE, ERR_INVALID_STATE, ERR_METHOD_NOT_IMPLEMENTED, ERR_OUT_OF_RANGE } } = require('internal/errors');
 const { validateAbortSignal, validateBoolean, validateInteger, validateObject, validateOneOf, kValidateObjectAllowNullable } = v;
-const { constants, kRef, kUnref, makeStats, makeStatFs, Dirent } = c;
+const { constants, kRef, kUnref, makeStats, makeStatFs, Dirent, validateReadFileBufferOptions, getReadFileBuffer, getReadFileBufferByteLengthName } = c;
+const fsBinding = require('internal/fs/binding');
+const { kUsePromises } = fsBinding;
 const promises = {};
 const kMaxUserId = 2 ** 32 - 1;
 const kIoMaxLength = 2 ** 31 - 1;
@@ -31,8 +33,15 @@ const { kDeserialize, kTransfer, kTransferList, markTransferMode } = require('in
 const invalidState = (message, Base = Error) => new (Base === Error ? ERR_INVALID_STATE : ERR_INVALID_STATE[Base.name])(message);
 
 // One native request with Promise ownership (requestKind 1), or 2 for a FileHandle close.
+// Its error's stack is captured again from the reaction, as Node's
+// handleErrorFromBinding does: the native error has no JS frames.
 function binding(operation, args, requestKind = 1) {
-  return new Promise((resolve, reject) => { c.submit(operation, args, c.promiseCallback((err, value) => err ? reject(err) : resolve(value), requestKind)); });
+  const request = new Promise((resolve, reject) => { c.submit(operation, args, c.promiseCallback((err, value) => err ? reject(err) : resolve(value), requestKind)); });
+  return requestKind === 1 ? PromisePrototypeThen(request, undefined, handleErrorFromBinding) : request;
+}
+function handleErrorFromBinding(error) {
+  ErrorCaptureStackTrace(error, handleErrorFromBinding);
+  return PromiseReject(error);
 }
 function aggregateTwoErrors(inner, outer) {
   if (inner && outer && inner !== outer) {
@@ -44,25 +53,14 @@ function aggregateTwoErrors(inner, outer) {
 }
 function checkAborted(signal) { if (signal?.aborted) throw new AbortError(undefined, { cause: signal?.reason }); }
 
-// Node's native FileHandle closes a descriptor that its object never closed, and then
-// warns from an unref'ed immediate, with the DEP0137 deprecation once per process.
-let gcCloseWarned = false;
-const gcCloser = new FinalizationRegistry((fd) => {
-  try { fs.closeSync(fd); } catch {}
-  setImmediate(() => {
-    process.emitWarning(`Closing file descriptor ${fd} on garbage collection`);
-    if (gcCloseWarned) return;
-    gcCloseWarned = true;
-    process.emitWarning('Closing a FileHandle object on garbage collection is deprecated. ' +
-      'Please close FileHandle objects explicitly using FileHandle.prototype.close(). ' +
-      'In the future, an error will be thrown if a file descriptor is closed during garbage collection.',
-    'DeprecationWarning', 'DEP0137');
-  }).unref();
-});
+// The binding FileHandle owns the descriptor: one whose object was never closed is
+// closed on garbage collection, with Node's warnings.
+const kNative = Symbol('kNative');
 function releaseFd(handle) {
   const fd = handle[kFd];
   handle[kFd] = -1;
-  gcCloser.unregister(handle);
+  handle[kNative]?.releaseFD();
+  handle[kNative] = undefined;
   return fd;
 }
 
@@ -72,7 +70,7 @@ class FileHandle extends EventEmitter {
   constructor(fd) {
     super();
     this[kFd] = fd === undefined ? -1 : fd;
-    if (this[kFd] !== -1) gcCloser.register(this, this[kFd], this);
+    this[kNative] = this[kFd] === -1 ? undefined : new fsBinding.FileHandle(this[kFd]);
     this[kRefs] = 1;
     this[kClosePromise] = null;
     markTransferMode(this, false, true);
@@ -172,7 +170,7 @@ class FileHandle extends EventEmitter {
   [kDeserialize]({ handle }) {
     this[kHandle] = handle;
     this[kFd] = handle.fd;
-    gcCloser.register(this, handle.fd, this);
+    this[kNative] = new fsBinding.FileHandle(handle.fd);
   }
   [kRef]() { this[kRefs]++; }
   [kUnref]() {
@@ -198,7 +196,7 @@ c.fileHandles = {
 require('internal/fs/iter').register(FileHandle, { kFd, kLocked, kRef, kUnref, kClosePromise, kCloseSync, invalidState });
 
 async function fsCall(fn, handle, ...args) {
-  if (!FileHandle.isFileHandle(handle)) throw new ERR_INVALID_ARG_TYPE('handle', 'FileHandle', handle);
+  require('internal/assert')(handle[kRefs] !== undefined, 'handle must be an instance of FileHandle');
   if (handle.fd === -1) {
     const err = new Error(handle[kCloseReason] ?? 'file closed');
     err.code = 'EBADF'; err.syscall = fn.name;
@@ -242,34 +240,22 @@ async function writeFileHandle(filehandle, data, signal, encoding) {
     data = new Uint8Array(data.buffer, data.byteOffset + bytesWritten, data.byteLength - bytesWritten);
   } while (remaining > 0);
 }
-function validateReadFileBufferOptions(options) {
-  const { buffer } = options;
-  if (buffer !== undefined && typeof buffer !== 'function' && !ArrayBuffer.isView(buffer)) throw new ERR_INVALID_ARG_TYPE('options.buffer', ['Buffer', 'TypedArray', 'DataView', 'Function'], buffer);
-}
-function getReadFileBuffer(options, size) {
-  let { buffer } = options;
-  if (typeof buffer === 'function') { buffer = options.buffer(size); v.validateBuffer(buffer, 'options.buffer()'); }
-  if (buffer === undefined) return undefined;
-  if (!Buffer.isBuffer(buffer)) buffer = Buffer.from(buffer.buffer, buffer.byteOffset, buffer.byteLength);
-  if (size > buffer.byteLength) throw new ERR_INVALID_ARG_VALUE(typeof options.buffer === 'function' ? 'options.buffer().byteLength' : 'options.buffer.byteLength', buffer.byteLength, `is smaller than the file size of ${size} bytes`);
-  return buffer;
-}
 async function readFileHandleWithUserBuffer(filehandle, options, size) {
   const signal = options?.signal; const encoding = options?.encoding;
   const buffer = getReadFileBuffer(options, size);
-  const byteLengthName = typeof options.buffer === 'function' ? 'options.buffer().byteLength' : 'options.buffer.byteLength';
+  const byteLengthName = getReadFileBufferByteLengthName(options);
   let totalRead = 0;
   while (totalRead < buffer.byteLength) {
     checkAborted(signal);
     const length = size === 0 ? buffer.byteLength - totalRead : Math.min(size - totalRead, kReadFileBufferLength);
-    const bytesRead = (await binding('read', [filehandle.fd, buffer, totalRead, length, null])) ?? 0;
+    const bytesRead = (await fsBinding.read(filehandle.fd, buffer, totalRead, length, -1, kUsePromises)) ?? 0;
     totalRead += bytesRead;
     if (bytesRead === 0 || totalRead === size) { const result = buffer.subarray(0, totalRead); return encoding ? result.toString(encoding) : result; }
   }
   if (size === 0) {
     checkAborted(signal);
     const extraBuffer = Buffer.allocUnsafeSlow(1);
-    const bytesRead = (await binding('read', [filehandle.fd, extraBuffer, 0, 1, null])) ?? 0;
+    const bytesRead = (await fsBinding.read(filehandle.fd, extraBuffer, 0, 1, -1, kUsePromises)) ?? 0;
     if (bytesRead !== 0) throw new ERR_INVALID_ARG_VALUE(byteLengthName, buffer.byteLength, 'is too small to contain the entire file');
   }
   return encoding ? buffer.toString(encoding) : buffer.subarray(0, totalRead);
@@ -278,10 +264,10 @@ async function readFileHandle(filehandle, options) {
   const signal = options?.signal; const encoding = options?.encoding;
   const decoder = encoding && new (require('string_decoder').StringDecoder)(encoding);
   checkAborted(signal);
-  const statFields = await binding('fstat', [filehandle.fd, { bigint: false }]);
+  const statFields = await fsBinding.fstat(filehandle.fd, false, kUsePromises);
   checkAborted(signal);
   let size = 0; let length = 0;
-  if ((statFields.mode & 0o170000) === 0o100000) { size = statFields.size; length = encoding ? Math.min(size, kReadFileBufferLength) : size; }
+  if ((statFields[1/* mode */] & 0o170000) === 0o100000) { size = statFields[8/* size */]; length = encoding ? Math.min(size, kReadFileBufferLength) : size; }
   if (length === 0) length = kReadFileUnknownBufferLength;
   if (size > kIoMaxLength) throw new ERR_FS_FILE_TOO_LARGE(size);
   if (options.buffer !== undefined) return readFileHandleWithUserBuffer(filehandle, options, size);
@@ -292,7 +278,7 @@ async function readFileHandle(filehandle, options) {
   for (;;) {
     checkAborted(signal);
     if (chunkedRead) length = Math.min(size - totalRead, kReadFileBufferLength);
-    const bytesRead = (await binding('read', [filehandle.fd, buffer, offset, length, null])) ?? 0;
+    const bytesRead = (await fsBinding.read(filehandle.fd, buffer, offset, length, -1, kUsePromises)) ?? 0;
     totalRead += bytesRead;
     if (bytesRead === 0 || totalRead === size || (bytesRead !== buffer.length && !chunkedRead && !noSize)) {
       const singleRead = bytesRead === totalRead;
@@ -316,7 +302,7 @@ async function readFileHandle(filehandle, options) {
 async function access(path, mode = constants.F_OK) {
   path = c.path(path);
   if (mode == null) mode = constants.F_OK; else validateInteger(mode, 'mode', 0, 7);
-  return binding('access', [path, mode]);
+  return await binding('access', [path, mode]);
 }
 async function cp(src, dest, options) {
   const { validateCpOptions, cpFn } = require('internal/fs/cp/cp');
@@ -327,7 +313,7 @@ async function cp(src, dest, options) {
 async function copyFile(src, dest, mode) {
   src = c.path(src, 'src'); dest = c.path(dest, 'dest');
   if (mode == null) mode = 0; else validateInteger(mode, 'mode', 0, 7);
-  return binding('copyFile', [src, dest, mode]);
+  return await binding('copyFile', [src, dest, mode]);
 }
 async function open(path, flags, mode) {
   path = c.path(path);
@@ -389,14 +375,14 @@ async function writev(handle, buffers, position) {
   const bytesWritten = (await binding('writev', [handle.fd, buffers, position])) || 0;
   return { __proto__: null, bytesWritten, buffers };
 }
-async function rename(oldPath, newPath) { return binding('rename', [c.path(oldPath, 'oldPath'), c.path(newPath, 'newPath')]); }
+async function rename(oldPath, newPath) { return await binding('rename', [c.path(oldPath, 'oldPath'), c.path(newPath, 'newPath')]); }
 async function truncate(path, len = 0) {
   const fd = await open(path, 'r+');
   return handleFdClose(ftruncate(fd, len), fd.close);
 }
 async function ftruncate(handle, len = 0) {
   validateInteger(len, 'len'); len = Math.max(0, len);
-  return binding('ftruncate', [handle.fd, len]);
+  return await binding('ftruncate', [handle.fd, len]);
 }
 async function rm(path, options) {
   path = c.path(path);
@@ -405,7 +391,7 @@ async function rm(path, options) {
   let info;
   try { info = await lstat(path); } catch (err) { if (options.force && err.code === 'ENOENT') return; throw err; }
   if (info.isDirectory() && !options.recursive) throw new ERR_FS_EISDIR({ code: 'EISDIR', message: 'is a directory', path, syscall: 'rm', errno: 21 });
-  return binding('rm', [path, options]);
+  return await binding('rm', [path, options]);
 }
 async function rmdir(path, options) {
   path = c.path(path);
@@ -413,25 +399,25 @@ async function rmdir(path, options) {
   if (options.recursive) {
     c.emitRecursiveRmdirWarning();
     const info = await stat(path);
-    if (info.isDirectory()) return binding('rm', [path, { ...options, force: false }]);
+    if (info.isDirectory()) return await binding('rm', [path, { ...options, force: false }]);
   }
-  return binding('rmdir', [path, {}]);
+  return await binding('rmdir', [path, {}]);
 }
-async function fdatasync(handle) { return binding('fdatasync', [handle.fd]); }
-async function fsync(handle) { return binding('fsync', [handle.fd]); }
+async function fdatasync(handle) { return await binding('fdatasync', [handle.fd]); }
+async function fsync(handle) { return await binding('fsync', [handle.fd]); }
 async function mkdir(path, options) {
   if (typeof options === 'number' || typeof options === 'string') options = { mode: options };
   const { recursive = false, mode = 0o777 } = options || {};
   path = c.path(path);
   validateBoolean(recursive, 'options.recursive');
-  return binding('mkdir', [path, { mode: c.mode(mode, 0o777), recursive }]);
+  return await binding('mkdir', [path, { mode: c.mode(mode, 0o777), recursive }]);
 }
 async function readdir(path, options) {
   options = { ...c.options(options) };
   path = c.path(path);
   const encoding = c.encoding(options.encoding, 'utf8', true);
   const value = await binding('readdir', [path, { ...options, encoding }]);
-  return value.map(entry => options.withFileTypes ? entry instanceof Dirent ? entry : new Dirent(c.encoded(entry.name, encoding), entry.mode, entry.parentPath === undefined ? path : entry.parentPath) : c.encoded(entry, encoding));
+  return value.map(entry => options.withFileTypes ? entry instanceof Dirent ? entry : new Dirent(c.encoded(entry.name, encoding), c.modeType(entry.mode), entry.parentPath === undefined ? path : entry.parentPath) : c.encoded(entry, encoding));
 }
 async function readlink(path, options) {
   options = c.options(options);
@@ -441,7 +427,7 @@ async function readlink(path, options) {
 async function symlink(target, path, type) {
   validateOneOf(type, 'type', ['dir', 'file', 'junction', null, undefined]);
   target = c.path(target, 'target'); path = c.path(path);
-  return binding('symlink', [c.preprocessSymlinkDestination(target, type, path), path, type]);
+  return await binding('symlink', [c.preprocessSymlinkDestination(target, type, path), path, type]);
 }
 async function fstat(handle, options = { bigint: false }) {
   return makeStats(await binding('fstat', [handle.fd, { bigint: !!options.bigint }]), !!options.bigint);
@@ -458,22 +444,22 @@ async function stat(path, options = { bigint: false, throwIfNoEntry: true }) {
 async function statfs(path, options = { bigint: false }) {
   return makeStatFs(await binding('statfs', [c.path(path), { bigint: !!options.bigint }]), !!options.bigint);
 }
-async function link(existingPath, newPath) { return binding('link', [c.path(existingPath, 'existingPath'), c.path(newPath, 'newPath')]); }
-async function unlink(path) { return binding('unlink', [c.path(path)]); }
-async function fchmod(handle, mode) { mode = c.mode(mode, undefined); return binding('fchmod', [handle.fd, mode]); }
-async function chmod(path, mode) { path = c.path(path); mode = c.mode(mode, undefined); return binding('chmod', [path, mode]); }
+async function link(existingPath, newPath) { return await binding('link', [c.path(existingPath, 'existingPath'), c.path(newPath, 'newPath')]); }
+async function unlink(path) { return await binding('unlink', [c.path(path)]); }
+async function fchmod(handle, mode) { mode = c.mode(mode, undefined); return await binding('fchmod', [handle.fd, mode]); }
+async function chmod(path, mode) { path = c.path(path); mode = c.mode(mode, undefined); return await binding('chmod', [path, mode]); }
 async function lchmod(path, mode) {
   if (constants.O_SYMLINK === undefined) throw new ERR_METHOD_NOT_IMPLEMENTED('lchmod()');
   const fd = await open(path, constants.O_WRONLY | constants.O_SYMLINK);
   return handleFdClose(fchmod(fd, mode), fd.close);
 }
 function ids(uid, gid) { validateInteger(uid, 'uid', -1, kMaxUserId); validateInteger(gid, 'gid', -1, kMaxUserId); }
-async function lchown(path, uid, gid) { path = c.path(path); ids(uid, gid); return binding('lchown', [path, uid, gid]); }
-async function fchown(handle, uid, gid) { ids(uid, gid); return binding('fchown', [handle.fd, uid, gid]); }
-async function chown(path, uid, gid) { path = c.path(path); ids(uid, gid); return binding('chown', [path, uid, gid]); }
-async function utimes(path, atime, mtime) { path = c.path(path); return binding('utimes', [path, c.time(atime), c.time(mtime)]); }
-async function futimes(handle, atime, mtime) { atime = c.time(atime, 'atime'); mtime = c.time(mtime, 'mtime'); return binding('futimes', [handle.fd, atime, mtime]); }
-async function lutimes(path, atime, mtime) { return binding('lutimes', [c.path(path), c.time(atime), c.time(mtime)]); }
+async function lchown(path, uid, gid) { path = c.path(path); ids(uid, gid); return await binding('lchown', [path, uid, gid]); }
+async function fchown(handle, uid, gid) { ids(uid, gid); return await binding('fchown', [handle.fd, uid, gid]); }
+async function chown(path, uid, gid) { path = c.path(path); ids(uid, gid); return await binding('chown', [path, uid, gid]); }
+async function utimes(path, atime, mtime) { path = c.path(path); return await binding('utimes', [path, c.time(atime), c.time(mtime)]); }
+async function futimes(handle, atime, mtime) { atime = c.time(atime, 'atime'); mtime = c.time(mtime, 'mtime'); return await binding('futimes', [handle.fd, atime, mtime]); }
+async function lutimes(path, atime, mtime) { return await binding('lutimes', [c.path(path), c.time(atime), c.time(mtime)]); }
 async function realpath(path, options) {
   options = c.options(options);
   return c.encoded(await binding('realpath', [c.path(path), options]), c.encoding(options.encoding, 'utf8', true));

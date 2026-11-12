@@ -287,16 +287,38 @@ function makeStats(value = {}, bigint = false) {
   return new Stats(small(value.dev), small(value.mode), small(value.nlink), small(value.uid), small(value.gid), small(value.rdev), small(value.blksize), small(value.ino), small(value.size), small(value.blocks),
     small(value.atimeMs), small(value.mtimeMs), small(value.ctimeMs), small(value.birthtimeMs));
 }
+// Node's lib/internal/fs/utils.js Dirent: the uv_dirent_t type, as the binding reports it.
+const kType = Symbol('type');
+const kStats = Symbol('stats');
 class Dirent {
-  constructor(name, mode, parentPath) { this.name = name; this.parentPath = parentPath; this.path = parentPath; Object.defineProperty(this, '_mode', { value: Number(mode) }); }
-  _is(type) { return (this._mode & 0o170000) === type; }
-  isFile() { return this._is(0o100000); }
-  isDirectory() { return this._is(0o040000); }
-  isBlockDevice() { return this._is(0o060000); }
-  isCharacterDevice() { return this._is(0o020000); }
-  isSymbolicLink() { return this._is(0o120000); }
-  isFIFO() { return this._is(0o010000); }
-  isSocket() { return this._is(0o140000); }
+  constructor(name, type, path) { this.name = name; this.parentPath = path; this.path = path; this[kType] = type; }
+  isDirectory() { return this[kType] === constants.UV_DIRENT_DIR; }
+  isFile() { return this[kType] === constants.UV_DIRENT_FILE; }
+  isBlockDevice() { return this[kType] === constants.UV_DIRENT_BLOCK; }
+  isCharacterDevice() { return this[kType] === constants.UV_DIRENT_CHAR; }
+  isSymbolicLink() { return this[kType] === constants.UV_DIRENT_LINK; }
+  isFIFO() { return this[kType] === constants.UV_DIRENT_FIFO; }
+  isSocket() { return this[kType] === constants.UV_DIRENT_SOCKET; }
+}
+class DirentFromStats extends Dirent {
+  constructor(name, stats, path) { super(name, null, path); this[kStats] = stats; }
+}
+for (const name of Reflect.ownKeys(Dirent.prototype)) {
+  if (name === 'constructor') continue;
+  DirentFromStats.prototype[name] = function() { return this[kStats][name](); };
+}
+// The uv_dirent_t type of a file mode, for entries the runtime reads with their mode.
+function modeType(mode) {
+  switch (Number(mode) & 0o170000) {
+    case 0o100000: return constants.UV_DIRENT_FILE;
+    case 0o040000: return constants.UV_DIRENT_DIR;
+    case 0o120000: return constants.UV_DIRENT_LINK;
+    case 0o010000: return constants.UV_DIRENT_FIFO;
+    case 0o140000: return constants.UV_DIRENT_SOCKET;
+    case 0o020000: return constants.UV_DIRENT_CHAR;
+    case 0o060000: return constants.UV_DIRENT_BLOCK;
+    default: return constants.UV_DIRENT_UNKNOWN;
+  }
 }
 class StatFs {
   constructor(type, bsize, frsize, blocks, bfree, bavail, files, ffree) {
@@ -357,7 +379,6 @@ const realpathCacheKey = Symbol('realpathCacheKey');
 
 // Node's getDirents and getDirent: readdir results with an unknown entry type are
 // completed with lstat, the others build their Dirent from the UV_DIRENT type.
-const kDirentModes = [0, 0o100000, 0o040000, 0o120000, 0o010000, 0o140000, 0o020000, 0o060000];
 function direntJoin(path, name) {
   const isBytes = (value) => value instanceof Uint8Array;
   if ((typeof path === 'string' || isBytes(path)) && name === undefined) return path;
@@ -373,12 +394,12 @@ function getDirent(path, name, type, callback) {
       try { filepath = direntJoin(path, name); } catch (err) { callback(err); return; }
       require('fs').lstat(filepath, (err, stats) => {
         if (err) { callback(err); return; }
-        callback(null, new Dirent(name, stats.mode, path));
+        callback(null, new DirentFromStats(name, stats, path));
       });
-    } else callback(null, new Dirent(name, kDirentModes[type], path));
+    } else callback(null, new Dirent(name, type, path));
   } else if (type === constants.UV_DIRENT_UNKNOWN) {
-    return new Dirent(name, require('fs').lstatSync(direntJoin(path, name)).mode, path);
-  } else return new Dirent(name, kDirentModes[type], path);
+    return new DirentFromStats(name, require('fs').lstatSync(direntJoin(path, name)), path);
+  } else return new Dirent(name, type, path);
 }
 function getDirents(path, { 0: names, 1: types }, callback) {
   const len = names.length;
@@ -389,7 +410,7 @@ function getDirents(path, { 0: names, 1: types }, callback) {
   let toFinish = 0; let done = false;
   const finish = (err, value) => { if (!done) { done = true; callback(err, value); } };
   for (let i = 0; i < len; i++) {
-    if (types[i] !== constants.UV_DIRENT_UNKNOWN) { names[i] = new Dirent(names[i], kDirentModes[types[i]], path); continue; }
+    if (types[i] !== constants.UV_DIRENT_UNKNOWN) { names[i] = new Dirent(names[i], types[i], path); continue; }
     toFinish++;
     getDirent(path, names[i], types[i], (err, dirent) => {
       if (err) { finish(err); return; }
@@ -424,4 +445,18 @@ function preprocessSymlinkDestination(path, type, linkPath) {
   // Windows symlinks don't tolerate forward slashes.
   return path.replace(/\//g, '\\');
 }
-module.exports = { preprocessSymlinkDestination, validatePath, getValidatedPath, defaultRmOptions, validateRmdirOptions, validateRmOptions, validateRmOptionsSync, isDirectoryError, emitRecursiveRmdirWarning, realpathCacheKey, getDirent, getDirents, kRef, kUnref, host, os, std, Buffer, constants, error, fail, pair, invalid, range, integer, path, toPathIfFileURL, fd, options, assertEncoding, mode, stringToFlags, native, callback, promiseCallback, submit, time, bytes, position, validateOffsetLengthRead, validateOffsetLengthWrite, validateStringAfterArrayBufferView, bufferArray, encoding, encoded, rawNames, rawEntryPath, aborted, Stats, BigIntStats, makeStats, Dirent, StatFs, makeStatFs, v };
+// The readFile buffer option, as Node's internal/fs/utils.
+function validateReadFileBufferOptions(options) {
+  const { buffer } = options;
+  if (buffer !== undefined && typeof buffer !== 'function' && !ArrayBuffer.isView(buffer)) throw new ERR_INVALID_ARG_TYPE('options.buffer', ['Buffer', 'TypedArray', 'DataView', 'Function'], buffer);
+}
+function getReadFileBufferByteLengthName(options) { return typeof options.buffer === 'function' ? 'options.buffer().byteLength' : 'options.buffer.byteLength'; }
+function getReadFileBuffer(options, size) {
+  let { buffer } = options;
+  if (typeof buffer === 'function') { buffer = options.buffer(size); v.validateBuffer(buffer, 'options.buffer()'); }
+  if (buffer === undefined) return undefined;
+  if (!Buffer.isBuffer(buffer)) buffer = Buffer.from(buffer.buffer, buffer.byteOffset, buffer.byteLength);
+  if (size > buffer.byteLength) throw new ERR_INVALID_ARG_VALUE(getReadFileBufferByteLengthName(options), buffer.byteLength, `is smaller than the file size of ${size} bytes`);
+  return buffer;
+}
+module.exports = { validateReadFileBufferOptions, getReadFileBuffer, getReadFileBufferByteLengthName, preprocessSymlinkDestination, validatePath, getValidatedPath, defaultRmOptions, validateRmdirOptions, validateRmOptions, validateRmOptionsSync, isDirectoryError, emitRecursiveRmdirWarning, realpathCacheKey, getDirent, getDirents, kRef, kUnref, host, os, std, Buffer, constants, error, fail, pair, invalid, range, integer, path, toPathIfFileURL, fd, options, assertEncoding, mode, stringToFlags, native, callback, promiseCallback, submit, time, bytes, position, validateOffsetLengthRead, validateOffsetLengthWrite, validateStringAfterArrayBufferView, bufferArray, encoding, encoded, rawNames, rawEntryPath, aborted, Stats, BigIntStats, makeStats, Dirent, DirentFromStats, modeType, StatFs, makeStatFs, v };

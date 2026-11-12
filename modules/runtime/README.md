@@ -6,7 +6,7 @@ Node 24 is the compatibility reference. [Deno](https://github.com/denoland/deno)
 
 ## Build
 
-The verified build target is **macOS arm64**. Other platforms are not claimed as verified.
+The verified build target is **macOS arm64**. Linux x64 (Ubuntu 24.04 with libuv, OpenSSL, zstd and nghttp2 built from source) builds and passes the differential suite (72/72, November 2026); other platforms are not claimed as verified.
 
 Requirements:
 
@@ -42,6 +42,32 @@ The engine is this repository's [`modules/engine`](../engine), a path dependency
 
 The implementation includes CommonJS and ESM package loading, TypeScript execution, filesystem and process APIs, streams, networking and TLS/HTTP2, crypto and WebCrypto, workers and cluster, SQLite, Intl (SilkJS's ECMA-402 implementation in Silk, with its own CLDR-derived locale data; no ICU), Web APIs, WebAssembly/WASI, Node-API addons, the test runner, REPL, inspector, and native profiling. Feature-specific fixtures in [`tests/`](tests/) exercise these contracts, including cross-process and cross-realm ownership and failure paths.
 
+## Embed
+
+Another Silk program can run the runtime inside itself with [`runtime.embed`](src/runtime/embed.silk) (`silkjsruntime` exports it). The executable owns its process; an embedded runtime does not. Its host passes the arguments it would have had, turns the loop from its own loop, and `process.exit()` ends the runtime instead of the process:
+
+```silk
+struct App {}
+impl Host for App {
+  effect fn drive<'e, 'm>(self: &mut Self, runtime: &mut Runtime<'e, 'm>) -> i32 ! OutOfMemoryError | JsException ? &mut Allocator {
+    run runtime.evaluateModule(b"/app/main.mjs", source)
+    while true {
+      // Timers, then native completions (waiting at most 16 ms), then immediates.
+      match run runtime.turn(16.0) { Turn.Running => () Turn.Finished { status } => { return status } }
+    }
+    return 0
+  }
+}
+let status = run embed.start(run Options.make(b"app"), &mut app)
+```
+
+- `Runtime.turn(milliseconds)` runs one pass of the loop and waits for native completions at most that long (0 never blocks). `Runtime.timeout()` says how long until a timer is due, and `Runtime.waker()` ends a turn's wait from another thread, for a host whose own events arrive elsewhere.
+- `Options.keepAlive` (on for `Options.make`): the host's own work keeps the runtime alive, as open windows do, so a loop with nothing referenced is not its end. The runtime finishes with `process.exit()` or `Runtime.finish()`, which runs the `'exit'` listeners.
+- The runtime runs on the thread that calls `embed.start`; its JavaScript stays on that thread. It leaves the host's signal dispositions alone (the executable ignores `SIGPIPE` and `SIGXFSZ`, as Node does).
+- Every extension is still linked into an embedder, and the heap image is the executable's alone, so an embedded runtime bootstraps cold. Native modules for the host's own API are the next step of the embedding API.
+
+[`tests/embed-smoke.py`](tests/embed-smoke.py) builds [`src/embed_smoke.silk`](src/embed_smoke.silk), a host that runs its own module, and checks the status its turn reports.
+
 ## Compatibility boundaries
 
 This is a Node compatibility implementation, not an official Node distribution or a claim that every Node package has been tested.
@@ -58,6 +84,7 @@ This is a Node compatibility implementation, not an official Node distribution o
 | Location | Responsibility |
 | --- | --- |
 | [`src/main.silk`](src/main.silk), [`src/libs/core/`](src/libs/core/) | Native entry point, engine embedding, host interfaces |
+| [`src/runtime/`](src/runtime/) | Runtime startup and teardown (`worker`), the loop in turns (`session`), the embedding API (`embed`) |
 | [`runtime/`](runtime/) | Bootstrap and event-loop integration |
 | [`libs/node_resolver/`](libs/node_resolver/) | Package resolution, module loading, and loader hooks |
 | [`src/ext/`](src/ext/) | Native extension implementations and resource ownership |
