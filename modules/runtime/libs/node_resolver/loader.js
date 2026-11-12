@@ -54,6 +54,8 @@ function createLoader(host, builtins) {
   let foundPaths = { __proto__: null };
   // The source format() read to tell a module from a script, for the load that follows.
   let probed = null;
+  // defaultResolve: format() leaves syntax detection to the load step.
+  let deferringDetection = false;
   const cache = Object.create(null);
   const extensions = Object.create(null);
   let main;
@@ -313,10 +315,13 @@ function createLoader(host, builtins) {
     if (pkg && pkg.data.type === 'module') return ext === '' && mode === 'import' && wasmMagic(disk) ? 'wasm' : 'module';
     if (ext === '' && mode === 'import' && (!pkg || pkg.data.type !== 'commonjs') && wasmMagic(disk)) return 'wasm';
     // Embedders may provide Node's syntax detection for ambiguous .js files.
-    if ((!pkg || pkg.data.type !== 'commonjs') && typeof host.detectModuleSyntax === 'function') {
+    if ((!pkg || pkg.data.type !== 'commonjs') && typeof host.detectModuleSyntax === 'function' && !host.detectModuleDisabled) {
       if (deferDetection) return ambiguous;
       const source = text(disk);
-      if (host.detectModuleSyntax(cleanSource(source), disk)) return 'module';
+      if (host.detectModuleSyntax(cleanSource(source), disk)) {
+        if (ext === '.js') warnTypelessPackage(pkg, disk);
+        return 'module';
+      }
       probed = { filename: disk, source };
     }
     return 'commonjs';
@@ -327,7 +332,7 @@ function createLoader(host, builtins) {
     const canonical = preserve ? path.resolve(filename) : realPath(filename);
     const identity = suffix && mode === 'import' ? fileURL(canonical) + suffix : canonical;
     let kind;
-    try { kind = format(identity, mode, mode === 'require' && !isMain && !hooks.active()); }
+    try { kind = format(identity, mode, deferringDetection || (mode === 'require' && !isMain && !hooks.active())); }
     catch (cause) {
       // As in Node, an unknown extension is a load error: resolution (and
       // import.meta.resolve) still succeeds and leaves the format to the load step.
@@ -618,13 +623,7 @@ function createLoader(host, builtins) {
       if (path.isAbsolute(specifier) || relative) {
         let requested = specifier;
         let suffix = '';
-        if (mode === 'import') {
-          const position = requested.search(/[?#]/);
-          if (position !== -1) { suffix = requested.slice(position); requested = requested.slice(0, position); }
-          if (/%2f|%5c/i.test(requested)) throw error('ERR_INVALID_MODULE_SPECIFIER', requested, 'must not include encoded "/" or "\\" characters', parent || undefined);
-          try { requested = decodeURIComponent(requested); }
-          catch (_) { throw error('ERR_INVALID_URL', specifier); }
-        }
+        if (mode === 'import') ({ requested, suffix } = urlPath(specifier, specifier, parent));
         const bases = options && Array.isArray(options.paths) ? options.paths : [path.dirname(parent)];
         const key = cacheable(mode, options, isMain) ? specifier + '\0' + bases[0] : null;
         if (key !== null) {
@@ -681,6 +680,18 @@ function createLoader(host, builtins) {
     } finally { seen.delete(recursion); resolvingModule = previousModule; }
   }
 
+  // An import's relative URL as a path (finalizeResolution): the query and fragment
+  // apart, percent escapes decoded, encoded separators refused.
+  function urlPath(text, specifier, parent) {
+    let requested = text, suffix = '';
+    const position = requested.search(/[?#]/);
+    if (position !== -1) { suffix = requested.slice(position); requested = requested.slice(0, position); }
+    if (/%2f|%5c/i.test(requested)) throw error('ERR_INVALID_MODULE_SPECIFIER', requested, 'must not include encoded "/" or "\\" characters', parent || undefined);
+    try { requested = decodeURIComponent(requested); }
+    catch (_) { throw error('ERR_INVALID_URL', specifier); }
+    return { requested, suffix };
+  }
+
   // Whether resolveInternal may keep what it finds in foundPaths: a plain require, as
   // hooks can answer differently each time and a main module's symlinks may be kept.
   function cacheable(mode, options, isMain) {
@@ -727,11 +738,14 @@ function createLoader(host, builtins) {
     const base = typeof parent === 'string' && parent.startsWith('file:') ? filesystemName(parent) : parent;
     const pkg = readPackage(root, mode === 'import' && base ? `"${specifier}" from ${base}` : undefined);
     if (pkg && pkg.data.exports !== undefined && pkg.data.exports !== null) return packageMap(pkg, pkg.data.exports, parsed.subpath, false, parent, mode, seen, isMain);
-    const candidate = parsed.subpath === '.' ? root : path.join(root, parsed.subpath.slice(2));
+    // packageResolve: in import mode only a directory is a package.
+    if (mode === 'import' && !isDirectory(root)) return undefined;
+    // A subpath without "exports" is a URL against the package (new URL(subpath, packageJSONUrl)).
     if (mode === 'import' && parsed.subpath !== '.') {
-      if (isDirectory(root)) return strictFile(candidate, specifier, parent, mode, undefined, isMain);
-      return undefined;
+      const { requested, suffix } = urlPath(parsed.subpath.slice(2), specifier, parent);
+      return strictFile(path.join(root, requested), specifier, parent, mode, suffix, isMain);
     }
+    const candidate = parsed.subpath === '.' ? root : path.join(root, parsed.subpath.slice(2));
     if (mode === 'import' && pkg && typeof pkg.data.main === 'string') {
       const exact = path.resolve(root, pkg.data.main);
       if (isFile(exact)) return descriptor(exact, mode, undefined, isMain);
@@ -804,12 +818,14 @@ function createLoader(host, builtins) {
         throw error('ERR_UNSUPPORTED_RESOLVE_REQUEST', specifier, context.parentURL);
       }
     }
-    const previous = activeConditions;
+    const previous = activeConditions, previousDeferring = deferringDetection;
     activeConditions = context.conditions;
+    // As get_format.js without the source: an ambiguous file's format is left to the load step.
+    deferringDetection = true;
     try {
       const result = resolveInternal(specifier, context.parentURL, mode, context.resolveOptions, new Set(), context.isMain);
-      return { url: asURL(result.filename), format: textImport ? 'text' : result.format };
-    } finally { activeConditions = previous; }
+      return { url: asURL(result.filename), format: textImport ? 'text' : result.ambiguous ? null : result.format };
+    } finally { activeConditions = previous; deferringDetection = previousDeferring; }
   }
 
   // The module map holds one module per URL and import "type", as in Node's load cache:
@@ -935,7 +951,13 @@ function createLoader(host, builtins) {
   }
 
   function resolveMain(filename) {
-    return resolve(path.resolve(host.cwd(), filename), undefined, 'require', undefined, undefined, true, hooks.hasAsync());
+    const absolute = path.resolve(host.cwd(), filename);
+    if (!hooks.hasAsync()) return resolve(absolute, undefined, 'require', undefined, undefined, true, false);
+    // run_main.js: with module.register() hooks the main runs through the ESM loader, whose resolve hooks
+    // get the file URL of the path the CommonJS lookup finds (or of the path itself).
+    let found = absolute;
+    try { found = resolveInternal(absolute, undefined, 'require', undefined, new Set(), true).filename; } catch (_) {}
+    return resolve(fileURL(found), undefined, 'import', undefined, undefined, true, true);
   }
 
   // A data: URL's format by its MIME type, as Node reads it: an unknown type has no format,
@@ -1107,6 +1129,8 @@ function createLoader(host, builtins) {
     require(specifier) { return makeRequire(this.filename || path.join(host.tryGetCwd(), '__entry__.js'), this, moduleAsyncModes.get(this) === true)(specifier); }
     _compile(source, filename) {
       const compiledSource = cleanSource(source);
+      const detecting = detectingFormat;
+      detectingFormat = false;
       let wrapper;
       try {
         wrapper = wrapperPatched
@@ -1116,6 +1140,7 @@ function createLoader(host, builtins) {
         host.attachArrow(error, filename, compiledSource, wrapperPatched ? Module.wrap(compiledSource).indexOf(compiledSource) : wrapperPrefix.length);
         // CompileFunctionForCJSLoader decorates the stack of a compile error.
         host.decorateErrorStack(error);
+        if (!detecting) warnRequireESM(error, compiledSource, filename);
         throw error;
       }
       const metadata = host.getScriptMetadata(wrapper);
@@ -1336,7 +1361,7 @@ function createLoader(host, builtins) {
         requireNamespace(module, filename);
       } else if (loaded && resolved.format !== 'addon') {
         if (resolved.format === 'json') module.exports = JSON.parse(loaded.source.replace(/^\uFEFF/, ''));
-        else if (resolved.format === 'commonjs') compileCommonJS(module, loaded.source, filename);
+        else if (resolved.format === 'commonjs') module._compile(loaded.source, filename);
         else throw error('ERR_UNKNOWN_MODULE_FORMAT', resolved.format, asURL(resolved.filename));
       } else {
         const basename = path.basename(filename);
@@ -1345,12 +1370,15 @@ function createLoader(host, builtins) {
           const candidate = basename.slice(index);
           if (own(extensions, candidate)) { ext = candidate; break; }
         }
-        if (resolved.ambiguous && ext === '.js') {
-          try { extensions[ext](module, filename); }
+        if (resolved.ambiguous && ext === '.js' && (isMain ? !host.detectModuleDisabled : requireModuleEnabled())) {
+          detectingFormat = true;
+          try { extensions[ext](module, filename); detectingFormat = false; }
           catch (cause) {
+            detectingFormat = false;
             // Only a file that does not compile as CommonJS can be a module.
             if (!(cause instanceof SyntaxError) || !host.detectModuleSyntax(cleanSource(text(filename)), filename)) host.rethrow(cause);
             detectedModules.add(module);
+            warnTypelessPackage(packageScope(filename), filename);
             requireNamespace(module, filename);
           }
         } else extensions[ext](module, filename);
@@ -1448,19 +1476,30 @@ function createLoader(host, builtins) {
     return error('ERR_REQUIRE_ASYNC_MODULE', filesystemName(filename), parent, locations);
   }
 
-  // Node's hint for a CommonJS global used in an ES module.
-  // Node's CompileFunctionForCJSLoader without module detection: ES module syntax in a
-  // file that must be CommonJS warns once, then its SyntaxError is thrown.
+  // get_format.js warnTypelessPackageJsonFile: a .js file detected as an ES module
+  // under a package.json without "type" warns once for that package.json, outside
+  // node_modules.
+  const typelessPackagesWarned = new Set();
+  function warnTypelessPackage(pkg, filename) {
+    if (!pkg || pkg.data.type !== undefined || typelessPackagesWarned.has(pkg.filename)) return;
+    const url = fileURL(filename);
+    if (url.includes('/node_modules/')) return;
+    typelessPackagesWarned.add(pkg.filename);
+    process.emitWarning(`Module type of ${url} is not specified and it doesn't parse as CommonJS.\n` +
+      'Reparsing as ES module because module syntax was detected. This incurs a performance overhead.\n' +
+      `To eliminate this warning, add "type": "module" to ${pkg.filename}.`, { code: 'MODULE_TYPELESS_PACKAGE_JSON' });
+  }
+
+  // Node's CompileFunctionForCJSLoader without module detection (a CommonJS file, or
+  // require() with require(esm) disabled): ES module syntax warns once, then the
+  // SyntaxError is thrown. Module._compile of an ambiguous file that may be detected
+  // as a module sets detectingFormat for its compile only.
+  let detectingFormat = false;
   let warnedRequireESM = false;
-  function compileCommonJS(module, source, filename) {
-    try { module._compile(source, filename); }
-    catch (cause) {
-      if (!warnedRequireESM && cause instanceof SyntaxError && host.detectModuleSyntax(cleanSource(source), filename)) {
-        warnedRequireESM = true;
-        require('internal/startup_controls').emitWarningSync(`Failed to load the ES module: ${filename}. Make sure to set "type": "module" in the nearest package.json file or use the .mjs extension.`);
-      }
-      throw cause;
-    }
+  function warnRequireESM(cause, source, filename) {
+    if (warnedRequireESM || !(cause instanceof SyntaxError) || !host.detectModuleSyntax(source, filename)) return;
+    warnedRequireESM = true;
+    require('internal/startup_controls').emitWarningSync(`Failed to load the ES module: ${filename}. Make sure to set "type": "module" in the nearest package.json file or use the .mjs extension.`);
   }
   // Node's ModuleWrap compile failure (AppendExceptionLine): a module that did
   // not parse reports the line of the bad token in its own file, by URL.
@@ -1512,6 +1551,15 @@ function createLoader(host, builtins) {
     if (cause === null || typeof cause !== 'object' || cause.name !== 'ReferenceError') return cause;
     const match = /^(require|module|exports|__filename|__dirname) is not defined$/.exec(cause.message);
     if (!match) return cause;
+    // explainCommonJSGlobalLikeNotDefinedError: with top-level await the format is ambiguous.
+    if (host.moduleHasTopLevelAwait(String(filename))) {
+      const advice = match[1] === 'require' ? 'replace require() with import'
+        : match[1] === 'module' || match[1] === 'exports' ? 'use export instead of module.exports/exports'
+        : `use import.meta.${match[1].slice(2)} instead`;
+      cause.message = `Cannot determine intended module format because both '${match[1]}' and top-level await are present. If the code is intended to be CommonJS, wrap await in an async function. If the code is intended to be an ES module, ${advice}.`;
+      cause.code = 'ERR_AMBIGUOUS_MODULE_SYNTAX';
+      return cause;
+    }
     let message = `${match[1]} is not defined in ES module scope`;
     if (match[1] === 'require') message += ', you can use import instead';
     const url = asURL(filename);
@@ -1604,12 +1652,40 @@ function createLoader(host, builtins) {
   let requireTracing;
   // Every module-scoped require calls this, as Node's calls mod.require: a stack
   // captured above it (traceRequireModule) starts at the require in helpers.js.
+  // NODE_DEBUG=module_timer and the node.module_timer trace category (Node's wrapModuleLoad).
+  // The untimed path stays one frame, as error stacks show it.
+  // The timer (and the debuglog module, which loads inspect) is made only once
+  // NODE_DEBUG is set or internal/trace_events is loaded: before that it is off.
+  // warmMain's requires are not timed: NODE_DEBUG is the started process's.
+  let moduleTimer, nodeDebug, warming = false;
+  function timing() {
+    if (warming) return false;
+    if (moduleTimer === undefined) {
+      nodeDebug ??= Boolean(host.env.NODE_DEBUG);
+      if (!nodeDebug && !host.builtinLoaded('internal/trace_events')) return false;
+      moduleTimer = builtins.get('internal/util/debuglog').debugWithTimer('module_timer');
+    }
+    return moduleTimer.active();
+  }
   function requireEntry(state, specifier) {
+    if (timing()) return timedRequire(state, specifier);
     const dc = host.diagnosticsChannel;
     if (dc !== undefined && (requireTracing ??= dc.tracingChannel('module.require')).hasSubscribers) {
       return requireTracing.traceSync(state.load, { __proto__: null, parentFilename: (state.parent || cache[state.filename])?.filename, id: specifier }, undefined, specifier);
     }
     return state.load(specifier);
+  }
+  function timedRequire(state, specifier) {
+    const parent = state.parent || cache[state.filename];
+    const logLabel = `[${parent?.id || ''}] [${specifier}]`, traceLabel = `require('${specifier}')`;
+    moduleTimer.start(logLabel, traceLabel);
+    try {
+      const dc = host.diagnosticsChannel;
+      if (dc !== undefined && (requireTracing ??= dc.tracingChannel('module.require')).hasSubscribers) {
+        return requireTracing.traceSync(state.load, { __proto__: null, parentFilename: parent?.filename, id: specifier }, undefined, specifier);
+      }
+      return state.load(specifier);
+    } finally { moduleTimer.end(logLabel, traceLabel); }
   }
   function makeRequire(filename, parent, allowAsync = false) {
     const require = loaderRequire(requireEntry, { __proto__: null, load, filename, parent });
@@ -1652,7 +1728,11 @@ function createLoader(host, builtins) {
   }
 
   // resolved, when given, is resolveMain(filename) as the caller just got it.
+  // ES module entries runMain started. Node imports an entry through the ESM loader,
+  // so module.runMain() of one already loaded does not evaluate it again.
+  const mainModules = new Set();
   function runMain(filename, inputTypeSet = false, resolved = resolveMain(filename)) {
+    if (mainModules.has(resolved.filename)) return undefined;
     if (hooks.active() || resolved.format === undefined || resolved.format.endsWith('-typescript')) {
       const loaded = loadSource(resolved, undefined, hooks.hasAsync(), 'require');
       resolved.format = loaded.format;
@@ -1665,6 +1745,7 @@ function createLoader(host, builtins) {
       }
       if (typeof host.evaluateModule !== 'function') throw error('ERR_METHOD_NOT_IMPLEMENTED', 'evaluateModule');
       const loaded = loadESM(resolved.filename);
+      mainModules.add(resolved.filename);
       let result;
       try { result = host.evaluateModule(loaded.source, loaded.filename, true); }
       catch (cause) { host.rethrow(decorateModuleError(cause, resolved.filename)); }
@@ -1687,8 +1768,11 @@ function createLoader(host, builtins) {
     const resolved = new Set(resolutions.keys()), previous = main;
     const scoped = new Set(scopes.keys()), looked = new Set(lookupPaths.keys()), reals = new Set(realPaths.keys());
     const parents = new Set(parentNames.keys()), founds = new Set(Object.keys(foundPaths));
+    warming = true;
     try { runMain(filename); }
     finally {
+      warming = false;
+      mainModules.clear();
       for (const key of Object.keys(cache)) if (!modules.has(key)) delete cache[key];
       for (const key of [...packages.keys()]) if (!directories.has(key)) packages.delete(key);
       for (const key of [...scopes.keys()]) if (!scoped.has(key)) scopes.delete(key);
