@@ -1,99 +1,815 @@
+// Adapted from Node.js v24.22.1 lib/internal/test_runner/coverage.js by tools/port_test_runner.py.
 'use strict';
+const {
+  ArrayFrom,
+  ArrayPrototypeMap,
+  ArrayPrototypePush,
+  JSONParse,
+  MathFloor,
+  MathMax,
+  MathMin,
+  NumberParseInt,
+  ObjectAssign,
+  RegExpPrototypeExec,
+  RegExpPrototypeSymbolSplit,
+  SafeMap,
+  SafeSet,
+  StringPrototypeIncludes,
+  StringPrototypeLocaleCompare,
+  StringPrototypeStartsWith,
+  StringPrototypeTrim,
+} = require('internal/per_context/primordials');
+const {
+  copyFileSync,
+  mkdirSync,
+  mkdtempSync,
+  opendirSync,
+  readFileSync,
+  rmSync,
+} = require('fs');
+const { setupCoverageHooks } = require('internal/util');
+const { tmpdir } = require('os');
+const { join, resolve, relative } = require('path');
+const { fileURLToPath, URL } = require('internal/url');
+const { kMappings, SourceMap } = require('internal/source_map/source_map');
+const {
+  codes: {
+    ERR_OPERATION_FAILED,
+    ERR_SOURCE_MAP_CORRUPT,
+    ERR_SOURCE_MAP_MISSING_SOURCE,
+  },
+} = require('internal/errors');
+const { createMatcher } = require('internal/fs/glob');
+const { constants: { kMockSearchParam } } = require('internal/test_runner/mock/loader');
 
-const host = require('internal/host');
-const path = require('path');
-const { fileURLToPath } = require('url');
-const fields = ['Line', 'Branch', 'Function'];
-const percent = (covered, total) => total === 0 ? 100 : covered * 100 / total;
-function metrics(file) {
-  for (const [kind, entries] of [['Line', file.lines], ['Branch', file.branches], ['Function', file.functions]]) {
-    file[`total${kind}Count`] = entries.length;
-    file[`covered${kind}Count`] = entries.filter(entry => entry.count > 0).length;
-    file[`covered${kind}Percent`] = percent(file[`covered${kind}Count`], entries.length);
+const kCoverageFileRegex = /^coverage-(\d+)-(\d{13})-(\d+)\.json$/;
+const kIgnoreRegex = /\/\* node:coverage ignore next (?<count>\d+ )?\*\//;
+const kLineEndingRegex = /\r?\n$/u;
+const kLineSplitRegex = /(?<=\r?\n)/u;
+const kStatusRegex = /\/\* node:coverage (?<status>enable|disable) \*\//;
+// Match dotfiles (e.g. `test/.foo.js`) when applying coverage globs so the
+// default exclude patterns cover them.
+const kMatchGlobPatternOptions = { __proto__: null, dot: true };
+const kTypeOnlyImportRegex = /^\s*import\s+type\b/u;
+const kTypeScriptSourceRegex = /\.(?:cts|mts|ts)$/u;
+
+let stripTypeScriptTypesForCoverage;
+
+function getStripTypeScriptTypesForCoverage() {
+  if (!process.config.variables.node_use_amaro) {
+    return;
   }
-  return file;
+
+  stripTypeScriptTypesForCoverage ??=
+    require('internal/modules/typescript').stripTypeScriptTypesForCoverage;
+  return stripTypeScriptTypesForCoverage;
 }
-function selected(filename, options, workingDirectory) {
-  const relative = path.relative(workingDirectory, filename).split(path.sep).join('/');
-  const match = pattern => path.matchesGlob(relative, pattern) || path.matchesGlob(filename, pattern);
-  const include = options.coverageIncludeGlobs;
-  if (include !== undefined && !(Array.isArray(include) ? include : [include]).some(match)) return false;
-  const exclude = options.coverageExcludeGlobs;
-  if (exclude !== undefined) return !(Array.isArray(exclude) ? exclude : [exclude]).some(match);
-  return !relative.split('/').some(part => part === 'node_modules' || part === 'test' || part === 'tests') &&
-    !/(?:^|\/)(?:test[-.]|[^/]*[._-]test\.)/.test(relative);
+
+function createCoverageMatcher(pattern) {
+  return {
+    __proto__: null,
+    relative: createMatcher(pattern, kMatchGlobPatternOptions),
+    absolute: createMatcher(pattern),
+  };
 }
-function summarize(files, options, workingDirectory) {
-  const totals = {};
-  for (const kind of fields) {
-    totals[`total${kind}Count`] = 0;
-    totals[`covered${kind}Count`] = 0;
+
+class CoverageLine {
+  constructor(line, startOffset, src, length = src?.length) {
+    const newlineLength = src == null ? 0 :
+      RegExpPrototypeExec(kLineEndingRegex, src)?.[0].length ?? 0;
+
+    this.line = line;
+    this.src = src;
+    this.startOffset = startOffset;
+    this.endOffset = startOffset + length - newlineLength;
+    this.ignore = false;
+    this.count = this.startOffset === this.endOffset ? 1 : 0;
   }
-  files.sort((a, b) => a.path.localeCompare(b.path));
-  for (const file of files) {
-    metrics(file);
-    for (const kind of fields) {
-      totals[`total${kind}Count`] += file[`total${kind}Count`];
-      totals[`covered${kind}Count`] += file[`covered${kind}Count`];
+}
+
+class TestCoverage {
+  constructor(coverageDirectory,
+              originalCoverageDirectory,
+              options) {
+    this.coverageDirectory = coverageDirectory;
+    this.originalCoverageDirectory = originalCoverageDirectory;
+    this.options = options;
+  }
+
+  #sourceLines = new SafeMap();
+  #typeScriptLines = new SafeSet();
+  #skipCache = new SafeMap();
+  #excludeMatchers = null;
+  #includeMatchers = null;
+
+  getLines(fileUrl, source) {
+    // Split the file source into lines. Make sure the lines maintain their
+    // original line endings because those characters are necessary for
+    // determining offsets in the file.
+    if (this.#sourceLines.has(fileUrl)) {
+      return this.#sourceLines.get(fileUrl);
     }
+
+    try {
+      source ??= readFileSync(fileURLToPath(fileUrl), 'utf8');
+    } catch {
+      // The file can no longer be read. It may have been deleted among
+      // other possibilities. Leave it out of the coverage report.
+      this.#sourceLines.set(fileUrl, null);
+      return;
+    }
+
+    const linesWithBreaks =
+      RegExpPrototypeSymbolSplit(kLineSplitRegex, source);
+    let ignoreCount = 0;
+    let enabled = true;
+    let offset = 0;
+
+    const lines = ArrayPrototypeMap(linesWithBreaks, (line, i) => {
+      const startOffset = offset;
+      const coverageLine = new CoverageLine(i + 1, startOffset, line);
+
+      offset += line.length;
+
+      // Determine if this line is being ignored.
+      if (ignoreCount > 0) {
+        ignoreCount--;
+        coverageLine.ignore = true;
+      } else if (!enabled) {
+        coverageLine.ignore = true;
+      }
+
+      if (!coverageLine.ignore) {
+        // If this line is not already being ignored, check for ignore
+        // comments.
+        const match = RegExpPrototypeExec(kIgnoreRegex, line);
+
+        if (match !== null) {
+          ignoreCount = NumberParseInt(match.groups?.count ?? 1, 10);
+        }
+      }
+
+      // Check for comments to enable/disable coverage no matter what. These
+      // take precedence over ignore comments.
+      const match = RegExpPrototypeExec(kStatusRegex, line);
+      const status = match?.groups?.status;
+
+      if (status) {
+        ignoreCount = 0;
+        enabled = status === 'enable';
+      }
+
+      return coverageLine;
+    });
+    this.#sourceLines.set(fileUrl, lines);
+    return lines;
   }
-  for (const kind of fields) totals[`covered${kind}Percent`] = percent(totals[`covered${kind}Count`], totals[`total${kind}Count`]);
-  return { workingDirectory, files, totals, thresholds: { line: options.lineCoverage ?? 0, branch: options.branchCoverage ?? 0, function: options.functionCoverage ?? 0 } };
-}
-function take(options, workingDirectory) {
-  const files = new Map();
-  for (const [, url, name, count, locations] of host.testCoverageTake()) {
-    if (!url || url.startsWith('node:') || url.startsWith('internal/') || url[0] === '<' || !locations.length) continue;
-    const filename = url.startsWith('file:') ? fileURLToPath(url) : path.resolve(workingDirectory, url);
-    if (!selected(filename, options, workingDirectory)) continue;
-    let file = files.get(filename);
-    if (!file) files.set(filename, file = { path: filename, functions: [], branches: [], lines: new Map() });
-    // Compiler positions, not source scanning, distinguish anonymous functions and
-    // repeated instantiations. Script identities are process-local, not merge keys.
-    const start = locations.reduce((value, location) => Math.min(value, location[3]), Infinity);
-    const first = locations.reduce((value, location) => Math.min(value, location[1]), Infinity);
-    const end = locations.reduce((value, location) => Math.max(value, location[3]), 0);
-    const key = `${name}:${start}:${end}`;
-    file.functions.push({ name, line: first + 1, count, key });
-    for (const [pc, line, column, sourcePosition, visits, taken, fallthrough, conditional] of locations) {
-      const number = line + 1;
-      // Several instructions implement one expression. The largest observed visit
-      // count counts line executions without charging every VM instruction as a hit.
-      file.lines.set(number, Math.max(file.lines.get(number) || 0, visits));
-      if (conditional) {
-        file.branches.push({ line: number, column, count: taken, key: `${key}:${pc}:0`, block: `${key}:${pc}`, branch: 0, sourcePosition });
-        file.branches.push({ line: number, column, count: fallthrough, key: `${key}:${pc}:1`, block: `${key}:${pc}`, branch: 1, sourcePosition });
+
+  markTypeScriptOnlyLines(fileUrl, source) {
+    if (this.#typeScriptLines.has(fileUrl)) {
+      return;
+    }
+    this.#typeScriptLines.add(fileUrl);
+
+    if (RegExpPrototypeExec(kTypeScriptSourceRegex, fileUrl) === null) {
+      return;
+    }
+
+    const lines = this.getLines(fileUrl, source);
+    if (!lines) {
+      return;
+    }
+
+    let strippedLines;
+    const stripSource = getStripTypeScriptTypesForCoverage();
+
+    if (stripSource) {
+      source ??= readFileSync(fileURLToPath(fileUrl), 'utf8');
+
+      try {
+        strippedLines = RegExpPrototypeSymbolSplit(
+          kLineSplitRegex,
+          stripSource(source),
+        );
+      } catch {
+        strippedLines = undefined;
+      }
+    }
+
+    for (let i = 0; i < lines.length; ++i) {
+      const originalLine = lines[i].src;
+
+      if (StringPrototypeTrim(originalLine).length === 0) {
+        continue;
+      }
+
+      if (strippedLines?.[i] !== undefined) {
+        if (StringPrototypeTrim(strippedLines[i]).length === 0) {
+          lines[i].ignore = true;
+        }
+        continue;
+      }
+
+      if (RegExpPrototypeExec(kTypeOnlyImportRegex, originalLine) !== null) {
+        lines[i].ignore = true;
       }
     }
   }
-  return merge([summarize([...files.values()].map(file => ({ ...file, lines: [...file.lines].map(([line, count]) => ({ line, count })) })), options, workingDirectory)], options, workingDirectory);
-}
-function merge(summaries, options, workingDirectory) {
-  const files = new Map();
-  for (const summary of summaries) for (const input of summary.files) {
-    let file = files.get(input.path);
-    if (!file) files.set(input.path, file = { path: input.path, lines: new Map(), functions: new Map(), branches: new Map() });
-    for (const kind of ['lines', 'functions', 'branches']) for (const entry of input[kind]) {
-      const key = kind === 'lines' ? entry.line : entry.key;
-      const previous = file[kind].get(key);
-      if (previous) previous.count += entry.count;
-      else file[kind].set(key, { ...entry });
+
+  summary() {
+    require('internal/profiler_binding').takeCoverage();
+    const coverage = this.getCoverageFromDirectory();
+    const coverageSummary = {
+      __proto__: null,
+      workingDirectory: this.options.cwd,
+      files: [],
+      totals: {
+        __proto__: null,
+        totalLineCount: 0,
+        totalBranchCount: 0,
+        totalFunctionCount: 0,
+        coveredLineCount: 0,
+        coveredBranchCount: 0,
+        coveredFunctionCount: 0,
+        coveredLinePercent: 0,
+        coveredBranchPercent: 0,
+        coveredFunctionPercent: 0,
+      },
+      thresholds: {
+        __proto__: null,
+        line: this.options.lineCoverage,
+        branch: this.options.branchCoverage,
+        function: this.options.functionCoverage,
+      },
+    };
+
+    if (!coverage) {
+      return coverageSummary;
+    }
+
+    for (let i = 0; i < coverage.length; ++i) {
+      const { functions, url } = coverage[i];
+
+      let totalBranches = 0;
+      let totalFunctions = 0;
+      let branchesCovered = 0;
+      let functionsCovered = 0;
+      const functionReports = [];
+      const branchReports = [];
+
+      const lines = this.getLines(url);
+      if (!lines) {
+        continue;
+      }
+
+
+      for (let j = 0; j < functions.length; ++j) {
+        const { isBlockCoverage, ranges } = functions[j];
+
+        let maxCountPerFunction = 0;
+        for (let k = 0; k < ranges.length; ++k) {
+          const range = ranges[k];
+          maxCountPerFunction = MathMax(maxCountPerFunction, range.count);
+
+          // Add some useful data to the range. The test runner has read these ranges
+          // from a file, so we own the data structures and can do what we want.
+          ObjectAssign(range, mapRangeToLines(range, lines));
+
+          if (isBlockCoverage) {
+            ArrayPrototypePush(branchReports, {
+              __proto__: null,
+              line: range.lines[0]?.line,
+              count: range.count,
+            });
+
+            if (range.count !== 0 ||
+                range.ignoredLines === range.lines.length) {
+              branchesCovered++;
+            }
+
+            totalBranches++;
+          }
+        }
+
+        if (j > 0 && ranges.length > 0) {
+          const range = ranges[0];
+
+          ArrayPrototypePush(functionReports, {
+            __proto__: null,
+            name: functions[j].functionName,
+            count: maxCountPerFunction,
+            line: range.lines[0]?.line,
+          });
+
+          if (range.count !== 0 || range.ignoredLines === range.lines.length) {
+            functionsCovered++;
+          }
+
+          totalFunctions++;
+        }
+      }
+
+      let coveredCnt = 0;
+      const lineReports = [];
+
+      for (let j = 0; j < lines.length; ++j) {
+        const line = lines[j];
+        if (!line.ignore) {
+          ArrayPrototypePush(lineReports, {
+            __proto__: null,
+            line: line.line,
+            count: line.count,
+          });
+        }
+        if (line.count > 0 || line.ignore) {
+          coveredCnt++;
+        }
+      }
+
+      ArrayPrototypePush(coverageSummary.files, {
+        __proto__: null,
+        path: fileURLToPath(url),
+        totalLineCount: lines.length,
+        totalBranchCount: totalBranches,
+        totalFunctionCount: totalFunctions,
+        coveredLineCount: coveredCnt,
+        coveredBranchCount: branchesCovered,
+        coveredFunctionCount: functionsCovered,
+        coveredLinePercent: toPercentage(coveredCnt, lines.length),
+        coveredBranchPercent: toPercentage(branchesCovered, totalBranches),
+        coveredFunctionPercent: toPercentage(functionsCovered, totalFunctions),
+        functions: functionReports,
+        branches: branchReports,
+        lines: lineReports,
+      });
+
+      coverageSummary.totals.totalLineCount += lines.length;
+      coverageSummary.totals.totalBranchCount += totalBranches;
+      coverageSummary.totals.totalFunctionCount += totalFunctions;
+      coverageSummary.totals.coveredLineCount += coveredCnt;
+      coverageSummary.totals.coveredBranchCount += branchesCovered;
+      coverageSummary.totals.coveredFunctionCount += functionsCovered;
+    }
+
+    coverageSummary.totals.coveredLinePercent = toPercentage(
+      coverageSummary.totals.coveredLineCount,
+      coverageSummary.totals.totalLineCount,
+    );
+    coverageSummary.totals.coveredBranchPercent = toPercentage(
+      coverageSummary.totals.coveredBranchCount,
+      coverageSummary.totals.totalBranchCount,
+    );
+    coverageSummary.totals.coveredFunctionPercent = toPercentage(
+      coverageSummary.totals.coveredFunctionCount,
+      coverageSummary.totals.totalFunctionCount,
+    );
+    coverageSummary.files.sort(sortCoverageFiles);
+
+    return coverageSummary;
+  }
+
+  cleanup() {
+    // Restore the original value of process.env.NODE_V8_COVERAGE. Then, copy
+    // all of the created coverage files to the original coverage directory.
+    require('internal/profiler_binding').endCoverage();
+
+    if (this.originalCoverageDirectory === undefined) {
+      delete process.env.NODE_V8_COVERAGE;
+    } else {
+      process.env.NODE_V8_COVERAGE = this.originalCoverageDirectory;
+      let dir;
+
+      try {
+        mkdirSync(this.originalCoverageDirectory, { __proto__: null, recursive: true });
+        dir = opendirSync(this.coverageDirectory);
+
+        for (let entry; (entry = dir.readSync()) !== null;) {
+          const src = join(this.coverageDirectory, entry.name);
+          const dst = join(this.originalCoverageDirectory, entry.name);
+          copyFileSync(src, dst);
+        }
+      } finally {
+        if (dir) {
+          dir.closeSync();
+        }
+      }
+    }
+
+    try {
+      rmSync(this.coverageDirectory, { __proto__: null, recursive: true });
+    } catch {
+      // Ignore cleanup errors.
     }
   }
-  return summarize([...files.values()].map(file => ({ path: file.path, lines: [...file.lines.values()].sort((a, b) => a.line - b.line), functions: [...file.functions.values()], branches: [...file.branches.values()] })), options, workingDirectory);
-}
-function publish(stream, summary) {
-  let success = true;
-  for (const kind of fields) {
-    const threshold = summary.thresholds[kind.toLowerCase()];
-    const actual = summary.totals[`covered${kind}Percent`];
-    if (actual < threshold) {
-      success = false;
-      process.exitCode = 1;
-      stream.publish('test:diagnostic', { nesting: 0, level: 'error', message: `${actual.toFixed(2)}% ${kind.toLowerCase()} coverage does not meet threshold of ${threshold}%.` });
+
+  getCoverageFromDirectory() {
+    const result = new SafeMap();
+    let dir;
+
+    try {
+      dir = opendirSync(this.coverageDirectory);
+
+      for (let entry; (entry = dir.readSync()) !== null;) {
+        if (RegExpPrototypeExec(kCoverageFileRegex, entry.name) === null) {
+          continue;
+        }
+
+        const coverageFile = join(this.coverageDirectory, entry.name);
+        const coverage = readCoverageFile(coverageFile);
+        this.mergeCoverage(result, this.mapCoverageWithSourceMap(coverage));
+      }
+
+      return ArrayFrom(result.values());
+    } finally {
+      if (dir) {
+        dir.closeSync();
+      }
     }
   }
-  stream.publish('test:coverage', { nesting: 0, summary });
-  return success;
+
+
+  mapCoverageWithSourceMap(coverage) {
+    const { result } = coverage;
+    const sourceMapCache = coverage['source-map-cache'];
+    if (!this.options.sourceMaps || !sourceMapCache) {
+      return result;
+    }
+    const newResult = new SafeMap();
+    for (let i = 0; i < result.length; ++i) {
+      const script = result[i];
+      const { url, functions } = script;
+
+      if (this.shouldSkipFileCoverage(url) || sourceMapCache[url] == null) {
+        newResult.set(url, script);
+        continue;
+      }
+      const { data, lineLengths } = sourceMapCache[url];
+      if (!data) throw new ERR_SOURCE_MAP_CORRUPT(url);
+      let offset = 0;
+      const executedLines = ArrayPrototypeMap(lineLengths, (length, i) => {
+        const coverageLine = new CoverageLine(i + 1, offset, null, length + 1);
+        offset += length + 1;
+        return coverageLine;
+      });
+      for (let j = 0; j < data.sources.length; ++j) {
+        const source = data.sourcesContent?.[j];
+        if (source != null) {
+          this.getLines(data.sources[j], source);
+        }
+        this.markTypeScriptOnlyLines(data.sources[j], source);
+      }
+      const sourceMap = new SourceMap(data, { __proto__: null, lineLengths });
+
+      for (let j = 0; j < functions.length; ++j) {
+        const { ranges, functionName, isBlockCoverage } = functions[j];
+        if (ranges == null) {
+          continue;
+        }
+        let newUrl;
+        const newRanges = [];
+        for (let k = 0; k < ranges.length; ++k) {
+          const { startOffset, endOffset, count } = ranges[k];
+          const { lines } = mapRangeToLines(ranges[k], executedLines);
+
+          let startEntry = sourceMap
+            .findEntry(lines[0].line - 1, MathMax(0, startOffset - lines[0].startOffset));
+          const endEntry = sourceMap
+            .findEntry(lines[lines.length - 1].line - 1, (endOffset - lines[lines.length - 1].startOffset) - 1);
+          if (!startEntry.originalSource && endEntry.originalSource &&
+            lines[0].line === 1 && startOffset === 0 && lines[0].startOffset === 0) {
+            // Edge case when the first line is not mappable
+            const { 2: originalSource, 3: originalLine, 4: originalColumn } = sourceMap[kMappings][0];
+            startEntry = { __proto__: null, originalSource, originalLine, originalColumn };
+          }
+
+          if (!startEntry.originalSource || startEntry.originalSource !== endEntry.originalSource) {
+            // The range is not mappable. Skip it.
+            continue;
+          }
+
+          newUrl ??= startEntry?.originalSource;
+          const mappedLines = this.getLines(newUrl);
+          if (!mappedLines) {
+            throw new ERR_SOURCE_MAP_MISSING_SOURCE(newUrl, url);
+          }
+          const mappedStartOffset = this.entryToOffset(startEntry, mappedLines);
+          const mappedEndOffset = this.entryToOffset(endEntry, mappedLines) + 1;
+          if (mappedStartOffset < 0 || mappedEndOffset < 1) {
+            // The range is not mappable. Skip it.
+            continue;
+          }
+          for (let l = startEntry.originalLine; l <= endEntry.originalLine; l++) {
+            mappedLines[l].count = count;
+          }
+
+          ArrayPrototypePush(newRanges, {
+            __proto__: null, startOffset: mappedStartOffset, endOffset: mappedEndOffset, count,
+          });
+        }
+
+        if (!newUrl) {
+          // No mappable ranges. Skip the function.
+          continue;
+        }
+        const newScript = newResult.get(newUrl) ?? { __proto__: null, url: newUrl, functions: [] };
+        ArrayPrototypePush(newScript.functions, { __proto__: null, functionName, ranges: newRanges, isBlockCoverage });
+        newResult.set(newUrl, newScript);
+      }
+    }
+
+    return ArrayFrom(newResult.values());
+  }
+
+  entryToOffset(entry, lines) {
+    const line = MathMax(entry.originalLine, 0);
+    const mappedLine = lines[line];
+    if (!mappedLine) {
+      // Return -1 if the line is not mappable.
+      return -1;
+    }
+    return MathMin(mappedLine.startOffset + entry.originalColumn, mappedLine.endOffset);
+  }
+
+  mergeCoverage(merged, coverage) {
+    for (let i = 0; i < coverage.length; ++i) {
+      const newScript = coverage[i];
+      const { url } = newScript;
+
+      if (this.shouldSkipFileCoverage(url)) {
+        continue;
+      }
+
+      const oldScript = merged.get(url);
+
+      if (oldScript === undefined) {
+        merged.set(url, newScript);
+      } else {
+        mergeCoverageScripts(oldScript, newScript);
+      }
+    }
+  }
+
+  shouldSkipFileCoverage(url) {
+    const cached = this.#skipCache.get(url);
+    if (cached !== undefined) return cached;
+    const result = this.#computeShouldSkipFileCoverage(url);
+    this.#skipCache.set(url, result);
+    return result;
+  }
+
+  #computeShouldSkipFileCoverage(url) {
+    // This check filters out core modules, which start with 'node:' in
+    // coverage reports, as well as any invalid coverages which have been
+    // observed on Windows.
+    if (!StringPrototypeStartsWith(url, 'file:')) return true;
+
+    const absolutePath = fileURLToPath(url);
+    const relativePath = relative(this.options.cwd, absolutePath);
+    // The exclude/include globs are fixed for the lifetime of this
+    // TestCoverage instance, so compile each glob to a matcher once and reuse
+    // it for every file. Building a fresh Minimatch per call (the previous
+    // behavior) dominated the coverage report time, scaling with
+    // files * globs. Each glob compiles to a matcher pair: `relative` enables
+    // dot:true so globs match dotfiles within the project, while `absolute`
+    // keeps the default behavior to avoid misinterpreting dot segments in the
+    // absolute filesystem path (e.g. tmp dirs like `test/.tmp.0`).
+    this.#excludeMatchers ??= ArrayPrototypeMap(
+      this.options.coverageExcludeGlobs ?? [], createCoverageMatcher);
+    this.#includeMatchers ??= ArrayPrototypeMap(
+      this.options.coverageIncludeGlobs ?? [], createCoverageMatcher);
+
+    // This check filters out files that match the exclude globs.
+    for (let i = 0; i < this.#excludeMatchers.length; ++i) {
+      const matcher = this.#excludeMatchers[i];
+      if (matcher.relative.match(relativePath) ||
+          matcher.absolute.match(absolutePath)) return true;
+    }
+
+    // This check filters out files that do not match the include globs.
+    if (this.#includeMatchers.length > 0) {
+      for (let i = 0; i < this.#includeMatchers.length; ++i) {
+        const matcher = this.#includeMatchers[i];
+        if (matcher.relative.match(relativePath) ||
+            matcher.absolute.match(absolutePath)) return false;
+      }
+      return true;
+    }
+
+    const searchParams = new URL(url).searchParams;
+    if (searchParams.get(kMockSearchParam)) {
+      return true;
+    }
+
+    // This check filters out the node_modules/ directory, unless it is explicitly included.
+    return StringPrototypeIncludes(url, '/node_modules/');
+  }
 }
-module.exports = { take, merge, publish };
+
+function readCoverageFile(coverageFile) {
+  const rawCoverage = readFileSync(coverageFile, 'utf8');
+
+  if (rawCoverage.length === 0) {
+    throw new ERR_OPERATION_FAILED(`coverage file is empty: ${coverageFile}`);
+  }
+
+  try {
+    return JSONParse(rawCoverage);
+  } catch (err) {
+    const error = new ERR_OPERATION_FAILED(
+      `failed to parse coverage file ${coverageFile}: ${err.message}`,
+    );
+    error.cause = err;
+    throw error;
+  }
+}
+
+function toPercentage(covered, total) {
+  return total === 0 ? 100 : (covered / total) * 100;
+}
+
+function sortCoverageFiles(a, b) {
+  return StringPrototypeLocaleCompare(a.path, b.path);
+}
+
+function setupCoverage(options) {
+  let originalCoverageDirectory = process.env.NODE_V8_COVERAGE;
+
+  // If NODE_V8_COVERAGE was already specified, convert it to an absolute path
+  // and store it for later. The test runner will use a temporary directory
+  // so that no preexisting coverage files interfere with the results of the
+  // coverage report. Then, once the coverage is computed, move the coverage
+  // files back to the original NODE_V8_COVERAGE directory.
+  originalCoverageDirectory &&= resolve(options.cwd, originalCoverageDirectory);
+
+  const coverageDirectory = mkdtempSync(join(tmpdir(), 'node-coverage-'));
+  const enabled = setupCoverageHooks(coverageDirectory);
+
+  if (!enabled) {
+    return null;
+  }
+
+  require('internal/profiler_binding').startCoverage();
+
+  // Ensure that NODE_V8_COVERAGE is set so that coverage can propagate to
+  // child processes.
+  process.env.NODE_V8_COVERAGE = coverageDirectory;
+
+  return new TestCoverage(
+    coverageDirectory,
+    originalCoverageDirectory,
+    options,
+  );
+}
+
+function mapRangeToLines(range, lines) {
+  const { startOffset, endOffset, count } = range;
+  const mappedLines = [];
+  let ignoredLines = 0;
+  let start = 0;
+  let end = lines.length;
+  let mid;
+
+  while (start <= end) {
+    mid = MathFloor((start + end) / 2);
+    let line = lines[mid];
+
+    if (startOffset >= line?.startOffset && startOffset <= line?.endOffset) {
+      while (endOffset > line?.startOffset) {
+        // If the range is not covered, and the range covers the entire line,
+        // then mark that line as not covered.
+        if (startOffset <= line.startOffset && endOffset >= line.endOffset) {
+          line.count = count;
+        }
+
+        ArrayPrototypePush(mappedLines, line);
+
+        if (line.ignore) {
+          ignoredLines++;
+        }
+
+        mid++;
+        line = lines[mid];
+      }
+
+      break;
+    } else if (startOffset >= line?.endOffset) {
+      start = mid + 1;
+    } else {
+      end = mid - 1;
+    }
+  }
+
+  return { __proto__: null, lines: mappedLines, ignoredLines };
+}
+
+function mergeCoverageScripts(oldScript, newScript) {
+  // Merge the functions from the new coverage into the functions from the
+  // existing (merged) coverage.
+  for (let i = 0; i < newScript.functions.length; ++i) {
+    const newFn = newScript.functions[i];
+    let found = false;
+
+    for (let j = 0; j < oldScript.functions.length; ++j) {
+      const oldFn = oldScript.functions[j];
+
+      if (newFn.functionName === oldFn.functionName &&
+          newFn.ranges?.[0].startOffset === oldFn.ranges?.[0].startOffset &&
+          newFn.ranges?.[0].endOffset === oldFn.ranges?.[0].endOffset) {
+        // These are the same functions.
+        found = true;
+
+        // If newFn is block level coverage, then it will:
+        // - Replace oldFn if oldFn is not block level coverage.
+        // - Merge with oldFn if it is also block level coverage.
+        // If newFn is not block level coverage, then it has no new data.
+        if (newFn.isBlockCoverage) {
+          if (oldFn.isBlockCoverage) {
+            // Merge the oldFn ranges with the newFn ranges.
+            mergeCoverageRanges(oldFn, newFn);
+          } else {
+            // Replace oldFn with newFn.
+            oldFn.isBlockCoverage = true;
+            oldFn.ranges = newFn.ranges;
+          }
+        }
+
+        break;
+      }
+    }
+
+    if (!found) {
+      // This is a new function to track. This is possible because V8 can
+      // generate a different list of functions depending on which code paths
+      // are executed. For example, if a code path dynamically creates a
+      // function, but that code path is not executed then the function does
+      // not show up in the coverage report. Unfortunately, this also means
+      // that the function counts in the coverage summary can never be
+      // guaranteed to be 100% accurate.
+      ArrayPrototypePush(oldScript.functions, newFn);
+    }
+  }
+}
+
+function mergeCoverageRanges(oldFn, newFn) {
+  const mergedRanges = new SafeSet();
+
+  // Keep all of the existing covered ranges.
+  for (let i = 0; i < oldFn.ranges.length; ++i) {
+    const oldRange = oldFn.ranges[i];
+
+    if (oldRange.count > 0) {
+      mergedRanges.add(oldRange);
+    }
+  }
+
+  // Merge in the new ranges where appropriate.
+  for (let i = 0; i < newFn.ranges.length; ++i) {
+    const newRange = newFn.ranges[i];
+    let exactMatch = false;
+
+    for (let j = 0; j < oldFn.ranges.length; ++j) {
+      const oldRange = oldFn.ranges[j];
+
+      if (doesRangeEqualOtherRange(newRange, oldRange)) {
+        // These are the same ranges, so keep the existing one.
+        oldRange.count += newRange.count;
+        mergedRanges.add(oldRange);
+        exactMatch = true;
+        break;
+      }
+
+      // Look at ranges representing missing coverage and add ranges that
+      // represent the intersection.
+      if (oldRange.count === 0 && newRange.count === 0) {
+        if (doesRangeContainOtherRange(oldRange, newRange)) {
+          // The new range is completely within the old range. Discard the
+          // larger (old) range, and keep the smaller (new) range.
+          mergedRanges.add(newRange);
+        } else if (doesRangeContainOtherRange(newRange, oldRange)) {
+          // The old range is completely within the new range. Discard the
+          // larger (new) range, and keep the smaller (old) range.
+          mergedRanges.add(oldRange);
+        }
+      }
+    }
+
+    // Add new ranges that do not represent missing coverage.
+    if (newRange.count > 0 && !exactMatch) {
+      mergedRanges.add(newRange);
+    }
+  }
+
+  oldFn.ranges = ArrayFrom(mergedRanges);
+}
+
+function doesRangeEqualOtherRange(range, otherRange) {
+  return range.startOffset === otherRange.startOffset &&
+         range.endOffset === otherRange.endOffset;
+}
+
+function doesRangeContainOtherRange(range, otherRange) {
+  return range.startOffset <= otherRange.startOffset &&
+         range.endOffset >= otherRange.endOffset;
+}
+
+module.exports = { setupCoverage, TestCoverage };
