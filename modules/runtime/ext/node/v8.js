@@ -132,16 +132,8 @@ class GCProfiler {
   stop() { unsupported('GCProfiler.stop', 'native GC events do not capture the before/after heap statistics required by this profile'); }
   [Symbol.dispose]() { this.stop(); }
 }
-function snapshotCallback(callback) {
-  if (typeof callback !== 'function') throw error('ERR_INVALID_ARG_TYPE', 'The "callback" argument must be a function', TypeError);
-  unsupported('startupSnapshot', 'the runtime has no startup heap-image serialization; replaying source is not a snapshot');
-}
-const startupSnapshot = {
-  isBuildingSnapshot() { return false; },
-  addSerializeCallback: snapshotCallback,
-  addDeserializeCallback: snapshotCallback,
-  setDeserializeMainFunction: snapshotCallback,
-};
+// lib/v8.js: startupSnapshot is internal/v8/startup_snapshot's namespace.
+const { namespace: startupSnapshot } = require('internal/v8/startup_snapshot');
 const promiseHooks = require('internal/promise_hooks');
 
 module.exports = {

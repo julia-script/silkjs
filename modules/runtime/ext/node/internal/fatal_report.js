@@ -89,4 +89,24 @@ function format(error, fromPromise) {
   return text + '\nNode.js ' + process.version + '\n';
 }
 
-module.exports = { format };
+// FormatCaughtException: what node.cc prints for an exception a TryCatch of its own
+// caught, as the snapshot builder's: the source line, the error as V8's
+// ToDetailString gives it (Error.prototype.toString for an error), then the frames.
+function caught(error) {
+  let source;
+  try { source = arrow(error, false); } catch {}
+  let text = source === undefined ? '' : source + '\n';
+  let reason;
+  try {
+    reason = require('util/types').isNativeError(error) ? Error.prototype.toString.call(error) : String(error);
+  } catch { reason = '<toString() threw exception>'; }
+  text += reason + '\n';
+  let stack;
+  try { stack = error !== null && typeof error === 'object' ? error.stack : undefined; } catch {}
+  if (typeof stack === 'string') {
+    for (const line of stack.split('\n')) if (line.startsWith('    at ')) text += line + '\n';
+  }
+  return text;
+}
+
+module.exports = { format, caught };

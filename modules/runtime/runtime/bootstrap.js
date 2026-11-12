@@ -75,6 +75,17 @@ for (const name of ['dispose', 'asyncDispose']) {
   if (Symbol[name] === undefined) Object.defineProperty(Symbol, name, { value: Symbol.for('nodejs.' + name) });
 }
 const host = { ...native, rawOS, rawStd };
+// Startup snapshots: what Node keeps in internalBinding('mksnapshot') for
+// internal/v8/startup_snapshot. With --build-snapshot (native.snapshotBuild) the
+// heap is saved as the blob when the loop ends; a start from the blob runs
+// runSnapshot instead of run.
+const snapshotState = { building: native.snapshotBuild === true, codeCache: true, serialize: undefined, deserialize: undefined, main: undefined };
+host.startupSnapshot = {
+  isBuildingSnapshotBuffer: new Uint8Array([native.snapshotBuild ? 1 : 0]),
+  setSerializeCallback(callback) { snapshotState.serialize = callback; },
+  setDeserializeCallback(callback) { snapshotState.deserialize = callback; },
+  setDeserializeMainFunction(callback) { snapshotState.main = callback; },
+};
 // Throws value again and keeps the throw site its first throw recorded, as
 // V8's TryCatch::ReThrow does for Node's own catch and rethrow paths.
 host.rethrow = value => { native.captureCallSites(-5, value); };
@@ -1151,6 +1162,10 @@ const HELP_TEXT = `Usage: silkjsruntime [options] [script.js] [arguments]
   --test-coverage-include=GLOB, --test-coverage-exclude=GLOB
   --test-coverage-lines=N, --test-coverage-branches=N, --test-coverage-functions=N
   --test-reporter=NAME, --test-reporter-destination=PATH
+  --build-snapshot ENTRY.js, --build-snapshot-config=FILE
+                     Run ENTRY.js and save the heap after its loop as a startup snapshot
+  --snapshot-blob=PATH Where --build-snapshot saves the snapshot, or the snapshot to start from
+  -h, --help         Print these options
   -v, --version
 Environment:
   NODE_OPTIONS      Supported runtime flags, applied before CLI flags
@@ -1170,8 +1185,52 @@ function loadRuntimeEnvironment(args, beforeLoading) {
   if (errors.length) return cliError(errors.join('\n' + process.execPath + ': '));
   if (loaded) loader.Module._initPaths();
 }
-function run() {
+// node.cc GenerateAndWriteSnapshotData and LoadSnapshotData, up to the process that
+// does the work: the checks that need no heap, then exec of this executable as
+// `--silk-build-snapshot BLOB` or `--silk-snapshot-blob BLOB` and the same arguments.
+function startSnapshotProcess(build, blob, config, entry, startupEnvironment) {
+  const fail = (text, status) => { host.writeStartupDiagnostic(text); return process.exit(status); };
+  if (build) {
+    if (config === undefined && entry === undefined)
+      return fail('--build-snapshot must be used with an entry point script.\nUsage: node --build-snapshot /path/to/entry.js\n', 9);
+    if (config === undefined && entry === 'node:embedded_snapshot_main')
+      return fail('node:embedded_snapshot_main was specified as snapshot entry point but Node.js was built without embedded snapshot.\n', 9);
+    if (config === undefined) {
+      try { rawOS.close(internalRequire('fs').openSync(entry, 'r')); } catch (error) {
+        return fail(`Cannot read builder script ${entry} for building snapshot. ${error.code}: ${systemMessage(error)}\n`, 1);
+      }
+    }
+  } else if (!internalRequire('fs').existsSync(blob)) {
+    return fail(`Cannot open ${blob}`, 14);
+  }
+  const argv = [native.argv[0], build ? '--silk-build-snapshot' : '--silk-snapshot-blob', blob ?? 'snapshot.blob', ...native.argv.slice(1)];
+  const environment = startupEnvironment ?? process.env, entries = [];
+  for (const key of Object.keys(environment)) entries.push(key + '=' + environment[key]);
+  const errno = native.osNative('execve', [process.execPath, argv, entries]);
+  return fail(`${process.execPath}: unable to start the snapshot process (errno ${errno})\n`, 1);
+}
+// uv_strerror's text, as an fs error message carries it: "ENOENT: no such file or directory, open 'x'".
+function systemMessage(error) {
+  const message = String(error.message), start = message.indexOf(': '), end = message.indexOf(', ', start);
+  return start < 0 ? message : message.slice(start + 2, end < 0 ? undefined : end);
+}
+// Node's V8 installs Error.stackTraceLimit when it deserializes a snapshot, which the
+// builder took it out of (internal/main/mksnapshot). A --stack-trace-limit given to
+// this process has already set it.
+function restoreStackTraceLimit() {
+  if (Object.prototype.hasOwnProperty.call(Error, 'stackTraceLimit')) return;
+  Object.defineProperty(Error, 'stackTraceLimit', { value: 10, writable: true, enumerable: true, configurable: true });
+}
+function runSnapshotBuilder(config) {
+  return internalRequire('internal/main/mksnapshot').run(config, (withoutCodeCache) => { snapshotState.codeCache = !withoutCodeCache; });
+}
+function run(restored = false) {
   if (workerBootstrap) return runWorker();
+  // The heap of a snapshot builder whose loop already ended: start over as this process.
+  if (restored) {
+    snapshotState.building = false; host.startupSnapshot.isBuildingSnapshotBuffer[0] = 0;
+    process._exiting = false; process.exitCode = undefined; process.execArgv.length = 0;
+  }
   if (native.seaNative(0)) return internalRequire('internal/sea').runMain(native.argv.slice(1), runtimeFlag, installRuntimeOptions, runPreloads, loadRuntimeEnvironment);
   // The environment as the process got it, before any environment file: only a
   // watch supervisor needs it, so it is copied only when a file is about to load.
@@ -1203,6 +1262,7 @@ function run() {
   let expression, print = false, inputType = 'commonjs';
   let filename, interactive = false, testMode = false, inputTypeSet = false, check = false;
   let watchMode = false, watchPreserveOutput = false, watchKillSignal = 'SIGTERM', runName;
+  let buildSnapshot = false, snapshotBlob, snapshotConfig;
   const watchPaths = [];
   const testOptions = {}, reporterNames = [], destinations = [];
   const afterMain = result => interactive ? result && typeof result.then === 'function' ? result.then(startRepl) : startRepl() : result;
@@ -1226,6 +1286,9 @@ function run() {
       case '--watch-path': watchPaths.push(value); continue;
       case '--watch-kill-signal': watchKillSignal = value; continue;
       case '--run': runName = value; continue;
+      case '--build-snapshot': buildSnapshot = value; continue;
+      case '--build-snapshot-config': snapshotConfig = value; continue;
+      case '--snapshot-blob': snapshotBlob = value; continue;
       case '--experimental-test-coverage': testOptions.coverage = value; continue;
       // Loaded before parsing, by loadRuntimeEnvironment.
       case '--env-file': case '--env-file-if-exists': continue;
@@ -1268,6 +1331,11 @@ function run() {
     if (runtimeFlag(optionFlag(entry)) || entry.implied) continue;
     return cliError('bad option: ' + entry.raw);
   }
+  // node.cc: --build-snapshot runs the builder, --snapshot-blob alone starts from a blob.
+  // Both take a process of their own (src/runtime/worker.silk), so this one becomes it.
+  if (!restored && !snapshotState.building && (buildSnapshot || snapshotBlob !== undefined)) {
+    return startSnapshotProcess(buildSnapshot, snapshotBlob, snapshotConfig, args[index], startupEnvironment);
+  }
   if (runName !== undefined) {
     const separator = native.argv.indexOf('--', 1);
     return internalRequire('internal/main/run').runPackageScript(runName, separator < 0 ? [] : native.argv.slice(separator + 1));
@@ -1290,6 +1358,27 @@ function run() {
   process._print_eval = print;
   filename = args[index];
   process.argv = [process.execPath, ...args.slice(index)];
+  if (snapshotState.building) {
+    installRuntimeOptions(environment.concat(process.execArgv));
+    // node_snapshotable.cc runs the builder under a TryCatch of its own: what it throws
+    // is printed and the build ends with kGenericUserError, with no 'exit' event.
+    return runPreloads(() => {
+      try { return runSnapshotBuilder(snapshotConfig); } catch (error) {
+        host.writeText(2, internalRequire('internal/fatal_report').caught(error) + '\n');
+        return rawStd.exit(1);
+      }
+    });
+  }
+  if (restored) {
+    // Before any preload, as Node's prepareMainThreadExecution runs them.
+    restoreStackTraceLimit();
+    if (snapshotState.deserialize !== undefined) snapshotState.deserialize();
+    const main = snapshotState.main;
+    if (main !== undefined) {
+      installRuntimeOptions(environment.concat(process.execArgv));
+      return runPreloads(() => afterMain(main()));
+    }
+  }
   // `node inspect ...`: the debugger client (lib/internal/main/inspect.js).
   if (filename === 'inspect' && expression === undefined && !testMode && !check && !watchMode && !interactive) {
     installRuntimeOptions(environment.concat(process.execArgv));
@@ -1439,6 +1528,8 @@ function loop() {
     if (!referencedWork()) {
       invoke(emitProcessEvent, undefined, ['beforeExit']);
       checkpoint();
+      // embed_helpers.cc SpinEventLoopInternal: a snapshot builder serializes here.
+      if (snapshotState.serialize !== undefined) { invoke(snapshotState.serialize, undefined, []); checkpoint(); }
       if (!referencedWork()) break;
     }
     loopTurn();
@@ -1449,6 +1540,15 @@ function loop() {
   inspectorBackend._atExit();
   if (moduleHas('internal/heap_prof')) internalRequire('internal/heap_prof').finish();
   if (moduleHas('internal/compile_cache')) internalRequire('internal/compile_cache').flushAtExit();
+  if (snapshotState.building) {
+    // What is left becomes the blob: no serialize callback, and no garbage.
+    snapshotState.serialize = undefined;
+    rawStd.gc();
+    // The cleanup callbacks of what that collected give its native handles back
+    // (src/runtime/worker.silk refuses a snapshot that still holds any).
+    checkpoint();
+    rawStd.gc();
+  }
   return Number(process.exitCode) || 0;
 }
 const imageModules = ['fs', 'fs/promises', 'internal/fs_streams', 'internal/fs_utf8_stream', 'path', 'os',
@@ -1501,6 +1601,10 @@ globalThis.__silkRuntime = {
   drainDestroy: asyncHooks._drainDestroy,
   workerError: workerThreads._reportError,
   run: () => invoke(run, undefined, []), loop, onRejection,
+  runSnapshot: () => invoke(run, undefined, [true]),
+  // Whether the snapshot this builder ends keeps compiled function bodies
+  // (a snapshot configuration's "withoutCodeCache").
+  snapshotCodeCache: () => snapshotState.codeCache,
   // Ends the build of a heap image. Each variable listed here is read again by hydrate.
   seal() {
     // Built-ins most programs load run here, so that a start from the image finds
