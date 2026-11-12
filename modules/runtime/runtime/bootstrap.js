@@ -208,6 +208,8 @@ function systemError(errno, syscall, path, dest) {
   if (dest !== undefined) error.dest = dest;
   return error;
 }
+// libc's text for an errno, as node's ErrnoException (api/exceptions.cc) words it.
+host.strerror = number => rawStd.strerror(number);
 function pair(result, syscall, path) { if (result[1] !== 0) throw systemError(result[1], syscall, path); return result[0]; }
 // node_process_methods.cc Cwd: a uv_cwd UVException, worded for a removed directory.
 host.cwd = () => {
