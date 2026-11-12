@@ -14,10 +14,11 @@ function site(error, fromPromise) {
     // Its column counts in the script's own text, before any column offset.
     // An eval's code is V8's "<anonymous_script>" in the message, or the name its
     // sourceURL comment gives, which its frames show.
+    // A module link error spans its import name, which V8 underlines whole.
     if (thrown !== undefined) {
       let name = thrown[0];
       if ((name === '' || name === '<input>') && typeof thrown[3] === 'string') name = evalScriptName(error) || '<anonymous_script>';
-      return { name, line: thrown[1], column: thrown[2], text: thrown[3], textColumn: true };
+      return { name, line: thrown[1], column: thrown[2], text: thrown[3], textColumn: true, length: thrown[4] };
     }
   }
   if (error === null || typeof error !== 'object') return undefined;
@@ -79,7 +80,8 @@ function arrow(error, fromPromise, scriptName, lineOffset = 0, columnOffset = 0,
   if (!(start >= 0) || start >= text.length) return result;
   let underline = '';
   for (let index = 0; index < start; index++) underline += text[index] === '\t' ? '\t' : ' ';
-  return result + underline + '^\n';
+  const span = where.length > 1 ? Math.min(where.length, text.length - start) : 1;
+  return result + underline + '^'.repeat(span) + '\n';
 }
 function stringOf(value) {
   try { return String(value); } catch { return '<toString() threw exception>'; }
@@ -105,7 +107,9 @@ function format(error, fromPromise) {
   const nativeError = object && require('util/types').isNativeError(error);
   let source;
   try {
-    if (!host.decoratedErrors.has(error)) source = host.errorArrows.get(error) ?? arrow(error, fromPromise);
+    // GetErrorSource prints an arrow the error was given (setArrowMessage) first.
+    const given = object ? error[host.privateSymbols.arrow_message_private_symbol] : undefined;
+    if (!host.decoratedErrors.has(error)) source = (typeof given === 'string' ? given : undefined) ?? host.errorArrows.get(error) ?? arrow(error, fromPromise);
   } catch {}
   let text = '';
   // AppendExceptionLine prints the source of anything but an error at once.
