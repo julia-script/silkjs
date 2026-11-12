@@ -850,7 +850,7 @@ function prepareAsymmetricKeyOptions(key, ctx, name, isPrivateKeyInput) {
   const parsed = parseKeyEncoding(key, undefined, isPrivateKeyInput ? false : undefined, name);
   return { data: keyData, format: parsed.format, type: parsed.type, passphrase: parsed.passphrase };
 }
-function webURL() { return require('internal/web/url'); }
+function webURL() { return require('internal/url'); }
 // lib/internal/crypto/keys.js prepareStorePrivateKey: the URI comes from the
 // URL's private state, file: URLs become paths, and NUL bytes are refused
 // because OpenSSL reads both strings as C strings.
@@ -889,6 +889,8 @@ function keyFromPrepared(prepared, type) {
   }
   if (prepared.format === 'jwk') return require('internal/crypto_keys').importJwk(prepared.data, type);
   if (prepared.format === 'store') {
+    // Node checks openssl.store (resource '') before it opens any OSSL_STORE URI, file: included.
+    if (require('internal/host').builtinLoaded('internal/permission')) require('internal/permission').check('openssl.store', '');
     const { uri, properties } = prepared.data;
     return newKeyObject('private', call('storeLoad', [uri, properties ?? '', packed(storePassphraseBlock(prepared.passphrase)), 0]));
   }

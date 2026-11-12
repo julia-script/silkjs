@@ -106,6 +106,15 @@ function getDeprecationWarningEmitter(
   };
 }
 
+const isWindows = process.platform === 'win32';
+const isMacOS = process.platform === 'darwin';
+
+function spliceOne(list, index) {
+  for (; index + 1 < list.length; index++)
+    list[index] = list[index + 1];
+  list.pop();
+}
+
 function isPendingDeprecation() {
   const { getOptionValue } = require('internal/options');
   return getOptionValue('--pending-deprecation') &&
@@ -613,7 +622,10 @@ module.exports = {
   getStructuredStack,
   getSystemErrorName,
   isError,
+  isMacOS,
+  spliceOne,
   isPendingDeprecation,
+  isWindows,
   join,
   kEmptyObject,
   kEnumerableProperty,

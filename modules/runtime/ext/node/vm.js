@@ -9,23 +9,17 @@ const {
   DataViewPrototypeGetByteLength, TypedArrayPrototypeGetBuffer,
   TypedArrayPrototypeGetByteOffset, TypedArrayPrototypeGetByteLength, Uint8Array,
 } = require('internal/streams/iter/primordials');
-const { isDataView, isModuleNamespaceObject } = require('util/types');
-const contexts = new WeakMap();
+const { isDataView } = require('util/types');
+const {
+  contexts, error, invalid, contextData, isContext, syntaxDiagnostic, run,
+} = require('internal/vm');
 const scripts = new WeakMap();
-const modules = new WeakMap();
-let nextModuleId = 0;
 const cacheMagic = Buffer.from('SILKVM01');
 const cacheIdentity = Buffer.from(host.cacheBuildIdentity, 'hex');
 const CACHE_HEADER = 120;
 const DONT_CONTEXTIFY = Symbol('vm_context_no_contextify');
 const USE_MAIN_CONTEXT_DEFAULT_LOADER = Symbol('vm_dynamic_import_main_context_default');
 const constants = Object.freeze(Object.assign(Object.create(null), { USE_MAIN_CONTEXT_DEFAULT_LOADER, DONT_CONTEXTIFY }));
-function error(code, message, Type = TypeError) {
-  return Object.assign(new Type(message), { code });
-}
-const { ERR_INVALID_ARG_TYPE } = require('internal/path_events/support').codes;
-// Node's ERR_INVALID_ARG_TYPE wording, with what was received.
-function invalid(name, expected, value) { return new ERR_INVALID_ARG_TYPE(name, expected, value); }
 function unsupported(surface) {
   throw error('ERR_NOT_IMPLEMENTED', `${surface} is not supported by this runtime`, Error);
 }
@@ -45,11 +39,6 @@ function boolean(value, name) {
   if (typeof value !== 'boolean') throw invalid(name, 'boolean', value);
   return value;
 }
-function contextData(value) {
-  const data = contexts.get(value);
-  if (!data) throw value === null || typeof value !== 'object' ? invalid('object', 'object', value) : invalid('contextifiedObject', 'vm.Context', value);
-  return data;
-}
 function contextOptions(value) {
   const opts = options(value);
   // Index loops: user code may have removed Array.prototype[Symbol.iterator].
@@ -63,7 +52,9 @@ function contextOptions(value) {
     if (generation.strings !== undefined) strings = boolean(generation.strings, 'options.codeGeneration.strings');
     if (generation.wasm !== undefined) wasm = boolean(generation.wasm, 'options.codeGeneration.wasm');
   }
-  return { strings, wasm, afterEvaluate: opts.microtaskMode === 'afterEvaluate', name: opts.name, origin: opts.origin };
+  validateImportCallback(opts.importModuleDynamically);
+  return { strings, wasm, afterEvaluate: opts.microtaskMode === 'afterEvaluate', name: opts.name, origin: opts.origin,
+    importModuleDynamically: opts.importModuleDynamically };
 }
 function createContext(sandbox = {}, value) {
   if (sandbox !== DONT_CONTEXTIFY && (sandbox === null || typeof sandbox !== 'object')) throw invalid('contextObject', 'object', sandbox);
@@ -77,23 +68,36 @@ function createContext(sandbox = {}, value) {
     // The sandbox mirror and the realm's binding record have distinct property
     // attributes. A host exotic object preserves both without Proxy invariants.
     const proxy = host.vmContextGlobal(handle, {
-      has(key) { return Reflect.has(sandbox, key) || Reflect.has(global, key); },
+      // Node's query interceptor: the sandbox's own properties, then the global's chain.
+      has(key) { return Object.hasOwn(sandbox, key) || Reflect.has(global, key); },
       get(key) {
-        return Reflect.has(sandbox, key) ? Reflect.get(sandbox, key, sandbox) : Reflect.get(global, key, global);
+        if (!Reflect.has(sandbox, key)) return Reflect.get(global, key, global);
+        // Node's getter interceptor answers the sandbox itself with the global proxy.
+        const value = Reflect.get(sandbox, key, sandbox);
+        return value === sandbox ? proxy : value;
       },
       set(key, value, receiver) {
         if (receiver !== proxy) return Reflect.set(sandbox, key, value, receiver);
         const own = Reflect.getOwnPropertyDescriptor(sandbox, key);
         const backing = Reflect.getOwnPropertyDescriptor(global, key);
         const descriptor = own || backing;
-        if (descriptor && (('writable' in descriptor && !descriptor.writable) || ('set' in descriptor && !descriptor.set))) return false;
+        if (descriptor && (('writable' in descriptor && !descriptor.writable) || ('set' in descriptor && !descriptor.set))) {
+          // Node's setter interceptor leaves a read-only property to V8. When only the
+          // sandbox has it, V8's [[Set]] defines it on the global through the definer
+          // interceptor, and the sandbox refuses that definition (null).
+          return own && !backing && 'writable' in own ? null : false;
+        }
         const mirrored = Reflect.set(sandbox, key, value, sandbox);
         const stored = Reflect.set(global, key, value, global);
         return mirrored || stored;
       },
       defineProperty(key, descriptor, declaration) {
-        if (!Reflect.defineProperty(global, key, descriptor)) return false;
         const own = Reflect.getOwnPropertyDescriptor(sandbox, key);
+        // V8 validates the definition against the descriptor the global reports,
+        // the sandbox's own first: a non-configurable one refuses incompatible changes.
+        if (own && !own.configurable &&
+            !Reflect.defineProperty(Object.defineProperty({}, key, own), key, descriptor)) return false;
+        if (!Reflect.defineProperty(global, key, descriptor)) return false;
         const visible = declaration && (!own || own.configurable) ? { ...descriptor, configurable: true } : descriptor;
         Reflect.defineProperty(sandbox, key, visible);
         return true;
@@ -123,12 +127,12 @@ function createContext(sandbox = {}, value) {
   }
   host.vmSetCodeGeneration(handle, config.strings);
   contexts.set(result, { handle, afterEvaluate: config.afterEvaluate });
+  // Node registers the context's importModuleDynamically for an import() with no
+  // referrer script; without one, such an import() reports the missing callback.
+  host.vmSetImportModuleDynamically(handle, importCallback(config.importModuleDynamically, result,
+    require('path').join(process.cwd(), 'vm-context')), true);
   require('internal/inspector_contexts').register(result, handle, config);
   return result;
-}
-function isContext(value) {
-  if (value === null || typeof value !== 'object') throw invalid('object', 'object', value);
-  return contexts.has(value);
 }
 function compileOptions(value, defaultFilename = 'evalmachine.<anonymous>') {
   const opts = options(value, true);
@@ -140,23 +144,6 @@ function compileOptions(value, defaultFilename = 'evalmachine.<anonymous>') {
   if (opts.cachedData !== undefined && !ArrayBufferIsView(opts.cachedData)) throw invalid('options.cachedData', ['Buffer', 'TypedArray', 'DataView'], opts.cachedData);
   if (opts.produceCachedData !== undefined) boolean(opts.produceCachedData, 'options.produceCachedData');
   return { opts, filename, line, column };
-}
-// Parser locations are real lexical coordinates. Presentation offsets never
-// alter source bytes, directive prologues, line continuations, or parser state.
-function syntaxDiagnostic(cause, source, filename, line, column, prefix = 0) {
-  if (!cause || cause.name !== 'SyntaxError' || !Number.isInteger(cause.lineNumber)) throw cause;
-  const sourceLine = cause.lineNumber;
-  const sourceColumn = cause.columnNumber - (sourceLine === 1 ? prefix : 0);
-  const lines = source.split(/\r\n|[\n\r\u2028\u2029]/);
-  const text = lines[sourceLine - 1] || '';
-  cause.lineNumber = (sourceLine + line) | 0;
-  cause.columnNumber = (sourceColumn + (sourceLine === 1 ? column : 0)) | 0;
-  cause.fileName = filename;
-  const frames = typeof cause.stack === 'string' ? cause.stack.split('\n').slice(1).join('\n') : '';
-  const caret = text.slice(0, Math.max(0, sourceColumn - 1)).replace(/[^\t]/g, ' ') +
-    (cause.columnNumber === 0 ? '' : '^');
-  cause.stack = `${filename}:${cause.lineNumber}\n${text}\n${caret}\n\n${cause.name}: ${cause.message}\n${frames}`;
-  throw cause;
 }
 function compile(source, filename, line, column, prefix = 0, body = source) {
   try { return host.vmCompile(source, filename, undefined, line, column, prefix); }
@@ -215,34 +202,6 @@ function cachedHandle(value, source, filename, line, column, prefix = 0, kind = 
     throw cause;
   }
 }
-const terminationErrors = new WeakSet();
-function terminationError(code, message) {
-  const result = error(code, message, Error);
-  terminationErrors.add(result);
-  return result;
-}
-function run(handle, { timeout, breakOnSigint }, afterEvaluate, wrapSignals = true) {
-  let listeners;
-  if (breakOnSigint && wrapSignals && process.listenerCount('SIGINT') > 0) {
-    listeners = process.rawListeners('SIGINT');
-    process.removeAllListeners('SIGINT');
-  }
-  try { return host.vmRun(handle, timeout, afterEvaluate, breakOnSigint); }
-  catch (cause) {
-    if (cause && typeof cause.message === 'string' && cause.message.startsWith('ERR_SCRIPT_EXECUTION_TIMEOUT:')) {
-      throw terminationError('ERR_SCRIPT_EXECUTION_TIMEOUT', `Script execution timed out${timeout ? ` after ${timeout}ms` : ''}`);
-    }
-    if (cause && typeof cause.message === 'string' && cause.message.startsWith('ERR_SCRIPT_EXECUTION_INTERRUPTED:')) {
-      throw terminationError('ERR_SCRIPT_EXECUTION_INTERRUPTED', 'Script execution was interrupted by `SIGINT`');
-    }
-    if (cause && typeof cause.message === 'string' && cause.message.startsWith('ERR_CANNOT_WATCH_SIGINT:')) {
-      throw error('ERR_CANNOT_WATCH_SIGINT', 'Cannot watch for SIGINT signals', Error);
-    }
-    throw cause;
-  } finally {
-    if (listeners) for (let i = 0; i < listeners.length; i++) process.addListener('SIGINT', listeners[i]);
-  }
-}
 function validateImportCallback(callback, module = false) {
   if (callback !== undefined && typeof callback !== 'function' &&
       (module || callback !== USE_MAIN_CONTEXT_DEFAULT_LOADER)) {
@@ -251,14 +210,15 @@ function validateImportCallback(callback, module = false) {
 }
 function importCallback(callback, referrer, filename, functionRef = false) {
   if (callback === USE_MAIN_CONTEXT_DEFAULT_LOADER) return host.vmCreateDefaultImporter(filename);
-  return async (specifier, attributes) => {
+  // internal/vm registerImportModuleDynamically: the callback answers through
+  // importModuleDynamicallyWrap, which unwraps a vm.Module to its namespace or source.
+  return async (specifier, attributes, sourcePhase) => {
     if (callback === undefined) throw error('ERR_VM_DYNAMIC_IMPORT_CALLBACK_MISSING', 'A dynamic import callback was not specified.', TypeError);
     if (!host.experimentalVmModules) throw error('ERR_VM_DYNAMIC_IMPORT_CALLBACK_MISSING_FLAG', 'A dynamic import callback was invoked without --experimental-vm-modules', TypeError);
-    const imported = await callback(specifier, functionRef ? referrer() : referrer, attributes || Object.create(null), 'evaluation');
-    if (isModuleNamespaceObject(imported)) return imported;
-    if (!modules.has(imported)) throw error('ERR_VM_MODULE_NOT_MODULE', 'Provided module is not an instance of Module', Error);
-    if (imported.status === 'errored') throw imported.error;
-    return imported.namespace;
+    const { importModuleDynamicallyWrap } = require('internal/vm/module');
+    const { kSourcePhase, kEvaluationPhase } = require('internal/vm/module_wrap');
+    return importModuleDynamicallyWrap(callback)(specifier, functionRef ? referrer() : referrer,
+      attributes || Object.create(null), sourcePhase ? kSourcePhase : kEvaluationPhase);
   };
 }
 const { kInternalImportModuleDynamically } = require('internal/vm');
@@ -378,213 +338,8 @@ function compileFunction(code, params = [], value) {
   }
   return result;
 }
-function moduleData(value) {
-  const data = modules.get(value);
-  if (!data) throw error('ERR_INVALID_THIS', 'Value of "this" must be a Module');
-  return data;
-}
-function moduleStatus(data) {
-  const status = host.vmModule(8, data.handle);
-  return status === 0 && data.linking ? 'linking' :
-    ['unlinked', 'linking', 'linked', 'evaluating', 'evaluated', 'errored'][status];
-}
-function moduleOptions(value) {
-  const opts = options(value);
-  if (opts.identifier !== undefined && typeof opts.identifier !== 'string') throw invalid('options.identifier', 'string', opts.identifier);
-  const context = opts.context === undefined ? undefined : contextData(opts.context);
-  return { opts, context, identifier: opts.identifier === undefined ? `vm:module(${nextModuleId++})` : opts.identifier };
-}
-function requireDependency(value, owner) {
-  if (!modules.has(value)) throw error('ERR_VM_MODULE_NOT_MODULE', 'Provided module is not an instance of Module', Error);
-  const data = moduleData(value);
-  if (data.context !== owner.context) throw error('ERR_VM_MODULE_DIFFERENT_CONTEXT', 'Linked modules must use the same context', Error);
-  if (moduleStatus(data) === 'errored') throw error('ERR_VM_MODULE_LINK_FAILURE', 'request for an errored module', Error);
-  return data;
-}
-function bindRequests(data, dependencies) {
-  if (!Array.isArray(dependencies)) throw invalid('modules', 'Array', dependencies);
-  if (dependencies.length !== data.requests.length) throw error('ERR_MODULE_LINK_MISMATCH', 'Expected one module for each module request', Error);
-  for (const dependency of dependencies) requireDependency(dependency, data);
-  for (let i = 0; i < dependencies.length; i++) host.vmModule(5, data.handle, i, moduleData(dependencies[i]).handle);
-  data.dependencies = dependencies.slice();
-}
-async function stageLink(module, linker, visited) {
-  if (visited.has(module)) return;
-  visited.add(module);
-  const data = moduleData(module);
-  if (moduleStatus(data) !== 'unlinked' && moduleStatus(data) !== 'linking') return;
-  if (!data.requestsPromise) {
-    data.linking = true;
-    data.requestsPromise = Promise.all(data.requests.map(async request => {
-      const attributes = Object.assign(Object.create(null), request.attributes);
-      const dependency = await linker(request.specifier, module, { attributes, assert: attributes });
-      requireDependency(dependency, data);
-      return dependency;
-    })).then(dependencies => { bindRequests(data, dependencies); });
-  }
-  await data.requestsPromise;
-  for (const dependency of data.dependencies) await stageLink(dependency, linker, visited);
-}
-function instantiateModule(module) {
-  const visited = new Set();
-  function collect(current) {
-    if (visited.has(current)) return;
-    visited.add(current);
-    const data = moduleData(current);
-    if (moduleStatus(data) === 'errored') throw current.error;
-    if (data.dependencies === undefined && data.requests.length !== 0) throw error('ERR_VM_MODULE_LINK_FAILURE', 'Module requests must be linked before instantiation', Error);
-    for (const dependency of data.dependencies || []) collect(dependency);
-  }
-  collect(module);
-  try { host.vmModule(6, moduleData(module).handle); }
-  finally { for (const current of visited) moduleData(current).linking = false; }
-}
-const moduleToken = {};
-class Module {
-  constructor(token, data) {
-    if (token !== moduleToken) throw error('ERR_ILLEGAL_CONSTRUCTOR', 'Illegal constructor');
-    modules.set(this, data);
-  }
-  get identifier() { return moduleData(this).identifier; }
-  get context() { return moduleData(this).context; }
-  [Symbol.for('nodejs.util.inspect.custom')](depth, options) {
-    moduleData(this);
-    if (typeof depth === 'number' && depth < 0) return this;
-    const constructor = Object.getPrototypeOf(this)?.constructor || Module;
-    const view = { __proto__: { constructor } };
-    view.status = this.status;
-    view.identifier = this.identifier;
-    view.context = this.context;
-    Object.setPrototypeOf(view, Object.getPrototypeOf(this));
-    Object.defineProperty(view, Symbol.toStringTag, { value: constructor.name, configurable: true });
-    return require('util').inspect(view, { ...options, customInspect: false });
-  }
-  get status() { return moduleStatus(moduleData(this)); }
-  get namespace() {
-    const data = moduleData(this);
-    if (host.vmModule(8, data.handle) < 2) throw error('ERR_VM_MODULE_STATUS', 'Module status must not be unlinked or linking', Error);
-    return host.vmModule(7, data.handle);
-  }
-  get error() {
-    const data = moduleData(this);
-    if (moduleStatus(data) !== 'errored') throw error('ERR_VM_MODULE_STATUS', 'Module status must be errored', Error);
-    return data.terminated ? null : host.vmModule(9, data.handle);
-  }
-  async link(linker) {
-    const data = moduleData(this);
-    if (typeof linker !== 'function') throw invalid('linker', 'function', linker);
-    // Node 24 synthetic modules are already instantiated at construction.
-    if (data.synthetic) return;
-    if (moduleStatus(data) !== 'unlinked') throw error('ERR_VM_MODULE_STATUS', 'Module status must be unlinked', Error);
-    await stageLink(this, linker, new Set());
-    instantiateModule(this);
-  }
-  // As in Node, the engine's own evaluation promise: already settled when the module
-  // (or a synthetic one's evaluation step) finished synchronously.
-  evaluate(value) {
-    try {
-      const data = moduleData(this);
-      const execution = runOptions(value);
-      const status = moduleStatus(data);
-      if (status === 'unlinked' || status === 'linking') throw error('ERR_VM_MODULE_STATUS', 'Module status must be one of linked, evaluated, or errored', Error);
-      if (data.terminated) throw null;
-      let result;
-      try { result = run(data.handle, execution, data.realm ? data.realm.afterEvaluate : false, false); }
-      catch (cause) {
-        if (terminationErrors.has(cause)) {
-          const visited = new Set();
-          const terminate = current => {
-            if (visited.has(current)) return;
-            visited.add(current);
-            const state = moduleData(current);
-            if (moduleStatus(state) === 'errored') state.terminated = true;
-            const dependencies = state.dependencies || [];
-            for (let i = 0; i < dependencies.length; i++) terminate(dependencies[i]);
-          };
-          terminate(this);
-        }
-        throw cause;
-      }
-      return result instanceof Promise ? result : Promise.resolve(result);
-    } catch (cause) { return Promise.reject(cause); }
-  }
-}
-class SourceTextModule extends Module {
-  constructor(code, value) {
-    if (typeof code !== 'string') throw invalid('code', 'string', code);
-    const { opts, context, identifier } = moduleOptions(value);
-    validateImportCallback(opts.importModuleDynamically, true);
-    if (opts.initializeImportMeta !== undefined && typeof opts.initializeImportMeta !== 'function') throw invalid('options.initializeImportMeta', 'function', opts.initializeImportMeta);
-    const line = opts.lineOffset === undefined ? 0 : integer(opts.lineOffset, 'options.lineOffset', -2147483648, 2147483647);
-    const column = opts.columnOffset === undefined ? 0 : integer(opts.columnOffset, 'options.columnOffset', -2147483648, 2147483647);
-    let handle;
-    try { handle = host.vmModule(0, code, identifier, context && context.handle, line, column); }
-    catch (cause) { syntaxDiagnostic(cause, code, identifier, line, column); }
-    const requests = [];
-    const count = host.vmModule(3, handle);
-    for (let i = 0; i < count; i++) {
-      const attributes = Object.freeze(Object.assign(Object.create(null), host.vmModule(4, handle, i, 1)));
-      requests.push(Object.freeze(Object.assign(Object.create(null), { specifier: host.vmModule(4, handle, i, 0), attributes, phase: 'evaluation' })));
-    }
-    super(moduleToken, { handle, identifier, context: opts.context, realm: context, requests: Object.freeze(requests), linking: false });
-    host.vmSetImportModuleDynamically(handle, importCallback(opts.importModuleDynamically, this, identifier));
-    const initializeImportMeta = opts.initializeImportMeta;
-    if (initializeImportMeta !== undefined) host.vmModule(11, handle, meta => initializeImportMeta(meta, this));
-  }
-  get dependencySpecifiers() { return Object.freeze(moduleData(this).requests.map(request => request.specifier)); }
-  get moduleRequests() { return moduleData(this).requests; }
-  linkRequests(dependencies) {
-    const data = moduleData(this);
-    if (moduleStatus(data) !== 'unlinked') throw error('ERR_VM_MODULE_STATUS', 'Module status must be unlinked', Error);
-    bindRequests(data, dependencies);
-  }
-  instantiate() {
-    const data = moduleData(this);
-    if (moduleStatus(data) !== 'unlinked') throw error('ERR_VM_MODULE_STATUS', 'Module status must be unlinked', Error);
-    instantiateModule(this);
-  }
-  hasTopLevelAwait() { return host.vmModule(12, moduleData(this).handle); }
-  hasAsyncGraph() {
-    const data = moduleData(this);
-    if (moduleStatus(data) === 'unlinked' || moduleStatus(data) === 'linking') throw error('ERR_VM_MODULE_STATUS', 'Module status must be linked', Error);
-    const seen = new Set(), pending = [this];
-    while (pending.length) {
-      const current = pending.pop();
-      if (seen.has(current)) continue;
-      seen.add(current);
-      const entry = moduleData(current);
-      if (host.vmModule(12, entry.handle)) return true;
-      pending.push(...(entry.dependencies || []));
-    }
-    return false;
-  }
-}
-class SyntheticModule extends Module {
-  constructor(exportNames, evaluateCallback, value) {
-    if (!Array.isArray(exportNames)) throw invalid('exportNames', 'Array', exportNames);
-    const names = new Set();
-    for (let i = 0; i < exportNames.length; i++) {
-      const name = exportNames[i];
-      if (typeof name !== 'string') throw invalid(`exportNames[${i}]`, 'string', name);
-      if (names.has(name)) throw error('ERR_INVALID_ARG_VALUE', `The property 'exportNames' contains duplicate export '${name}'`);
-      names.add(name);
-    }
-    if (typeof evaluateCallback !== 'function') throw invalid('evaluateCallback', 'function', evaluateCallback);
-    const { opts, context, identifier } = moduleOptions(value);
-    let module;
-    const handle = host.vmModule(1, identifier, context && context.handle, () => Reflect.apply(evaluateCallback, module, []));
-    for (const name of names) host.vmModule(2, handle, name);
-    host.vmModule(6, handle);
-    super(moduleToken, { handle, identifier, context: opts.context, realm: context, requests: [], dependencies: [], synthetic: true, names });
-    module = this;
-  }
-  setExport(name, value) {
-    const data = moduleData(this);
-    if (typeof name !== 'string') throw invalid('name', 'string', name);
-    if (!data.synthetic) throw error('ERR_INVALID_THIS', 'Value of "this" must be a SyntheticModule');
-    if (!data.names.has(name)) throw new ReferenceError(`Export '${name}' is not defined in module`);
-    host.vmModule(10, data.handle, name, value);
-  }
-}
 module.exports = { Script, createContext, createScript, isContext, runInContext, runInNewContext, runInThisContext, compileFunction, constants };
-if (host.experimentalVmModules) Object.assign(module.exports, { Module, SourceTextModule, SyntheticModule });
+if (host.experimentalVmModules) {
+  const { Module, SourceTextModule, SyntheticModule } = require('internal/vm/module');
+  Object.assign(module.exports, { Module, SourceTextModule, SyntheticModule });
+}

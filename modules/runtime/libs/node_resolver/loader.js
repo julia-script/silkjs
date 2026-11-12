@@ -130,7 +130,7 @@ function createLoader(host, builtins) {
 
   function parentName(parent) {
     if (parent && typeof parent === 'object') parent = parent.filename;
-    if (!parent) return path.join(host.cwd(), '__silk_entry__.js');
+    if (!parent) return path.join(host.tryGetCwd(), '__silk_entry__.js');
     parent = String(parent);
     let name = parentNames.get(parent);
     if (name !== undefined) return name;
@@ -448,7 +448,7 @@ function createLoader(host, builtins) {
         }
       }
       for (let i3 = 0, a3 = keys; i3 < a3.length; i3++) { const condition = a3[i3];
-        if (condition === 'default' || (activeConditions ? activeConditions.includes(condition) : condition === 'node' || condition === 'node-addons' || condition === mode || (condition === 'module-sync' && requireModuleEnabled()) || (host.moduleConditions && host.moduleConditions.includes(condition)))) {
+        if (condition === 'default' || (activeConditions ? activeConditions.includes(condition) : condition === 'node' || (condition === 'node-addons' && !host.noAddons) || condition === mode || (condition === 'module-sync' && requireModuleEnabled()) || (host.moduleConditions && host.moduleConditions.includes(condition)))) {
           const result = packageTarget(pkg, target[condition], replacement, key, pattern, internal, parent, mode, seen);
           if (result !== undefined) return result;
         }
@@ -653,7 +653,8 @@ function createLoader(host, builtins) {
   }
 
   function conditions(mode) {
-    const values = mode === 'require' ? ['require', 'node', 'node-addons'] : ['node', 'import', 'node-addons'];
+    const values = mode === 'require' ? ['require', 'node'] : ['node', 'import'];
+    if (!host.noAddons) values.push('node-addons');
     if (requireModuleEnabled()) values.push('module-sync');
     if (host.moduleConditions) for (let index = 0; index < host.moduleConditions.length; index++) values.push(host.moduleConditions[index]);
     return values;
@@ -956,10 +957,10 @@ function createLoader(host, builtins) {
       this.exports = {};
       this[kModuleParent] = parent;
       this.children = [];
-      this.paths = modulePaths(this.path);
+      // As Node, paths come with load() (or from whoever made the module).
       this.loaded = false;
     }
-    require(specifier) { return makeRequire(this.filename || path.join(host.cwd(), '__entry__.js'), this, moduleAsyncModes.get(this) === true)(specifier); }
+    require(specifier) { return makeRequire(this.filename || path.join(host.tryGetCwd(), '__entry__.js'), this, moduleAsyncModes.get(this) === true)(specifier); }
     _compile(source, filename) {
       const compiledSource = cleanSource(source);
       const wrapper = wrapperPatched
@@ -1092,6 +1093,7 @@ function createLoader(host, builtins) {
   function makeModule(filename, parent) {
     const module = new Module(filename, parent || null);
     module.filename = filename;
+    module.paths = modulePaths(module.path);
     return module;
   }
 

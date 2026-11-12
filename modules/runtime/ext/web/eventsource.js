@@ -2,7 +2,7 @@
 
 const { Buffer } = require('buffer');
 const { Event, EventTarget, DOMException, AbortController } = require('internal/path_events/event_target');
-const { URL } = require('internal/web/url');
+const { URL } = require('internal/url');
 const { fetch } = require('internal/web/fetch');
 const { MessageEvent, string } = require('internal/web/websocket/events');
 const { EventSourceParser } = require('internal/web/eventsource/parser');

@@ -1,6 +1,6 @@
-// child_process adapted from Node.js v24.22.1 lib/child_process.js and the ChildProcess
-// parts of lib/internal/child_process.js: the same argument handling, validation, events
-// and error shapes, on the runtime's native process host (src/ext/process_native.silk).
+// child_process adapted from Node.js v24.22.1 lib/child_process.js: the same argument
+// handling, validation, events and error shapes. ChildProcess, the stdio translation and
+// the native spawnSync are internal/child_process, called through its exports as in Node.
 // Copyright Joyent, Inc. and other Node contributors.
 //
 // Permission is hereby granted, free of charge, to any person obtaining a
@@ -24,12 +24,9 @@
 
 'use strict';
 const host = require('internal/host');
-const { EventEmitter } = require('events');
-const { AsyncResource } = require('async_hooks');
 const { Buffer } = require('buffer');
-const diagnostics = require('internal/host').diagnostics;
-const { Socket } = require('net');
-const { setupChannel } = require('internal/child_process/ipc');
+const child_process = require('internal/child_process');
+const { ChildProcess, errnoException, getValidStdio, stdioStringToArray, kInheritEnvironment } = child_process;
 const { AbortError } = require('internal/path_events/support');
 const {
   codes: { ERR_INVALID_ARG_TYPE, ERR_INVALID_ARG_VALUE, ERR_OUT_OF_RANGE },
@@ -39,15 +36,7 @@ const {
 const native = (op, args = []) => host.processNative(op, args);
 const MAX_BUFFER = 1024 * 1024;
 const kEmptyObject = Object.freeze({ __proto__: null });
-// The child gets this thread's own process.env natively, without a copy key by key.
-const kInheritEnvironment = Symbol('kInheritEnvironment');
-// A stream handed to a child as its stdio: the child reads it now, so this process must not.
-const kIsUsedAsStdio = Symbol('kIsUsedAsStdio');
 
-function errnoException(err, syscall) {
-  const code = native('errorName', [err]);
-  return Object.assign(new Error(`${syscall} ${code}`), { errno: err, code, syscall });
-}
 function genericNodeError(message, properties) { return Object.assign(new Error(message), properties); }
 function validateArgumentNullCheck(arg, name) {
   if (typeof arg === 'string' && arg.includes('\u0000')) throw new ERR_INVALID_ARG_VALUE(name, arg, 'must be a string without null bytes');
@@ -67,201 +56,45 @@ function sanitizeKillSignal(killSignal) {
 }
 const isInt32 = value => value === (value | 0);
 
-function stdioStringToArray(stdio, channel) {
-  const options = [];
-  switch (stdio) {
-    case 'ignore': case 'overlapped': case 'pipe': options.push(stdio, stdio, stdio); break;
-    case 'inherit': options.push(0, 1, 2); break;
-    default: throw new ERR_INVALID_ARG_VALUE('stdio', stdio);
-  }
-  if (channel) options.push(channel);
-  return options;
-}
-// The native host's descriptor of an stdio entry: -1 a new pipe, -2 ignore, else an inherited fd.
-function getValidStdio(stdio, sync) {
-  let ipc;
-  if (typeof stdio === 'string') stdio = stdioStringToArray(stdio);
-  else if (!Array.isArray(stdio)) throw new ERR_INVALID_ARG_VALUE('stdio', stdio);
-  else stdio = stdio.slice();
-  while (stdio.length < 3) stdio.push(undefined);
-  const result = stdio.map((entry, i) => {
-    entry ??= i < 3 ? 'pipe' : 'ignore';
-    if (entry === 'ignore') return { type: 'ignore', fd: -2 };
-    if (entry === 'pipe' || entry === 'overlapped' || (typeof entry === 'number' && entry < 0)) return { type: 'pipe', fd: -1 };
-    if (entry === 'ipc') {
-      if (sync) throw codedError(Error, 'ERR_IPC_SYNC_FORK', 'IPC cannot be used with synchronous forks');
-      if (ipc !== undefined) throw codedError(Error, 'ERR_IPC_ONE_PIPE', 'Child process can have only one IPC pipe');
-      ipc = i;
-      return { type: 'pipe', fd: -1, ipc: true };
-    }
-    if (entry === 'inherit') return { type: 'inherit', fd: i };
-    if (typeof entry === 'number') return { type: 'fd', fd: entry };
-    if (typeof entry.fd === 'number') return { type: 'fd', fd: entry.fd };
-    const fd = entry._transport?.call('fileno');
-    if (Number.isInteger(fd) && fd >= 0) return { type: 'wrap', fd, source: entry };
-    if (ArrayBuffer.isView(entry) || typeof entry === 'string') {
-      if (!sync) throw codedError(TypeError, 'ERR_INVALID_SYNC_FORK_INPUT',
-        `Asynchronous forks do not support Buffer, TypedArray, DataView or string input: ${require('util').inspect(entry)}`);
-      return { type: 'pipe', fd: -1 };
-    }
-    throw new ERR_INVALID_ARG_VALUE('stdio', entry);
-  });
-  return { stdio: result, ipc };
-}
-function nativeCwd(cwd) {
-  if (cwd == null || cwd === '') return null;
-  return Buffer.isBuffer(cwd) || cwd instanceof Uint8Array ? Buffer.from(cwd).toString() : cwd;
-}
-function nativeEnvironment(options) {
-  const pairs = options[kInheritEnvironment] ? null : options.envPairs;
-  return pairs == null ? null : pairs.join('\0') + (pairs.length ? '\0' : '');
-}
-function inheritedPairs() {
-  const pairs = [];
-  for (const key of Object.keys(process.env)) if (process.env[key] !== undefined) pairs.push(`${key}=${process.env[key]}`);
-  return pairs;
-}
-
-function flushStdio(subprocess) {
-  for (const stream of subprocess.stdio || []) if (stream && stream.readable && !stream[kIsUsedAsStdio] && stream !== subprocess.stdin) stream.resume();
-}
-function maybeClose(subprocess) {
-  if (++subprocess._closesGot === subprocess._closesNeeded) {
-    subprocess.emit('close', subprocess.exitCode, subprocess.signalCode);
-    subprocess._resource.emitDestroy();
-  }
-}
-class ChildProcess extends EventEmitter {
-  constructor() {
-    super();
-    this._closesNeeded = 1;
-    this._closesGot = 0;
-    this.connected = false;
-    this.signalCode = null;
-    this.exitCode = null;
-    this.killed = false;
-    this.spawnfile = null;
-    this._handle = null;
-    this._resource = new AsyncResource('PROCESSWRAP');
-    diagnostics.publish('child_process', { process: this });
-  }
-  _onexit(exitCode, signal) {
-    if (signal) this.signalCode = signalName(signal) ?? null;
-    else this.exitCode = exitCode;
-    this.stdin?.destroy();
-    this._handle = null;
-    if (exitCode < 0) {
-      const syscall = this.spawnfile ? 'spawn ' + this.spawnfile : 'spawn';
-      const err = errnoException(exitCode, syscall);
-      if (this.spawnfile) err.path = this.spawnfile;
-      err.spawnargs = this.spawnargs.slice(1);
-      this.emit('error', err);
-    } else {
-      this.emit('exit', this.exitCode, this.signalCode);
-    }
-    process.nextTick(flushStdio, this);
-    maybeClose(this);
-  }
-  spawn(options) {
-    validateObject(options, 'options');
-    const { stdio, ipc } = getValidStdio(options.stdio || 'pipe', false);
-    options.stdio = stdio;
-    validateOneOf(options.serialization, 'options.serialization', [undefined, 'json', 'advanced']);
-    const serialization = options.serialization || 'json';
-    if (ipc !== undefined) {
-      if (options[kInheritEnvironment]) { options.envPairs = inheritedPairs(); options[kInheritEnvironment] = false; }
-      else if (options.envPairs === undefined) options.envPairs = [];
-      else validateArray(options.envPairs, 'options.envPairs');
-      options.envPairs.push(`NODE_CHANNEL_FD=${ipc}`, `NODE_CHANNEL_SERIALIZATION_MODE=${serialization}`);
-    }
-    validateString(options.file, 'options.file');
-    this.spawnfile = options.file;
-    if (options.args === undefined) this.spawnargs = [];
-    else {
-      validateArray(options.args, 'options.args');
-      this.spawnargs = options.args;
-    }
-    let flags = options.detached ? 8 : 0;
-    if (options.uid != null) flags |= 1;
-    if (options.gid != null) flags |= 2;
-    const argv = this.spawnargs.length ? this.spawnargs : [options.file];
-    const tracing = diagnostics.tracing('child_process.spawn');
-    tracing?.start.publish({ process: this, options });
-    const result = native('spawn', [options.file, argv.map(String).join('\0') + '\0', nativeEnvironment(options),
-      nativeCwd(options.cwd), stdio.map(entry => entry.fd), flags, options.uid >>> 0, options.gid >>> 0, (code, signal) => {
-        host.invokeResource(this._resource, this._onexit, this, [code, signal], false);
-        host.checkpoint();
-      }]);
-    let err = 0;
-    if (typeof result === 'number') {
-      err = result;
-      const code = native('errorName', [err]);
-      if (code !== 'EACCES' && code !== 'EAGAIN' && code !== 'EMFILE' && code !== 'ENFILE' && code !== 'ENOENT') {
-        this._resource.emitDestroy();
-        tracing?.error.publish({ process: this, error: errnoException(err, 'spawn') });
-        throw errnoException(err, 'spawn');
-      }
-      tracing?.error.publish({ process: this, error: errnoException(err, 'spawn') });
-      process.nextTick(() => this._onexit(err, 0));
-      if (code === 'EMFILE' || code === 'ENFILE') return err;
-      this.pid = undefined;
-    } else {
-      this._handle = result[0];
-      this.pid = result[1];
-      tracing?.end.publish({ process: this });
-      process.nextTick(() => this.emit('spawn'));
-    }
-    this.stdio = [];
-    for (let i = 0; i < stdio.length; i++) {
-      const entry = stdio[i];
-      const fd = err ? -1 : result[i + 2];
-      if (entry.type === 'wrap' && !err) {
-        // Like Node: the parent stops reading a stream the child now reads.
-        const handle = entry.source._handle;
-        if (handle) { handle.reading = false; handle.readStop?.(); }
-        entry.source.pause();
-        entry.source.readableFlowing = false;
-        if (entry.source._readableState) entry.source._readableState.reading = false;
-        entry.source[kIsUsedAsStdio] = true;
-      }
-      if (entry.type !== 'pipe') { this.stdio.push(null); continue; }
-      if (entry.ipc) {
-        this.stdio.push(null);
-        if (!err) { this._closesNeeded++; setupChannel(this, fd, serialization, () => maybeClose(this)); }
-        continue;
-      }
-      let stream;
-      if (err) stream = new Socket({ readable: i > 0, writable: i === 0 });
-      else {
-        try { stream = new Socket({ fd, readable: i !== 0, writable: i === 0 || i > 2 }); }
-        catch (error) { native('closeFd', [fd]); this.kill(); throw error; }
-        if (i > 0) { this._closesNeeded++; stream.on('close', () => maybeClose(this)); }
-      }
-      this.stdio.push(stream);
-    }
-    this.stdin = this.stdio.length >= 1 ? this.stdio[0] : null;
-    this.stdout = this.stdio.length >= 2 ? this.stdio[1] : null;
-    this.stderr = this.stdio.length >= 3 ? this.stdio[2] : null;
-    return err;
-  }
-  kill(sig) {
-    const signal = sig === 0 ? sig : convertToValidSignal(sig === undefined ? 'SIGTERM' : sig);
-    if (this._handle) {
-      const err = native('kill', [this._handle, signal]);
-      if (err === 0) { this.killed = true; return true; }
-      const code = native('errorName', [err]);
-      if (code === 'ESRCH') { /* Already dead. */ }
-      else if (code === 'EINVAL' || code === 'ENOSYS') throw errnoException(err, 'kill');
-      else this.emit('error', errnoException(err, 'kill'));
-    }
-    return false;
-  }
-  ref() { if (this._handle) native('ref', [this._handle]); }
-  unref() { if (this._handle) native('unref', [this._handle]); }
-  [Symbol.dispose]() { if (!this.killed) this.kill(); }
-}
-
 let emittedDEP0190Already = false;
+// Node's lib/child_process.js: a child of a process under the permission model gets the
+// parent's permission flags through NODE_OPTIONS, unless it is given its own.
+function permissionEnabled() {
+  return require('internal/host').builtinLoaded('internal/permission') && require('internal/permission').enabled();
+}
+let permissionModelFlagsToCopy;
+function getPermissionModelFlagsToCopy() {
+  if (permissionModelFlagsToCopy === undefined) {
+    permissionModelFlagsToCopy = ['--allow-fs-read', '--allow-fs-write', '--allow-addons', '--allow-child-process',
+      '--allow-inspector', '--allow-wasi', '--allow-worker', '--allow-openssl-store', '--permission'];
+  }
+  return permissionModelFlagsToCopy;
+}
+function hasPermissionFlagInEnv(nodeOptions) {
+  if (!nodeOptions) return false;
+  const tokens = nodeOptions.split(/\s+/);
+  return tokens.some((token) =>
+    token === '--permission' ||
+    token.startsWith('--permission=') ||
+    token === '--permission-audit' ||
+    token.startsWith('--permission-audit='),
+  );
+}
+function copyPermissionModelFlagsToEnv(env, key, args) {
+  if (args.includes('--permission') || args.includes('--permission-audit') ||
+      hasPermissionFlagInEnv(env[key])) {
+    return;
+  }
+  const flagsToCopy = getPermissionModelFlagsToCopy();
+  for (const arg of process.execArgv) {
+    for (const flag of flagsToCopy) {
+      if (arg.startsWith(flag)) {
+        env[key] = `${env[key] ? env[key] + ' ' + arg : arg}`;
+      }
+    }
+  }
+}
+
 function normalizeSpawnArguments(file, args, options) {
   validateString(file, 'file');
   validateArgumentNullCheck(file, 'file');
@@ -297,15 +130,32 @@ function normalizeSpawnArguments(file, args, options) {
       emittedDEP0190Already = true;
     }
     const command = args.length > 0 ? `${file} ${args.join(' ')}` : file;
-    file = typeof options.shell === 'string' ? options.shell : process.platform === 'android' ? '/system/bin/sh' : '/bin/sh';
-    args = ['-c', command];
+    // Set the shell, switches, and commands.
+    if (process.platform === 'win32') {
+      if (typeof options.shell === 'string') file = options.shell;
+      else file = process.env.comspec || 'cmd.exe';
+      // '/d /s /c' is used only for cmd.exe.
+      if (/^(?:.*\\)?cmd(?:\.exe)?$/i.exec(file) !== null) {
+        args = ['/d', '/s', '/c', `"${command}"`];
+        windowsVerbatimArguments = true;
+      } else args = ['-c', command];
+    } else {
+      if (typeof options.shell === 'string') file = options.shell;
+      else if (process.platform === 'android') file = '/system/bin/sh';
+      else file = '/bin/sh';
+      args = ['-c', command];
+    }
   }
   args.unshift(typeof options.argv0 === 'string' ? options.argv0 : file);
   let envPairs;
-  const inherit = !options.env || options.env === process.env;
+  let env = options.env;
+  if (permissionEnabled()) {
+    env = env || { ...process.env };
+    copyPermissionModelFlagsToEnv(env, 'NODE_OPTIONS', args);
+  }
+  const inherit = !env || env === process.env;
   if (!inherit) {
     envPairs = [];
-    const env = options.env;
     // Prototype values are intentionally included.
     for (const key in env) {
       const value = env[key];
@@ -491,46 +341,22 @@ function spawnSync(file, args, options) {
   validateTimeout(options.timeout);
   validateMaxBuffer(options.maxBuffer);
   options.killSignal = sanitizeKillSignal(options.killSignal);
-  const stdio = getValidStdio(options.stdio || 'pipe', true).stdio;
-  const source = typeof options.stdio === 'string' || !Array.isArray(options.stdio) ? [] : options.stdio;
-  let input = options.input || (source[0] && typeof source[0] === 'object' ? source[0].input : undefined);
-  for (let i = 0; i < stdio.length; i++) {
-    const value = i === 0 ? input : source[i]?.input;
-    if (value == null) continue;
-    if (ArrayBuffer.isView(value)) { if (i === 0) input = value; }
-    else if (typeof value === 'string') { if (i === 0) input = Buffer.from(value, options.encoding); }
-    else throw new ERR_INVALID_ARG_TYPE(`options.stdio[${i}]`, ['Buffer', 'TypedArray', 'DataView', 'string'], value);
+  options.stdio = getValidStdio(options.stdio || 'pipe', true).stdio;
+  if (options.input) {
+    const stdin = options.stdio[0] = { ...options.stdio[0] };
+    stdin.input = options.input;
   }
-  const exactInput = input == null ? new ArrayBuffer(0) : input.buffer.slice(input.byteOffset, input.byteOffset + input.byteLength);
-  const argv = options.args.map(String).join('\0') + '\0';
-  let flags = 0;
-  if (options.uid != null) flags |= 1;
-  if (options.gid != null) flags |= 2;
-  const raw = native('spawnSync', [options.file, argv, nativeEnvironment(options), nativeCwd(options.cwd),
-    stdio.map(entry => entry.fd), flags, options.uid >>> 0, options.gid >>> 0, exactInput, options.timeout || 0,
-    options.maxBuffer ?? MAX_BUFFER, options.killSignal || convertToValidSignal('SIGTERM')]);
-  let result;
-  if (typeof raw === 'number') result = { error: raw, status: null, signal: null, output: null, pid: 0 };
-  else {
-    const output = stdio.map((entry, i) => {
-      if (entry.fd !== -1 || i === 0) return null;
-      // Buffer.from(arrayBuffer) without its type checks: raw[i + 4] is a fresh ArrayBuffer.
-      return Object.setPrototypeOf(new Uint8Array(raw[i + 4]), Buffer.prototype);
-    });
-    result = { status: raw[3] ? null : raw[2], signal: raw[3] ? signalName(raw[3]) ?? null : null, output, pid: raw[1] };
-    if (raw[0]) result.error = raw[0];
+  // We may want to pass data in on any given fd, ensure it is a valid buffer.
+  for (let i = 0; i < options.stdio.length; i++) {
+    const input = options.stdio[i]?.input;
+    if (input != null) {
+      const pipe = options.stdio[i] = { ...options.stdio[i] };
+      if (ArrayBuffer.isView(input)) pipe.input = input;
+      else if (typeof input === 'string') pipe.input = Buffer.from(input, options.encoding);
+      else throw new ERR_INVALID_ARG_TYPE(`options.stdio[${i}]`, ['Buffer', 'TypedArray', 'DataView', 'string'], input);
+    }
   }
-  if (result.output && options.encoding && options.encoding !== 'buffer') {
-    for (let i = 0; i < result.output.length; i++) if (result.output[i]) result.output[i] = result.output[i].toString(options.encoding);
-  }
-  result.stdout = result.output && result.output[1];
-  result.stderr = result.output && result.output[2];
-  if (result.error) {
-    result.error = errnoException(result.error, 'spawnSync ' + options.file);
-    result.error.path = options.file;
-    result.error.spawnargs = options.args.slice(1);
-  }
-  return result;
+  return child_process.spawnSync(options);
 }
 function checkExecSyncError(ret, args, cmd) {
   let err;

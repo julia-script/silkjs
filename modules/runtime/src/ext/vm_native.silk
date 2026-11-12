@@ -40,6 +40,7 @@ import silkjs.js_core_types { ModuleDef, ModuleStatus }
 import silkjs.js_string_types { StringLengthError }
 import silkjs.js_eval_errors as errors
 import silkjs.js_promise as promises
+import silkjs.js_promise { Capability }
 import silkjs.js_error_intrinsics as errorIntrinsics
 import ext.vm_interrupt
 import libs.core.intl as intl
@@ -268,6 +269,14 @@ pub unsafe effect fn dispatch<'m, S: EngineServices>(engine: &mut Engine<'m, S>,
   let memory = engine.memory let rt = unsafe runtime.contextRuntime(context)
   let first = unsafe common.argument(argv, 0)
   if operation == 13 { return run unsafe moduleDispatch(&mut engine, context, argv) }
+  if operation == 10 && match unsafe common.argument(argv, 2) { ValueBits.Bool { value } => value _ => false } {
+    // A context handle: the callback for its import() calls with no referrer script.
+    let target = run unsafe realm(&mut engine, context, first, handleId)
+    let mut anchor = () let state = unsafe HeapCell.payloadMut<ContextState, ()>(&mut anchor, target)
+    let previous = Intrinsic.replace(state.hostImport, unsafe Value.retain(unsafe common.argument(argv, 1))) drop state
+    unsafe gc.release(&mut engine, rt, previous.intoBits())
+    return ValueBits.Undefined
+  }
   if operation == 10 {
     let compiled = run unsafe bytecode(&mut engine, context, first, handleId)
     let mut code = compiled let mut owner = ValueBits.Undefined
@@ -402,7 +411,7 @@ pub unsafe effect fn dispatch<'m, S: EngineServices>(engine: &mut Engine<'m, S>,
       engine.domain = unsafe atomics.withInterrupt(previousDomain, silkVMWaitInterrupt,
         unsafe Intrinsic.pointerReinterpret<*mut Deadline, *mut u8>(Pointer.fromMutRef<Deadline>(&mut deadline)))
     }
-    let outcome = run Effect.result(unsafe execute(&mut engine, target, compiled, afterEvaluate))
+    let outcome = run Effect.result(unsafe execute(&mut engine, context, target, compiled, afterEvaluate))
     engine.domain = previousDomain
     unsafe runtime.setInterruptHandler(rt, move saved)
     if deadline.watchSignal {
@@ -436,9 +445,29 @@ unsafe effect fn drain<'m, S: EngineServices>(engine: &mut Engine<'m, S>, contex
     if result.status < 0 { fail JsException {} }
   }
 }
-unsafe effect fn execute<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, compiled: ValueBits, afterEvaluate: bool) -> ValueBits ! OutOfMemoryError | JsException ? &mut Allocator {
+unsafe effect fn execute<'m, S: EngineServices>(engine: &mut Engine<'m, S>, outer: *mut HeapHeader, context: *mut HeapHeader, compiled: ValueBits, afterEvaluate: bool) -> ValueBits ! OutOfMemoryError | JsException ? &mut Allocator {
   let memory = engine.memory
-  let result = (run evaluation.evaluateFunction(&mut engine, memory, unsafe lendRealm(&context, context), unsafe Value.retain(compiled))).intoBits()
+  let mut result = (run evaluation.evaluateFunction(&mut engine, memory, unsafe lendRealm(&context, context), unsafe Value.retain(compiled))).intoBits()
+  // Node's ModuleWrap::Evaluate for a context with its own microtask queue: a
+  // module's promise is returned as a promise of the caller's realm, resolved
+  // with it before the context's queue runs, so awaiting it needs no job on the
+  // context's queue after evaluate returns (nodejs/node#59541).
+  let module = match compiled { ValueBits.Module { .. } => true _ => false }
+  if afterEvaluate && module && promises.stateOf(unsafe lendFor(result)) >= 0 {
+    let made = run Effect.result(promises.newCapability(&mut engine, memory, unsafe lendRealm(&outer, outer), unsafe lendFor(ValueBits.Undefined)))
+    let capability = match move made {
+      Result<Capability, JsException>.Success { value } => move value
+      Result<Capability, JsException>.Failure { error } => { unsafe gc.release(&mut engine, unsafe runtime.contextRuntime(context), result) fail move error }
+    }
+    let resolved = run Effect.result(promises.call(&mut engine, unsafe lendRealm(&outer, outer), capability.resolve.borrow(), unsafe lendFor(ValueBits.Undefined), &[result]))
+    unsafe gc.release(&mut engine, unsafe runtime.contextRuntime(context), result)
+    let promise = move capability.promise
+    result = promise.intoBits()
+    match move resolved {
+      Result<Value, JsException>.Success { value } => { drop value }
+      Result<Value, JsException>.Failure { error } => { unsafe gc.release(&mut engine, unsafe runtime.contextRuntime(context), result) fail move error }
+    }
+  }
   if afterEvaluate {
     let drained = run Effect.result(unsafe drain(&mut engine, context))
     match move drained {
@@ -545,7 +574,12 @@ unsafe effect fn moduleOperation<'m, S: EngineServices>(engine: &mut Engine<'m, 
     let name = data.requestedModules.asSlice()[index].name
     let attributes = data.requestedModules.asSlice()[index].attributes.view() drop data
     if operation == 4 {
-      if (unsafe common.argument(argv, 3)).numericValue() == 1.0 { return unsafe attributes.retained() }
+      let field = (unsafe common.argument(argv, 3)).numericValue()
+      if field == 1.0 { return unsafe attributes.retained() }
+      if field == 2.0 {
+        let sourcePhase = (unsafe HeapCell.payload<ModuleDef, ()>(&anchor, module)).requestedModules.asSlice()[index].sourcePhase
+        return ValueBits.Bool { value: sourcePhase }
+      }
       let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, rt)
       return run state.atoms.toValue(name, true)
     }
@@ -562,6 +596,19 @@ unsafe effect fn moduleOperation<'m, S: EngineServices>(engine: &mut Engine<'m, 
     requests[index].module = Option<CellRef<ModuleDef>>.some(unsafe CellRef<ModuleDef>.of(reference))
     drop requests drop changed
     if let Option<CellRef<ModuleDef>>.Some { value: replaced } = previous { unsafe gc.releaseHeader(&mut engine, rt, replaced.header()) }
+    return ValueBits.Undefined
+  }
+  // The source object a source-phase request (import source x from 'y') binds.
+  if operation == 13 {
+    let index = f64.toUsize(second.numericValue())
+    let mut anchor = () let changed = unsafe HeapCell.payloadMut<ModuleDef, ()>(&mut anchor, module)
+    if index >= changed.requestedModules.length() || !changed.requestedModules.asSlice()[index].sourcePhase {
+      drop changed return run engine.throwError(unsafe lendRealm(&context, context), NativeErrorKind.Range, b"Invalid source phase request index")
+    }
+    let requests = changed.requestedModules.asMutSlice()
+    let previous = Intrinsic.replace(requests[index].sourceObject, unsafe Value.retain(unsafe common.argument(argv, 3)))
+    drop requests drop changed
+    unsafe gc.release(&mut engine, rt, previous.intoBits())
     return ValueBits.Undefined
   }
   if operation == 6 {

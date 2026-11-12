@@ -37,21 +37,16 @@ function pair(result, syscall, path) {
   return result[0];
 }
 const v = require('internal/validators');
-const { AbortError, codes: { ERR_FS_EISDIR, ERR_INVALID_ARG_TYPE, ERR_INVALID_ARG_VALUE, ERR_INVALID_FILE_URL_HOST, ERR_INVALID_FILE_URL_PATH, ERR_INVALID_URL_SCHEME, ERR_OUT_OF_RANGE } } = require('internal/errors');
+const { AbortError, codes: { ERR_FS_EISDIR, ERR_INVALID_ARG_TYPE, ERR_INVALID_ARG_VALUE, ERR_OUT_OF_RANGE } } = require('internal/errors');
 // Legacy helpers for callers that state the expectation in words.
 function invalid(name, expected) { const e = new TypeError(`The "${name}" argument must be ${expected}`); e.code = 'ERR_INVALID_ARG_TYPE'; return e; }
 function range(name) { const e = new RangeError(`The value of "${name}" is out of range`); e.code = 'ERR_OUT_OF_RANGE'; return e; }
 function integer(value, name, min = 0, max = Number.MAX_SAFE_INTEGER) { v.validateInteger(value, name, min, max); return value; }
 // Node's getValidatedPath: a string, a Uint8Array or a file: URL, without null bytes.
+let urlToPath;
 function toPathIfFileURL(value) {
-  if (value == null || typeof value !== 'object' || value.href === undefined || value.protocol === undefined) return value;
-  if (value.protocol !== 'file:') { throw new ERR_INVALID_URL_SCHEME('file'); }
-  if (value.hostname !== '' && value.hostname !== 'localhost') throw new ERR_INVALID_FILE_URL_HOST(process.platform);
-  const pathname = value.pathname;
-  for (let n = 0; n < pathname.length; n++) {
-    if (pathname[n] === '%') { const third = pathname.codePointAt(n + 2) | 0x20; if (pathname[n + 1] === '2' && third === 102) throw new ERR_INVALID_FILE_URL_PATH('must not include encoded / characters'); }
-  }
-  return decodeURIComponent(pathname);
+  urlToPath ??= require('internal/url').toPathIfFileURL;
+  return urlToPath(value);
 }
 function path(value, name = 'path') {
   value = toPathIfFileURL(value);
@@ -61,7 +56,9 @@ function path(value, name = 'path') {
   }
   if (value instanceof Uint8Array) {
     if (value.includes(0)) throw new ERR_INVALID_ARG_VALUE(name, value, 'must be a string, Uint8Array, or URL without null bytes');
-    return Buffer.from(value.buffer, value.byteOffset, value.byteLength).toString();
+    const bytes = Buffer.from(value.buffer, value.byteOffset, value.byteLength);
+    // A name that is not valid UTF-8 goes to the native operations as its raw bytes.
+    return require('buffer').isUtf8(bytes) ? bytes.toString() : value.buffer.slice(value.byteOffset, value.byteOffset + value.byteLength);
   }
   throw new ERR_INVALID_ARG_TYPE(name, ['string', 'Buffer', 'URL'], value);
 }
@@ -204,7 +201,19 @@ function encoding(value, fallback = 'utf8', bufferAllowed = false) {
   assertEncoding(value);
   return value;
 }
-function encoded(value, enc) { return enc === 'buffer' ? Buffer.from(value) : enc === 'utf8' || enc === 'utf-8' ? value : Buffer.from(value).toString(enc); }
+// A directory entry name in the requested encoding. Names arrive as strings, or as their raw
+// bytes (an ArrayBuffer) when rawNames(enc) asked scandir for them.
+function encoded(value, enc) {
+  if (typeof value !== 'string') { const bytes = Buffer.from(value); return enc === 'buffer' ? bytes : bytes.toString(enc); }
+  return enc === 'buffer' ? Buffer.from(value) : enc === 'utf8' || enc === 'utf-8' ? value : Buffer.from(value).toString(enc);
+}
+// Names that are not valid UTF-8 survive only as bytes, so every other encoding reads them raw.
+function rawNames(enc) { return enc != null && enc !== 'utf8' && enc !== 'utf-8' && String(enc).toLowerCase() !== 'utf8' && String(enc).toLowerCase() !== 'utf-8'; }
+// The path, as a Buffer, of a raw entry name inside a directory given as a string or bytes.
+function rawEntryPath(directory, name) {
+  const parent = Buffer.from(directory);
+  return Buffer.concat(parent[parent.length - 1] === 0x2f ? [parent, Buffer.from(name)] : [parent, Buffer.from('/'), Buffer.from(name)]);
+}
 function aborted(signal) { if (signal && signal.aborted) throw new AbortError(undefined, { cause: signal?.reason }); }
 // Node's Stats and BigIntStats (lib/internal/fs/utils.js): function constructors taking the
 // fields in order, with atime, mtime, ctime and birthtime as Dates made when first read.
@@ -375,4 +384,4 @@ function getDirents(path, { 0: names, 1: types }, callback) {
 // Node's validatePath and getValidatedPath live in internal/fs/utils.
 const { validatePath, getValidatedPath } = require('internal/validators');
 
-module.exports = { validatePath, getValidatedPath, defaultRmOptions, validateRmdirOptions, validateRmOptions, validateRmOptionsSync, isDirectoryError, emitRecursiveRmdirWarning, realpathCacheKey, getDirent, getDirents, kRef, kUnref, host, os, std, Buffer, constants, error, fail, pair, invalid, range, integer, path, toPathIfFileURL, fd, options, assertEncoding, mode, stringToFlags, native, callback, promiseCallback, submit, time, bytes, position, validateOffsetLengthRead, validateOffsetLengthWrite, validateStringAfterArrayBufferView, bufferArray, encoding, encoded, aborted, Stats, BigIntStats, makeStats, Dirent, StatFs, makeStatFs, v };
+module.exports = { validatePath, getValidatedPath, defaultRmOptions, validateRmdirOptions, validateRmOptions, validateRmOptionsSync, isDirectoryError, emitRecursiveRmdirWarning, realpathCacheKey, getDirent, getDirents, kRef, kUnref, host, os, std, Buffer, constants, error, fail, pair, invalid, range, integer, path, toPathIfFileURL, fd, options, assertEncoding, mode, stringToFlags, native, callback, promiseCallback, submit, time, bytes, position, validateOffsetLengthRead, validateOffsetLengthWrite, validateStringAfterArrayBufferView, bufferArray, encoding, encoded, rawNames, rawEntryPath, aborted, Stats, BigIntStats, makeStats, Dirent, StatFs, makeStatFs, v };

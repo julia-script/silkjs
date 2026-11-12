@@ -223,7 +223,9 @@ class File extends Blob {
     const name = scalarString(fileName);
     options = optionsObject(options);
     super(fileBits, options);
-    const lastModified = options.lastModified === undefined ? Date.now() : integer(options.lastModified);
+    // The dictionary member is read once, as Web IDL converts it.
+    const lastModifiedOption = options.lastModified;
+    const lastModified = lastModifiedOption === undefined ? Date.now() : integer(lastModifiedOption);
     // Web IDL signed long long conversion.
     const finite = Number.isFinite(lastModified) ? lastModified : 0;
     const wrapped = ((finite % 18446744073709551616) + 18446744073709551616) % 18446744073709551616;
