@@ -6,6 +6,8 @@ import subprocess
 import sys
 
 BUILD = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'build')
+# Another program of this package (tools/embed_smoke.py) keeps its link apart from the executable's.
+BUILD = os.environ.get('SILKJS_CLANG_BUILD', BUILD)
 arguments = sys.argv[1:]
 compiler = os.environ.get('SILK_CLANG', 'clang')
 # Compilation, inspection, preprocessing, and relocatable links do not produce
