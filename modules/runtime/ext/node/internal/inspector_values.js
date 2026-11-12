@@ -312,7 +312,8 @@ function preview(value, info, limit, withEntries = true) {
       for (const item of collectionEntries(value, subtype === 'map', 5)) {
         entries.push(subtype === 'map' ? { key: entryPreview(item[0]), value: entryPreview(item[1]) } : { value: entryPreview(item) });
       }
-      result.entries = entries;
+      // V8 leaves entries out of an empty collection's preview.
+      if (entries.length) result.entries = entries;
     }
   } else if (subtype === 'promise') {
     const details = host.getPromiseDetails(value);

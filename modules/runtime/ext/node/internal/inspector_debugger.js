@@ -156,7 +156,10 @@ function paused(payload) {
       if (data.blackbox.some(pattern => pattern.test(url))) continue;
     }
     delivered = true;
-    const reason = stepped && hits.length === 0 && payload.reason !== 'exception' ? 'step' : payload.reason || 'other';
+    // The pause --inspect-brk arms (V8's schedulePauseOnNextStatement from Node's
+    // agent) reports 'Break on start'.
+    const reason = stepped && hits.length === 0 && payload.reason !== 'exception' ? 'step'
+      : startup && hits.length === 0 && !payload.reason ? 'Break on start' : payload.reason || 'other';
     const asyncStackTrace = data.asyncDepth > 0 ? asyncTasks().asyncStackTrace(data.asyncDepth) : undefined;
     session.emit('Debugger.paused', { callFrames: frames(session, source), reason, hitBreakpoints: hits, ...(asyncStackTrace && { asyncStackTrace }) });
     if (!native(31)) break;

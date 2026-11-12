@@ -40,7 +40,9 @@ function evaluation(session, result, params) {
   const remote = session.values.remote(exception, params.objectGroup, false, !!params.generatePreview, params._context);
   return { result: remote, exceptionDetails: exceptionDetails(exception, remote) };
 }
-// V8's exceptionDetails: the throw site and stack come from the frames the error captured.
+// V8's exceptionDetails (InjectedScript::createExceptionDetails): the location is the
+// message's, where the throw statement threw (else the error's first frame), with the
+// script id and no url; the stack is the frames the error captured.
 function exceptionDetails(exception, remote) {
   const details = { exceptionId: nextException++, text: 'Uncaught', lineNumber: 0, columnNumber: 0 };
   const frames = require('internal/error_stack').framesOf(exception);
@@ -50,7 +52,11 @@ function exceptionDetails(exception, remote) {
     details.lineNumber = top.lineNumber;
     details.columnNumber = top.columnNumber;
     details.scriptId = top.scriptId;
-    if (top.url) details.url = top.url;
+    const thrown = host.captureCallSites(-4, exception);
+    if (thrown !== undefined && thrown[0] === frames[0].scriptName) {
+      details.lineNumber = thrown[1] - 1;
+      details.columnNumber = thrown[2] - 1;
+    }
     details.stackTrace = trace;
   }
   details.exception = remote;

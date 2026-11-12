@@ -662,6 +662,8 @@ Object.assign(process, {
     internalRequire('internal/permission').check('addon', module);
     throw Object.assign(new Error(`No such binding was linked: ${module}`), { code: 'ERR_INVALID_MODULE' });
   },
+  // lib/internal/bootstrap/realm.js: the bindings still allowed, as this runtime emulates them.
+  binding(module) { return internalRequire('internal/bindings').processBinding(module); },
   // Formats like console.log and writes to fd 2 at once: no streams, ticks or console.
   _rawDebug(...args) { host.writeText(2, internalRequire('util').format(...args) + '\n'); },
 });
