@@ -9,6 +9,7 @@ const { AsyncResource } = require('async_hooks');
 const { Buffer } = require('buffer');
 const { validateFunction } = require('internal/validators');
 const { codes: { ERR_SOCKET_BAD_TYPE } } = require('internal/errors');
+const { owner_symbol } = require('internal/async_hooks').symbols;
 
 const kStateSymbol = Symbol('state symbol');
 const isIP = input => typeof input === 'string' ? host.net('isIP', [input]) : 0;
@@ -53,6 +54,7 @@ class UDP {
     }
   }
   call(operation, ...args) { return host.net(operation, [this.id, ...args]); }
+  get fd() { const fd = this.closed ? -1 : this.call('fileno'); return fd >= 0 ? fd : -1; }
   // Node's handle.lookup: an IP literal of the socket's family resolves to itself.
   lookup(address, callback) {
     address ||= this.family === 4 ? '127.0.0.1' : '::1';
@@ -96,6 +98,9 @@ class UDP {
     this.queueSize = 0;
     host.net('close', [this.id]);
   }
+  // UDPWrap's owner, which cluster closes through on a disconnect.
+  get [owner_symbol]() { return this.owner; }
+  set [owner_symbol](owner) { this.owner = owner; }
   ref() { if (!this.closed) this.call('ref'); }
   unref() { if (!this.closed) this.call('unref'); }
   hasRef() { return !this.closed && !!this.call('hasRef'); }
@@ -109,4 +114,29 @@ function newHandle(type, lookup) {
   return handle;
 }
 
-module.exports = { kStateSymbol, newHandle, UDP, UV_UDP_IPV6ONLY, UV_UDP_REUSEADDR, UV_UDP_REUSEPORT };
+const { UV_EINVAL } = require('internal/net/binding').uv;
+
+function _createSocketHandle(address, port, addressType, fd, flags) {
+  const handle = newHandle(addressType);
+  let err;
+
+  if (Number.isInteger(fd) && fd > 0 && fd <= 0x7fffffff) {
+    const type = require('internal/net/binding').guessHandleType(fd);
+    if (type !== 'UDP') {
+      err = UV_EINVAL;
+    } else {
+      err = handle.open(fd);
+    }
+  } else if (port || address) {
+    err = handle.bind(address, port || 0, flags);
+  }
+
+  if (err) {
+    handle.close();
+    return err;
+  }
+
+  return handle;
+}
+
+module.exports = { kStateSymbol, _createSocketHandle, newHandle, UDP, UV_UDP_IPV6ONLY, UV_UDP_REUSEADDR, UV_UDP_REUSEPORT };

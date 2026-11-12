@@ -1,4 +1,4 @@
-// priority_queue copied from Node.js v24.22.1 lib/internal/priority_queue.js.
+// priority_queue adapted from Node.js v24.22.1 lib/internal/priority_queue.js.
 // Copyright Node.js contributors. MIT license (see vendor/node-api/LICENSE).
 'use strict';
 
@@ -8,41 +8,44 @@
 // this enables priority queues that are based on a comparison of more than
 // just a single criteria.
 
+// The fields are plain properties here, not Node's #private ones: a private
+// field access costs about twice a named one in the engine, and the timer
+// lists use this queue on every new list.
 module.exports = class PriorityQueue {
-  #compare = (a, b) => a - b;
-  #heap = [undefined, undefined];
-  #setPosition;
-  #size = 0;
+  _compare = (a, b) => a - b;
+  _heap = [undefined, undefined];
+  _setPosition = undefined;
+  _size = 0;
 
   constructor(comparator, setPosition) {
     if (comparator !== undefined)
-      this.#compare = comparator;
+      this._compare = comparator;
     if (setPosition !== undefined)
-      this.#setPosition = setPosition;
+      this._setPosition = setPosition;
   }
 
   insert(value) {
-    const heap = this.#heap;
-    const pos = ++this.#size;
+    const heap = this._heap;
+    const pos = ++this._size;
     heap[pos] = value;
 
     this.percolateUp(pos);
   }
 
   peek() {
-    return this.#heap[1];
+    return this._heap[1];
   }
 
   peekBottom() {
-    return this.#heap[this.#size];
+    return this._heap[this._size];
   }
 
   percolateDown(pos) {
-    const compare = this.#compare;
-    const setPosition = this.#setPosition;
+    const compare = this._compare;
+    const setPosition = this._setPosition;
     const hasSetPosition = setPosition !== undefined;
-    const heap = this.#heap;
-    const size = this.#size;
+    const heap = this._heap;
+    const size = this._size;
     const hsize = size >> 1;
     const item = heap[pos];
 
@@ -71,9 +74,9 @@ module.exports = class PriorityQueue {
   }
 
   percolateUp(pos) {
-    const heap = this.#heap;
-    const compare = this.#compare;
-    const setPosition = this.#setPosition;
+    const heap = this._heap;
+    const compare = this._compare;
+    const setPosition = this._setPosition;
     const hasSetPosition = setPosition !== undefined;
     const item = heap[pos];
 
@@ -94,14 +97,14 @@ module.exports = class PriorityQueue {
   }
 
   removeAt(pos) {
-    const heap = this.#heap;
-    let size = this.#size;
+    const heap = this._heap;
+    let size = this._size;
     heap[pos] = heap[size];
     heap[size] = undefined;
-    size = --this.#size;
+    size = --this._size;
 
     if (size > 0 && pos <= size) {
-      if (pos > 1 && this.#compare(heap[pos >> 1], heap[pos]) > 0)
+      if (pos > 1 && this._compare(heap[pos >> 1], heap[pos]) > 0)
         this.percolateUp(pos);
       else
         this.percolateDown(pos);
@@ -109,7 +112,7 @@ module.exports = class PriorityQueue {
   }
 
   shift() {
-    const heap = this.#heap;
+    const heap = this._heap;
     const value = heap[1];
     if (value === undefined)
       return;

@@ -35,8 +35,14 @@ function sourcePhaseNotDefined(url) {
 // ModuleCacheKey: the specifier and the attributes, in their source order.
 function cacheKey(request) {
   const names = Object.keys(request.attributes);
-  return { id: JSON.stringify([request.specifier, ...names.flatMap(name => [name, request.attributes[name]])]),
-    text: `ModuleCacheKey("${request.specifier}"${names.length ? `, {${names.map(name => `${name}: ${request.attributes[name]}`).join(', ')}}` : ''})` };
+  // Index loops: user code may have removed Array.prototype[Symbol.iterator].
+  let id = JSON.stringify(request.specifier);
+  let text = '';
+  for (let i = 0; i < names.length; i++) {
+    id += ',' + JSON.stringify(names[i]) + ':' + JSON.stringify(request.attributes[names[i]]);
+    text += (i === 0 ? '' : ', ') + `${names[i]}: ${request.attributes[names[i]]}`;
+  }
+  return { id, text: `ModuleCacheKey("${request.specifier}"${names.length ? `, {${text}}` : ''})` };
 }
 
 class ModuleWrap {
@@ -58,7 +64,7 @@ class ModuleWrap {
     if (synthetic) {
       const steps = lineOffset;
       this.#handle = host.vmModule(SYNTHETIC, url, realm && realm.handle, () => Reflect.apply(steps, this, []));
-      for (const name of source) host.vmModule(ADD_EXPORT, this.#handle, name);
+      for (let i = 0; i < source.length; i++) host.vmModule(ADD_EXPORT, this.#handle, source[i]);
       this.#linked = true;
     } else {
       try { this.#handle = host.vmModule(COMPILE, source, url, realm && realm.handle, lineOffset, columnOffset); }
@@ -86,7 +92,9 @@ class ModuleWrap {
   }
 
   getModuleRequests() {
-    return this.#requests.map(request => Object.freeze(Object.assign(Object.create(null), request)));
+    const requests = [];
+    for (let i = 0; i < this.#requests.length; i++) requests[i] = Object.freeze(Object.assign(Object.create(null), this.#requests[i]));
+    return requests;
   }
 
   link(modules) {
@@ -98,7 +106,9 @@ class ModuleWrap {
           `Module request '${key.text}' at index ${i} must be linked to the same module requested at index ${coalesced}`);
       }
     }
-    this.#linkedRequests = Array.from(modules);
+    const linked = [];
+    for (let i = 0; i < modules.length; i++) linked[i] = modules[i];
+    this.#linkedRequests = linked;
     this.#linked = true;
   }
 
@@ -133,7 +143,8 @@ class ModuleWrap {
     if (visited.has(this)) return;
     visited.add(this);
     if (this.getStatus() === kErrored) this.#terminated = true;
-    for (const dependency of this.#linkedRequests || []) dependency.#terminate(visited);
+    const linked = this.#linkedRequests || [];
+    for (let i = 0; i < linked.length; i++) linked[i].#terminate(visited);
   }
 
   // As in Node, the engine's own evaluation promise: already settled when the module

@@ -104,7 +104,7 @@ fn operation(name: &[u8]) -> i32 {
   if equal(name, b"keyQBits") { return 65 }
   if equal(name, b"checkPrime") { return 66 } if equal(name, b"generatePrime") { return 67 } if equal(name, b"cipherInfo") { return 68 }
   if equal(name, b"privateEncrypt") { return 69 } if equal(name, b"publicDecrypt") { return 70 }
-  if equal(name, b"secureHeapUsed") { return 71 } if equal(name, b"setEngine") { return 72 } if equal(name, b"keyParam") { return 73 } if equal(name, b"keyPublic") { return 74 } if equal(name, b"keyCheck") { return 75 } if equal(name, b"turboshake") { return 76 } if equal(name, b"secureHeapInit") { return 77 } if equal(name, b"secLevel") { return 78 } if equal(name, b"fipsAvailable") { return 79 } if equal(name, b"rsaPubkey") { return 80 }
+  if equal(name, b"secureHeapUsed") { return 71 } if equal(name, b"setEngine") { return 72 } if equal(name, b"keyParam") { return 73 } if equal(name, b"keyPublic") { return 74 } if equal(name, b"keyCheck") { return 75 } if equal(name, b"turboshake") { return 76 } if equal(name, b"secureHeapInit") { return 77 } if equal(name, b"secLevel") { return 78 } if equal(name, b"fipsAvailable") { return 79 } if equal(name, b"rsaPubkey") { return 80 } if equal(name, b"storeLoad") { return 81 } if equal(name, b"opensslInit") { return 82 } if equal(name, b"csprngCheck") { return 83 }
   if equal(name, b"x509Create") { return 100 } if equal(name, b"x509Raw") { return 101 } if equal(name, b"x509PEM") { return 102 }
   if equal(name, b"x509Name") { return 103 } if equal(name, b"x509Time") { return 104 } if equal(name, b"x509Fingerprint") { return 105 }
   if equal(name, b"x509Serial") { return 106 } if equal(name, b"x509PublicKey") { return 107 } if equal(name, b"x509CA") { return 108 }
@@ -166,6 +166,9 @@ pub effect fn open(main: bool) -> *mut State ! OutOfMemoryError {
   unsafe Pointer.put<State>(state, State { first: Pointer.null<Handle>(), jobs: Pointer.null<Job>(), next: 1, closing: false, main: main, configured: false })
   return state
 }
+// Every operation but the startup configuration (opensslInit, which must run
+// before any other OpenSSL call) configures the providers first.
+unsafe fn configureFor(state: *mut State, op: i32) -> () { if op != 82 { unsafe configure(state) } }
 /// Configures the providers on the main thread, the first time it is called there.
 /// Worker threads start only after the main thread called this, so it is done for them.
 pub unsafe fn configure(state: *mut State) -> () {
@@ -239,15 +242,22 @@ unsafe fn bnOutput(j: &mut Job, bn: ?*mut u8) -> bool {
 }
 // No allocator, engine, JavaScript references or runtime-global mutation below.
 unsafe fn execute(j: &mut Job) -> bool {
+  // Startup configuration runs before any OpenSSL call, which would load the
+  // default configuration first.
+  if j.op == 82 { return unsafe executeUtilities(&mut j) }
   unsafe ssl.ERR_clear_error()
   let op = j.op let h = j.handle
   if op == 6 || op == 7 || op == 8 { return unsafe executeOneShot(&mut j) }
   if op >= 60 && op <= 65 || op == 73 { return unsafe executeInformation(&mut j) }
   if op == 74 {
-    // createPublicKey(privateKeyObject): the public half of the same key, like Node's KeyObjectData.
-    j.createdKind = 4 j.resultKind = 2 j.created = unsafe publicPart(h) return !Pointer.isNull<u8>(j.created)
+    // createPublicKey(privateKeyObject) shares the same EVP_PKEY, like Node's KeyObjectData:
+    // nothing is re-encoded, so a curve without an OID only fails when it is exported.
+    if unsafe ssl.EVP_PKEY_up_ref(h) != 1 { return false }
+    j.createdKind = 4 j.resultKind = 2 j.created = h return true
   }
   if op >= 66 && op <= 72 || op == 77 || op == 78 || op == 79 || op == 80 { return unsafe executeUtilities(&mut j) }
+  if op == 81 { return unsafe storeLoad(&mut j) }
+  if op == 83 { return unsafe executeUtilities(&mut j) }
   if op == 76 { return unsafe turboShake(&mut j) }
   if op >= 100 && op <= 139 { return unsafe executeCertificates(&mut j) }
   if op == 148 { return unsafe executeProviderRawImport(&mut j) }
@@ -326,6 +336,68 @@ unsafe fn execute(j: &mut Job) -> bool {
 export "C" fn silkCryptoNoPassphrase(buffer: ?*mut u8, size: i32, writing: i32, asked: ?*mut u8) -> i32 {
   if !Pointer.isNull<u8>(asked) { unsafe Pointer.put<u8>(unsafe nonnull(asked), 1) }
   return -1
+}
+// ncrypto's StorePasswordCallback over the passphrase block crypto.js builds:
+// [has passphrase, asked without one, length (u32 LE), passphrase bytes].
+export "C" fn silkCryptoStorePassphrase(buffer: ?*mut u8, size: i32, writing: i32, block: ?*mut u8) -> i32 {
+  if Pointer.isNull<u8>(block) { return -1 }
+  if unsafe Pointer.read<u8>(unsafe buffers.dataAt(block, 0)) == 0 {
+    unsafe Pointer.put<u8>(unsafe buffers.dataAt(block, 1), 1)
+    return -1
+  }
+  let length = unsafe providerReadU32(block, 2)
+  if size <= 0 || i32.toU32(size) < length { return -1 }
+  let mut i: u32 = 0
+  while i < length {
+    unsafe Pointer.put<u8>(unsafe buffers.dataAt(buffer, u32.toU64(i)), unsafe Pointer.read<u8>(unsafe buffers.dataAt(block, u32.toU64(i) + 6)))
+    i = i + 1
+  }
+  return u32.toI32(length)
+}
+// ncrypto TryLoadPrivateKeyFromStore: data[0] the URI, data[1] the property
+// query (empty for none), data[2] the passphrase block. The first private
+// key the loader yields becomes the handle.
+unsafe fn storeLoad(j: &mut Job) -> bool {
+  let callback: ssl.PasswordCallback = silkCryptoStorePassphrase
+  let method = unsafe ssl.UI_UTIL_wrap_read_pem_callback(callback, 0)
+  if Pointer.isNull<u8>(method) { return false }
+  let mut properties = nil()
+  if j.lengths[1] != 0 { properties = j.data[1] }
+  let params = [providerEnd()]
+  let ctx = unsafe pssl.OSSL_STORE_open_ex(j.data[0], nil(), properties, method, j.data[2], Pointer.fromRef<pssl.Param>(&params[0]), nil(), nil())
+  let mut key = nil() let mut failed = Pointer.isNull<u8>(ctx)
+  // OSSL_STORE_INFO_PKEY
+  if !failed && unsafe pssl.OSSL_STORE_expect(ctx, 4) != 1 { failed = true }
+  while !failed && Pointer.isNull<u8>(key) && unsafe pssl.OSSL_STORE_eof(ctx) == 0 {
+    let info = unsafe pssl.OSSL_STORE_load(ctx)
+    if Pointer.isNull<u8>(info) {
+      if unsafe pssl.OSSL_STORE_error(ctx) != 0 { failed = true }
+    } else {
+      if unsafe pssl.OSSL_STORE_INFO_get_type(info) == 4 {
+        key = unsafe pssl.OSSL_STORE_INFO_get1_PKEY(info)
+        if Pointer.isNull<u8>(key) { failed = true }
+      }
+      unsafe pssl.OSSL_STORE_INFO_free(info)
+    }
+  }
+  // Loaders that declined the URI leave their errors oldest-first, so the
+  // newest names the loader that handled it; read it before closing.
+  let last = unsafe ssl.ERR_peek_last_error()
+  if !Pointer.isNull<u8>(ctx) { let _closed = unsafe pssl.OSSL_STORE_close(ctx) }
+  unsafe ssl.UI_destroy_method(method)
+  let asked = unsafe Pointer.read<u8>(unsafe buffers.dataAt(j.data[2], 1)) != 0
+  if !Pointer.isNull<u8>(key) {
+    unsafe ssl.ERR_clear_error()
+    j.createdKind = 4 j.resultKind = 2 j.created = key
+    return true
+  }
+  if asked { return unsafe providerFailure(&mut j, b"ERR_MISSING_PASSPHRASE: Passphrase required for encrypted key") }
+  if !failed { return unsafe providerFailure(&mut j, b"ERR_CRYPTO_OPERATION_FAILED: No private key found through the OpenSSL STORE loader") }
+  if last == 0 { return unsafe providerFailure(&mut j, b"ERR_CRYPTO_OPERATION_FAILED: Failed to load private key through an OpenSSL STORE loader") }
+  unsafe ssl.ERR_clear_error()
+  unsafe ssl.ERR_error_string_n(last, j.error, 256)
+  j.codedError = false
+  return false
 }
 unsafe fn decodeKey(slot: *mut ?*mut u8, format: ?*mut u8, structure: ?*mut u8, keyType: ?*mut u8, bio: ?*mut u8, selection: i32, passphrase: ?*mut u8, length: usize, hasPassphrase: bool, asked: *mut u8) -> bool {
   let decoder = unsafe ssl.OSSL_DECODER_CTX_new_for_pkey(slot, format, structure, keyType, selection, nil(), nil())
@@ -483,6 +555,13 @@ unsafe fn executeKey(j: &mut Job) -> bool {
       let mut params = [unsafe providerParam(b"encoding\0", 4, Pointer.fromMutRef<u8>(&mut explicit[0]), 8), providerEnd()]
       ok = unsafe pssl.EVP_PKEY_CTX_set_params(ctx, Pointer.fromMutRef<pssl.Param>(&mut params[0])) == 1
     }
+    if ok && j.numbers[7] == 4 {
+      // Like Node (EVP_PKEY_CTX_set_ec_param_enc with OPENSSL_EC_NAMED_CURVE), a named EC key
+      // keeps the named encoding, so a curve without an OID fails to encode (missing OID).
+      let mut named: [u8; 12] = [110, 97, 109, 101, 100, 95, 99, 117, 114, 118, 101, 0]
+      let mut params = [unsafe providerParam(b"encoding\0", 4, Pointer.fromMutRef<u8>(&mut named[0]), 11), providerEnd()]
+      ok = unsafe pssl.EVP_PKEY_CTX_set_params(ctx, Pointer.fromMutRef<pssl.Param>(&mut params[0])) == 1
+    }
     if j.lengths[3] != 0 {
       let exponent = unsafe ssl.BN_bin2bn(j.data[3], usize.toI32(j.lengths[3]), nil())
       ok = ok && !Pointer.isNull<u8>(exponent) && unsafe ssl.EVP_PKEY_CTX_set1_rsa_keygen_pubexp(ctx, exponent) == 1
@@ -492,7 +571,19 @@ unsafe fn executeKey(j: &mut Job) -> bool {
     if j.lengths[5] != 0 { ok = ok && unsafe ssl.EVP_PKEY_CTX_set_rsa_pss_keygen_mgf1_md_name(ctx, j.data[5]) == 1 }
     if j.numbers[6] >= 0 { ok = ok && unsafe ssl.EVP_PKEY_CTX_set_rsa_pss_keygen_saltlen(ctx, i64.toI32(j.numbers[6])) == 1 }
     ok = ok && unsafe ssl.EVP_PKEY_keygen(ctx, Pointer.fromMutRef<?*mut u8>(&mut j.created)) == 1
-    unsafe ssl.EVP_PKEY_CTX_free(ctx) return ok
+    unsafe ssl.EVP_PKEY_CTX_free(ctx)
+    // An RSA-PSS key restricted to a digest the PSS parameters cannot name
+    // (a truncated SHA-2 such as sha256-192) has no SubjectPublicKeyInfo.
+    // Node's generation fails for it, so it is reported the same way.
+    if ok && (j.lengths[4] != 0 || j.lengths[5] != 0) {
+      let mut encoded = nil()
+      let length = unsafe ssl.i2d_PUBKEY(j.created, Pointer.fromMutRef<?*mut u8>(&mut encoded))
+      unsafe ssl.CRYPTO_free(encoded, nil(), 0)
+      if length <= 0 { unsafe ssl.EVP_PKEY_free(j.created) j.created = nil() ok = false unsafe ssl.ERR_clear_error() }
+    }
+    // KeyGenJob: a failure that leaves no OpenSSL error is "Key generation job failed".
+    if !ok && unsafe ssl.ERR_peek_error() == 0 { return unsafe providerFailure(&mut j, b"Key generation job failed") }
+    return ok
   }
   if (op == 33 || op == 34) && j.numbers[7] == 1 { return unsafe streamSignature(&mut j) }
   if op == 33 || op == 34 {
@@ -762,7 +853,7 @@ pub unsafe effect fn dispatch<'m, S: EngineServices>(engine: &mut Engine<'m, S>,
   match move prepared { Result<(), OutOfMemoryError | JsException>.Success { .. } => () Result<(), OutOfMemoryError | JsException>.Failure { error } => { unsafe destroyJob(j) fail move error } }
   let entry2 = unsafe Pointer.borrowMut<(), Job>(&mut anchor, j)
   if entry2.op == 99 { unsafe releaseHandle(state, i64.toI32(entry2.numbers[0])) entry2.resultKind = 4 }
-  else { if !unsafe execute(&mut entry2) { unsafe recordError(&mut entry2) } }
+  else { unsafe configureFor(state, entry2.op) if !unsafe execute(&mut entry2) { unsafe recordError(&mut entry2) } }
   let converted = run Effect.result(unsafe finish(&mut engine, context, state, &mut entry2)) drop entry2
   unsafe destroyJob(j)
   return match move converted { Result<ValueBits, OutOfMemoryError | JsException>.Success { value } => value Result<ValueBits, OutOfMemoryError | JsException>.Failure { error } => { fail move error } }
@@ -785,6 +876,7 @@ pub unsafe effect fn submit<'m, S: EngineServices>(engine: &mut Engine<'m, S>, c
   let prepared = run Effect.result(unsafe prepare(&mut engine, context, state, &mut entry, argv, true)) drop entry
   match move prepared { Result<(), OutOfMemoryError | JsException>.Success { .. } => () Result<(), OutOfMemoryError | JsException>.Failure { error } => { unsafe destroyJob(j) fail move error } }
   let entry2 = unsafe Pointer.borrowMut<(), Job>(&mut mutable, j)
+  unsafe configureFor(state, entry2.op)
   entry2.callback = unsafe (unsafe common.argument(argv, 2)).retained()
   let mut stateAnchor = () let s2 = unsafe Pointer.borrowMut<(), State>(&mut stateAnchor, state)
   entry2.next = s2.jobs s2.jobs = j drop s2
@@ -1162,6 +1254,35 @@ unsafe fn executeUtilities(j: &mut Job) -> bool {
     unsafe ssl.ERR_clear_error()
     return true
   }
+  if j.op == 82 {
+    // Node's InitializeOncePerProcess: the configuration file (data[0], empty
+    // for OpenSSL's default) loads under the appname in data[1] before any
+    // other OpenSSL use; a missing file is ignored.
+    let settings = unsafe ssl.OPENSSL_INIT_new()
+    if Pointer.isNull<u8>(settings) { return false }
+    if j.lengths[0] != 0 { let _set = unsafe ssl.OPENSSL_INIT_set_config_filename(settings, j.data[0]) }
+    let _named = unsafe ssl.OPENSSL_INIT_set_config_appname(settings, j.data[1])
+    // CONF_MFLAGS_IGNORE_MISSING_FILE
+    unsafe ssl.OPENSSL_INIT_set_config_file_flags(settings, 16)
+    // OPENSSL_INIT_LOAD_CONFIG
+    let _loaded = unsafe ssl.OPENSSL_init_crypto(64, settings)
+    unsafe ssl.OPENSSL_INIT_free(settings)
+    j.resultKind = 1 j.result = 1
+    return unsafe ssl.ERR_peek_error() == 0
+  }
+  if j.op == 83 {
+    // crypto::CSPRNG(nullptr, 0): whether the random generator can be seeded.
+    j.resultKind = 1 j.result = 0
+    // ncrypto polls while RAND_poll succeeds; a generator that cannot be
+    // fetched (no provider with a DRBG) can keep RAND_poll succeeding, so the
+    // retries are bounded.
+    let mut seeded = unsafe ssl.RAND_status() == 1
+    let mut polls = 0
+    while !seeded && polls < 8 && unsafe ssl.RAND_poll() == 1 { seeded = unsafe ssl.RAND_status() == 1 polls = polls + 1 }
+    if seeded { j.result = 1 }
+    unsafe ssl.ERR_clear_error()
+    return true
+  }
   if j.op == 78 {
     // Node's GetOpenSSLSecLevelCrypto: the level a default TLS connection gets.
     j.resultKind = 1 j.result = -1
@@ -1341,7 +1462,10 @@ unsafe fn executeCertificates(j: &mut Job) -> bool {
     if op == 104 {
       let mut time = unsafe xssl.X509_get0_notBefore(h)
       if j.numbers[1] != 0 { time = unsafe xssl.X509_get0_notAfter(h) }
-      ok = unsafe xssl.ASN1_TIME_print(bio, time) == 1
+      // ASN1_TIME_print writes "Bad time value" for a malformed time and
+      // returns 0; ncrypto keeps that text as the result.
+      ok = unsafe xssl.ASN1_TIME_print(bio, time) == 1 || unsafe ssl.BIO_ctrl(bio, 10, 0, nil()) > 0
+      unsafe ssl.ERR_clear_error()
     }
     if op == 122 {
       let mut input = j.data[0]

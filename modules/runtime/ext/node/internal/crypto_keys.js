@@ -1,5 +1,7 @@
 'use strict';
 const { Buffer, bytes, error } = require('internal/crypto_core');
+// JWK members are defined, as Node's C++ export does, so inherited setters never run.
+const dataProperty = (object, key, value) => Object.defineProperty(object, key, { __proto__: null, value, writable: true, enumerable: true, configurable: true });
 const fail = () => { throw error('ERR_CRYPTO_INVALID_JWK', 'Invalid key encoding'); };
 function length(n) { if (n < 128) return Buffer.from([n]); const out = []; while (n) { out.unshift(n & 255); n = Math.floor(n / 256); } return Buffer.from([128 | out.length, ...out]); }
 function tlv(tag, value) { value = Buffer.from(value); return Buffer.concat([Buffer.from([tag]), length(value.length), value]); }
@@ -55,7 +57,7 @@ const jwkMessages = { RSA: 'Invalid JWK RSA key', EC: 'Invalid JWK EC key', OKP:
 // ImportJWKRawKey for AKP: `alg` names an available ML-DSA, ML-KEM or SLH-DSA
 // key; `priv` is its seed (ML-*) or private key (SLH-DSA) and must match `pub`.
 const pqcNames = ['ML-DSA-44', 'ML-DSA-65', 'ML-DSA-87', 'ML-KEM-512', 'ML-KEM-768', 'ML-KEM-1024'];
-for (const hash of ['SHA2', 'SHAKE']) for (const size of ['128', '192', '256']) for (const kind of ['s', 'f']) pqcNames.push(`SLH-DSA-${hash}-${size}${kind}`);
+{ const hashes = ['SHA2', 'SHAKE'], sizes = ['128', '192', '256'], kinds = ['s', 'f']; for (let h = 0; h < 2; h++) for (let s = 0; s < 3; s++) for (let k = 0; k < 2; k++) pqcNames[pqcNames.length] = `SLH-DSA-${hashes[h]}-${sizes[s]}${kinds[k]}`; }
 function importAkp(jwk, type) {
   const c = require('internal/crypto_core');
   if (!pqcNames.includes(jwk.alg) || !c.call('providerAvailable', ['key', jwk.alg])) jwkFail('Unsupported JWK AKP "alg"');
@@ -84,7 +86,7 @@ function exportAkp(key) {
     let priv;
     try { priv = c.providerRawExport(key, { format: type.startsWith('ml-') ? 'raw-seed' : 'raw-private' }); }
     catch { throw error('ERR_CRYPTO_OPERATION_FAILED', 'key does not have an available seed'); }
-    result.priv = b64(priv);
+    dataProperty(result, 'priv', b64(priv));
   }
   return result;
 }
@@ -104,18 +106,20 @@ function importJwk(jwk, type) {
 function exportJwk(key, encoded, publicEncoded) {
   const real = require('internal/host').types.isKeyObject(key), c = require('internal/crypto_core');
   if (real && pqcNames.some(name => name.toLowerCase() === c.keyObjectAsymmetricType(key))) return exportAkp(key);
+  // Like Node's ExportJWKEcKey, the curve is checked before anything is encoded.
+  if (real && c.keyObjectAsymmetricType(key) === 'ec') { const namedCurve = c.keyObjectDetails(key).namedCurve; if (!curves[jwkCurveAliases[namedCurve] ?? namedCurve]) throw error('ERR_CRYPTO_JWK_UNSUPPORTED_CURVE', `Unsupported JWK EC curve: ${namedCurve}.`); }
   const privateKey = (real ? c.keyObjectType(key) : key.type) === 'private'; const nodes = root(encoded || c.keyObjectDer(key)); const algorithm = children(nodes[privateKey ? 1 : 0].data); if (!algorithm[0] || algorithm[0].tag !== 6) fail(); const id = algorithm[0].data.toString('hex'); let payload = nodes[privateKey ? 2 : 1].data; if (!privateKey) { if (payload[0] !== 0) fail(); payload = payload.subarray(1); }
-  if (id === rsaOid) { const parts = root(payload); const names = privateKey ? ['n', 'e', 'd', 'p', 'q', 'dp', 'dq', 'qi'] : ['n', 'e']; const result = { kty: 'RSA' }; names.forEach((name, i) => { result[name] = b64(unsigned(parts[i + (privateKey ? 1 : 0)])); }); if (privateKey && parts[9]) result.oth = children(parts[9].data).map(prime => { const [r, d, t] = children(prime.data); return { r: b64(unsigned(r)), d: b64(unsigned(d)), t: b64(unsigned(t)) }; }); return result; }
+  if (id === rsaOid) { const parts = root(payload); const names = privateKey ? ['n', 'e', 'd', 'p', 'q', 'dp', 'dq', 'qi'] : ['n', 'e']; const result = { kty: 'RSA' }; names.forEach((name, i) => { dataProperty(result, name, b64(unsigned(parts[i + (privateKey ? 1 : 0)]))); }); if (privateKey && parts[9]) dataProperty(result, 'oth', children(parts[9].data).map(prime => { const fields = children(prime.data), r = fields[0], d = fields[1], t = fields[2]; return { r: b64(unsigned(r)), d: b64(unsigned(d)), t: b64(unsigned(t)) }; })); return result; }
   if (id === ecOid) {
     const named = algorithm[1] && algorithm[1].data.toString('hex'), crv = Object.keys(curves).find(k => curves[k].oid === named);
     if (!crv) throw error('ERR_CRYPTO_JWK_UNSUPPORTED_CURVE', `Unsupported JWK EC curve: ${real ? c.keyObjectDetails(key).namedCurve : named}.`);
     let pub = payload, d;
-    if (privateKey) { const parts = root(payload); d = parts[1].data; const publicPart = parts.find(p => p.tag === 161); if (publicPart) pub = parse(publicPart.data).data.subarray(1); else { let result; if (publicEncoded) result = exportJwk({ type: 'public' }, publicEncoded); else { const publicKey = require('crypto').createPublicKey(key); try { result = exportJwk(publicKey); } finally { require('internal/crypto_core').release(publicKey); } } result.d = b64(d); return result; } }
+    if (privateKey) { const parts = root(payload); d = parts[1].data; const publicPart = parts.find(p => p.tag === 161); if (publicPart) pub = parse(publicPart.data).data.subarray(1); else { let result; if (publicEncoded) result = exportJwk({ type: 'public' }, publicEncoded); else { const publicKey = require('crypto').createPublicKey(key); try { result = exportJwk(publicKey); } finally { require('internal/crypto_core').release(publicKey); } } dataProperty(result, 'd', b64(d)); return result; } }
     const size = curves[crv].size; if (pub[0] !== 4 || pub.length !== size * 2 + 1) fail();
-    const result = { kty: 'EC', x: b64(pub.subarray(1, size + 1)), y: b64(pub.subarray(size + 1)), crv }; if (privateKey) result.d = b64(d); return result;
+    const result = { kty: 'EC', x: b64(pub.subarray(1, size + 1)), y: b64(pub.subarray(size + 1)), crv }; if (privateKey) dataProperty(result, 'd', b64(d)); return result;
   }
   const crv = Object.keys(okp).find(k => okp[k] === id);
-  if (crv) { let x = payload, d; if (privateKey) { d = parse(payload).data; if (publicEncoded) x = decode(exportJwk({ type: 'public' }, publicEncoded).x); else { const publicKey = require('crypto').createPublicKey(key); try { x = decode(exportJwk(publicKey).x); } finally { require('internal/crypto_core').release(publicKey); } } } const result = { crv, x: b64(x), kty: 'OKP' }; if (privateKey) result.d = b64(d); return result; }
+  if (crv) { let x = payload, d; if (privateKey) { d = parse(payload).data; if (publicEncoded) x = decode(exportJwk({ type: 'public' }, publicEncoded).x); else { const publicKey = require('crypto').createPublicKey(key); try { x = decode(exportJwk(publicKey).x); } finally { require('internal/crypto_core').release(publicKey); } } } const result = { crv, x: b64(x), kty: 'OKP' }; if (privateKey) dataProperty(result, 'd', b64(d)); return result; }
   throw error('ERR_CRYPTO_JWK_UNSUPPORTED_KEY_TYPE', 'Unsupported JWK Key Type.');
 }
 function signature(data, size, toDer) { data = bytes(data); if (toDer) { if (data.length !== size * 2) throw error('ERR_CRYPTO_INVALID_SIGNATURE', 'Invalid P1363 signature length'); return sequence(integer(data.subarray(0, size)), integer(data.subarray(size))); } const parts = root(data); if (parts.length !== 2) fail(); const result = Buffer.alloc(size * 2); parts.forEach((part, i) => { const b = unsigned(part); if (b.length > size) fail(); result.set(b, (i + 1) * size - b.length); }); return result; }

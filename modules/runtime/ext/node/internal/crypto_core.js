@@ -1,6 +1,12 @@
 'use strict';
 const host = require('internal/host');
 const { Buffer } = require('buffer');
+// Captured at load: crypto inputs never reach a user-replaced Buffer.from.
+const bufferFrom = Buffer.from.bind(Buffer);
+// Brand checks, so ArrayBuffers from another realm (vm contexts) are accepted too.
+const types = require('util/types');
+const isAnyArrayBuffer = value => value instanceof ArrayBuffer || typeof value === 'object' && value !== null && types.isAnyArrayBuffer(value);
+const isShared = buffer => !(buffer instanceof ArrayBuffer) && typeof SharedArrayBuffer !== 'undefined' && types.isSharedArrayBuffer(buffer);
 const ids = new WeakMap();
 const finalizers = new FinalizationRegistry(id => host.crypto('release', [id]));
 function error(code, message, Type = Error) { const e = new Type(message); e.code = code; return e; }
@@ -8,13 +14,13 @@ function invalid(name, type) { return error('ERR_INVALID_ARG_TYPE', `The "${name
 function integer(n, name, min = 0, max = 0x7fffffff) { require('internal/validators').validateInteger(n, name, min, max); return n; }
 function callback(cb) { if (typeof cb !== 'function') throw invalid('callback', 'a function'); return cb; }
 function bytes(value, encoding, name = 'data') {
-  if (typeof value === 'string') return Buffer.from(value, encoding);
-  if (ArrayBuffer.isView(value)) return Buffer.from(value.buffer, value.byteOffset, value.byteLength);
-  if (value instanceof ArrayBuffer || typeof SharedArrayBuffer !== 'undefined' && value instanceof SharedArrayBuffer) return Buffer.from(value);
+  if (typeof value === 'string') return bufferFrom(value, encoding);
+  if (ArrayBuffer.isView(value)) return bufferFrom(value.buffer, value.byteOffset, value.byteLength);
+  if (isAnyArrayBuffer(value)) return bufferFrom(value);
   throw invalid(name, 'a string, ArrayBuffer, Buffer, TypedArray, or DataView');
 }
 function binary(value, name = 'buffer') { if (typeof value === 'string') throw invalid(name, 'an ArrayBuffer or ArrayBufferView'); return bytes(value, undefined, name); }
-function packed(value) { const b = bytes(value); return b.byteOffset === 0 && b.byteLength === b.buffer.byteLength && !(typeof SharedArrayBuffer !== 'undefined' && b.buffer instanceof SharedArrayBuffer) ? b.buffer : b.buffer.slice(b.byteOffset, b.byteOffset + b.byteLength); }
+function packed(value) { const b = bytes(value); return b.byteOffset === 0 && b.byteLength === b.buffer.byteLength && !isShared(b.buffer) ? b.buffer : b.buffer.slice(b.byteOffset, b.byteOffset + b.byteLength); }
 const opensslLibraries = { 2: 'SYS', 3: 'BN', 4: 'RSA', 5: 'DH', 6: 'EVP', 7: 'BUF', 8: 'OBJ', 9: 'PEM', 10: 'DSA', 11: 'X509', 13: 'ASN1', 14: 'CONF', 15: 'CRYPTO', 16: 'EC', 20: 'SSL', 32: 'BIO', 33: 'PKCS7', 34: 'X509V3', 35: 'PKCS12', 36: 'RAND', 37: 'DSO', 38: 'ENGINE', 39: 'OCSP', 40: 'UI', 41: 'COMP', 42: 'ECDSA', 43: 'ECDH', 44: 'OSSL_STORE', 45: 'FIPS', 46: 'CMS', 47: 'TS', 48: 'HMAC', 50: 'CT', 51: 'ASYNC', 52: 'KDF', 53: 'SM2', 128: 'USER' };
 function normalize(e) {
   if (!(e instanceof Error)) e = new Error(String(e));
@@ -47,7 +53,7 @@ function submit(op, args, cb, convert = x => x) {
     });
   } catch (e) { resource.emitDestroy(); throw normalize(e); }
 }
-function output(value, encoding) { const b = Buffer.from(value); return encoding && encoding !== 'buffer' ? b.toString(encoding) : b; }
+function output(value, encoding) { const b = bufferFrom(value); return encoding && encoding !== 'buffer' ? b.toString(encoding) : b; }
 function attach(object, id) { try { ids.set(object, id); finalizers.register(object, id, object); } catch (e) { call('release', [id]); throw e; } return object; }
 function handle(object) { const id = ids.get(object); if (id === undefined) throw error('ERR_CRYPTO_INVALID_STATE', 'Crypto object has been finalized'); return id; }
 // `object` uses the native object of `owner`, which stays alive while it does.
@@ -121,7 +127,6 @@ const typedArrayByteLength = getter(Object.getPrototypeOf(Uint8Array.prototype),
 const arrayBufferByteLength = getter(ArrayBuffer.prototype, 'byteLength');
 const sharedArrayBufferByteLength = typeof SharedArrayBuffer === 'undefined' ? undefined : getter(SharedArrayBuffer.prototype, 'byteLength');
 function byteLength(value) { if (value instanceof DataView) return dataViewByteLength(value); if (isView(value)) return typedArrayByteLength(value); if (value instanceof ArrayBuffer) return arrayBufferByteLength(value); return sharedArrayBufferByteLength(value); }
-const isAnyArrayBuffer = value => value instanceof ArrayBuffer || typeof SharedArrayBuffer !== 'undefined' && value instanceof SharedArrayBuffer;
 const validate = {
   string(value, name) { if (typeof value !== 'string') throw codes.ERR_INVALID_ARG_TYPE(name, 'string', value); },
   number(value, name, min, max) {
@@ -149,9 +154,11 @@ const validate = {
   // lib/internal/crypto/util.js getArrayBufferOrView
   bufferSource(value, name, encoding) {
     if (isAnyArrayBuffer(value)) return value;
-    if (typeof value === 'string') { if (encoding === 'buffer') encoding = 'utf8'; return Buffer.from(value, encoding); }
+    if (typeof value === 'string') { if (encoding === 'buffer') encoding = 'utf8'; return bufferFrom(value, encoding); }
     if (!isView(value)) throw codes.ERR_INVALID_ARG_TYPE(name, ['string', 'ArrayBuffer', 'Buffer', 'TypedArray', 'DataView'], value);
     return value;
   },
 };
-module.exports = { Buffer, error, invalid, integer, callback, bytes, binary, packed, normalize, call, submit, output, attach, share, handle, release, name, codes, validate, isAnyArrayBuffer, byteLength };
+// internal/crypto/util's kHandle: the native handle slot of Hash and friends.
+const kHandle = Symbol('kHandle');
+module.exports = { kHandle, Buffer, error, invalid, integer, callback, bytes, binary, packed, normalize, call, submit, output, attach, share, handle, release, name, codes, validate, isAnyArrayBuffer, byteLength };

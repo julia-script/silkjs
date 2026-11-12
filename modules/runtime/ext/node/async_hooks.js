@@ -1,6 +1,7 @@
 'use strict';
 
 const host = require('internal/host');
+const RunScope = require('internal/async_local_storage/run_scope');
 const apply = Reflect.apply;
 const hookNames = ['init', 'before', 'after', 'destroy', 'promiseResolve'];
 const hooks = new Set();
@@ -14,6 +15,20 @@ const resourceOwnerToken = Symbol('resourceOwner');
 let nextId = 2;
 let emitting = false;
 let pendingDestroy = [];
+// Node's async_hook_fields counters: enabled hooks per callback kind (kInit..kPromiseResolve)
+// and their total (kTotals), kept current by enable() and disable().
+const hookFields = new Uint32Array(6);
+function countHookFields() {
+  hookFields.fill(0);
+  for (const hook of hooks) {
+    for (let index = 0; index < hookNames.length; index++) {
+      if (hook.callbacks[hookNames[index]] !== undefined) { hookFields[index]++; hookFields[5]++; }
+    }
+  }
+}
+// Node's getPromiseHooks: the init, before, after and settled functions that
+// setPromiseHooks installed (internal/promise_hooks), undefined where none is.
+function getPromiseHooks() { return promiseHookFunctions.slice(); }
 
 function error(code, message, Kind = TypeError) {
   const value = new Kind(message);
@@ -54,7 +69,9 @@ function emit(name, args, promise = false) {
   emitting = true;
   syncNativeHooks();
   try {
-    for (const hook of listeners) {
+    // An index loop: user code may have replaced Array.prototype[Symbol.iterator].
+    for (let i = 0; i < listeners.length; i++) {
+      const hook = listeners[i];
       if (promise && !hook.trackPromises) continue;
       const callback = hook.callbacks[name];
       if (callback !== undefined) apply(callback, hook, args);
@@ -98,7 +115,7 @@ function drainDestroy() {
   if (pendingDestroy.length === 0) return;
   const pending = pendingDestroy;
   pendingDestroy = [];
-  for (const state of pending) emit('destroy', [state.id], state.promise);
+  for (let index = 0; index < pending.length; index++) emit('destroy', [pending[index].id], pending[index].promise);
 }
 
 class AsyncHook {
@@ -114,8 +131,8 @@ class AsyncHook {
     this.trackPromises = callbacks.trackPromises !== false;
     if (!this.trackPromises && this.callbacks.promiseResolve !== undefined) throw error('ERR_INVALID_ARG_VALUE', 'trackPromises must not be false when promiseResolve is enabled');
   }
-  enable() { hooks.add(this); syncNativeHooks(); return this; }
-  disable() { hooks.delete(this); syncNativeHooks(); return this; }
+  enable() { hooks.add(this); countHookFields(); syncNativeHooks(); return this; }
+  disable() { hooks.delete(this); countHookFields(); syncNativeHooks(); return this; }
 }
 function createHook(callbacks) { return new AsyncHook(callbacks); }
 let enterResource, leaveResource, invokeIn;
@@ -126,7 +143,8 @@ const kId = Symbol('asyncId'), kScope = Symbol('asyncScope'), kStack = Symbol('a
 function frameScope(id, trigger, resource) { return { stores: undefined, id, trigger, resource }; }
 
 class AsyncResource {
-  #context;
+  // Only the stores: the whole context would keep the resource that was current alive.
+  #stores;
   #id;
   #trigger;
   #destroy;
@@ -171,14 +189,14 @@ class AsyncResource {
   [kStack]() { return this.#previousContexts ??= []; }
   [kScope](omitFrame) {
     if (omitFrame && usesContextFrames()) return frameScope(this.#id, this.#trigger, this.#owner ?? this);
-    return this.#scope ??= { stores: this.#context?.stores, id: this.#id, trigger: this.#trigger, resource: this.#owner ?? this };
+    return this.#scope ??= { stores: this.#stores, id: this.#id, trigger: this.#trigger, resource: this.#owner ?? this };
   }
   constructor(type, options = {}, token, owner, explicitId) {
     if (typeof type !== 'string') throw error('ERR_INVALID_ARG_TYPE', 'The "type" argument must be a string');
     if (type.length === 0 && Array.from(hooks).some(hook => hook.callbacks.init !== undefined)) throw error('ERR_ASYNC_TYPE', 'Invalid name for async "type"');
     const trigger = typeof options === 'number' ? options : options.triggerAsyncId ?? executionAsyncId();
     if (!Number.isSafeInteger(trigger) || trigger < -1) throw error('ERR_INVALID_ASYNC_ID', `Invalid triggerAsyncId value: ${trigger}`, RangeError);
-    this.#context = captureContext();
+    this.#stores = captureContext()?.stores;
     this.#id = token === resourceOwnerToken && typeof explicitId === 'number' && explicitId !== -1 ? explicitId : nextId++;
     this.#trigger = trigger;
     this.#destroy = { id: this.#id, destroyed: false, promise: false };
@@ -224,7 +242,8 @@ class InternalResource {
     if (typeof type !== 'string') throw error('ERR_INVALID_ARG_TYPE', 'The "type" argument must be a string');
     if (hooks.size !== 0 && type.length === 0 && Array.from(hooks).some(hook => hook.callbacks.init !== undefined)) throw error('ERR_ASYNC_TYPE', 'Invalid name for async "type"');
     const context = captureContext();
-    this.context = context;
+    // Only the stores: the whole context would keep the resource that was current alive.
+    this.stores = context?.stores;
     this.id = typeof explicitId === 'number' && explicitId !== -1 ? explicitId : nextId++;
     this.trigger = context?.id ?? 1;
     this.owner = owner;
@@ -238,7 +257,7 @@ class InternalResource {
   [kStack]() { return this.stack ??= []; }
   [kScope](omitFrame) {
     if (omitFrame && usesContextFrames()) return frameScope(this.id, this.trigger, this.owner ?? this);
-    return this.scope ??= { stores: this.context?.stores, id: this.id, trigger: this.trigger, resource: this.owner ?? this };
+    return this.scope ??= { stores: this.stores, id: this.id, trigger: this.trigger, resource: this.owner ?? this };
   }
   asyncId() { return this.id; }
   triggerAsyncId() { return this.trigger; }
@@ -258,13 +277,19 @@ Object.defineProperties(AsyncContextFrame.prototype, frameDescriptors);
 Object.setPrototypeOf(AsyncContextFrame.prototype, null);
 function usesContextFrames() { return host.asyncContextFrame !== false; }
 
+// With --no-async-context-frame the stores are Node's legacy layout: a null-prototype
+// object keyed by each storage's kResourceStore symbol, which resources keep under
+// internal/async_hooks async_local_storage_context_symbol.
+function legacyStores(stores) { return Object.assign({ __proto__: null }, stores); }
 class AsyncLocalStorage {
-  #key = {};
-  #enabled = false;
   #defaultValue;
   #name;
   constructor(options = {}) {
     if (options === null || typeof options !== 'object') throw error('ERR_INVALID_ARG_TYPE', 'The "options" argument must be an object');
+    if (!usesContextFrames()) {
+      this.kResourceStore = Symbol('kResourceStore');
+      this.enabled = true;
+    }
     this.#defaultValue = options.defaultValue;
     this.#name = options.name === undefined ? '' : `${options.name}`;
   }
@@ -272,55 +297,64 @@ class AsyncLocalStorage {
   disable() {
     const context = captureContext();
     if (usesContextFrames()) { context?.stores?.delete(this); return; }
-    if (context?.stores?.has(this.#key)) {
-      const stores = new Map(context.stores);
-      stores.delete(this.#key);
-      host.setAsyncContext({ stores, id: context.id, trigger: context.trigger, resource: context.resource });
-    }
-    this.#enabled = false;
-    this.#key = {};
+    this.enabled = false;
   }
   getStore() {
-    if (usesContextFrames()) {
-      const stores = captureContext()?.stores;
-      return stores?.has(this) ? stores.get(this) : this.#defaultValue;
-    }
-    if (!this.#enabled) return this.#defaultValue;
     const stores = captureContext()?.stores;
-    return stores?.has(this.#key) ? stores.get(this.#key) : this.#defaultValue;
+    if (usesContextFrames()) return stores?.has(this) ? stores.get(this) : this.#defaultValue;
+    if (!this.enabled || stores === undefined || !(this.kResourceStore in stores)) return this.#defaultValue;
+    return stores[this.kResourceStore];
   }
   enterWith(store) {
-    this.#enabled = true;
     const context = captureContext();
-    const frames = usesContextFrames();
-    const stores = frames ? new AsyncContextFrame(context?.stores) : new Map(context?.stores);
-    stores.set(frames ? this : this.#key, store);
+    let stores;
+    if (usesContextFrames()) {
+      stores = new AsyncContextFrame(context?.stores);
+      stores.set(this, store);
+    } else {
+      this.enabled = true;
+      stores = legacyStores(context?.stores);
+      stores[this.kResourceStore] = store;
+    }
     host.setAsyncContext({ stores, id: context?.id, trigger: context?.trigger, resource: context?.resource });
   }
   run(store, callback, ...args) {
     checkFunction(callback, 'callback');
+    if (Object.is(store, this.getStore())) return apply(callback, null, args);
     if (usesContextFrames()) {
       const prior = this.getStore();
-      if (Object.is(prior, store)) return apply(callback, null, args);
       this.enterWith(store);
       try { return apply(callback, null, args); }
       finally { this.enterWith(prior); }
     }
-    const previous = captureContext();
+    // Node's legacy run restores only this storage's slot, so another storage's
+    // enterWith inside callback stays in force after it.
+    const oldStore = captureContext()?.stores?.[this.kResourceStore];
     this.enterWith(store);
-    try { return apply(callback, undefined, args); }
-    finally { host.setAsyncContext(previous); }
+    try { return apply(callback, null, args); }
+    finally {
+      const context = captureContext();
+      const stores = legacyStores(context?.stores);
+      stores[this.kResourceStore] = oldStore;
+      host.setAsyncContext({ stores, id: context?.id, trigger: context?.trigger, resource: context?.resource });
+    }
   }
   exit(callback, ...args) {
     checkFunction(callback, 'callback');
     if (usesContextFrames()) return this.run(undefined, callback, ...args);
+    if (!this.enabled) return apply(callback, null, args);
+    // Node disables the storage while callback runs, so resources made there do not
+    // take the store; here they take the context, so it goes without the store.
     const previous = captureContext();
-    if (!previous?.stores?.has(this.#key)) return apply(callback, undefined, args);
-    const stores = new Map(previous.stores);
-    stores.delete(this.#key);
+    if (previous?.stores === undefined || !(this.kResourceStore in previous.stores)) return apply(callback, null, args);
+    const stores = legacyStores(previous.stores);
+    delete stores[this.kResourceStore];
     host.setAsyncContext({ stores, id: previous.id, trigger: previous.trigger, resource: previous.resource });
-    try { return apply(callback, undefined, args); }
+    try { return apply(callback, null, args); }
     finally { host.setAsyncContext(previous); }
+  }
+  withScope(store) {
+    return new RunScope(this, store);
   }
   static bind(fn) { return AsyncResource.bind(fn); }
   static snapshot() {
@@ -406,4 +440,10 @@ Object.defineProperties(module.exports, {
   _nativeDestroy: { value: nativeDestroy },
   _setPromiseObserver: { value: setPromiseObserver },
   _drainDestroy: { value: drainDestroy },
+  // Node's newAsyncId: the next id from the same counter every resource takes its id from.
+  _newAsyncId: { value: () => nextId++ },
+  _hookFields: { value: hookFields },
+  _getPromiseHooks: { value: getPromiseHooks },
+  // Node's async_wrap.queueDestroyAsyncId: a destroy event for an id with no resource.
+  _queueDestroyId: { value: id => { if (hooks.size !== 0) pendingDestroy.push({ id, destroyed: true }); } },
 });

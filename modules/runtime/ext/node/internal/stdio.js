@@ -23,7 +23,7 @@ function output(fd) {
   } else if (kind === 1 || kind === 2) {
     stream = socket(fd, false);
     if (process.platform === 'win32') {
-      const status = stream._transport.call('setBlocking', true);
+      const status = stream._handle.setBlocking(true);
       if (status < 0) { stream.destroy(); throw nativeError(status, 'setBlocking'); }
     }
   } else {
@@ -74,17 +74,21 @@ function input() {
   stream.fd = 0;
   stream._isStdio = true;
   if (stream._writableState) stream._writableState.ended = true;
-  if (stream._transport) {
-    stream._transport.readStop();
+  // As Node's getStdin: don't start reading until the user asks, and stop reading once
+  // the stream pauses (one tick later), so that the process can exit.
+  if (stream._handle?.readStop) {
+    stream._handle.reading = false;
     stream._readableState.reading = false;
-    stream.on('pause', () => {
-      process.nextTick(() => {
-        if (!stream.readableFlowing) {
-          stream._transport?.readStop();
-          stream._readableState.reading = false;
-        }
-      });
-    });
+    stream._handle.readStop();
+    stream.on('pause', () => process.nextTick(onpause));
+  }
+  function onpause() {
+    if (!stream._handle) return;
+    if (stream._handle.reading && !stream.readableFlowing) {
+      stream._readableState.reading = false;
+      stream._handle.reading = false;
+      stream._handle.readStop();
+    }
   }
   return stream;
 }

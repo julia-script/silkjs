@@ -973,11 +973,15 @@ function test_weak_ref()
         assert(w2.deref(), o);
         
         o = null;
-        assert(w1.deref(), undefined);
-        assert(w2.deref(), undefined);
-        std.gc();
-        assert(w1.deref(), undefined);
-        assert(w2.deref(), undefined);
+        // SilkJS: ECMA-262 keeps a WeakRef's target alive to the end of the job
+        // (KeepDuringJob), so it is gone only in a later job.
+        assert(typeof w1.deref(), i == 0 ? "object" : "symbol");
+        let k1 = w1, k2 = w2;
+        os.setTimeout(() => {
+            std.gc();
+            assert(k1.deref(), undefined);
+            assert(k2.deref(), undefined);
+        }, 0);
     }
 }
 

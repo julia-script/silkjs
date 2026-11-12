@@ -30,7 +30,7 @@ const {
   ObjectSetPrototypeOf,
   StringPrototypeSlice,
   SymbolDispose,
-} = require('internal/readline/primordials');
+} = require('internal/per_context/primordials');
 
 const {
   clearLine,
@@ -46,12 +46,12 @@ const promises = require('readline/promises');
 
 const {
   inspect,
-} = require('internal/readline/width');
+} = require('internal/util/inspect');
 const {
   kEmptyObject,
   promisify,
-} = require('internal/readline/support');
-const { validateAbortSignal } = require('internal/readline/support');
+} = require('internal/util');
+const { validateAbortSignal } = require('internal/validators');
 
 /**
  * @typedef {import('./stream.js').Readable} Readable

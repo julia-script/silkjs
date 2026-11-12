@@ -41,7 +41,9 @@ function boolean(value, name) {
 }
 function contextOptions(value) {
   const opts = options(value);
-  for (const key of ['name', 'origin']) if (opts[key] !== undefined && typeof opts[key] !== 'string') throw invalid(`options.${key}`, 'string', opts[key]);
+  // Index loops: user code may have removed Array.prototype[Symbol.iterator].
+  if (opts.name !== undefined && typeof opts.name !== 'string') throw invalid('options.name', 'string', opts.name);
+  if (opts.origin !== undefined && typeof opts.origin !== 'string') throw invalid('options.origin', 'string', opts.origin);
   if (opts.microtaskMode !== undefined && opts.microtaskMode !== 'afterEvaluate')
     throw error('ERR_INVALID_ARG_VALUE', 'options.microtaskMode must be "afterEvaluate"');
   let strings = true, wasm = true;
@@ -94,7 +96,8 @@ function createContext(sandbox = {}, value) {
       },
       ownKeys() {
         const keys = Reflect.ownKeys(sandbox);
-        for (const key of Reflect.ownKeys(global)) if (!keys.includes(key)) keys.push(key);
+        const globalKeys = Reflect.ownKeys(global);
+        for (let i = 0; i < globalKeys.length; i++) if (!keys.includes(globalKeys[i])) keys.push(globalKeys[i]);
         return keys;
       },
       getPrototypeOf() { return Reflect.getPrototypeOf(global); },
@@ -199,6 +202,7 @@ function importCallback(callback, referrer, filename, functionRef = false) {
       attributes || Object.create(null), sourcePhase ? kSourcePhase : kEvaluationPhase);
   };
 }
+const { kInternalImportModuleDynamically } = require('internal/vm');
 class Script {
   constructor(code, value) {
     const source = String(code);
@@ -209,7 +213,11 @@ class Script {
       this.cachedDataRejected = handle === undefined;
     }
     if (handle == null) handle = compile(source, filename, line, column);
-    const dynamicImport = importCallback(opts.importModuleDynamically, this, filename);
+    // A built-in (makeContextifyScript) may give its own import() handler, which
+    // like Node's internal referrers needs no --experimental-vm-modules.
+    const internalImport = opts[kInternalImportModuleDynamically];
+    const dynamicImport = internalImport !== undefined ? (specifier, attributes) => internalImport(specifier, this, attributes || Object.create(null), 'evaluation')
+      : importCallback(opts.importModuleDynamically, this, filename);
     host.vmSetImportModuleDynamically(handle, dynamicImport);
     scripts.set(this, { source, handle, dynamicImport, realms: new WeakMap() });
     // The last "//# sourceMappingURL=" magic comment, as V8 reports it.
