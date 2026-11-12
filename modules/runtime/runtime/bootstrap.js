@@ -1834,6 +1834,8 @@ globalThis.__silkRuntime = {
           throw new (internalRequire('internal/errors').codes.ERR_INVALID_ARG_TYPE)('parentURL', ['string', 'URL'], parent);
         from = String(parent);
       }
+      // Node's resolveSync takes `${specifier}`, so a URL object resolves as its href.
+      specifier = `${specifier}`;
       // As in Node, a file that is missing (or a directory) still resolves to its URL.
       try { return asURL(loader.resolve(specifier, from, 'import').filename); }
       catch (error) {
