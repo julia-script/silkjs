@@ -155,7 +155,7 @@ function runOptions(value) {
   const timeout = duration === undefined ? 0 : integer(duration, 'options.timeout', 1, 4294967295);
   if (displayErrors !== undefined) boolean(displayErrors, 'options.displayErrors');
   boolean(breakOnSigint, 'options.breakOnSigint');
-  return { timeout, breakOnSigint };
+  return { timeout, breakOnSigint, displayErrors: displayErrors !== false };
 }
 function digest(value, encoding) { return createHash('sha256').update(value, encoding).digest(); }
 function writeCache(handle, source, kind) {
@@ -238,7 +238,7 @@ class Script {
     const dynamicImport = internalImport !== undefined ? (specifier, attributes) => internalImport(specifier, this, attributes || Object.create(null), 'evaluation')
       : importCallback(opts.importModuleDynamically, this, filename);
     host.vmSetImportModuleDynamically(handle, dynamicImport);
-    scripts.set(this, { source, handle, dynamicImport, realms: new WeakMap() });
+    scripts.set(this, { source, handle, dynamicImport, realms: new WeakMap(), filename, line, column });
     // The last "//# sourceMappingURL=" magic comment, as V8 reports it.
     let mapURL;
     for (const match of source.matchAll(/\/\/[#@][ \t]+sourceMappingURL=[ \t]*([^\s'"]+)[ \t]*$/gm)) mapURL = match[1];
@@ -250,7 +250,8 @@ class Script {
   }
   runInThisContext(value) {
     const data = scriptData(this);
-    return run(data.handle, runOptions(value), false);
+    const execution = runOptions(value);
+    return run(data.handle, execution, false, true, execution.displayErrors ? data : undefined);
   }
   runInContext(contextifiedObject, value) {
     const data = scriptData(this);
@@ -262,7 +263,7 @@ class Script {
       host.vmSetImportModuleDynamically(handle, data.dynamicImport);
       data.realms.set(contextifiedObject, handle);
     }
-    return run(handle, execution, context.afterEvaluate);
+    return run(handle, execution, context.afterEvaluate, true, execution.displayErrors ? data : undefined);
   }
   runInNewContext(sandbox, value) {
     // As in Node, the context takes its options under context-prefixed names.
@@ -270,6 +271,11 @@ class Script {
       name: value.contextName, origin: value.contextOrigin,
       codeGeneration: value.contextCodeGeneration, microtaskMode: value.microtaskMode,
     };
+    // getContextOptions validates under the names the caller gave.
+    if (contextOptions !== undefined) {
+      if (contextOptions.name !== undefined && typeof contextOptions.name !== 'string') throw invalid('options.contextName', 'string', contextOptions.name);
+      if (contextOptions.origin !== undefined && typeof contextOptions.origin !== 'string') throw invalid('options.contextOrigin', 'string', contextOptions.origin);
+    }
     return this.runInContext(createContext(sandbox, contextOptions), value);
   }
   createCachedData() {

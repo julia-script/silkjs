@@ -44,7 +44,21 @@ function terminationError(code, message) {
   terminationErrors.add(result);
   return result;
 }
-function run(handle, { timeout, breakOnSigint }, afterEvaluate, wrapSignals = true) {
+// DecorateErrorStack (node_errors.cc), for a script run with displayErrors: a
+// native error leaving the script gets the arrow of where it was thrown before
+// its stack, once. It runs before any rethrow here, which would move the site.
+function decorateErrorStack(cause, script) {
+  try {
+    if (!require('util/types').isNativeError(cause) || host.decoratedErrors.has(cause)) return;
+    const arrow = require('internal/fatal_report').arrow(cause, false, script.filename, script.line, script.column, script.source);
+    const stack = cause.stack;
+    if (arrow === undefined || typeof stack !== 'string') return;
+    cause.stack = arrow + '\n' + stack;
+    host.decoratedErrors.add(cause);
+  } catch {}
+}
+// display: the script (filename and offsets) whose errors are decorated, if any.
+function run(handle, { timeout, breakOnSigint }, afterEvaluate, wrapSignals = true, display = undefined) {
   let listeners;
   if (breakOnSigint && wrapSignals && process.listenerCount('SIGINT') > 0) {
     listeners = process.rawListeners('SIGINT');
@@ -61,6 +75,7 @@ function run(handle, { timeout, breakOnSigint }, afterEvaluate, wrapSignals = tr
     if (cause && typeof cause.message === 'string' && cause.message.startsWith('ERR_CANNOT_WATCH_SIGINT:')) {
       throw error('ERR_CANNOT_WATCH_SIGINT', 'Cannot watch for SIGINT signals', Error);
     }
+    if (display !== undefined) decorateErrorStack(cause, display);
     throw cause;
   } finally {
     if (listeners) for (let i = 0; i < listeners.length; i++) process.addListener('SIGINT', listeners[i]);
