@@ -697,6 +697,8 @@ Object.assign(process, {
     return true;
   },
   _fatalException: internalRequire('internal/startup_controls').fatalException,
+  // realm.js: the allowlisted internal bindings and the natives/util legacy wrappers.
+  binding(module) { return internalRequire('internal/bindings').processBinding(module); },
   // node_binding.cc GetLinkedBinding: the addon permission names the module, then the embedder's
   // linked modules are searched. This runtime links none.
   _linkedBinding(module) {

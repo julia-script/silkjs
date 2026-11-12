@@ -10,8 +10,16 @@ const entries = host.utilErrorMap();
 const names = new Map();
 for (let i = 0; i < entries.length; i += 3) names.set(entries[i], entries[i + 1]);
 
-// uv_err_name, which names an unknown code as Node's binding does.
+// uv.cc ErrName: uv_err_name, which names an unknown code as Node's binding
+// does. Under --pending-deprecation the first call warns (DEP0119); the
+// runtime's own code names errors through errors.js uvErrmapGet instead.
+let warnedErrName = false;
 function errname(err) {
+  if (host.pendingDeprecation && !warnedErrName) {
+    warnedErrName = true;
+    process.emitWarning('Directly calling process.binding(\'uv\').errname(<val>) is being ' +
+      'deprecated. Please make sure to use util.getSystemErrorName() instead.', 'DeprecationWarning', 'DEP0119');
+  }
   return names.get(err) ?? `Unknown system error ${err}`;
 }
 function getErrorMessage(err) {

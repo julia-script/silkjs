@@ -54,6 +54,11 @@ function initialize() {
   }
   if (!state.deprecation) process.noDeprecation = true;
   host.pendingDeprecation = state.pendingDeprecation ?? process.env.NODE_PENDING_DEPRECATION === '1';
+  // pre_execution.js initializeDeprecations.
+  if (host.pendingDeprecation) {
+    process.binding = require('internal/util').deprecate(process.binding,
+      'process.binding() is deprecated. Please use public APIs instead.', 'DEP0111');
+  }
   state.redirectWarnings ||= process.env.NODE_REDIRECT_WARNINGS;
   if (state.warnings && process.env.NODE_NO_WARNINGS !== '1') process.on('warning', onWarning);
   if (state.abortOnUncaughtException) host.abortOnUncaughtException = abortOnUncaughtException;

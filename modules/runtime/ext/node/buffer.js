@@ -1342,11 +1342,8 @@ Buffer.prototype.toLocaleString = Buffer.prototype.toString;
 
 // Transcodes the Buffer from one encoding to another, returning a new
 // Buffer instance. ICU's converters are replaced by the Buffer codecs for the
-// encodings Node's transcode() supports.
-const transcodeEncodings = ['utf8', 'utf16le', 'latin1', 'ascii'];
-function icuError(code, errno) {
-  return genericNodeError(`Unable to transcode Buffer [${code}]`, { code, errno });
-}
+// lib/buffer.js transcode over internalBinding('icu'), which returns an ICU error code
+// when it cannot convert.
 function transcode(source, fromEncoding, toEncoding) {
   if (!isUint8Array(source)) {
     throw new ERR_INVALID_ARG_TYPE('source',
@@ -1356,55 +1353,17 @@ function transcode(source, fromEncoding, toEncoding) {
 
   fromEncoding = normalizeEncoding(fromEncoding) || fromEncoding;
   toEncoding = normalizeEncoding(toEncoding) || toEncoding;
-  if (!transcodeEncodings.includes(fromEncoding) ||
-      !transcodeEncodings.includes(toEncoding)) {
-    throw icuError('U_ILLEGAL_ARGUMENT_ERROR', 1);
-  }
-  const invalid = () => icuError('U_INVALID_CHAR_FOUND', 10);
-  if (fromEncoding === 'utf8' && toEncoding === 'utf16le' &&
-      !bindingIsUtf8(source)) {
-    throw invalid();
-  }
-  let text;
-  if (fromEncoding === 'ascii' && toEncoding !== 'utf16le') {
-    text = '';
-    for (let i = 0; i < source.length; i++)
-      text += source[i] < 128 ? String.fromCharCode(source[i]) : '�';
-  } else if (fromEncoding === 'utf8') {
-    text = utf8Slice(source, 0, source.length);
-  } else if (fromEncoding === 'utf16le') {
-    text = ucs2Slice(source, 0, source.length);
-  } else {
-    text = latin1Slice(source, 0, source.length);
-  }
-  if (fromEncoding === 'utf16le') {
-    if (toEncoding === 'utf8') {
-      if (text.length === 0) throw invalid();
-      for (let i = 0; i < text.length; i++) {
-        const c = text.charCodeAt(i);
-        if (c >= 0xd800 && c <= 0xdbff) {
-          const next = text.charCodeAt(++i);
-          if (!(next >= 0xdc00 && next <= 0xdfff)) throw invalid();
-        } else if (c >= 0xdc00 && c <= 0xdfff) {
-          throw invalid();
-        }
-      }
-    } else {
-      // Lone surrogates become U+FFFD, as ICU's UTF-16 converter does.
-      text = utf8Slice(fromString(text, 'utf8'), 0);
-      if (toEncoding === 'utf16le' && source.length % 2) text += '�';
-    }
-  }
-  if (toEncoding === 'ascii' || toEncoding === 'latin1') {
-    const max = toEncoding === 'ascii' ? 127 : 255;
-    const out = [];
-    for (const char of text) {
-      const cp = char.codePointAt(0);
-      out.push(cp <= max ? cp : 0x3f);
-    }
-    return fromArrayLike(out);
-  }
-  return fromString(text, toEncoding);
+  const { icuErrName, transcode: _transcode } = require('internal/icu_binding');
+  const result = _transcode(source, fromEncoding, toEncoding);
+  if (typeof result !== 'number')
+    return result;
+
+  const code = icuErrName(result);
+  const err = genericNodeError(
+    `Unable to transcode Buffer [${code}]`,
+    { code: code, errno: result },
+  );
+  throw err;
 }
 
 function btoa(input) {
