@@ -125,8 +125,11 @@ async function snapshots(root) {
     assert.equal(Object.hasOwn(heap, 'total_available_size'), false);
     assert.equal(Object.hasOwn(heap, 'heap_size_limit'), false);
     assert.throws(() => v8.getHeapSnapshot({ exposeNumericValues: true }), { code: 'ERR_NOT_SUPPORTED' });
-    for (const name of ['getHeapSpaceStatistics', 'getHeapCodeStatistics', 'getCppHeapStatistics', 'takeCoverage', 'stopCoverage'])
+    for (const name of ['getHeapSpaceStatistics', 'getHeapCodeStatistics', 'getCppHeapStatistics'])
       assert.throws(() => v8[name](), { code: 'ERR_NOT_SUPPORTED' });
+    // Without NODE_V8_COVERAGE there is no coverage to take or stop, as in Node.
+    assert.equal(v8.takeCoverage(), undefined);
+    assert.equal(v8.stopCoverage(), undefined);
     assert.throws(() => v8.setFlagsFromString('--expose-gc'), { code: 'ERR_NOT_SUPPORTED' });
     assert.throws(() => v8.startupSnapshot.addSerializeCallback(() => {}), { code: 'ERR_NOT_BUILDING_SNAPSHOT' });
     assert.equal(v8.startupSnapshot.isBuildingSnapshot(), false);
