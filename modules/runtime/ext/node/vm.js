@@ -52,7 +52,9 @@ function contextOptions(value) {
     if (generation.strings !== undefined) strings = boolean(generation.strings, 'options.codeGeneration.strings');
     if (generation.wasm !== undefined) wasm = boolean(generation.wasm, 'options.codeGeneration.wasm');
   }
-  return { strings, wasm, afterEvaluate: opts.microtaskMode === 'afterEvaluate', name: opts.name, origin: opts.origin };
+  validateImportCallback(opts.importModuleDynamically);
+  return { strings, wasm, afterEvaluate: opts.microtaskMode === 'afterEvaluate', name: opts.name, origin: opts.origin,
+    importModuleDynamically: opts.importModuleDynamically };
 }
 function createContext(sandbox = {}, value) {
   if (sandbox !== DONT_CONTEXTIFY && (sandbox === null || typeof sandbox !== 'object')) throw invalid('contextObject', 'object', sandbox);
@@ -112,6 +114,10 @@ function createContext(sandbox = {}, value) {
   }
   host.vmSetCodeGeneration(handle, config.strings);
   contexts.set(result, { handle, afterEvaluate: config.afterEvaluate });
+  // Node registers the context's importModuleDynamically for an import() with no
+  // referrer script; without one, such an import() reports the missing callback.
+  host.vmSetImportModuleDynamically(handle, importCallback(config.importModuleDynamically, result,
+    require('path').join(process.cwd(), 'vm-context')), true);
   require('internal/inspector_contexts').register(result, handle, config);
   return result;
 }
