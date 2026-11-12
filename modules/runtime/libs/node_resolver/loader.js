@@ -785,9 +785,9 @@ function createLoader(host, builtins) {
     regularFile = null;
     mode = mode === 'import' || mode === 'esm' ? 'import' : 'require';
     if (allowAsync === undefined) allowAsync = mode === 'import';
-    // defaultResolve's check, for the path that skips it: a module with a URL other than
+    // defaultResolve's check, for the path without hooks that skips it: a module with a URL other than
     // file: (a data: module) can import only URLs and absolute paths.
-    if (mode === 'import' && typeof parent === 'string' && /^[A-Za-z][A-Za-z\d+.-]*:/.test(parent) && !parent.startsWith('file:') &&
+    if (mode === 'import' && !hooks.active(allowAsync) && typeof parent === 'string' && /^[A-Za-z][A-Za-z\d+.-]*:/.test(parent) && !parent.startsWith('file:') &&
         !isBuiltinFile(parent) && typeof specifier === 'string' && !/^[A-Za-z][A-Za-z\d+.-]*:/.test(specifier) && !path.isAbsolute(specifier) && builtinName(specifier) === null) {
       throw error('ERR_UNSUPPORTED_RESOLVE_REQUEST', specifier, parent);
     }
