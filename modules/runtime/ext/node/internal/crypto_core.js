@@ -38,10 +38,17 @@ function normalize(e) {
   return e;
 }
 function call(op, args) { try { return host.crypto(op, args); } catch (e) { throw normalize(e); } }
+// The async_wrap provider of Node's CryptoJob for each operation (src/crypto/*.h).
+const jobProviders = {
+  __proto__: null, random: 'RANDOMBYTESREQUEST', hkdf: 'DERIVEBITSREQUEST', scrypt: 'SCRYPTREQUEST',
+  pbkdf2: 'PBKDF2REQUEST', argon2: 'ARGON2REQUEST', generatePrime: 'RANDOMPRIMEREQUEST',
+  checkPrime: 'CHECKPRIMEREQUEST', encapsulate: 'DERIVEBITSREQUEST', decapsulate: 'DERIVEBITSREQUEST',
+  derive: 'DERIVEBITSREQUEST', sign: 'SIGNREQUEST', verify: 'SIGNREQUEST', keyGenerate: 'KEYPAIRGENREQUEST',
+};
 function submit(op, args, cb, convert = x => x) {
   callback(cb);
   const { AsyncResource } = require('async_hooks');
-  const resource = new AsyncResource(`${op.toUpperCase()}REQUEST`, { requireManualDestroy: true });
+  const resource = new AsyncResource(jobProviders[op] ?? `${op.toUpperCase()}REQUEST`, { requireManualDestroy: true });
   try {
     host.cryptoAsync(op, args, (err, value) => {
       host.invokeResource(resource, () => {

@@ -254,6 +254,7 @@ class WorkerHandle {
 }
 class Worker extends EventEmitter {
   constructor(filename, options) {
+    require('internal/v8/startup_snapshot').throwIfBuildingSnapshot('Creating workers');
     super();
     const config = workerOptions(filename, options);
     const list = clone().transferList(config.options.transferList);
