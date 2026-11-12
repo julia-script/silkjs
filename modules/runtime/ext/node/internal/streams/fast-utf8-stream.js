@@ -26,8 +26,8 @@
 const ArrayPrototypePush = (array, ...values) => array.push(...values);
 const MathMax = Math.max;
 const SymbolDispose = Symbol.dispose;
-const sleep = ms => require('internal/fs_core').os.sleep(ms);
-const core = require('internal/fs_core');
+const sleep = ms => require('internal/fs/utils').os.sleep(ms);
+const core = require('internal/fs/utils');
 class ERR_INVALID_ARG_TYPE extends TypeError { constructor(name, expected) { super(`The "${name}" argument must be ${expected}`); this.code = 'ERR_INVALID_ARG_TYPE'; } }
 class ERR_INVALID_ARG_VALUE extends TypeError { constructor(name, value, reason = '') { super(`The argument '${name}' is invalid. ${reason}`); this.code = 'ERR_INVALID_ARG_VALUE'; } }
 ERR_INVALID_ARG_VALUE.RangeError = class extends RangeError { constructor(name, value, reason) { super(`The argument '${name}' is invalid. ${reason}`); this.code = 'ERR_INVALID_ARG_VALUE'; } };

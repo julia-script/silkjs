@@ -34,7 +34,7 @@ const StringPrototypeEndsWith = (value, suffix) => value.endsWith(suffix);
 const { lstatSync, readdirSync, realpathSync, statSync } = require('fs');
 const { lstat, readdir, realpath, stat } = require('fs/promises');
 const { join, resolve, basename, isAbsolute, dirname } = require('path');
-const core = require('internal/fs_core');
+const core = require('internal/fs/utils');
 const kEmptyObject = Object.freeze({});
 const isWindows = process.platform === 'win32';
 const validateBoolean = (value, name) => { if (typeof value !== 'boolean') throw core.invalid(name, 'a boolean'); };
@@ -878,4 +878,4 @@ class Glob {
 }
 
 
-module.exports = { Glob, matchGlobPattern };
+module.exports = { Glob, createMatcher, matchGlobPattern };

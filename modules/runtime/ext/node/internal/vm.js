@@ -1,4 +1,70 @@
 'use strict';
+// State and helpers shared by vm (Script, contexts) and internal/vm/module_wrap
+// (vm modules): the contexts made by vm.createContext, argument errors, syntax
+// diagnostics and running a compiled handle under a timeout or SIGINT watch.
+const host = require('internal/host');
+const contexts = new WeakMap();
+const { ERR_INVALID_ARG_TYPE } = require('internal/path_events/support').codes;
+// Node's ERR_INVALID_ARG_TYPE wording, with what was received.
+function invalid(name, expected, value) { return new ERR_INVALID_ARG_TYPE(name, expected, value); }
+function error(code, message, Type = TypeError) {
+  return Object.assign(new Type(message), { code });
+}
+function contextData(value) {
+  const data = contexts.get(value);
+  if (!data) throw value === null || typeof value !== 'object' ? invalid('object', 'object', value) : invalid('contextifiedObject', 'vm.Context', value);
+  return data;
+}
+function isContext(value) {
+  if (value === null || typeof value !== 'object') throw invalid('object', 'object', value);
+  return contexts.has(value);
+}
+// Parser locations are real lexical coordinates. Presentation offsets never
+// alter source bytes, directive prologues, line continuations, or parser state.
+function syntaxDiagnostic(cause, source, filename, line, column, prefix = 0) {
+  if (!cause || cause.name !== 'SyntaxError' || !Number.isInteger(cause.lineNumber)) throw cause;
+  const sourceLine = cause.lineNumber;
+  const sourceColumn = cause.columnNumber - (sourceLine === 1 ? prefix : 0);
+  const lines = source.split(/\r\n|[\n\r\u2028\u2029]/);
+  const text = lines[sourceLine - 1] || '';
+  cause.lineNumber = (sourceLine + line) | 0;
+  cause.columnNumber = (sourceColumn + (sourceLine === 1 ? column : 0)) | 0;
+  cause.fileName = filename;
+  const frames = typeof cause.stack === 'string' ? cause.stack.split('\n').slice(1).join('\n') : '';
+  const caret = text.slice(0, Math.max(0, sourceColumn - 1)).replace(/[^\t]/g, ' ') +
+    (cause.columnNumber === 0 ? '' : '^');
+  cause.stack = `${filename}:${cause.lineNumber}\n${text}\n${caret}\n\n${cause.name}: ${cause.message}\n${frames}`;
+  throw cause;
+}
+const terminationErrors = new WeakSet();
+function terminationError(code, message) {
+  const result = error(code, message, Error);
+  terminationErrors.add(result);
+  return result;
+}
+function run(handle, { timeout, breakOnSigint }, afterEvaluate, wrapSignals = true) {
+  let listeners;
+  if (breakOnSigint && wrapSignals && process.listenerCount('SIGINT') > 0) {
+    listeners = process.rawListeners('SIGINT');
+    process.removeAllListeners('SIGINT');
+  }
+  try { return host.vmRun(handle, timeout, afterEvaluate, breakOnSigint); }
+  catch (cause) {
+    if (cause && typeof cause.message === 'string' && cause.message.startsWith('ERR_SCRIPT_EXECUTION_TIMEOUT:')) {
+      throw terminationError('ERR_SCRIPT_EXECUTION_TIMEOUT', `Script execution timed out${timeout ? ` after ${timeout}ms` : ''}`);
+    }
+    if (cause && typeof cause.message === 'string' && cause.message.startsWith('ERR_SCRIPT_EXECUTION_INTERRUPTED:')) {
+      throw terminationError('ERR_SCRIPT_EXECUTION_INTERRUPTED', 'Script execution was interrupted by `SIGINT`');
+    }
+    if (cause && typeof cause.message === 'string' && cause.message.startsWith('ERR_CANNOT_WATCH_SIGINT:')) {
+      throw error('ERR_CANNOT_WATCH_SIGINT', 'Cannot watch for SIGINT signals', Error);
+    }
+    throw cause;
+  } finally {
+    if (listeners) for (let i = 0; i < listeners.length; i++) process.addListener('SIGINT', listeners[i]);
+  }
+}
+
 
 // makeContextifyScript of Node's lib/internal/vm.js, over the vm module's Script.
 // The runtime has no V8 code cache, so cachedData and produceCachedData are
@@ -14,4 +80,7 @@ function makeContextifyScript(code, filename, lineOffset, columnOffset, cachedDa
   return new Script(code, options);
 }
 
-module.exports = { kInternalImportModuleDynamically, makeContextifyScript };
+module.exports = {
+  contexts, error, invalid, contextData, isContext, syntaxDiagnostic, terminationErrors, terminationError, run,
+  kInternalImportModuleDynamically, makeContextifyScript,
+};

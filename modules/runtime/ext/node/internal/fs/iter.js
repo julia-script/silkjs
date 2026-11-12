@@ -3,7 +3,7 @@
 // Node's lib/internal/fs/promises.js (v24).
 const { Buffer } = require('buffer');
 const fs = require('fs');
-const c = require('internal/fs_core');
+const c = require('internal/fs/utils');
 const v = require('internal/validators');
 const { validateAbortSignal, validateBoolean, validateInteger, validateObject } = v;
 const { codes: { ERR_OPERATION_FAILED, ERR_OUT_OF_RANGE } } = require('internal/errors');
