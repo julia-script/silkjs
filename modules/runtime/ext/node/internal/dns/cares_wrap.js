@@ -158,6 +158,12 @@ class ChannelWrap {
   // QueryWrap: oncomplete(code string) on failure, else (0, records) and, for A and AAAA,
   // the ttls as a third argument.
   _query(req, name, rrtype) {
+    // c-ares refuses .onion names (RFC 7686) with ARES_ENOTFOUND before any
+    // packet is sent; Node completes such a query from an immediate.
+    if (/\.onion\.?$/i.test(name)) {
+      setImmediate(() => req.oncomplete('ENOTFOUND'));
+      return 0;
+    }
     this.#pending++;
     try {
       native('dnsQuery', 'QUERYWRAP', [this.#id, ascii(name), packet.types[rrtype], (status, data) => {

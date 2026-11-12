@@ -9,6 +9,7 @@ const v = c.v;
 const { AbortError, codes: { ERR_FS_FILE_TOO_LARGE, ERR_INVALID_ARG_VALUE } } = require('internal/errors');
 const { validateBoolean, validateFunction, validateInteger, validateObject, validateOneOf, validateString, kValidateObjectAllowNullable } = v;
 const { bufferCodec } = c.host;
+const binding = require('internal/fs/binding');
 const fs = module.exports;
 const kMaxUserId = 2 ** 32 - 1;
 const kIoMaxLength = 2 ** 31 - 1;
@@ -393,7 +394,7 @@ function readdirEntries(dir, o, recursive) {
       if (name === '.' || name === '..') continue;
       const full = raw ? c.rawEntryPath(current, name) : p.join(current, name);
       const info = o.withFileTypes || recursive ? fs.lstatSync(full) : null;
-      if (o.withFileTypes) output.push(new Dirent(c.encoded(name, o.encoding), info.mode, current));
+      if (o.withFileTypes) output.push(new Dirent(c.encoded(name, o.encoding), c.modeType(info.mode), current));
       else output.push(c.encoded(recursive ? p.relative(dir, full) : name, o.encoding));
       if (recursive && (info.isDirectory() || (info.isSymbolicLink() && fs.statSync(full, { throwIfNoEntry: false })?.isDirectory()))) queue.push(full);
     }
@@ -403,16 +404,26 @@ function readdirEntries(dir, o, recursive) {
 fs.readdirSync = function readdirSync(path, options) {
   const o = c.options(options, { encoding: 'utf8' }); path = c.path(path);
   if (o.recursive != null) validateBoolean(o.recursive, 'options.recursive');
-  return readdirEntries(path, o, !!o.recursive);
+  if (o.recursive) return readdirEntries(path, o, true);
+  // As Node: one binding call, then Dirents from the names and types.
+  const result = binding.readdir(path, o.encoding, !!o.withFileTypes);
+  return o.withFileTypes ? c.getDirents(path, result) : result;
 };
 fs.readdir = function readdir(path, options, callback) {
   callback = makeCallback(typeof options === 'function' ? options : callback);
   const o = c.options(options, { encoding: 'utf8' }); path = c.path(path);
   if (o.recursive != null) validateBoolean(o.recursive, 'options.recursive');
-  c.submit('readdir', [path, o], (err, value) => {
-    if (err) { callback(err); return; }
-    callback(null, value.map(entry => o.withFileTypes ? entry instanceof Dirent ? entry : new Dirent(c.encoded(entry.name, o.encoding), entry.mode, entry.parentPath === undefined ? path : entry.parentPath) : c.encoded(entry, o.encoding)));
-  }, callback);
+  if (o.recursive) {
+    c.submit('readdir', [path, o], (err, value) => {
+      if (err) { callback(err); return; }
+      callback(null, value.map(entry => o.withFileTypes ? entry instanceof Dirent ? entry : new Dirent(c.encoded(entry.name, o.encoding), c.modeType(entry.mode), entry.parentPath === undefined ? path : entry.parentPath) : c.encoded(entry, o.encoding)));
+    }, callback);
+    return;
+  }
+  const req = new binding.FSReqCallback();
+  if (!o.withFileTypes) req.oncomplete = callback;
+  else req.oncomplete = (err, result) => { if (err) { callback(err); return; } c.getDirents(path, result, callback); };
+  binding.readdir(path, o.encoding, !!o.withFileTypes, req);
 };
 
 function statCallback(cb, bigint) { validateFunction(cb, 'cb'); return [(err, value) => { if (err) return cb(err); cb(null, stats(value, bigint)); }, cb]; }
@@ -519,47 +530,127 @@ fs.lutimes = function lutimes(path, atime, mtime, callback) {
 };
 fs.lutimesSync = function lutimesSync(path, atime, mtime) { c.native('lutimes', [c.path(path), c.time(atime), c.time(mtime)]); };
 
-// Most files fit in this buffer, read into until a read returns 0 and then decoded or
-// copied at the size read. A reader takes it, so a nested read gets its own.
+// writeSync encodes a short string into this scratch buffer; a writer takes it, so a nested write gets its own.
 let readBuffer = null;
-function readAll(fd, signal, encoding) {
-  const buffer = readBuffer || Buffer.allocUnsafeSlow(65536); readBuffer = null;
-  try {
-    let chunks = null, held = 0, total = 0;
-    for (;;) {
-      c.aborted(signal);
-      if (held === buffer.length) { (chunks ??= []).push(Buffer.from(buffer)); held = 0; }
-      const count = c.fail(os.read(fd, buffer.buffer, buffer.byteOffset + held, buffer.length - held), 'read');
-      if (count === 0) break;
-      held += count; total += count;
-      if (total > kIoMaxLength) throw fileTooLarge(total);
-    }
-    if (chunks === null) return encoding == null ? Buffer.from(buffer.subarray(0, held)) : buffer.toString(encoding, 0, held);
-    if (held !== 0) chunks.push(Buffer.from(buffer.subarray(0, held)));
-    const result = Buffer.concat(chunks, total); return encoding == null ? result : result.toString(encoding);
-  } finally { readBuffer = buffer; }
-}
 function fileTooLarge(size) { return new ERR_FS_FILE_TOO_LARGE(size); }
-fs.readFileSync = function readFileSync(path, options) {
-  const o = c.options(options, { flag: 'r' }); c.aborted(o.signal);
-  const isUserFd = isFd(path);
-  const fd = isUserFd ? path : fs.openSync(path, o.flag, 0o666);
-  try {
-    // As Node: a regular file over 2 GiB fails before any read.
-    const stats = c.native('fstat', [fd, { bigint: false }]);
-    if ((stats.mode & 0o170000) === 0o100000 && stats.size > kIoMaxLength) throw fileTooLarge(stats.size);
-    return readAll(fd, o.signal, o.encoding || null);
-  } finally { if (!isUserFd) fs.closeSync(fd); }
-};
+const isRegular = stats => stats !== undefined && (stats[1/* mode */] & 0o170000) === 0o100000;
+// Node's readFile and readFileSync, step by step over the fs binding (and fs.openSync,
+// fs.readSync and fs.closeSync, as Node), so a patched binding call is the one used.
+function readFileAfterOpen(err, fd) {
+  const context = this.context;
+  if (err) { context.callback(err); return; }
+  context.fd = fd;
+  const req = new binding.FSReqCallback();
+  req.oncomplete = readFileAfterStat;
+  req.context = context;
+  binding.fstat(fd, false, req);
+}
+function readFileAfterStat(err, stats) {
+  const context = this.context;
+  if (err) return context.close(err);
+  const size = context.size = isRegular(stats) ? stats[8] : 0;
+  if (size > kIoMaxLength) return context.close(fileTooLarge(size));
+  try { context.prepare(); } catch (err) { return context.close(err); }
+  context.read();
+}
+let ReadFileContext;
 fs.readFile = function readFile(path, options, callback) {
   callback ||= options; validateFunction(callback, 'cb');
-  const o = c.options(options, { flag: 'r' });
-  const encoding = o.encoding || null;
-  const done = (err, value) => { if (err) { callback(err); return; } callback(null, encoding === null ? Buffer.from(value) : typeof value === 'string' ? value : Buffer.from(value).toString(encoding)); };
-  if (isFd(path)) { c.submit('readFile', [path, { signal: o.signal, flag: 0 }], done, callback); return; }
-  if (checkAborted(o.signal, callback)) return;
-  const flag = c.stringToFlags(o.flag, 'options.flag');
-  c.submit('readFile', [c.path(path), { signal: o.signal, flag }], done, callback);
+  options = c.options(options, { flag: 'r' });
+  c.validateReadFileBufferOptions(options);
+  ReadFileContext ??= require('internal/fs/read/context');
+  const context = new ReadFileContext(callback, options);
+  context.isUserFd = isFd(path);
+  if (options.signal) context.signal = options.signal;
+  if (context.isUserFd) {
+    process.nextTick(function tick(context) { Reflect.apply(readFileAfterOpen, { context }, [null, path]); }, context);
+    return;
+  }
+  if (checkAborted(options.signal, callback)) return;
+  const flagsNumber = c.stringToFlags(options.flag, 'options.flag');
+  const req = new binding.FSReqCallback();
+  req.context = context;
+  req.oncomplete = readFileAfterOpen;
+  binding.open(c.path(path), flagsNumber, 0o666, req);
+};
+function tryStatSync(fd, isUserFd) {
+  const stats = binding.fstat(fd, false, undefined, true /* shouldNotThrow */);
+  if (stats === undefined && !isUserFd) fs.closeSync(fd);
+  return stats;
+}
+function tryCreateBuffer(size, fd, isUserFd) {
+  let threw = true, buffer;
+  try {
+    if (size > kIoMaxLength) throw fileTooLarge(size);
+    buffer = Buffer.allocUnsafe(size);
+    threw = false;
+  } finally { if (threw && !isUserFd) fs.closeSync(fd); }
+  return buffer;
+}
+function tryGetReadFileBuffer(options, size, fd, isUserFd) {
+  let threw = true, buffer;
+  try { buffer = c.getReadFileBuffer(options, size); threw = false; }
+  finally { if (threw && !isUserFd) fs.closeSync(fd); }
+  return buffer;
+}
+function tryReadSync(fd, isUserFd, buffer, pos, len) {
+  let threw = true, bytesRead;
+  try { bytesRead = fs.readSync(fd, buffer, pos, len); threw = false; }
+  finally { if (threw && !isUserFd) fs.closeSync(fd); }
+  return bytesRead;
+}
+function tryReadSyncWithUserBuffer(fd, isUserFd, buffer, byteLengthName) {
+  let pos = 0, bytesRead = 0;
+  while (pos < buffer.byteLength) {
+    bytesRead = tryReadSync(fd, isUserFd, buffer, pos, buffer.byteLength - pos);
+    pos += bytesRead;
+    if (bytesRead === 0) return pos;
+  }
+  const extraBuffer = tryCreateBuffer(1, fd, isUserFd);
+  bytesRead = tryReadSync(fd, isUserFd, extraBuffer, 0, 1);
+  if (bytesRead !== 0) {
+    if (!isUserFd) fs.closeSync(fd);
+    throw new ERR_INVALID_ARG_VALUE(byteLengthName, buffer.byteLength, 'is too small to contain the entire file');
+  }
+  return pos;
+}
+fs.readFileSync = function readFileSync(path, options) {
+  options = c.options(options, { flag: 'r' });
+  c.validateReadFileBufferOptions(options);
+  const hasUserBuffer = options.buffer !== undefined;
+  if ((options.encoding === 'utf8' || options.encoding === 'utf-8') && !hasUserBuffer) {
+    if (!isFd(path)) path = c.path(path);
+    return binding.readFileUtf8(path, c.stringToFlags(options.flag));
+  }
+  const isUserFd = isFd(path);
+  const fd = isUserFd ? path : fs.openSync(path, options.flag, 0o666);
+  const stats = tryStatSync(fd, isUserFd);
+  const size = isRegular(stats) ? stats[8] : 0;
+  let pos = 0, buffer, buffers, bytesRead;
+  if (hasUserBuffer) buffer = tryGetReadFileBuffer(options, size, fd, isUserFd);
+  else if (size === 0) buffers = [];
+  else buffer = tryCreateBuffer(size, fd, isUserFd);
+  if (hasUserBuffer) {
+    if (size !== 0) {
+      do { bytesRead = tryReadSync(fd, isUserFd, buffer, pos, size - pos); pos += bytesRead; } while (bytesRead !== 0 && pos < size);
+    } else pos = tryReadSyncWithUserBuffer(fd, isUserFd, buffer, c.getReadFileBufferByteLengthName(options));
+  } else if (size !== 0) {
+    do { bytesRead = tryReadSync(fd, isUserFd, buffer, pos, size - pos); pos += bytesRead; } while (bytesRead !== 0 && pos < size);
+  } else {
+    do {
+      // The kernel lies about many files: read until a read returns no bytes.
+      buffer = Buffer.allocUnsafe(8192);
+      bytesRead = tryReadSync(fd, isUserFd, buffer, 0, 8192);
+      if (bytesRead !== 0) buffers.push(buffer.slice(0, bytesRead));
+      pos += bytesRead;
+    } while (bytesRead !== 0);
+  }
+  if (!isUserFd) fs.closeSync(fd);
+  if (hasUserBuffer) buffer = buffer.subarray(0, pos);
+  else if (size === 0) buffer = Buffer.concat(buffers, pos);
+  else if (pos < size) buffer = buffer.slice(0, pos);
+  if (options.encoding) buffer = buffer.toString(options.encoding);
+  return buffer;
 };
 function writeFileOptions(options, flag) {
   const o = c.options(options, { encoding: 'utf8', mode: 0o666, flag, flush: false });
@@ -602,6 +693,12 @@ function writeAll(fd, isUserFd, buffer, offset, length, signal, flush, callback)
 }
 fs.writeFileSync = function writeFileSync(path, data, options) {
   const o = writeFileOptions(options, 'w');
+  // Node's C++ fast path for string data in UTF-8. A flush goes through fs.fsyncSync, which
+  // test-fs-write-file-flush watches, so it takes the general path.
+  if (typeof data === 'string' && !o.flush && (o.encoding === 'utf8' || o.encoding === 'utf-8')) {
+    if (!isFd(path)) path = c.path(path);
+    return binding.writeFileUtf8(path, data, c.stringToFlags(o.flag), c.mode(o.mode, 0o666));
+  }
   data = writeFileData(data, o);
   const isUserFd = isFd(path);
   const fd = isUserFd ? path : fs.openSync(path, o.flag, o.mode);
@@ -783,7 +880,7 @@ fs.opendir = function opendir(path, options, callback) {
   path = c.path(path); options = c.options(options, { encoding: 'utf8' });
   c.submit('opendir', [path, { encoding: options.encoding }], (err, entries) => {
     if (err) { callback(err); return; }
-    callback(null, new Dir(new DirHandle(entries.map(e => e instanceof Dirent ? e : new Dirent(e.name, e.mode, e.parentPath === undefined ? path : e.parentPath))), path, options));
+    callback(null, new Dir(new DirHandle(entries.map(e => e instanceof Dirent ? e : new Dirent(e.name, c.modeType(e.mode), e.parentPath === undefined ? path : e.parentPath))), path, options));
   }, callback);
 };
 const streamConstructors = {};

@@ -12,7 +12,7 @@ const {
 } = require('internal/streams/iter/primordials');
 const { isDataView } = require('util/types');
 const {
-  contexts, error, invalid, contextData, isContext, syntaxDiagnostic, run,
+  contexts, error, invalid, contextData, isContext, syntaxDiagnostic, run, runBegin, runEnd, runFailure, rethrow,
 } = require('internal/vm');
 const scripts = new WeakMap();
 const cacheMagic = Buffer.from('SILKVM01');
@@ -261,7 +261,13 @@ class Script {
   runInThisContext(value) {
     const data = scriptData(this);
     const execution = runOptions(value);
-    return run(data.handle, execution, false, true, execution.displayErrors ? data : undefined);
+    const listeners = runBegin(execution.breakOnSigint, true);
+    let result;
+    // No finally: leaving through one would move the recorded throw site.
+    try { result = host.vmRun(data.handle, execution.timeout, false, execution.breakOnSigint); }
+    catch (cause) { runEnd(listeners); rethrow(cause, runFailure(cause, execution.timeout, execution.displayErrors ? data : undefined)); }
+    runEnd(listeners);
+    return result;
   }
   runInContext(contextifiedObject, value) {
     const data = scriptData(this);
@@ -273,7 +279,13 @@ class Script {
       host.vmSetImportModuleDynamically(handle, data.dynamicImport);
       data.realms.set(contextifiedObject, handle);
     }
-    return run(handle, execution, context.afterEvaluate, true, execution.displayErrors ? data : undefined);
+    const listeners = runBegin(execution.breakOnSigint, true);
+    let result;
+    // No finally: leaving through one would move the recorded throw site.
+    try { result = host.vmRun(handle, execution.timeout, context.afterEvaluate, execution.breakOnSigint); }
+    catch (cause) { runEnd(listeners); rethrow(cause, runFailure(cause, execution.timeout, execution.displayErrors ? data : undefined)); }
+    runEnd(listeners);
+    return result;
   }
   runInNewContext(sandbox, value) {
     // As in Node, the context takes its options under context-prefixed names.

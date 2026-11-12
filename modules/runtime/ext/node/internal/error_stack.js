@@ -93,7 +93,9 @@ function install(global, isolated = false) {
     }
     return filename;
   }
-  function stringify(frame) {
+  // V8's SerializeJSStackFrame: an async stack trace frame is "async " then the frame.
+  function stringify(frame) { return frame.isAsync ? 'async ' + stringifyFrame(frame) : stringifyFrame(frame); }
+  function stringifyFrame(frame) {
     const name = frame.functionName;
     const place = location(frame);
     if (frame.isConstructor) return 'new ' + (name || '<anonymous>') + ' (' + place + ')';
@@ -127,7 +129,7 @@ function install(global, isolated = false) {
     getLineNumber() { return coordinate(record(this).lineNumber); },
     getMethodName() { return methodName(record(this)); },
     getPosition() { return position(record(this)); },
-    // Synchronous capture does not invent V8 asynchronous continuation frames.
+    // Promise.all continuations are not walked: no frame is one.
     getPromiseIndex() { record(this); return null; },
     getScriptNameOrSourceURL() { const frame = record(this); return frame.scriptName || (frame.isEval ? undefined : null); },
     getScriptHash() {
@@ -138,7 +140,7 @@ function install(global, isolated = false) {
     },
     getThis() { return record(this).receiver; },
     getTypeName() { return typeName(record(this)); },
-    isAsync() { record(this); return false; },
+    isAsync() { return record(this).isAsync; },
     isConstructor() { return record(this).isConstructor; },
     isEval() { return record(this).isEval; },
     isNative() { return record(this).isNative; },
@@ -160,7 +162,7 @@ function install(global, isolated = false) {
       enclosingColumnNumber: raw[16]?.enclosingColumnNumber ?? raw[12],
       typeName: raw[13], methodName: raw[14], isToplevel: raw[15],
       scriptMetadata: raw[16],
-      sourceLineNumber: raw[18], sourceColumnNumber: raw[19],
+      sourceLineNumber: raw[18], sourceColumnNumber: raw[19], isAsync: raw[20] === true,
     };
   }
   function defaultFormat(error, frames, sites) {
