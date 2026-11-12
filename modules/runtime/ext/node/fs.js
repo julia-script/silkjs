@@ -404,16 +404,26 @@ function readdirEntries(dir, o, recursive) {
 fs.readdirSync = function readdirSync(path, options) {
   const o = c.options(options, { encoding: 'utf8' }); path = c.path(path);
   if (o.recursive != null) validateBoolean(o.recursive, 'options.recursive');
-  return readdirEntries(path, o, !!o.recursive);
+  if (o.recursive) return readdirEntries(path, o, true);
+  // As Node: one binding call, then Dirents from the names and types.
+  const result = binding.readdir(path, o.encoding, !!o.withFileTypes);
+  return o.withFileTypes ? c.getDirents(path, result) : result;
 };
 fs.readdir = function readdir(path, options, callback) {
   callback = makeCallback(typeof options === 'function' ? options : callback);
   const o = c.options(options, { encoding: 'utf8' }); path = c.path(path);
   if (o.recursive != null) validateBoolean(o.recursive, 'options.recursive');
-  c.submit('readdir', [path, o], (err, value) => {
-    if (err) { callback(err); return; }
-    callback(null, value.map(entry => o.withFileTypes ? entry instanceof Dirent ? entry : new Dirent(c.encoded(entry.name, o.encoding), c.modeType(entry.mode), entry.parentPath === undefined ? path : entry.parentPath) : c.encoded(entry, o.encoding)));
-  }, callback);
+  if (o.recursive) {
+    c.submit('readdir', [path, o], (err, value) => {
+      if (err) { callback(err); return; }
+      callback(null, value.map(entry => o.withFileTypes ? entry instanceof Dirent ? entry : new Dirent(c.encoded(entry.name, o.encoding), c.modeType(entry.mode), entry.parentPath === undefined ? path : entry.parentPath) : c.encoded(entry, o.encoding)));
+    }, callback);
+    return;
+  }
+  const req = new binding.FSReqCallback();
+  if (!o.withFileTypes) req.oncomplete = callback;
+  else req.oncomplete = (err, result) => { if (err) { callback(err); return; } c.getDirents(path, result, callback); };
+  binding.readdir(path, o.encoding, !!o.withFileTypes, req);
 };
 
 function statCallback(cb, bigint) { validateFunction(cb, 'cb'); return [(err, value) => { if (err) return cb(err); cb(null, stats(value, bigint)); }, cb]; }

@@ -193,6 +193,24 @@ const binding = {
     if (req === undefined) return transferSync('read', fd, buffer, offset, length, pos);
     return same(req, 'read', [fd, buffer, offset, length, pos]);
   },
+  // node_file.cc ReadDir: the names, or [names, types] with UV_DIRENT_* types.
+  readdir(path, encoding, withTypes, req) {
+    if (req === undefined) {
+      const raw = c.rawNames(encoding);
+      const names = [], types = [];
+      for (const name of c.native('scandir', [path, raw])) {
+        if (name === '.' || name === '..') continue;
+        names.push(c.encoded(name, encoding));
+        if (withTypes) types.push(c.modeType(c.native('lstat', [raw ? c.rawEntryPath(path, name) : require('path').join(path, name), { bigint: false }]).mode));
+      }
+      return withTypes ? [names, types] : names;
+    }
+    const result = entries => {
+      if (!withTypes) return entries.map(name => c.encoded(name, encoding));
+      return [entries.map(entry => c.encoded(entry.name, encoding)), entries.map(entry => c.modeType(entry.mode))];
+    };
+    return same(req, 'readdir', [path, { encoding, withFileTypes: !!withTypes }], result);
+  },
   // node_file.cc ReadFileUtf8: open (unless given a descriptor), read to the end, close.
   readFileUtf8(path, flags) {
     const isUserFd = typeof path === 'number';

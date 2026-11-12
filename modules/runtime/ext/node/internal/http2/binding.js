@@ -70,6 +70,7 @@ const FRAME_PING = 6;
 const FRAME_GOAWAY = 7;
 const FLAG_END_STREAM = 1;
 const FLAG_ACK = 1;
+const FLAG_PADDED = 0x8;
 
 // SessionJSFields: bitfield, priority and frameError listener counts, then the
 // uint32 invalid frame and rejected stream limits.
@@ -247,6 +248,18 @@ function fromLoop(fn) {
   try { return fn(); } finally { outermost = previous; }
 }
 
+// Node's Debug(this, ...) under NODE_DEBUG_NATIVE=http2: the object's diagnostic
+// name, then the message, on stderr.
+let debugNative;
+function debug(target, message) {
+  if (debugNative === undefined) {
+    const list = process.env.NODE_DEBUG_NATIVE;
+    debugNative = typeof list === 'string' && list.split(',').some(name => name.trim().toUpperCase() === 'HTTP2');
+  }
+  if (!debugNative) return;
+  try { require('fs').writeSync(2, `${target.diagnosticName()} ${message}\n`); } catch {}
+}
+
 class Http2Ping {
   constructor(session, callback) {
     this.session = session;
@@ -314,6 +327,9 @@ class Http2Stream {
     this.consumedWhilePaused = 0;
     // Queued chunks: the write request completes with the last chunk of its write.
     this.queue = [];
+    // Where the next DATA byte on the wire falls in queue: entry index and offset.
+    this.wireIndex = 0;
+    this.wireOffset = 0;
     this.onread = undefined;
     if (options & STREAM_OPTION_EMPTY_PAYLOAD) this.writable = false;
     session.streams.set(id, this);
@@ -343,9 +359,15 @@ class Http2Stream {
   }
   id() { return this.streamId; }
   getAsyncId() { return this.resource.asyncId(); }
+  diagnosticName() {
+    const session = this.session;
+    const name = session && !session.destroyed ? session.diagnosticName() : 'session already destroyed';
+    return `HttpStream ${this.streamId} (${this.getAsyncId()}) [${name}]`;
+  }
   get isStreamBase() { return true; }
 
   readStart() {
+    debug(this, 'reading starting');
     const session = this.session;
     session.scope(() => {
       this.reading = true;
@@ -502,7 +524,10 @@ class Http2Stream {
       // Writes still queued when the stream goes away never complete.
       const queue = this.queue;
       this.queue = [];
+      this.wireIndex = 0;
+      this.wireOffset = 0;
       for (const { req } of queue) if (req) session.completeWrite(req, UV_ECANCELED);
+      debug(this, 'tearing down stream');
       this.resource.emitDestroy();
     });
   }
@@ -615,6 +640,7 @@ class Http2Session {
   }
   alive() { return !this.released; }
   getAsyncId() { return this.resource.asyncId(); }
+  diagnosticName() { return `Http2Session ${this.type === NGHTTP2_SESSION_SERVER ? 'server' : 'client'} (${this.getAsyncId()})`; }
 
   // Http2Scope: operations from JS schedule a write for the next loop turn.
   scope(fn) {
@@ -629,7 +655,8 @@ class Http2Session {
     if (!this.alive()) return;
     if (!call('wantWrite', this.id) && !this.outgoing.length) return;
     this.writeScheduled = true;
-    setImmediate(() => {
+    // Node's MaybeScheduleWrite queues a native immediate, which runs before the JS ones.
+    host.setNativeImmediate(() => {
       if (!this.alive() || !this.writeScheduled) return;
       fromLoop(() => this.sendPendingData());
     });
@@ -733,6 +760,8 @@ class Http2Session {
         const stream = this.streams.get(id);
         if (stream === undefined || stream.queue.length === 0) return;
         const { req, length } = stream.queue.shift();
+        if (stream.wireIndex > 0) stream.wireIndex--;
+        else stream.wireOffset = 0;
         if (stream.stats.firstByteSent === 0n) stream.stats.firstByteSent = hrtimeNs();
         stream.stats.sentBytes += length;
         if (req) this.outgoing.push(req);
@@ -764,7 +793,8 @@ class Http2Session {
         return;
       }
       case 14: {
-        if (a < NGHTTP2_ERR_FATAL || a === NGHTTP2_ERR_STREAM_CLOSED || a === NGHTTP2_ERR_FLOW_CONTROL || a === NGHTTP2_ERR_PROTO) {
+        // OnInvalidFrame: fatal errors, a frame on a closed stream and protocol errors.
+        if (a < NGHTTP2_ERR_FATAL || a === NGHTTP2_ERR_STREAM_CLOSED || a === NGHTTP2_ERR_PROTO) {
           makeCallback(this.resource, callbacks.error, this, [a]);
         }
         return;
@@ -778,6 +808,7 @@ class Http2Session {
   onFrame(id, flags, type, extra, payload) {
     switch (type) {
       case FRAME_DATA: {
+        debug(this, `handling data frame for stream ${id}`);
         const stream = this.streams.get(id);
         if (stream !== undefined && !stream.destroyed && (flags & FLAG_END_STREAM)) {
           streamBaseState[kReadBytesOrError] = UV_EOF;
@@ -884,9 +915,11 @@ class Http2Session {
   }
   onStreamClose(id, code) {
     const stream = this.streams.get(id);
+    debug(this, `stream ${id} closed with code: ${code}`);
     if (stream === undefined || stream.destroyed) return;
     stream.closed = true;
     stream.code = code;
+    debug(stream, `closed with code ${code}`);
     const answer = makeCallback(stream.resource, callbacks.streamClose, stream, [code, stream.peerReset]);
     if (answer === undefined || answer === false) stream.destroy();
   }
@@ -899,6 +932,37 @@ class Http2Session {
     makeCallback(this.resource, callbacks.frameError, this, [id, type, translateNghttp2ErrorCode(code)]);
   }
 
+  // One nghttp2 output as Node's outgoing buffers: a DATA frame goes out as its
+  // frame header, the pad length octet, the stream's queued writes it carries
+  // (each by itself, as OnSendData sends them by reference) and the padding;
+  // other frames stay as nghttp2 serialized them. Runs before drain(), so the
+  // writes this output completes are still in the stream's queue.
+  splitOutput(out, chunks) {
+    let start = 0, pos = 0;
+    while (pos + 9 <= out.length) {
+      const length = out.readUIntBE(pos, 3);
+      const end = pos + 9 + length;
+      if (out[pos + 3] !== FRAME_DATA || end > out.length) { pos = end; continue; }
+      if (pos > start) chunks.push(out.subarray(start, pos));
+      chunks.push(out.subarray(pos, pos + 9));
+      let at = pos + 9, pad = 0;
+      if (out[pos + 4] & FLAG_PADDED) { pad = out[at]; chunks.push(out.subarray(at, at + 1)); at++; }
+      const dataEnd = end - pad;
+      const stream = this.streams.get(out.readUInt32BE(pos + 5) & 0x7fffffff);
+      while (at < dataEnd) {
+        const entry = stream?.queue[stream.wireIndex];
+        if (entry === undefined) { chunks.push(out.subarray(at, dataEnd)); break; }
+        const n = Math.min(entry.length - stream.wireOffset, dataEnd - at);
+        chunks.push(out.subarray(at, at + n));
+        at += n;
+        stream.wireOffset += n;
+        if (stream.wireOffset === entry.length) { stream.wireIndex++; stream.wireOffset = 0; }
+      }
+      if (pad !== 0) chunks.push(out.subarray(dataEnd, end));
+      start = pos = end;
+    }
+    if (start < out.length) chunks.push(out.subarray(start));
+  }
   // Http2Session::SendPendingData: returns 1 when a send cannot start now.
   sendPendingData() {
     if (this.destroyed || !this.alive()) return 0;
@@ -909,10 +973,10 @@ class Http2Session {
     const chunks = [];
     while (this.alive()) {
       const out = call('send', this.id);
-      if (typeof out === 'number') break;
+      if (typeof out === 'number') { this.drain(); break; }
+      if (out.byteLength === 0) { this.drain(); break; }
+      this.splitOutput(Buffer.from(out), chunks);
       this.drain();
-      if (out.byteLength === 0) break;
-      chunks.push(Buffer.from(out));
     }
     const socket = this.socket;
     if (socket === null) {
