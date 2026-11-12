@@ -13,6 +13,8 @@ const states = new WeakMap();
 const endpoints = new Map();
 const retained = new Map();
 const token = {};
+// Ports closed while messages for them were queued, until those are emitted.
+const closing = new Map();
 const finalizer = new FinalizationRegistry(id => {
   endpoints.delete(id);
   host.workerNative('close', [id]);
@@ -96,8 +98,19 @@ function close(port, callback) {
   }
   if (value.id === null) return;
   value.refedAtClose = host.workerNative('hasRef', [value.id]);
-  host.workerNative('close', [value.id]);
+  // As Node's MessagePort::Close: messages already queued for this port are
+  // still emitted, before 'close'.
+  const endpoint = value.id;
+  const queued = [];
+  if (value.started) {
+    let envelope;
+    while ((envelope = host.workerNative('receive', [endpoint])) !== null) queued.push(envelope);
+  }
+  host.workerNative('close', [endpoint]);
+  closing.set(endpoint, port);
+  for (let at = 0; at < queued.length; at++) host.nextTick(() => deliver(port, queued[at]));
   dispose(port, true);
+  host.nextTick(() => closing.delete(endpoint));
 }
 function ref(port, enabled) {
   const value = state(port);
@@ -262,15 +275,18 @@ function receiveMessageOnPort(port) {
   if (envelope === null) return undefined;
   return { message: clone.decode(envelope, state(port).realm) };
 }
-function dispatch(event) {
-  const port = endpoints.get(event.port)?.deref();
-  if (!port) return false;
-  if (event.type === 'close') { dispose(port, true); return true; }
+function deliver(port, envelope) {
   let value;
   const ports = [];
-  try { value = clone.decode(event.envelope, state(port).realm, ports); }
-  catch (error) { emit(port, 'messageerror', error); return true; }
+  try { value = clone.decode(envelope, state(port).realm, ports); }
+  catch (error) { emit(port, 'messageerror', error); return; }
   emit(port, 'message', value, ports);
+}
+function dispatch(event) {
+  const port = endpoints.get(event.port)?.deref() ?? closing.get(event.port);
+  if (!port) return false;
+  if (event.type === 'close') { dispose(port, true); return true; }
+  deliver(port, event.envelope);
   return true;
 }
 function moveMessagePortToContext(port, context) {

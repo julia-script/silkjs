@@ -156,6 +156,11 @@ function splitStep(step) {
   return [name, args, recover];
 }
 function cpSyncFn(src, dest, opts) {
+  // Node's cpSyncCheckPaths binding checks both paths before it copies anything.
+  if (require('internal/host').builtinLoaded('internal/permission')) {
+    const permission = require('internal/permission');
+    permission.check('fs.read', src); permission.check('fs.write', dest);
+  }
   opts = { ...opts, [kSync]: true };
   const steps = cpSteps(src, dest, opts, true);
   let input; let error; let failed = false;

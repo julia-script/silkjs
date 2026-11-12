@@ -3,6 +3,7 @@
 // edges; JavaScript keeps only weak associations with public sandbox objects.
 const host = require('internal/host');
 const { Buffer } = require('buffer');
+const { RegExpPrototypeExec } = require('internal/per_context/primordials');
 const { createHash } = require('crypto');
 const {
   ArrayBufferIsView, DataViewPrototypeGetBuffer, DataViewPrototypeGetByteOffset,
@@ -247,8 +248,10 @@ class Script {
     host.vmSetImportModuleDynamically(handle, dynamicImport);
     scripts.set(this, { source, handle, dynamicImport, realms: new WeakMap(), filename, line, column });
     // The last "//# sourceMappingURL=" magic comment, as V8 reports it.
+    // The primordial exec, not matchAll: user code may have replaced RegExp.prototype's methods.
     let mapURL;
-    for (const match of source.matchAll(/\/\/[#@][ \t]+sourceMappingURL=[ \t]*([^\s'"]+)[ \t]*$/gm)) mapURL = match[1];
+    const mapPattern = /\/\/[#@][ \t]+sourceMappingURL=[ \t]*([^\s'"]+)[ \t]*$/gm;
+    for (let match; (match = RegExpPrototypeExec(mapPattern, source)) !== null;) mapURL = match[1];
     this.sourceMapURL = mapURL;
     if (opts.produceCachedData) {
       this.cachedData = this.createCachedData();

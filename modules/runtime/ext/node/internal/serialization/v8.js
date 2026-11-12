@@ -56,6 +56,13 @@ function isHostObject(value) {
 }
 
 function invalid() { throw new Error('Unable to deserialize cloned data.'); }
+function publicRead(deserializer, read, name) {
+  const offset = deserializer._offset;
+  try { return apply(read, deserializer, []); } catch {
+    deserializer._offset = offset;
+    throw new Error(`${name}() failed`);
+  }
+}
 function uint32(value) {
   if (!Number.isInteger(value) || value < 0 || value > 0xffffffff) throw new RangeError('Expected a uint32');
   return value;
@@ -109,7 +116,25 @@ function describeValue(value) {
   return `#<${name}>`;
 }
 
-class Serializer {
+// As the serdes binding's FunctionTemplates: a call without `new` is Node's
+// ERR_CONSTRUCT_CALL_REQUIRED, while subclasses construct through it as usual.
+function constructCallRequired(Class) {
+  const name = Class.name;
+  const constructor = { [name]: function(...args) {
+    if (new.target === undefined) {
+      const error = new TypeError(`Class constructor ${name} cannot be invoked without 'new'`);
+      error.code = 'ERR_CONSTRUCT_CALL_REQUIRED';
+      throw error;
+    }
+    return Reflect.construct(Class, args, new.target);
+  } }[name];
+  define(constructor, 'length', { __proto__: null, value: Class.length, configurable: true });
+  define(constructor, 'prototype', { __proto__: null, value: Class.prototype, writable: false });
+  define(Class.prototype, 'constructor', { __proto__: null, value: constructor, writable: true, configurable: true, enumerable: false });
+  return constructor;
+}
+
+const Serializer = constructCallRequired(class Serializer {
   constructor() {
     this._buffer = Buffer.allocUnsafe(256);
     this._length = 0;
@@ -144,7 +169,7 @@ class Serializer {
     this._length += 8;
   }
   writeRawBytes(value) {
-    if (!ArrayBuffer.isView(value)) throw new TypeError('Expected an ArrayBufferView');
+    if (!ArrayBuffer.isView(value)) throw new TypeError('source must be a TypedArray or a DataView');
     const info = viewInfo(value);
     this._reserve(info.length);
     this._buffer.set(new Uint8Array(info.buffer, info.offset, info.length), this._length);
@@ -299,12 +324,12 @@ class Serializer {
     this._tag('o'); const count = this._properties(value, keys(value));
     this._tag('{'); this.writeUint32(count);
   }
-}
+});
 Serializer.prototype._getDataCloneError = Error;
 
-class Deserializer {
+const Deserializer = constructCallRequired(class Deserializer {
   constructor(bytes) {
-    if (!ArrayBuffer.isView(bytes)) throw new TypeError('Expected an ArrayBufferView');
+    if (!ArrayBuffer.isView(bytes)) throw new TypeError('buffer must be a TypedArray or a DataView');
     const info = viewInfo(bytes);
     this.buffer = Buffer.from(info.buffer, info.offset, info.length);
     this._offset = 0;
@@ -321,7 +346,7 @@ class Deserializer {
     this._need(1); return this.buffer[this._offset];
   }
   _tag() { const tag = this._peek(); this._offset++; return tag; }
-  readUint32() {
+  _uint32() {
     let value = 0;
     for (let i = 0; i < 5; i++) {
       const byte = this._byte();
@@ -331,7 +356,7 @@ class Deserializer {
     }
     invalid();
   }
-  readUint64() {
+  _uint64() {
     let value = 0n;
     for (let i = 0; i < 10; i++) {
       const byte = this._byte();
@@ -341,16 +366,21 @@ class Deserializer {
     }
     invalid();
   }
-  readDouble() {
+  _double() {
     this._need(8);
     const value = new DataView(this.buffer.buffer, this.buffer.byteOffset + this._offset, 8).getFloat64(0, nativeLittleEndian);
     this._offset += 8; return value;
   }
+  // node_serdes.cc: the public reads report their own failure (V8's own reads say
+  // "Unable to deserialize cloned data.").
+  readUint32() { return publicRead(this, this._uint32, 'ReadUint32'); }
+  readUint64() { return publicRead(this, this._uint64, 'ReadUint64'); }
+  readDouble() { return publicRead(this, this._double, 'ReadDouble'); }
   _readRawBytes(length) { this._need(length); const start = this._offset; this._offset += length; return start; }
   readRawBytes(length) { const start = this._readRawBytes(length); return this.buffer.subarray(start, start + length); }
   readHeader() {
     if (this._byte() !== 255) invalid();
-    this._version = this.readUint32();
+    this._version = this._uint32();
     // Legacy pre-v13 host-object formats require an embedder-specific codec.
     if (this._version < 13 || this._version > 15) throw new Error('Unable to deserialize cloned data due to invalid or unsupported version.');
     return true;
@@ -364,7 +394,7 @@ class Deserializer {
   _getSharedArrayBufferFromId() { invalid(); }
   _add(value) { this._objects.push(value); return value; }
   _string(tag) {
-    const bytes = this.readRawBytes(this.readUint32());
+    const bytes = this.readRawBytes(this._uint32());
     if (tag === 83) return bytes.toString('utf8');
     if (tag === 34) return bytes.toString('latin1');
     if (tag !== 99 || bytes.length % 2) invalid();
@@ -379,7 +409,7 @@ class Deserializer {
     return this._string(tag);
   }
   _bigint() {
-    const bits = this.readUint32();
+    const bits = this._uint32();
     // V8's length bitfield has 30 bits and its sign occupies bit 0.
     if (bits >= 0x80000000) invalid();
     const length = bits >>> 1;
@@ -401,7 +431,7 @@ class Deserializer {
       dataProperty(object, name, value); count++;
     }
     this._tag();
-    if (this.readUint32() !== count) invalid();
+    if (this._uint32() !== count) invalid();
   }
   readValue() {
     let value = this._value();
@@ -413,13 +443,13 @@ class Deserializer {
     }
     return value;
   }
-  _readViewExtent() { return this.readUint32(); }
+  _readViewExtent() { return this._uint32(); }
   _view(buffer) {
-    const tag = this.readUint32();
+    const tag = this._uint32();
     const index = viewTags.indexOf(tag);
     const offset = this._readViewExtent();
     const length = this._readViewExtent();
-    const flags = this._version >= 14 ? this.readUint32() : 0;
+    const flags = this._version >= 14 ? this._uint32() : 0;
     const resize = isResizable(buffer);
     const shared = types.isSharedArrayBuffer(buffer);
     const size = apply(shared ? sharedLength : bufferLength, buffer, []);
@@ -434,24 +464,24 @@ class Deserializer {
   _value() {
     const tag = this._tag();
     switch (tag) {
-      case 63: this.readUint32(); return this.readValue();
+      case 63: this._uint32(); return this.readValue();
       case 95: return undefined;
       case 48: return null;
       case 84: return true;
       case 70: return false;
-      case 73: { const n = this.readUint32(); return (n >>> 1) ^ -(n & 1); }
-      case 85: return this.readUint32();
-      case 78: return this.readDouble();
+      case 73: { const n = this._uint32(); return (n >>> 1) ^ -(n & 1); }
+      case 85: return this._uint32();
+      case 78: return this._double();
       case 90: return this._bigint();
       case 83: case 34: case 99: return this._string(tag);
       case 94: {
-        const id = this.readUint32();
+        const id = this._uint32();
         if (id >= this._objects.length || this._objects[id] === UNRESOLVED) invalid();
         return this._objects[id];
       }
       case 111: { const object = this._add({}); this._properties(object, 123); return object; }
       case 97: case 65: {
-        const length = this.readUint32();
+        const length = this._uint32();
         if (tag === 65 && length > this.buffer.length - this._offset) invalid();
         const array = this._add(new Array(length));
         if (tag === 65) {
@@ -461,18 +491,18 @@ class Deserializer {
           }
         }
         this._properties(array, tag === 65 ? 36 : 64);
-        if (this.readUint32() !== length || array.length !== length) invalid();
+        if (this._uint32() !== length || array.length !== length) invalid();
         return array;
       }
-      case 68: return this._add(new Date(this.readDouble()));
+      case 68: return this._add(new Date(this._double()));
       case 121: return this._add(new Boolean(true));
       case 120: return this._add(new Boolean(false));
-      case 110: return this._add(new Number(this.readDouble()));
+      case 110: return this._add(new Number(this._double()));
       case 122: return this._add(Object(this._bigint()));
       case 115: return this._add(new String(this._readString()));
       case 82: {
         const pattern = this._readString();
-        const flags = this.readUint32();
+        const flags = this._uint32();
         if (flags & ~0x1bf || (flags & 16) && (flags & 256)) invalid();
         let text = '';
         for (let i = 0; i < flagLetters.length; i++) if (flags & (1 << i)) {
@@ -484,16 +514,16 @@ class Deserializer {
       case 59: {
         const map = this._add(new Map()); let count = 0;
         while (this._peek() !== 58) { const key = this.readValue(); const item = this.readValue(); Map.prototype.set.call(map, key, item); count += 2; }
-        this._tag(); if (this.readUint32() !== count) invalid(); return map;
+        this._tag(); if (this._uint32() !== count) invalid(); return map;
       }
       case 39: {
         const set = this._add(new Set()); let count = 0;
         while (this._peek() !== 44) { Set.prototype.add.call(set, this.readValue()); count++; }
-        this._tag(); if (this.readUint32() !== count) invalid(); return set;
+        this._tag(); if (this._uint32() !== count) invalid(); return set;
       }
       case 66: case 126: {
-        const length = this.readUint32();
-        const max = tag === 126 ? this.readUint32() : length;
+        const length = this._uint32();
+        const max = tag === 126 ? this._uint32() : length;
         if (length > max || tag === 126 && !resizable) invalid();
         const bytes = this.readRawBytes(length);
         const buffer = tag === 126 ? new ArrayBuffer(length, { maxByteLength: max }) : new ArrayBuffer(length);
@@ -501,11 +531,11 @@ class Deserializer {
         new Uint8Array(buffer).set(bytes); return this._add(buffer);
       }
       case 116: {
-        const id = this.readUint32(); if (!this._transfers.has(id)) invalid();
+        const id = this._uint32(); if (!this._transfers.has(id)) invalid();
         return this._add(this._transfers.get(id));
       }
       case 117: {
-        const value = this._getSharedArrayBufferFromId(this.readUint32());
+        const value = this._getSharedArrayBufferFromId(this._uint32());
         if (!types.isSharedArrayBuffer(value)) invalid();
         return this._add(value);
       }
@@ -521,23 +551,23 @@ class Deserializer {
   }
   _error() {
     const id = this._objects.length; this._add(UNRESOLVED);
-    let tag = this.readUint32();
+    let tag = this._uint32();
     if (tag > 255) invalid();
     let Ctor = Error;
     const name = String.fromCharCode(tag);
-    if (own(errorConstructors, name)) { Ctor = errorConstructors[name]; tag = this.readUint32(); }
+    if (own(errorConstructors, name)) { Ctor = errorConstructors[name]; tag = this._uint32(); }
     let message;
-    if (tag === 109) { message = this._readString(); tag = this.readUint32(); }
+    if (tag === 109) { message = this._readString(); tag = this._uint32(); }
     let stack;
-    if (tag === 115) { stack = this._readString(); tag = this.readUint32(); }
+    if (tag === 115) { stack = this._readString(); tag = this._uint32(); }
     const error = message === undefined ? new Ctor() : new Ctor(message);
     dataProperty(error, 'stack', stack, false);
     this._objects[id] = error;
-    if (tag === 99) { dataProperty(error, 'cause', this.readValue(), false); tag = this.readUint32(); }
+    if (tag === 99) { dataProperty(error, 'cause', this.readValue(), false); tag = this._uint32(); }
     if (tag !== 46) invalid();
     return error;
   }
-}
+});
 
 class DefaultSerializer extends Serializer {
   constructor() { super(); this._setTreatArrayBufferViewsAsHostObjects(true); }
@@ -554,10 +584,10 @@ class DefaultSerializer extends Serializer {
 }
 class DefaultDeserializer extends Deserializer {
   _readHostObject() {
-    const index = this.readUint32();
+    const index = this._uint32();
     const Ctor = constructors[index];
     if (!Ctor) invalid();
-    const length = this.readUint32();
+    const length = this._uint32();
     const width = Ctor.BYTES_PER_ELEMENT || 1;
     if (length % width) invalid();
     let bytes = this.readRawBytes(length);
@@ -579,7 +609,7 @@ class IPCSerializer extends DefaultSerializer {
 }
 class IPCDeserializer extends DefaultDeserializer {
   _readHostObject() {
-    const tag = this.readUint32();
+    const tag = this._uint32();
     if (tag === 0) return super._readHostObject();
     if (tag === 1) return this.readValue();
     invalid();

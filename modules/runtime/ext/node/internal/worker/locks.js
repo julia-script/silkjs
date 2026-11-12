@@ -4,6 +4,11 @@ const host = require('internal/host');
 const { codedError } = require('internal/worker/clone');
 const { DOMException } = require('internal/path_events/event_target');
 const { validateAbortSignal } = require('internal/path_events/support');
+const dc = require('diagnostics_channel');
+const startChannel = dc.channel('locks.request.start');
+const grantChannel = dc.channel('locks.request.grant');
+const missChannel = dc.channel('locks.request.miss');
+const endChannel = dc.channel('locks.request.end');
 const token = {};
 const lockStates = new WeakMap();
 const requests = new Map();
@@ -38,6 +43,10 @@ function finish(request, error, result, failed) {
   // notification was polled. Resolve according to synchronized ownership.
   if (host.workerNative('lockStatus', [request.id]) === 2) { failed = true; error = abortError(); }
   host.workerNative('lockRelease', [request.id]);
+  if (endChannel.hasSubscribers) {
+    const { name, mode, ifAvailable, steal } = request;
+    endChannel.publish({ name, mode, ifAvailable, steal, error: failed ? error : undefined });
+  }
   if (failed) request.reject(error); else request.resolve(result);
 }
 function invoke(request, status) {
@@ -48,6 +57,8 @@ function invoke(request, status) {
     if (request.finished) return;
     if (request.signal?.aborted) { finish(request, request.signal.reason, undefined, true); return; }
     request.started = true;
+    if (status === 3) { if (request.ifAvailable && missChannel.hasSubscribers) missChannel.publish({ name: request.name, mode: request.mode }); }
+    else if (grantChannel.hasSubscribers) grantChannel.publish({ name: request.name, mode: request.mode });
     let result;
     try { result = request.callback(status === 3 ? null : new Lock(token, request.name, request.mode)); }
     catch (error) { finish(request, error, undefined, true); return; }
@@ -80,9 +91,10 @@ class LockManager {
     if (ifAvailable && steal) throw unsupported('ifAvailable and steal are mutually exclusive');
     if (steal && mode !== 'exclusive') throw unsupported('mode: "shared" and steal are mutually exclusive');
     if (signal && (steal || ifAvailable)) throw unsupported('signal cannot be used with steal or ifAvailable');
+    if (startChannel.hasSubscribers) startChannel.publish({ name, mode });
     return new Promise((resolve, reject) => {
       const id = host.workerNative('lockRequest', [name, mode === 'shared', steal, ifAvailable]);
-      const request = { id, name, mode, callback, signal, resolve, reject, started: false, finished: false, abort: undefined };
+      const request = { id, name, mode, ifAvailable, steal, callback, signal, resolve, reject, started: false, finished: false, abort: undefined };
       requests.set(id, request);
       if (signal) {
         request.abort = () => {

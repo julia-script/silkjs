@@ -404,4 +404,24 @@ function getDirents(path, { 0: names, 1: types }, callback) {
 // Node's validatePath and getValidatedPath live in internal/fs/utils.
 const { validatePath, getValidatedPath } = require('internal/validators');
 
-module.exports = { validatePath, getValidatedPath, defaultRmOptions, validateRmdirOptions, validateRmOptions, validateRmOptionsSync, isDirectoryError, emitRecursiveRmdirWarning, realpathCacheKey, getDirent, getDirents, kRef, kUnref, host, os, std, Buffer, constants, error, fail, pair, invalid, range, integer, path, toPathIfFileURL, fd, options, assertEncoding, mode, stringToFlags, native, callback, promiseCallback, submit, time, bytes, position, validateOffsetLengthRead, validateOffsetLengthWrite, validateStringAfterArrayBufferView, bufferArray, encoding, encoded, rawNames, rawEntryPath, aborted, Stats, BigIntStats, makeStats, Dirent, StatFs, makeStatFs, v };
+function preprocessSymlinkDestination(path, type, linkPath) {
+  if (process.platform !== 'win32') {
+    // No preprocessing is needed on Unix.
+    return path;
+  }
+  const pathModule = require('path');
+  path = '' + path;
+  if (type === 'junction') {
+    // Junctions paths need to be absolute and \\?\-prefixed.
+    // A relative target is relative to the link's parent directory.
+    path = pathModule.resolve(linkPath, '..', path);
+    return pathModule.toNamespacedPath(path);
+  }
+  if (pathModule.isAbsolute(path)) {
+    // If the path is absolute, use the \\?\-prefix to enable long filenames
+    return pathModule.toNamespacedPath(path);
+  }
+  // Windows symlinks don't tolerate forward slashes.
+  return path.replace(/\//g, '\\');
+}
+module.exports = { preprocessSymlinkDestination, validatePath, getValidatedPath, defaultRmOptions, validateRmdirOptions, validateRmOptions, validateRmOptionsSync, isDirectoryError, emitRecursiveRmdirWarning, realpathCacheKey, getDirent, getDirents, kRef, kUnref, host, os, std, Buffer, constants, error, fail, pair, invalid, range, integer, path, toPathIfFileURL, fd, options, assertEncoding, mode, stringToFlags, native, callback, promiseCallback, submit, time, bytes, position, validateOffsetLengthRead, validateOffsetLengthWrite, validateStringAfterArrayBufferView, bufferArray, encoding, encoded, rawNames, rawEntryPath, aborted, Stats, BigIntStats, makeStats, Dirent, StatFs, makeStatFs, v };

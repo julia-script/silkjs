@@ -83,6 +83,13 @@ function format(error, fromPromise) {
   let text = '';
   // AppendExceptionLine prints the source of anything but an error at once.
   if (source !== undefined && !nativeError) { text += '\n' + source; source = undefined; }
+  // fatalExceptionStackEnhancers.beforeInspector: an unhandled 'error' event names its emitter.
+  if (object) {
+    try {
+      const enhance = error[require('internal/errors').kEnhanceStackBeforeInspector];
+      if (typeof enhance === 'function') error.stack = enhance();
+    } catch {}
+  }
   const trace = object ? inspected(error) : undefined;
   if (typeof trace === 'string' && trace.length > 0) {
     text += (source === undefined ? '' : source + '\n') + trace + '\n';
