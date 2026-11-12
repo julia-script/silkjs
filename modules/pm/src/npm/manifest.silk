@@ -1,0 +1,368 @@
+//! Reads what an install needs from a package manifest: a `package.json`, or the object of one
+//! version in a registry document, which has the same fields.
+//!
+//! A [`Manifest`] owns its text, so the document it was read from can be dropped.
+
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.collections.bytes { Bytes }
+import silk.collections.list { List }
+import silk.collections.slice { Slice }
+import silk.core.option { Option }
+import silk.core.ownership { Copy }
+import pkg.json_walk { Text, Walker }
+import pkg.text { same }
+
+/// A dependency that is installed for everyone.
+pub const PRODUCTION: u8 = 0
+/// A dependency of the package's own development, installed only for the root project.
+pub const DEVELOPMENT: u8 = 1
+/// A dependency whose failure to install is not an error.
+pub const OPTIONAL: u8 = 2
+/// A dependency the package expects its consumer to provide.
+pub const PEER: u8 = 3
+
+/// A range of the manifest's own text.
+pub struct Span {
+  start: usize,
+  length: usize,
+}
+
+impl Copy for Span {}
+
+/// One entry of a dependency field.
+pub struct Dependency {
+  /// The name the dependency is installed under.
+  pub name: Span,
+  /// What to install: a version range, a tag, or a protocol such as `npm:` or `workspace:`.
+  pub spec: Span,
+  /// One of [`PRODUCTION`], [`DEVELOPMENT`], [`OPTIONAL`] and [`PEER`].
+  pub kind: u8,
+  /// For a peer: whether `peerDependenciesMeta` marks it optional.
+  pub optionalPeer: bool,
+}
+
+impl Copy for Dependency {}
+
+/// One executable a package provides.
+pub struct Bin {
+  /// The command name.
+  pub name: Span,
+  /// The file, relative to the package.
+  pub path: Span,
+}
+
+impl Copy for Bin {}
+
+/// The fields of a manifest that an install reads.
+pub struct Manifest {
+  content: Bytes,
+  /// The package name. Empty when the manifest has none.
+  pub name: Span,
+  /// The package version. Empty when the manifest has none.
+  pub version: Span,
+  dependencies: List<Dependency>,
+  bins: List<Bin>,
+  os: List<Span>,
+  cpu: List<Span>,
+  libc: List<Span>,
+  /// Whether the package has scripts that run at install time.
+  pub hasInstallScript: bool,
+}
+
+// Copies a string of the document into the manifest's own text.
+effect fn keep(text: &mut Bytes, value: &Text<'_>) -> Span ! OutOfMemoryError ? &mut Allocator {
+  let start = Bytes.length(&text)
+  if value.escaped {
+    let decoded = run Text.decode(value)
+    run text.append(Bytes.asSlice(&decoded))
+  } else {
+    run text.append(Text.bytes(value))
+  }
+  return Span { start: start, length: Bytes.length(&text) - start }
+}
+
+effect fn readDependencies(walker: &mut Walker<'_>, manifest: &mut Manifest, kind: u8) -> () ! OutOfMemoryError ? &mut Allocator {
+  if Walker.enterObject(&mut walker) == false {
+    return ()
+  }
+  while true {
+    match move Walker.key(&mut walker) {
+      Option.None => { break }
+      Option.Some { value: key } => {
+        let spec = Walker.string(&mut walker)
+        if Text.present(&spec) {
+          let name = run keep(&mut manifest.content, &key)
+          let kept = run keep(&mut manifest.content, &spec)
+          run manifest.dependencies.append(Dependency { name: name, spec: kept, kind: kind, optionalPeer: false })
+        }
+      }
+    }
+  }
+}
+
+// Reads a field that is one string or an array of strings.
+effect fn readNames(walker: &mut Walker<'_>, text: &mut Bytes, names: &mut List<Span>) -> () ! OutOfMemoryError ? &mut Allocator {
+  if Walker.enterArray(&mut walker) == false {
+    return ()
+  }
+  let mut more = true
+  while more {
+    let element = Walker.element(&mut walker, &mut more)
+    if Text.present(&element) {
+      run names.append(run keep(&mut text, &element))
+    }
+  }
+}
+
+// Reads the names that `peerDependenciesMeta` marks optional.
+effect fn readOptionalPeers(walker: &mut Walker<'_>, text: &mut Bytes, names: &mut List<Span>) -> () ! OutOfMemoryError ? &mut Allocator {
+  if Walker.enterObject(&mut walker) == false {
+    return ()
+  }
+  while true {
+    match move Walker.key(&mut walker) {
+      Option.None => { break }
+      Option.Some { value: peer } => {
+        if Walker.enterObject(&mut walker) == false {
+          continue
+        }
+        while true {
+          match move Walker.key(&mut walker) {
+            Option.None => { break }
+            Option.Some { value: field } => {
+              if same(Text.bytes(&field), b"optional") {
+                if Walker.isTrue(&mut walker) {
+                  run names.append(run keep(&mut text, &peer))
+                }
+              } else {
+                Walker.skip(&mut walker)
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+effect fn readScripts(walker: &mut Walker<'_>, manifest: &mut Manifest) -> () {
+  if Walker.enterObject(&mut walker) == false {
+    return ()
+  }
+  while true {
+    match move Walker.key(&mut walker) {
+      Option.None => { break }
+      Option.Some { value: key } => {
+        let name = Text.bytes(&key)
+        if same(name, b"preinstall") || same(name, b"install") || same(name, b"postinstall") {
+          manifest.hasInstallScript = true
+        }
+        Walker.skip(&mut walker)
+      }
+    }
+  }
+}
+
+impl Manifest {
+  /// Reads a manifest. Returns none when `source` is not a JSON object.
+  pub effect fn parse(source: &[u8]) -> Option<Manifest> ! OutOfMemoryError ? &mut Allocator {
+    let mut walker = Walker.make(source)
+    let mut manifest = Manifest {
+      content: Bytes.make(),
+      name: Span { start: 0, length: 0 },
+      version: Span { start: 0, length: 0 },
+      dependencies: List<Dependency>.make(),
+      bins: List<Bin>.make(),
+      os: List<Span>.make(),
+      cpu: List<Span>.make(),
+      libc: List<Span>.make(),
+      hasInstallScript: false,
+    }
+    let mut optionalPeers = List<Span>.make()
+    // A `bin` that is one string is named after the package, which may come later.
+    let mut soleBin = Span { start: 0, length: 0 }
+    if Walker.enterObject(&mut walker) == false {
+      return Option<Manifest>.none()
+    }
+    while true {
+      match move Walker.key(&mut walker) {
+        Option.None => { break }
+        Option.Some { value: key } => {
+          let field = Text.bytes(&key)
+          if same(field, b"name") {
+            let value = Walker.string(&mut walker)
+            manifest.name = run keep(&mut manifest.content, &value)
+          } else if same(field, b"version") {
+            let value = Walker.string(&mut walker)
+            manifest.version = run keep(&mut manifest.content, &value)
+          } else if same(field, b"dependencies") {
+            run readDependencies(&mut walker, &mut manifest, PRODUCTION)
+          } else if same(field, b"devDependencies") {
+            run readDependencies(&mut walker, &mut manifest, DEVELOPMENT)
+          } else if same(field, b"optionalDependencies") {
+            run readDependencies(&mut walker, &mut manifest, OPTIONAL)
+          } else if same(field, b"peerDependencies") {
+            run readDependencies(&mut walker, &mut manifest, PEER)
+          } else if same(field, b"peerDependenciesMeta") {
+            run readOptionalPeers(&mut walker, &mut manifest.content, &mut optionalPeers)
+          } else if same(field, b"os") {
+            run readNames(&mut walker, &mut manifest.content, &mut manifest.os)
+          } else if same(field, b"cpu") {
+            run readNames(&mut walker, &mut manifest.content, &mut manifest.cpu)
+          } else if same(field, b"libc") {
+            run readNames(&mut walker, &mut manifest.content, &mut manifest.libc)
+          } else if same(field, b"hasInstallScript") {
+            if Walker.isTrue(&mut walker) {
+              manifest.hasInstallScript = true
+            }
+          } else if same(field, b"scripts") {
+            run readScripts(&mut walker, &mut manifest)
+          } else if same(field, b"bin") {
+            run readBin(&mut walker, &mut manifest, &mut soleBin)
+          } else {
+            Walker.skip(&mut walker)
+          }
+        }
+      }
+    }
+    if Walker.failed(&walker) {
+      return Option<Manifest>.none()
+    }
+    if soleBin.length > 0 && manifest.name.length > 0 {
+      // The command is the package name without its scope.
+      let name = Manifest.text(&manifest, manifest.name)
+      let mut start: usize = 0
+      let mut index: usize = 0
+      while index < name.length {
+        if name[index] == 47 {
+          start = index + 1
+        }
+        index = index + 1
+      }
+      let command = Span { start: manifest.name.start + start, length: manifest.name.length - start }
+      run manifest.bins.append(Bin { name: command, path: soleBin })
+    }
+    run Manifest.settle(&mut manifest, &optionalPeers)
+    return Option<Manifest>.some(move manifest)
+  }
+
+  // Applies the rules between fields: an optional dependency replaces a production one of the
+  // same name, and peers take their optional mark.
+  effect fn settle(self: &mut Self, optionalPeers: &List<Span>) -> () ! OutOfMemoryError ? &mut Allocator {
+    let mut kept = List<Dependency>.make()
+    let all = List<Dependency>.asSlice(&self.dependencies)
+    let marks = List<Span>.asSlice(optionalPeers)
+    let mut index: usize = 0
+    while index < all.length {
+      let mut entry = all[index]
+      let name = Manifest.text(&self, entry.name)
+      let mut dropped = false
+      if entry.kind == PRODUCTION {
+        let mut other: usize = 0
+        while other < all.length {
+          if all[other].kind == OPTIONAL && same(Manifest.text(&self, all[other].name), name) {
+            dropped = true
+          }
+          other = other + 1
+        }
+      }
+      if entry.kind == PEER {
+        let mut mark: usize = 0
+        while mark < marks.length {
+          if same(Manifest.text(&self, marks[mark]), name) {
+            entry.optionalPeer = true
+          }
+          mark = mark + 1
+        }
+      }
+      if dropped == false {
+        run kept.append(entry)
+      }
+      index = index + 1
+    }
+    self.dependencies = move kept
+  }
+
+  /// The bytes of a span of this manifest.
+  pub fn text(self: &Self, span: Span) -> &[u8] {
+    return Slice.view<u8>(Bytes.asSlice(&self.content), span.start, span.length)
+  }
+
+  /// Every dependency, of every kind.
+  pub fn allDependencies(self: &Self) -> &[Dependency] {
+    return List<Dependency>.asSlice(&self.dependencies)
+  }
+
+  /// The executables the package provides.
+  pub fn allBins(self: &Self) -> &[Bin] {
+    return List<Bin>.asSlice(&self.bins)
+  }
+
+  /// Whether the package can be installed on a host, by its `os`, `cpu` and `libc` fields. A
+  /// field lists the hosts it allows, or with `!` the ones it excludes. An empty `hostLibc`
+  /// means the host has no notion of one, which satisfies any `libc` field.
+  pub fn supports(self: &Self, hostOs: &[u8], hostCpu: &[u8], hostLibc: &[u8]) -> bool {
+    if Manifest.allows(self, &self.os, hostOs) == false {
+      return false
+    }
+    if Manifest.allows(self, &self.cpu, hostCpu) == false {
+      return false
+    }
+    if hostLibc.length == 0 {
+      return true
+    }
+    return Manifest.allows(self, &self.libc, hostLibc)
+  }
+
+  fn allows(self: &Self, list: &List<Span>, host: &[u8]) -> bool {
+    let names = List<Span>.asSlice(list)
+    if names.length == 0 {
+      return true
+    }
+    let mut anyAllowList = false
+    let mut allowed = false
+    let mut index: usize = 0
+    while index < names.length {
+      let name = Manifest.text(self, names[index])
+      if name.length > 0 && name[0] == 33 {
+        if same(Slice.view<u8>(name, 1, name.length - 1), host) {
+          return false
+        }
+      } else {
+        anyAllowList = true
+        if same(name, host) {
+          allowed = true
+        }
+      }
+      index = index + 1
+    }
+    return allowed || anyAllowList == false
+  }
+}
+
+// Reads `bin`: one string, or an object of command names and files.
+effect fn readBin(walker: &mut Walker<'_>, manifest: &mut Manifest, sole: &mut Span) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut entered = false
+  let value = Walker.stringOrObject(&mut walker, &mut entered)
+  if Text.present(&value) {
+    // The name is settled at the end, when the package name is known.
+    sole.* = run keep(&mut manifest.content, &value)
+    return ()
+  }
+  if entered == false {
+    return ()
+  }
+  while true {
+    match move Walker.key(&mut walker) {
+      Option.None => { break }
+      Option.Some { value: key } => {
+        let path = Walker.string(&mut walker)
+        if Text.present(&path) {
+          let name = run keep(&mut manifest.content, &key)
+          let kept = run keep(&mut manifest.content, &path)
+          run manifest.bins.append(Bin { name: name, path: kept })
+        }
+      }
+    }
+  }
+}
