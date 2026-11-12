@@ -202,11 +202,12 @@ const kGenericUserError = 1;
 const kInvalidFatalExceptionMonkeyPatching = 6;
 const kExceptionInFatalExceptionHandler = 7;
 // The at-exit work process.exit does too: the inspector's exit handshake, the
-// compile cache, a --heap-prof profile.
+// compile cache, a --heap-prof profile, NODE_V8_COVERAGE.
 function terminate(code) {
   if (host.builtinLoaded('internal/inspector')) require('internal/inspector')._atExit();
   if (host.builtinLoaded('internal/compile_cache')) require('internal/compile_cache').flushAtExit();
   if (host.builtinLoaded('internal/heap_prof')) require('internal/heap_prof').finish();
+  if (host.builtinLoaded('internal/profiler_binding')) require('internal/profiler_binding').finish();
   host.rawStd.exit(code);
 }
 // TriggerUncaughtException: an error nothing caught reaches process._fatalException;
