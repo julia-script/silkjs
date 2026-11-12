@@ -633,4 +633,11 @@ module.exports = {
   importGenericSecretKey,
   serializeKey,
   deserializeKey,
+  // The KeyObject half (crypto.js port).
+  prepareAsymmetricKey: (key, ctx, name) => core.prepareAsymmetricKey(key, ctx, name),
+  getKeyObjectHandle: (key) => core.getKeyObjectHandle(key),
+  kCreatePrivate: core.keyContexts.kCreatePrivate,
+  kCreatePublic: core.keyContexts.kCreatePublic,
+  kConsumePrivate: core.keyContexts.kConsumePrivate,
+  kConsumePublic: core.keyContexts.kConsumePublic,
 };

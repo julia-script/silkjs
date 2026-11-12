@@ -7,7 +7,7 @@
 
 const host = require('internal/host');
 const { AsyncResource } = require('async_hooks');
-const { Response, readResponse, responseState, serverRequest } = require('internal/web/fetch/message');
+const { Response, readResponse, takeResponseText, responseState, serverRequest } = require('internal/web/fetch/message');
 const { headerList } = require('internal/web/fetch/headers');
 const { URL } = require('internal/web/url');
 const { _memoryBytes: memoryBytes } = require('internal/web/blob');
@@ -129,6 +129,13 @@ function send(connection, requestFlags, head, response) {
   server._pending--;
   if (connection.closed || connection.closing || connection.finished) return;
   // The common case: a kept-alive GET answered with text and no headers of its own.
+  if ((requestFlags & KEEP_ALIVE) !== 0 && !head && !server._stopping) {
+    const text = takeResponseText(response);
+    if (text !== undefined) {
+      if (httpRespondText(connection.id, 200, '', 'text/plain;charset=UTF-8', text) < 0) connection.close();
+      return;
+    }
+  }
   const fast = readResponse(response);
   if (fast !== undefined && fast.fields === null && (requestFlags & KEEP_ALIVE) !== 0 && !head && !server._stopping) {
     const payload = fast.body;

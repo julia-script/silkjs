@@ -24,18 +24,18 @@
 
 const {
   NumberIsNaN,
-} = require('internal/readline/primordials');
+} = require('internal/per_context/primordials');
 
 const {
   codes: {
     ERR_INVALID_ARG_VALUE,
     ERR_INVALID_CURSOR_POS,
   },
-} = require('internal/readline/support');
+} = require('internal/errors');
 
 const {
   validateFunction,
-} = require('internal/readline/support');
+} = require('internal/validators');
 const {
   CSI,
 } = require('internal/readline/utils');
