@@ -42,12 +42,35 @@ function aggregateTwoErrors(inner, outer) {
 }
 function checkAborted(signal) { if (signal?.aborted) throw new AbortError(undefined, { cause: signal?.reason }); }
 
+// Node's native FileHandle closes a descriptor that its object never closed, and then
+// warns from an unref'ed immediate, with the DEP0137 deprecation once per process.
+let gcCloseWarned = false;
+const gcCloser = new FinalizationRegistry((fd) => {
+  try { fs.closeSync(fd); } catch {}
+  setImmediate(() => {
+    process.emitWarning(`Closing file descriptor ${fd} on garbage collection`);
+    if (gcCloseWarned) return;
+    gcCloseWarned = true;
+    process.emitWarning('Closing a FileHandle object on garbage collection is deprecated. ' +
+      'Please close FileHandle objects explicitly using FileHandle.prototype.close(). ' +
+      'In the future, an error will be thrown if a file descriptor is closed during garbage collection.',
+    'DeprecationWarning', 'DEP0137');
+  }).unref();
+});
+function releaseFd(handle) {
+  const fd = handle[kFd];
+  handle[kFd] = -1;
+  gcCloser.unregister(handle);
+  return fd;
+}
+
 class FileHandle extends EventEmitter {
   #brandCheck = undefined;
   static isFileHandle(value) { return value != null && typeof value === 'object' && #brandCheck in value; }
   constructor(fd) {
     super();
     this[kFd] = fd === undefined ? -1 : fd;
+    if (this[kFd] !== -1) gcCloser.register(this, this[kFd], this);
     this[kRefs] = 1;
     this[kClosePromise] = null;
   }
@@ -75,7 +98,7 @@ class FileHandle extends EventEmitter {
     if (this[kClosePromise]) return this[kClosePromise];
     this[kRefs]--;
     if (this[kRefs] === 0) {
-      const fd = this[kFd]; this[kFd] = -1;
+      const fd = releaseFd(this);
       this[kClosePromise] = binding('close', [fd], 2).finally(() => { this[kClosePromise] = undefined; });
     } else {
       this[kClosePromise] = new Promise((resolve, reject) => { this[kCloseResolve] = resolve; this[kCloseReject] = reject; })
@@ -87,7 +110,7 @@ class FileHandle extends EventEmitter {
   [kCloseSync]() {
     if (this[kFd] === -1) return;
     if (this[kClosePromise]) throw invalidState('The FileHandle is closing');
-    const fd = this[kFd]; this[kFd] = -1;
+    const fd = releaseFd(this);
     fs.closeSync(fd);
     this.emit('close');
   }
@@ -126,7 +149,7 @@ class FileHandle extends EventEmitter {
   [kUnref]() {
     this[kRefs]--;
     if (this[kRefs] === 0) {
-      const fd = this[kFd]; this[kFd] = -1;
+      const fd = releaseFd(this);
       binding('close', [fd], 2).then(this[kCloseResolve], this[kCloseReject]);
     }
   }
@@ -143,7 +166,7 @@ c.fileHandles = {
     return handle[kFd];
   },
   detach(handle) {
-    handle[kFd] = -1;
+    releaseFd(handle);
     handle[kCloseReason] = 'The FileHandle has been transferred';
     handle[kRefs] = 0;
   },
@@ -385,7 +408,7 @@ async function readdir(path, options) {
   path = c.path(path);
   const encoding = c.encoding(options.encoding, 'utf8', true);
   const value = await binding('readdir', [path, { ...options, encoding }]);
-  return value.map(entry => options.withFileTypes ? entry instanceof Dirent ? entry : new Dirent(c.encoded(entry.name, encoding), entry.mode, entry.parentPath === undefined ? path : entry.parentPath) : typeof entry === 'string' ? c.encoded(entry, encoding) : Buffer.from(entry));
+  return value.map(entry => options.withFileTypes ? entry instanceof Dirent ? entry : new Dirent(c.encoded(entry.name, encoding), entry.mode, entry.parentPath === undefined ? path : entry.parentPath) : c.encoded(entry, encoding));
 }
 async function readlink(path, options) {
   options = c.options(options);
