@@ -1,0 +1,360 @@
+//! The content-addressable store: every file of every package, written once and named by the
+//! SHA-256 of its content.
+//!
+//! A [`Store`] is a directory. `files/ab/cdef…` holds the file whose content hashes to `abcdef…`,
+//! and an executable file has the same name with `-x` appended, so the two modes of one content
+//! are two files that can each be hard-linked into a project. [`Store.addTarball`] turns a gzip
+//! tar archive into store files and returns the list a package is made of.
+//!
+//! Writes are idempotent: a file that is already there with the right size is left alone, so two
+//! processes filling the store at once need no lock. Nothing here knows what kind of package the
+//! files belong to.
+
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.collections.bytes { Bytes }
+import silk.collections.list { List }
+import silk.collections.slice { Slice }
+import silk.compress.inflate { Decoder, Format, Limits, Status }
+import silk.compress.tar { TarKind, TarReader }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.core.ownership { Copy }
+import silk.core.result { Result }
+import silk.crypto.sha2 { Sha256 }
+import silk.num.u8
+import silk.num.u32
+import silk.num.u64
+import silk.num.usize
+import silk.platform.native.file { NativeFile, NativeFileError, OPEN_CREATE, OPEN_EXCLUSIVE, OPEN_WRITE_ONLY }
+
+/// What went wrong in a store operation.
+pub enum StoreErrorKind {
+  /// A file system call failed; `code` is its `errno`.
+  Io,
+  /// The archive is not valid gzip data.
+  Gzip,
+  /// The archive is not a valid tar file.
+  Tar,
+}
+
+/// The failure of a store operation.
+pub struct StoreError {
+  pub kind: StoreErrorKind,
+  /// The `errno` of the failed system call for `Io`, and zero otherwise.
+  pub code: i32,
+}
+
+/// One file of a package: its path inside the package and the store file that holds its content.
+pub struct FileEntry {
+  nameStart: usize,
+  nameLength: usize,
+  /// The SHA-256 of the content, which names the store file.
+  pub key: [u8; 32],
+  /// The content length in bytes.
+  pub size: u64,
+  /// Whether the file is executable.
+  pub executable: bool,
+}
+
+impl Copy for FileEntry {}
+
+/// The files of one package, in archive order.
+pub struct PackageFiles {
+  names: Bytes,
+  entries: List<FileEntry>,
+}
+
+impl PackageFiles {
+  /// The entries, in archive order.
+  pub fn all(self: &Self) -> &[FileEntry] {
+    return List<FileEntry>.asSlice(&self.entries)
+  }
+
+  /// The path of `entry` inside the package, with `/` separators and no leading directory.
+  pub fn name(self: &Self, entry: &FileEntry) -> &[u8] {
+    return Slice.view<u8>(Bytes.asSlice(&self.names), entry.nameStart, entry.nameLength)
+  }
+}
+
+/// A store directory.
+pub struct Store {
+  root: Bytes,
+}
+
+const EXISTS: i32 = 17
+const MISSING: i32 = 2
+
+fn io(error: &NativeFileError) -> StoreError {
+  return StoreError { kind: StoreErrorKind.Io, code: error.code }
+}
+
+fn hexDigit(value: u8) -> u8 {
+  if value < 10 {
+    return value + 48
+  }
+  return value + 87
+}
+
+// Makes `path` and every missing directory above it.
+effect fn makeDirectories(path: &[u8]) -> () ! StoreError {
+  let mut end: usize = 1
+  while end <= path.length {
+    if end == path.length || path[end] == 47 {
+      match run Effect.result(NativeFile.makeDirectory(Slice.view<u8>(path, 0, end), 493)) {
+        Result<(), NativeFileError>.Success {..} => {}
+        Result<(), NativeFileError>.Failure { error } => {
+          if error.code != EXISTS {
+            fail io(&error)
+          }
+        }
+      }
+    }
+    end = end + 1
+  }
+  return ()
+}
+
+effect fn writeAll(fd: i32, content: &[u8]) -> () ! NativeFileError {
+  let mut written: usize = 0
+  while written < content.length {
+    let count = run NativeFile.write(fd, Slice.view<u8>(content, written, content.length - written), Option<u64>.none())
+    written = written + count
+  }
+  return ()
+}
+
+/// Decompresses gzip data held in memory.
+///
+/// # Errors
+/// - [`StoreError`] with `Gzip` when the data is not valid or is cut short.
+pub effect fn gunzip(compressed: &[u8]) -> Bytes ! StoreError | OutOfMemoryError ? &mut Allocator {
+  if compressed.length < 18 {
+    fail StoreError { kind: StoreErrorKind.Gzip, code: 0 }
+  }
+  // The last four bytes hold the uncompressed size modulo 2^32: the right buffer for one member.
+  let tail = compressed.length - 4
+  let announced = u8.toU32(compressed[tail]) | u32.shiftLeft(u8.toU32(compressed[tail + 1]), 8)
+    | u32.shiftLeft(u8.toU32(compressed[tail + 2]), 16) | u32.shiftLeft(u8.toU32(compressed[tail + 3]), 24)
+  let mut capacity = u32.toUsize(announced)
+  // The trailer is not trusted: damaged or hostile data must not size the buffer. Deflate rarely
+  // passes 16 to 1 on package files, and the buffer grows when it does.
+  if capacity > compressed.length * 16 {
+    capacity = compressed.length * 16
+  }
+  if capacity < 512 {
+    capacity = 512
+  }
+  let limits = Limits {
+    maxInputBytes: usize.toU64(compressed.length),
+    maxOutputBytes: 17179869184,
+    maxMembers: 1024,
+    maxHeaderBytes: 65536,
+    maxMemoryBytes: 65536,
+  }
+  let mut decoder = match move run Effect.result(Decoder.make(Format.Gzip, move limits)) {
+    Result.Success { value } => move value
+    Result.Failure {..} => { fail StoreError { kind: StoreErrorKind.Gzip, code: 0 } }
+  }
+  let mut output = run Bytes.zeroed(capacity)
+  let mut consumed: usize = 0
+  let mut written: usize = 0
+  while true {
+    let step = Decoder.step(
+      &mut decoder,
+      Slice.view<u8>(compressed, consumed, compressed.length - consumed),
+      Slice.viewMut<u8>(Bytes.asMutSlice(&mut output), written, capacity - written),
+      true,
+    )
+    match move step {
+      Result.Failure {..} => {
+        fail StoreError { kind: StoreErrorKind.Gzip, code: 0 }
+      }
+      Result.Success { value: progress } => {
+        consumed = consumed + progress.consumed
+        written = written + progress.written
+        if progress.status == Status.Finished {
+          break
+        }
+        if progress.status == Status.NeedInput {
+          fail StoreError { kind: StoreErrorKind.Gzip, code: 0 }
+        }
+        let mut larger = run Bytes.zeroed(capacity * 2)
+        Slice.copyInto<u8>(Bytes.asMutSlice(&mut larger), 0, Slice.view<u8>(Bytes.asSlice(&output), 0, written))
+        output = move larger
+        capacity = capacity * 2
+      }
+    }
+  }
+  Bytes.truncate(&mut output, written)
+  return move output
+}
+
+// The offset after the first path segment and its `/`, or the length when there is none.
+fn afterFirstSegment(path: &[u8]) -> usize {
+  let mut index: usize = 0
+  while index < path.length {
+    if path[index] == 47 {
+      return index + 1
+    }
+    index = index + 1
+  }
+  return path.length
+}
+
+impl Store {
+  /// Opens the store at `root`, creating the directory when it is missing.
+  pub effect fn open(root: &[u8]) -> Store ! StoreError | OutOfMemoryError ? &mut Allocator {
+    let mut files = run Bytes.copy(root)
+    run Bytes.append(&mut files, b"/files")
+    run makeDirectories(Bytes.asSlice(&files))
+    return Store { root: run Bytes.copy(root) }
+  }
+
+  /// The directory of the store.
+  pub fn directory(self: &Self) -> &[u8] {
+    return Bytes.asSlice(&self.root)
+  }
+
+  /// The path of the store file for `key`, whether or not the file exists.
+  pub effect fn filePath(self: &Self, key: &[u8; 32], executable: bool) -> Bytes ! OutOfMemoryError ? &mut Allocator {
+    let root = Bytes.asSlice(&self.root)
+    let mut path = run Bytes.makeWithCapacity(root.length + 76)
+    run Bytes.append(&mut path, root)
+    run Bytes.append(&mut path, b"/files/")
+    let mut hex: [u8; 65] = [0; 65]
+    let mut index: usize = 0
+    let mut at: usize = 0
+    while index < 32 {
+      if index == 1 {
+        hex[at] = 47
+        at = at + 1
+      }
+      let byte = key[index]
+      hex[at] = hexDigit(u8.shiftRight(byte, 4))
+      hex[at + 1] = hexDigit(byte & 15)
+      at = at + 2
+      index = index + 1
+    }
+    run Bytes.append(&mut path, &hex)
+    if executable {
+      run Bytes.append(&mut path, b"-x")
+    }
+    return move path
+  }
+
+  /// Writes `content` to the store when it is not there yet, and returns its key.
+  ///
+  /// # Errors
+  /// - [`StoreError`] with `Io` when the file cannot be written.
+  pub effect fn addFile(self: &Self, content: &[u8], executable: bool) -> [u8; 32]
+    ! StoreError | OutOfMemoryError
+    ? &mut Allocator {
+    let key = Sha256.hash(content)
+    let path = run Store.filePath(self, &key, executable)
+    let target = Bytes.asSlice(&path)
+    let mut mode: u32 = 292
+    if executable {
+      mode = 365
+    }
+    let mut attempt: u8 = 0
+    while attempt < 3 {
+      attempt = attempt + 1
+      match run Effect.result(NativeFile.open(target, OPEN_WRITE_ONLY | OPEN_CREATE | OPEN_EXCLUSIVE, mode)) {
+        Result<i32, NativeFileError>.Success { value: fd } => {
+          let outcome = run Effect.result(writeAll(fd, content))
+          let closed = run Effect.result(NativeFile.close(fd))
+          match move outcome {
+            Result<(), NativeFileError>.Failure { error } => {
+              // Do not leave a short file under a name that promises the whole content.
+              drop run Effect.result(NativeFile.remove(target))
+              fail io(&error)
+            }
+            Result<(), NativeFileError>.Success {..} => {}
+          }
+          match move closed {
+            Result<(), NativeFileError>.Failure { error } => { fail io(&error) }
+            Result<(), NativeFileError>.Success {..} => {}
+          }
+          return key
+        }
+        Result<i32, NativeFileError>.Failure { error } => {
+          if error.code == MISSING {
+            // The two-character directory of this key is not there yet.
+            run makeDirectories(Slice.view<u8>(target, 0, Bytes.length(&self.root) + 9))
+          } else if error.code == EXISTS {
+            match run Effect.result(NativeFile.status(target, false)) {
+              Result.Success { value: status } => {
+                if status.size == usize.toU64(content.length) {
+                  return key
+                }
+              }
+              Result.Failure {..} => {}
+            }
+            // A writer stopped part way. Replace its file.
+            drop run Effect.result(NativeFile.remove(target))
+          } else {
+            fail io(&error)
+          }
+        }
+      }
+    }
+    fail StoreError { kind: StoreErrorKind.Io, code: EXISTS }
+  }
+
+  /// Unpacks a gzip tar archive into the store and returns its files.
+  ///
+  /// # Details
+  /// The first path segment of every member is dropped, as package archives keep their files
+  /// under one top directory. Only regular files are stored: directories are implied by the file
+  /// paths, and links are left out.
+  ///
+  /// # Errors
+  /// - [`StoreError`] with `Gzip` or `Tar` when the archive is not valid, and `Io` when a file
+  ///   cannot be written.
+  pub effect fn addTarball(self: &Self, tarball: &[u8]) -> PackageFiles
+    ! StoreError | OutOfMemoryError
+    ? &mut Allocator {
+    let archive = run gunzip(tarball)
+    let mut names = Bytes.make()
+    let mut entries = List<FileEntry>.make()
+    let mut reader = TarReader.open(Bytes.asSlice(&archive))
+    while true {
+      match TarReader.next(&mut reader) {
+        Result.Failure {..} => {
+          fail StoreError { kind: StoreErrorKind.Tar, code: 0 }
+        }
+        Result.Success { value: next } => match move next {
+          Option.None => { break }
+          Option.Some { value: member } => {
+            if member.kind == TarKind.File {
+              let nameStart = Bytes.length(&names)
+              if member.prefix.length > 0 {
+                let skip = afterFirstSegment(member.prefix)
+                if skip < member.prefix.length {
+                  run Bytes.append(&mut names, Slice.view<u8>(member.prefix, skip, member.prefix.length - skip))
+                  run Bytes.append(&mut names, b"/")
+                }
+                run Bytes.append(&mut names, member.name)
+              } else {
+                let skip = afterFirstSegment(member.name)
+                run Bytes.append(&mut names, Slice.view<u8>(member.name, skip, member.name.length - skip))
+              }
+              let nameLength = Bytes.length(&names) - nameStart
+              if nameLength > 0 {
+                let key = run Store.addFile(self, member.content, member.executable)
+                run entries.append(FileEntry {
+                  nameStart: nameStart,
+                  nameLength: nameLength,
+                  key: key,
+                  size: usize.toU64(member.content.length),
+                  executable: member.executable,
+                })
+              }
+            }
+          }
+        }
+      }
+    }
+    return PackageFiles { names: move names, entries: move entries }
+  }
+}

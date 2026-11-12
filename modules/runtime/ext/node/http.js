@@ -136,6 +136,7 @@ function setGlobalProxyFromEnv(env = process.env) {
   validateObject(env, 'proxyEnv');
   const httpProxy = parseProxyUrl(env, 'http:');
   const httpsProxy = parseProxyUrl(env, 'https:');
+  const noProxy = env.no_proxy || env.NO_PROXY;
 
   if (!httpProxy && !httpsProxy) {
     return () => {};
@@ -148,9 +149,16 @@ function setGlobalProxyFromEnv(env = process.env) {
     throw new ERR_PROXY_INVALID_CONFIG(httpsProxy);
   }
 
-  // The runtime's fetch has no undici dispatcher to point at the proxies; only the
-  // http and https agents change.
-  let originalHttpsAgent, originalHttpAgent;
+  let originalDispatcher, originalHttpsAgent, originalHttpAgent;
+  if (httpProxy || httpsProxy) {
+    // Set it for fetch, which uses Undici's global dispatcher.
+    const { setGlobalDispatcher, getGlobalDispatcher, EnvHttpProxyAgent } = require('internal/deps/undici/undici');
+    const envHttpProxyAgent = new EnvHttpProxyAgent({
+      __proto__: null, httpProxy, httpsProxy, noProxy,
+    });
+    originalDispatcher = getGlobalDispatcher();
+    setGlobalDispatcher(envHttpProxyAgent);
+  }
 
   if (httpProxy) {
     originalHttpAgent = module.exports.globalAgent;
@@ -163,6 +171,10 @@ function setGlobalProxyFromEnv(env = process.env) {
   }
 
   return function restore() {
+    if (originalDispatcher) {
+      const { setGlobalDispatcher } = require('internal/deps/undici/undici');
+      setGlobalDispatcher(originalDispatcher);
+    }
     if (originalHttpAgent) {
       module.exports.globalAgent = originalHttpAgent;
     }

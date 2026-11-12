@@ -1,0 +1,261 @@
+//! Reads `.npmrc` files for the two things they are still used for: where a registry is, and how
+//! to sign in to it. Every other setting lives in `package.json`.
+//!
+//! An [`Npmrc`] holds the settings of any number of files. Add the files from the least specific
+//! to the most specific (the user's file, then the project's), because the last setting of a name
+//! wins. `${NAME}` in a key or a value is replaced with that environment variable when the file is
+//! added, and is left as written when the variable is not set.
+
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.collections.bytes { Bytes }
+import silk.collections.list { List }
+import silk.collections.slice { Slice }
+import silk.core.option { Option }
+import silk.core.ownership { Copy }
+import silk.core.result { Result }
+import silk.encoding.base64 { Base64 }
+import silk.system.host_input { HostInput, HostInputError }
+import pkg.text { same, startsWith }
+
+/// The registry used when no file names one.
+pub const DEFAULT_REGISTRY: &'static [u8] = b"https://registry.npmjs.org/"
+
+struct Setting {
+  keyStart: usize,
+  keyLength: usize,
+  valueStart: usize,
+  valueLength: usize,
+}
+
+impl Copy for Setting {}
+
+/// The settings of the `.npmrc` files that were added.
+pub struct Npmrc {
+  text: Bytes,
+  settings: List<Setting>,
+}
+
+fn isBlank(byte: u8) -> bool {
+  return byte == 32 || byte == 9 || byte == 13
+}
+
+fn trim(text: &[u8]) -> &[u8] {
+  let mut start: usize = 0
+  let mut end = text.length
+  while start < end && isBlank(text[start]) {
+    start = start + 1
+  }
+  while end > start && isBlank(text[end - 1]) {
+    end = end - 1
+  }
+  return Slice.view<u8>(text, start, end - start)
+}
+
+fn unquote(text: &[u8]) -> &[u8] {
+  if text.length >= 2 {
+    let first = text[0]
+    if (first == 34 || first == 39) && text[text.length - 1] == first {
+      return Slice.view<u8>(text, 1, text.length - 2)
+    }
+  }
+  return text
+}
+
+// Appends `raw` to `out` with each `${NAME}` replaced by the environment variable.
+effect fn expand(out: &mut Bytes, raw: &[u8]) -> () ! HostInputError | OutOfMemoryError ? &mut HostInput | &mut Allocator {
+  let mut index: usize = 0
+  let mut plain: usize = 0
+  while index + 1 < raw.length {
+    if raw[index] == 36 && raw[index + 1] == 123 {
+      let mut close = index + 2
+      while close < raw.length && raw[close] != 125 {
+        close = close + 1
+      }
+      if close < raw.length {
+        let found = run HostInput.variable(Slice.view<u8>(raw, index + 2, close - index - 2))
+        match move found {
+          Option.None => {}
+          Option.Some { value } => {
+            run out.append(Slice.view<u8>(raw, plain, index - plain))
+            run out.append(Bytes.asSlice(&value))
+            plain = close + 1
+          }
+        }
+        index = close + 1
+        continue
+      }
+    }
+    index = index + 1
+  }
+  run out.append(Slice.view<u8>(raw, plain, raw.length - plain))
+}
+
+impl Npmrc {
+  /// Settings with nothing in them.
+  pub fn make() -> Npmrc {
+    return Npmrc { text: Bytes.make(), settings: List<Setting>.make() }
+  }
+
+  /// Adds the settings of one file. They take precedence over the ones added before.
+  pub effect fn add(self: &mut Self, source: &[u8]) -> () ! HostInputError | OutOfMemoryError ? &mut HostInput | &mut Allocator {
+    let mut index: usize = 0
+    while index < source.length {
+      let start = index
+      while index < source.length && source[index] != 10 {
+        index = index + 1
+      }
+      let line = trim(Slice.view<u8>(source, start, index - start))
+      index = index + 1
+      // Comments, and the section headers of the ini format, which npm settings never use.
+      if line.length == 0 || line[0] == 59 || line[0] == 35 || line[0] == 91 {
+        continue
+      }
+      let mut split: usize = 0
+      while split < line.length && line[split] != 61 {
+        split = split + 1
+      }
+      let key = unquote(trim(Slice.view<u8>(line, 0, split)))
+      let value = if split < line.length {
+        unquote(trim(Slice.view<u8>(line, split + 1, line.length - split - 1)))
+      } else {
+        b"true"
+      }
+      if key.length == 0 {
+        continue
+      }
+      let keyStart = Bytes.length(&self.text)
+      run expand(&mut self.text, key)
+      let valueStart = Bytes.length(&self.text)
+      run expand(&mut self.text, value)
+      run self.settings.append(Setting {
+        keyStart: keyStart,
+        keyLength: valueStart - keyStart,
+        valueStart: valueStart,
+        valueLength: Bytes.length(&self.text) - valueStart,
+      })
+    }
+  }
+
+  // The value of the setting named `prefix` followed by `suffix`.
+  fn find(self: &Self, prefix: &[u8], suffix: &[u8]) -> Option<&[u8]> {
+    let text = Bytes.asSlice(&self.text)
+    let settings = List<Setting>.asSlice(&self.settings)
+    let mut index = settings.length
+    while index > 0 {
+      index = index - 1
+      let setting = settings[index]
+      if setting.keyLength == prefix.length + suffix.length {
+        let key = Slice.view<u8>(text, setting.keyStart, setting.keyLength)
+        if startsWith(key, prefix) && same(Slice.view<u8>(key, prefix.length, suffix.length), suffix) {
+          return Option<&[u8]>.some(Slice.view<u8>(text, setting.valueStart, setting.valueLength))
+        }
+      }
+    }
+    return Option<&[u8]>.none()
+  }
+
+  /// The value of a setting, or none when no file sets it.
+  pub fn value(self: &Self, key: &[u8]) -> Option<&[u8]> {
+    return Npmrc.find(self, key, b"")
+  }
+
+  /// The registry URL for the package `name`: the registry of its scope when one is set, else the
+  /// `registry` setting, else the public npm registry.
+  pub fn registryFor(self: &Self, name: &[u8]) -> &[u8] {
+    if name.length > 0 && name[0] == 64 {
+      let mut slash: usize = 0
+      while slash < name.length && name[slash] != 47 {
+        slash = slash + 1
+      }
+      match Npmrc.find(self, Slice.view<u8>(name, 0, slash), b":registry") {
+        Option.Some { value } => { return value }
+        Option.None => {}
+      }
+    }
+    return match Npmrc.find(self, b"registry", b"") {
+      Option.Some { value } => value
+      Option.None => DEFAULT_REGISTRY
+    }
+  }
+
+  /// The `Authorization` header value for a request to `url`, or none when no credentials are
+  /// set for it. Credentials are keyed by `//host/path/` and apply to every URL below that path;
+  /// the longest matching path wins.
+  pub effect fn authorization(self: &Self, url: &[u8]) -> Option<Bytes> ! OutOfMemoryError ? &mut Allocator {
+    let mut start: usize = 0
+    while start + 1 < url.length && (url[start] != 47 || url[start + 1] != 47) {
+      start = start + 1
+    }
+    if start + 1 >= url.length {
+      return Option<Bytes>.none()
+    }
+    let mut end = url.length
+    while end > start + 2 {
+      // Shorten to the previous `/`, which ends a candidate path.
+      while end > start + 2 && url[end - 1] != 47 {
+        end = end - 1
+      }
+      if end <= start + 2 {
+        break
+      }
+      let scope = Slice.view<u8>(url, start, end - start)
+      match Npmrc.find(self, scope, b":_authToken") {
+        Option.Some { value: token } => {
+          let mut header = run Bytes.copy(b"Bearer ")
+          run header.append(token)
+          return Option<Bytes>.some(move header)
+        }
+        Option.None => {}
+      }
+      match Npmrc.find(self, scope, b":_auth") {
+        Option.Some { value: basic } => {
+          let mut header = run Bytes.copy(b"Basic ")
+          run header.append(basic)
+          return Option<Bytes>.some(move header)
+        }
+        Option.None => {}
+      }
+      match Npmrc.find(self, scope, b":username") {
+        Option.Some { value: user } => {
+          match Npmrc.find(self, scope, b":_password") {
+            Option.Some { value: encoded } => {
+              return run basic(user, encoded)
+            }
+            Option.None => {}
+          }
+        }
+        Option.None => {}
+      }
+      end = end - 1
+    }
+    return Option<Bytes>.none()
+  }
+}
+
+// `Basic` credentials from a user name and a base64 password, the way npm stores them.
+effect fn basic(user: &[u8], encoded: &[u8]) -> Option<Bytes> ! OutOfMemoryError ? &mut Allocator {
+  let passwordLength = match Base64.decodedLength(encoded) {
+    Result.Success { value } => value
+    Result.Failure {..} => { return Option<Bytes>.none() }
+  }
+  let mut password = run Bytes.zeroed(passwordLength)
+  match Base64.decodeInto(Bytes.asMutSlice(&mut password), encoded) {
+    Result.Success {..} => {}
+    Result.Failure {..} => { return Option<Bytes>.none() }
+  }
+  let mut pair = run Bytes.copy(user)
+  run pair.append(b":")
+  run pair.append(Bytes.asSlice(&password))
+  let encodedLength = match Base64.encodedLength(Bytes.length(&pair)) {
+    Result.Success { value } => value
+    Result.Failure {..} => { return Option<Bytes>.none() }
+  }
+  let mut header = run Bytes.copy(b"Basic ")
+  let mut text = run Bytes.zeroed(encodedLength)
+  match Base64.encodeInto(Bytes.asMutSlice(&mut text), Bytes.asSlice(&pair)) {
+    Result.Success {..} => {}
+    Result.Failure {..} => { return Option<Bytes>.none() }
+  }
+  run header.append(Bytes.asSlice(&text))
+  return Option<Bytes>.some(move header)
+}
