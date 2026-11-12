@@ -3,7 +3,8 @@
 //! The walk is breadth first and in waves: every package a wave needs metadata for is asked of
 //! the [`Registry`] in one call, so the fetches run at the same time. A range is satisfied by a
 //! version already in the graph when one fits, which keeps one copy of a package where the
-//! ranges allow it, and else by the version npm would pick.
+//! ranges allow it, and else by the version npm would pick. Packages for other platforms stay in
+//! the graph, so one resolution serves every machine.
 //!
 //! Peer dependencies are linked after the walk: to what the project itself depends on under that
 //! name, else to a fitting version already in the graph, and else the peer is resolved like a
@@ -102,6 +103,54 @@ impl Graph {
     return Slice.view<u8>(Bytes.asSlice(&self.text), place.start, place.length)
   }
 
+  /// A graph with no packages.
+  pub fn make() -> Graph {
+    return Graph { names: Names.make(), text: Bytes.make(), packages: List<Package>.make(), root: List<Edge>.make() }
+  }
+
+  /// Adds a package and returns its index.
+  pub effect fn addPackage(
+    self: &mut Self,
+    name: &[u8],
+    version: &[u8],
+    tarball: &[u8],
+    integrity: &[u8],
+    shasum: &[u8],
+    manifest: Manifest,
+  ) -> usize ! OutOfMemoryError ? &mut Allocator {
+    let id = run Names.intern(&mut self.names, name)
+    let package = Package {
+      name: id,
+      version: run keep(&mut self.text, version),
+      tarball: run keep(&mut self.text, tarball),
+      integrity: run keep(&mut self.text, integrity),
+      shasum: run keep(&mut self.text, shasum),
+      manifest: move manifest,
+      edges: List<Edge>.make(),
+      next: 0,
+    }
+    run self.packages.append(move package)
+    return List<Package>.length(&self.packages) - 1
+  }
+
+  /// Makes the package at `from` depend on the package at `target` under the name `alias`.
+  pub effect fn addEdge(self: &mut Self, from: usize, alias: &[u8], target: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+    let id = run Names.intern(&mut self.names, alias)
+    run List<Edge>.append(&mut List<Package>.asMutSlice(&mut self.packages)[from].edges, Edge { alias: id, target: target })
+  }
+
+  /// Makes the project depend on the package at `target` under the name `alias`.
+  pub effect fn addRootEdge(self: &mut Self, alias: &[u8], target: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+    let id = run Names.intern(&mut self.names, alias)
+    run self.root.append(Edge { alias: id, target: target })
+  }
+
+  /// Whether the package at `index` is for `host`, by its `os`, `cpu` and `libc` fields. An
+  /// install leaves out the packages that are not.
+  pub fn supports(self: &Self, index: usize, host: Host) -> bool {
+    return Manifest.supports(&Graph.package(self, index).manifest, host.os, host.cpu, host.libc)
+  }
+
   /// How many packages the graph has.
   pub fn count(self: &Self) -> usize {
     return List<Package>.length(&self.packages)
@@ -193,7 +242,6 @@ struct Work {
   documents: List<usize>,
   // Per name: the first package of that name, plus one.
   first: List<usize>,
-  host: Host,
 }
 
 effect fn reject(kind: ResolveErrorKind, work: &Work, pending: &Pending, message: string<'static>) -> never
@@ -347,16 +395,13 @@ effect fn link(work: &mut Work, parent: usize, alias: usize, target: usize) -> (
 }
 
 // Adds version `index` of a packument to the graph and queues its dependencies. Returns the
-// package index plus one, or 0 when the package is optional and not for this host.
+// package index plus one.
 effect fn add(work: &mut Work, next: &mut List<Pending>, pending: &Pending, document: usize, index: usize) -> usize
   ! ResolveError | OutOfMemoryError ? &mut Allocator {
   let parsed = run Manifest.parse(Packument.object(&List<Packument>.asSlice(&work.packuments)[document], index))
   let manifest = match move parsed {
     Option.Some { value } => move value
     Option.None => { run reject(ResolveErrorKind.Metadata, &work, pending, "the registry metadata of this version is not valid") }
-  }
-  if pending.optional && Manifest.supports(&manifest, work.host.os, work.host.cpu, work.host.libc) == false {
-    return 0
   }
   let tarball = run Packument.tarball(&List<Packument>.asSlice(&work.packuments)[document], index)
   let integrity = run Packument.integrity(&List<Packument>.asSlice(&work.packuments)[document], index)
@@ -405,8 +450,46 @@ effect fn add(work: &mut Work, next: &mut List<Pending>, pending: &Pending, docu
   return position + 1
 }
 
+// The highest version of `name` in an earlier graph that satisfies `range` and is still
+// published, as an index into the packument.
+fn preferred(earlier: &Graph, work: &Work, name: usize, document: usize, range: &Range<'_>) -> Option<usize> {
+  let wanted = Names.bytes(&work.graph.names, name)
+  let id = match Names.find(&earlier.names, wanted) {
+    Option.Some { value } => value
+    Option.None => { return Option<usize>.none() }
+  }
+  let packument = &List<Packument>.asSlice(&work.packuments)[document]
+  let mut best = Option<usize>.none()
+  let mut index: usize = 0
+  while index < Graph.count(earlier) {
+    if Graph.package(earlier, index).name == id {
+      match Version.parse(Graph.version(earlier, index)) {
+        Option.None => {}
+        Option.Some { value: version } => {
+          if Range.satisfies(range, &version, true) {
+            match Packument.exact(packument, Graph.version(earlier, index)) {
+              Option.None => {}
+              Option.Some { value: found } => {
+                let better = match best {
+                  Option.None => true
+                  Option.Some { value: current } => Version.compare(&version, &Packument.version(packument, current)) > 0
+                }
+                if better {
+                  best = Option<usize>.some(found)
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+    index = index + 1
+  }
+  return best
+}
+
 // Resolves one dependency: links the dependent to a package, adding the package when it is new.
-effect fn settle(work: &mut Work, next: &mut List<Pending>, pending: &Pending) -> ()
+effect fn settle(work: &mut Work, next: &mut List<Pending>, pending: &Pending, previous: Option<&Graph>) -> ()
   ! ResolveError | OutOfMemoryError ? &mut Allocator {
   if pending.unsupported {
     if pending.optional {
@@ -429,6 +512,12 @@ effect fn settle(work: &mut Work, next: &mut List<Pending>, pending: &Pending) -
     Option.Some { value: range } => {
       target = existing(&work, pending.name, &range)
       if target == 0 {
+        chosen = match previous {
+          Option.Some { value: earlier } => preferred(earlier, &work, pending.name, document, &range)
+          Option.None => Option<usize>.none()
+        }
+      }
+      if target == 0 && Option.isSome(&chosen) == false {
         chosen = Packument.pick(&List<Packument>.asSlice(&work.packuments)[document], &range)
       }
     }
@@ -458,7 +547,7 @@ effect fn settle(work: &mut Work, next: &mut List<Pending>, pending: &Pending) -
 }
 
 // Resolves a wave and every wave it leads to.
-effect fn drain(work: &mut Work, first: List<Pending>) -> ()
+effect fn drain(work: &mut Work, first: List<Pending>, previous: Option<&Graph>) -> ()
   ! ResolveError | OutOfMemoryError ? &mut Registry | &mut Allocator {
   let mut wave = move first
   while List<Pending>.length(&wave) > 0 {
@@ -467,7 +556,7 @@ effect fn drain(work: &mut Work, first: List<Pending>) -> ()
     let mut index: usize = 0
     while index < List<Pending>.length(&wave) {
       let pending = List<Pending>.get(&wave, index)
-      run settle(&mut work, &mut next, &pending)
+      run settle(&mut work, &mut next, &pending, previous)
       index = index + 1
     }
     wave = move next
@@ -546,21 +635,24 @@ effect fn peers(work: &mut Work, from: usize, wave: &mut List<Pending>) -> () ! 
   }
 }
 
-/// Resolves the production, development and optional dependencies of the project `root` for
-/// `host`.
+/// Resolves the production, development and optional dependencies of the project `root`.
+///
+/// The graph is the same on every machine: packages for other platforms are part of it, and
+/// [`Graph.supports`] tells an install which ones to leave out. With `previous`, the graph of an
+/// earlier resolution, a version that graph has is preferred over a newer one wherever the range
+/// allows, so changing one dependency does not move the others.
 ///
 /// # Errors
 ///
 /// - [`ResolveError`] for a dependency that cannot be resolved. An optional dependency that
-///   cannot be resolved, or is not for `host`, is left out instead.
-pub effect fn resolve(root: &Manifest, host: Host) -> Graph
+///   cannot be resolved is left out instead.
+pub effect fn resolve(root: &Manifest, previous: Option<&Graph>) -> Graph
   ! ResolveError | OutOfMemoryError ? &mut Registry | &mut Allocator {
   let mut work = Work {
-    graph: Graph { names: Names.make(), text: Bytes.make(), packages: List<Package>.make(), root: List<Edge>.make() },
+    graph: Graph.make(),
     packuments: List<Packument>.make(),
     documents: List<usize>.make(),
     first: List<usize>.make(),
-    host: host,
   }
   let mut wave = List<Pending>.make()
   let dependencies = Manifest.allDependencies(root)
@@ -579,16 +671,16 @@ pub effect fn resolve(root: &Manifest, host: Host) -> Graph
     }
     index = index + 1
   }
-  run drain(&mut work, move wave)
+  run drain(&mut work, move wave, previous)
   let mut linked: usize = 0
   while linked < Graph.count(&work.graph) {
     let mut more = List<Pending>.make()
     let until = Graph.count(&work.graph)
     run peers(&mut work, linked, &mut more)
     linked = until
-    run drain(&mut work, move more)
+    run drain(&mut work, move more, previous)
   }
-  let Work { graph, packuments, documents, first, host: _ } = move work
+  let Work { graph, packuments, documents, first } = move work
   drop packuments
   drop documents
   drop first
