@@ -37,7 +37,7 @@ import js_core_types { blankConstructEntry, NO_SP, ScopeData, scopeSlot, Literal
   RuntimeState, ContextState, GcPhase, HeapList, ObjectData, ObjectPayload,
   PropertySlot, ShapeData, ShapeProperty, JS_PROP_TMASK, JS_PROP_AUTOINIT, FunctionBytecode, VarRef, VarRefState, 
   StackFrame, AsyncFrame, ModuleDef, ExportBinding, NativeFunctionId, BuiltinFamily,
-  WeakRefHeader, JobEntry, ByteStorage, JS_MODE_ASYNC, VarDef, ClosureVar,
+  WeakRefHeader, WeakRefKind, JobEntry, ByteStorage, JS_MODE_ASYNC, VarDef, ClosureVar,
   FunctionDebugInfo, RequestedModule, ExportEntry, ImportEntry, StarExportEntry,
   linkedModule, NativeCapturedValues
 }
@@ -85,8 +85,36 @@ struct RestoreStack { cells: [?*mut HeapHeader; 1024], depth: usize, overflowed:
 /// does not own/retain runtime and must not escape or be used after collection.
 /// young: a young collection, whose edges to old cells count for nothing (their
 /// counts are neither decremented nor restored).
-pub struct Tracer { runtime: *mut HeapHeader, operation: MarkOperation, stack: *mut RestoreStack, young: bool }
+/// deferred: weak-table entries (ephemerons) a full collection's restore found with
+/// a key not yet reachable, whose values wait for it; round: the tracer revisits
+/// those entries (ephemeronRounds); resolved: a round restored a waiting value.
+pub struct Tracer { runtime: *mut HeapHeader, operation: MarkOperation, stack: *mut RestoreStack, young: bool,
+  deferred: usize, round: bool, resolved: bool }
 impl Tracer {
+  /// One weak-table entry, an ephemeron: its value is an edge of the table only
+  /// while its key is reachable without it. waiting says the restore already
+  /// deferred the value; the result is whether it waits now. Entries wait only
+  /// in a full collection's restore, and only for a value with GC edges; a
+  /// round (ephemeronTracerRound) passes over the entries that do not wait.
+  pub unsafe fn ephemeron(self: &mut Self, key: ValueBits, value: ValueBits, waiting: bool) -> bool {
+    if self.operation != MarkOperation.RestoreReachable || self.young { unsafe self.value(value) return false }
+    match value {
+      ValueBits.Object { .. } => ()
+      ValueBits.FunctionBytecode { .. } => ()
+      ValueBits.Module { .. } => ()
+      _ => { return false }
+    }
+    if self.round && !waiting { return false }
+    if unsafe ephemeronKeyReachable(key) {
+      unsafe self.value(value)
+      if waiting { self.deferred = self.deferred - 1 self.resolved = true }
+      return false
+    }
+    if !waiting { self.deferred = self.deferred + 1 }
+    return true
+  }
+  /// Whether this trace only revisits waiting ephemerons (see ephemeron).
+  pub fn ephemeronRound(self: &Self) -> bool { return self.round }
   pub unsafe fn header(self: &mut Self, child: *mut HeapHeader) -> () {
     let mut anchor = ()
     let h = unsafe Pointer.borrowMut<(), HeapHeader>(&mut anchor, child)
@@ -146,6 +174,16 @@ impl Tracer {
   }
 }
 
+/// A weak key is reachable once the restore found it (mark 0, or MARK_RESTORE
+/// while it waits on a full stack) or when it takes no part in trial deletion
+/// (a symbol, which owns no edges, is never marked).
+@inlineAlways
+unsafe fn ephemeronKeyReachable(key: ValueBits) -> bool {
+  match key {
+    ValueBits.Object { reference } => { return unsafe markOf(reference) != 1 }
+    _ => { return true }
+  }
+}
 /// A trial-deleted cell (mark 1) just found reachable: its children are restored
 /// from the stack, or from a rescan when the stack is full.
 @inlineAlways
@@ -1517,13 +1555,16 @@ unsafe effect fn collectCells<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHea
   unsafe HeapHooks.gcLifecycle(&mut hooks, runtime, generation)
   if removeWeakObjects { run unsafe sweepWeak(&mut hooks, runtime) }
   let mut stack = RestoreStack { cells: [Pointer.null<HeapHeader>(); 1024], depth: 0, overflowed: false }
-  let mut tracer = Tracer { runtime: runtime, operation: MarkOperation.Decrement, stack: Pointer.fromMutRef<RestoreStack>(&mut stack), young: young }
+  let mut tracer = Tracer { runtime: runtime, operation: MarkOperation.Decrement, stack: Pointer.fromMutRef<RestoreStack>(&mut stack), young: young,
+    deferred: 0, round: false, resolved: false }
   unsafe decrementPass(&mut hooks, runtime, &mut tracer)
   tracer.operation = MarkOperation.RestoreReachable
   unsafe restorePass(&mut hooks, runtime, &mut tracer)
+  if tracer.deferred != 0 { unsafe ephemeronRounds(&mut hooks, runtime, &mut tracer) }
   tracer.operation = MarkOperation.RestoreUnreachable
   unsafe unreachablePass(&mut hooks, runtime, &mut tracer)
   unsafe setPhase(runtime, GcPhase.RemoveCycles)
+  if tracer.deferred != 0 { run unsafe clearEphemerons(&mut hooks, runtime) }
   unsafe removeCycles(&mut hooks, runtime)
   unsafe setPhase(runtime, GcPhase.None)
   unsafe destroyZombies(runtime)
@@ -1687,6 +1728,10 @@ unsafe fn restorePass<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader, tra
     linked = unsafe linkedNext(node)
     if unsafe markOf(node) == 1 && unsafe count(node) > 0 { unsafe mark(node, 0) unsafe restoreFrom(&mut hooks, node, &mut tracer) }
   }
+  unsafe rescanOverflow(&mut hooks, runtime, &mut tracer)
+}
+/// Restores what the restore stack had no room for, until it overflows no more.
+unsafe fn rescanOverflow<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader, tracer: &mut Tracer) -> () {
   while true {
     let mut anchor = ()
     let stack = unsafe Pointer.borrowMut<(), RestoreStack>(&mut anchor, tracer.stack)
@@ -1694,6 +1739,60 @@ unsafe fn restorePass<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader, tra
     stack.overflowed = false
     drop stack
     unsafe rescanRestore(&mut hooks, runtime, &mut tracer)
+  }
+}
+/// Ephemerons (ECMA-262 WeakMap/WeakSet entries): a weak table's value is
+/// reachable only through a reachable key. The restore pass deferred the values
+/// whose keys it had not reached; each round revisits the reachable tables
+/// holding such entries, restores the values whose keys the last round reached,
+/// and what those values reach, until a round reaches no new key. Values still
+/// waiting then hang from garbage keys only (clearEphemerons).
+@inlineNever
+unsafe fn ephemeronRounds<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader, tracer: &mut Tracer) -> () {
+  while tracer.deferred != 0 {
+    tracer.resolved = false
+    let mut anchor = ()
+    let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, runtime)
+    let mut cursor = state.weakReferences.first
+    drop state
+    while !Pointer.isNull<WeakRefHeader>(cursor) {
+      let node = unsafe Intrinsic.pointerRequalify<?*mut WeakRefHeader, *mut WeakRefHeader>(cursor)
+      let weak = unsafe Pointer.borrow<(), WeakRefHeader>(&anchor, node)
+      cursor = weak.next
+      let kind = weak.kind let owner = weak.owner
+      drop weak
+      // A garbage table (mark 1) deferred nothing; the unreachable pass restores it whole.
+      if kind == WeakRefKind.Map && unsafe markOf(owner) != 1 {
+        let classId = (unsafe HeapCell.payload<ObjectData, ()>(&anchor, owner)).classId()
+        // Only this table's waiting entries: what they restore is traced normally below.
+        tracer.round = true
+        unsafe traceClassOf(&mut hooks, owner, classId, &mut tracer)
+        tracer.round = false
+        unsafe drainRestore(&mut hooks, &mut tracer)
+      }
+    }
+    unsafe rescanOverflow(&mut hooks, runtime, &mut tracer)
+    if !tracer.resolved { return () }
+  }
+}
+/// After the unreachable pass, in phase RemoveCycles: every still-waiting entry
+/// has a garbage key, so it leaves its reachable table now, before cycle removal
+/// destroys the key and the value. Its value's count was dropped by the decrement
+/// pass and never restored, so the entry goes without releasing it.
+@inlineNever
+unsafe effect fn clearEphemerons<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader) -> () ? &mut Allocator {
+  let anchor = ()
+  let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, runtime)
+  let mut cursor = state.weakReferences.first
+  drop state
+  while !Pointer.isNull<WeakRefHeader>(cursor) {
+    let node = unsafe Intrinsic.pointerRequalify<?*mut WeakRefHeader, *mut WeakRefHeader>(cursor)
+    let weak = unsafe Pointer.borrow<(), WeakRefHeader>(&anchor, node)
+    cursor = weak.next
+    let kind = weak.kind let owner = weak.owner
+    drop weak
+    // A table's sweep clears its waiting entries instead of its dead keys.
+    if kind == WeakRefKind.Map && unsafe markOf(owner) != 1 { run unsafe HeapHooks.sweepWeak(&mut hooks, runtime, node) }
   }
 }
 /// Restores the cells marked MARK_RESTORE when the restore stack was full.
