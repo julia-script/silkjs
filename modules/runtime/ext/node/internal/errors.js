@@ -65,6 +65,7 @@ const {
 // internal/error_stack owns these two: its stack header names the code of a
 // NodeError, and it formats an error found in overrideStackTrace with that callback.
 const { kIsNodeError, overrides: overrideStackTrace } = require('internal/host').errorStackState;
+const kEnhanceStackBeforeInspector = Symbol('kEnhanceStackBeforeInspector');
 // Node's ErrorPrepareStackTrace: the default V8-style formatter, for callers (the REPL)
 // that format frames themselves when no Error.prepareStackTrace is set.
 function ErrorPrepareStackTrace(error, trace) {
@@ -970,6 +971,7 @@ module.exports = {
   inspectWithNoCustomRetry,
   isErrorStackTraceLimitWritable,
   isStackOverflowError,
+  kEnhanceStackBeforeInspector,
   kIsNodeError,
   overrideStackTrace,
   setArrowMessage,
