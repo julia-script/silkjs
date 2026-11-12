@@ -259,10 +259,11 @@ function environmentFiles(args) {
 }
 
 const loaderWorkerExcluded = new Set(['--inspect', '--inspect-brk', '--inspect-wait', '--inspect-port',
-  '--require', '--import', '--input-type', '--watch', '--watch-path', '--watch-preserve-output',
+  '--import', '--input-type', '--watch', '--watch-path', '--watch-preserve-output',
   '--watch-kill-signal', '--experimental-test-coverage']);
 // The runtime options of the internal module hooks worker: runtime policy, not
-// entry-point execution or preloads that would register another hooks worker.
+// entry-point execution. --require preloads run there too, as in Node; --import
+// ones run once, on the main thread.
 // Module mocking is CLI-only, but remains runtime policy in hook workers.
 function loaderWorkerArguments(args) {
   const result = [];

@@ -59,6 +59,8 @@ function createLoader(host, builtins) {
   let main;
   let globalPaths = [];
   const resolutions = new Map();
+  // parent -> request key -> resolution of an import (resolveImport).
+  const importResolutions = new Map();
   const pendingLoads = new Map();
   const moduleAsyncModes = new WeakMap();
   let sourceLoadActive = false;
@@ -279,6 +281,15 @@ function createLoader(host, builtins) {
   // Modules of such files that turned out to be ES modules.
   const detectedModules = new WeakSet();
 
+  function wasmMagic(disk) {
+    const fs = builtins.get('fs');
+    const bytes = new Uint8Array(4);
+    let fd;
+    try { fd = fs.openSync(disk, 'r'); return fs.readSync(fd, bytes, 0, 4, 0) === 4 && bytes[0] === 0 && bytes[1] === 0x61 && bytes[2] === 0x73 && bytes[3] === 0x6d; }
+    catch { return false; }
+    finally { if (fd !== undefined) fs.closeSync(fd); }
+  }
+
   function format(filename, mode, deferDetection = false) {
     if (isBuiltinFile(filename)) return 'builtin';
     const disk = filesystemName(filename);
@@ -298,7 +309,9 @@ function createLoader(host, builtins) {
       throw error('ERR_UNKNOWN_FILE_EXTENSION', ext, disk);
     }
     const pkg = ext === '.js' || mode === 'import' ? packageScope(disk) : null;
-    if (pkg && pkg.data.type === 'module') return 'module';
+    // get_format.js getFormatOfExtensionlessFile: a module scope's extensionless Wasm.
+    if (pkg && pkg.data.type === 'module') return ext === '' && mode === 'import' && wasmMagic(disk) ? 'wasm' : 'module';
+    if (ext === '' && mode === 'import' && (!pkg || pkg.data.type !== 'commonjs') && wasmMagic(disk)) return 'wasm';
     // Embedders may provide Node's syntax detection for ambiguous .js files.
     if ((!pkg || pkg.data.type !== 'commonjs') && typeof host.detectModuleSyntax === 'function') {
       if (deferDetection) return ambiguous;
@@ -590,7 +603,15 @@ function createLoader(host, builtins) {
         return packageMap(pkg, pkg.data.imports, specifier, true, parent, mode, seen, isMain);
       }
       if (mode === 'import' && specifier.startsWith('file:')) {
-        const url = fromFileURL(specifier);
+        let url;
+        try { url = fromFileURL(specifier); }
+        catch (failure) {
+          // finalizeResolution: the error names the URL and the module that imported it.
+          for (const [key, value] of [['input', specifier], ['module', parent ? (parent.includes(':') && !path.isAbsolute(parent) ? parent : fileURL(parent)) : 'undefined']]) {
+            Object.defineProperty(failure, key, { __proto__: null, value, writable: true, enumerable: true, configurable: true });
+          }
+          throw failure;
+        }
         return strictFile(url.filename, specifier, parent, mode, url.suffix, isMain);
       }
       const relative = specifier === '.' || specifier === '..' || specifier.startsWith('./') || specifier.startsWith('../');
@@ -882,6 +903,8 @@ function createLoader(host, builtins) {
       delete cache[filename];
       moduleMocks.set(key, mock);
     }
+    // Imports resolved before the mock existed must find it.
+    importResolutions.clear();
     let restored = false;
     return {
       restore() {
@@ -1618,6 +1641,7 @@ function createLoader(host, builtins) {
       for (const key of [...parentNames.keys()]) if (!parents.has(key)) parentNames.delete(key);
       for (const key of Object.keys(foundPaths)) if (!founds.has(key)) delete foundPaths[key];
       for (const key of [...resolutions.keys()]) if (!resolved.has(key)) resolutions.delete(key);
+      importResolutions.clear();
       main = previous;
       probed = null;
       regularFile = null;
@@ -1866,18 +1890,36 @@ function createLoader(host, builtins) {
     if (found && found !== specifier) error.message += `\nDid you mean to import ${JSON.stringify(found)}?`;
   }
 
+  // Node's ResolveCache: the default resolver answers a request (specifier and
+  // attributes) from one parent once, so a module that was found stays found after its
+  // file goes away, and one that was not is looked for again. Hooks and mocks resolve
+  // on every request.
+  function importRequestKey(specifier, attributes) {
+    if (!attributes) return specifier;
+    const keys = Object.keys(attributes).sort();
+    return keys.length ? `${specifier}::${keys.map(key => `${key}:${attributes[key]}`).join(',')}` : specifier;
+  }
   function resolveImport(specifier, parent, attributes) {
-    let resolved;
-    try { resolved = resolve(specifier, parent, 'import', attributes); }
-    catch (error) {
-      if ((error?.code === 'ERR_MODULE_NOT_FOUND' || error?.code === 'ERR_UNSUPPORTED_DIR_IMPORT') && typeof specifier === 'string' && typeof parent === 'string') {
-        commonJSHint(error, specifier, parent);
+    const cacheable = typeof specifier === 'string' && typeof parent === 'string' && moduleMocks.size === 0 && !hooks.active();
+    let byParent = cacheable ? importResolutions.get(parent) : undefined;
+    const requestKey = cacheable ? importRequestKey(specifier, attributes) : undefined;
+    let resolved = byParent?.get(requestKey);
+    if (resolved === undefined) {
+      try { resolved = resolve(specifier, parent, 'import', attributes); }
+      catch (error) {
+        if ((error?.code === 'ERR_MODULE_NOT_FOUND' || error?.code === 'ERR_UNSUPPORTED_DIR_IMPORT') && typeof specifier === 'string' && typeof parent === 'string') {
+          commonJSHint(error, specifier, parent);
+        }
+        throw error;
       }
-      throw error;
+      // --experimental-import-text: `with { type: 'text' }` asks for the text format
+      // whatever the file is (Node's isExperimentalTextImport).
+      if (host.importText && attributes && attributes.type === 'text') resolved = { ...resolved, format: 'text' };
+      if (cacheable) {
+        if (byParent === undefined) importResolutions.set(parent, byParent = new Map());
+        byParent.set(requestKey, resolved);
+      }
     }
-    // --experimental-import-text: `with { type: 'text' }` asks for the text format
-    // whatever the file is (Node's isExperimentalTextImport).
-    if (host.importText && attributes && attributes.type === 'text') resolved = { ...resolved, format: 'text' };
     if (resolved.format && !hooks.active()) validateAttributes(resolved.format, asURL(resolved.filename), attributes || {});
     if (requiringESM > 0 && resolved.format === 'commonjs' && own(cache, resolved.filename) && !cache[resolved.filename].loaded) {
       const from = typeof parent === 'string' ? ` (from ${filesystemName(parent)})` : '';
@@ -1918,7 +1960,9 @@ function createLoader(host, builtins) {
     return { source, format: resolved.format, filename: resolved.filename };
   }
 
-  return { decorateModuleError, moduleEvaluationError, realmResolve, resolveImport, importKey, moduleSource, requireFor, runMain, defaultRunMain, warmMain, resolve, resolveMain, loadESM, cleanSource, prepareSource, bridge, Module, mockModule };
+  // A file's package scope "type" (run_main.js shouldUseESMLoader asks for the main).
+  const packageType = filename => packageScope(filename)?.data.type;
+  return { packageType, decorateModuleError, moduleEvaluationError, realmResolve, resolveImport, importKey, moduleSource, requireFor, runMain, defaultRunMain, warmMain, resolve, resolveMain, loadESM, cleanSource, prepareSource, bridge, Module, mockModule };
 }
 
 module.exports = { createLoader };
