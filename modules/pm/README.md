@@ -13,7 +13,8 @@ silk run -- install                 # install the package.json of the working di
 `pm install` resolves the dependencies against the registry, downloads what the store at
 `$SILKJS_STORE` (or `~/.silkjs/store`) does not have, and links an isolated `node_modules`: each
 package once under `node_modules/.sjs`, with its dependencies as sibling links. Tarballs are
-unpacked on a thread pool while later ones still download.
+unpacked on a thread pool while later ones still download, and a resolution starts the downloads
+of the packages it has settled while it still asks for the metadata of the rest.
 
 The resolved graph is written to `sjs.lock`, one line per package. The next install reads it and
 asks the registry nothing when it still matches `package.json`. The graph holds the packages of
