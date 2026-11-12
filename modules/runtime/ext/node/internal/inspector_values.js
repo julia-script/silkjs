@@ -189,9 +189,9 @@ class RemoteValues {
     if (generatePreview && typeof value === 'object') result.preview = preview(value, info);
     return result;
   }
-  scope(frameId, scope, depth, context) {
+  scope(frameId, scope, depth, context, type) {
     const objectId = `${this.prefix}:${this.next++}`;
-    this.entries.set(objectId, { group: 'backtrace', context, scope: { frameId, scope, depth } });
+    this.entries.set(objectId, { group: 'backtrace', context, scope: { frameId, scope, depth, type } });
     return { type: 'object', className: 'Object', description: 'Object', objectId };
   }
   entry(id) {
@@ -225,7 +225,7 @@ class RemoteValues {
     if (entry.scope) {
       const scope = entry.scope;
       for (const binding of native(30, scope.frameId)) {
-        if (binding.kind === 0 || !scope.scope.includes(binding.scope) || binding.depth !== scope.depth || params.accessorPropertiesOnly) continue;
+        if (scopeType(binding) !== scope.type || !scope.scope.includes(binding.scope) || binding.depth !== scope.depth || params.accessorPropertiesOnly) continue;
         result.push({ name: binding.name, configurable: false, enumerable: true, writable: !binding.isConst, isOwn: true,
           value: binding.isUninitialized ? { type: 'undefined', description: '<uninitialized>' } : this.remote(binding.value, entry.group, false, params.generatePreview, entry.context) });
       }
@@ -312,7 +312,11 @@ function preview(value, info, limit, withEntries = true) {
       for (const item of collectionEntries(value, subtype === 'map', 5)) {
         entries.push(subtype === 'map' ? { key: entryPreview(item[0]), value: entryPreview(item[1]) } : { value: entryPreview(item) });
       }
-      result.entries = entries;
+      // V8 leaves entries out of an empty collection's preview.
+      if (entries.length) result.entries = entries;
+    } else if ((subtype === 'map' ? mapSize(value) : setSize(value)) > 0) {
+      // A collection inside an entry preview has no entries of its own: V8 marks what it left out.
+      result.overflow = true;
     }
   } else if (subtype === 'promise') {
     const details = host.getPromiseDetails(value);
@@ -346,4 +350,13 @@ function format(value, depth = 2, seen = new Set(), budget = { remaining: 1000 }
   budget.remaining -= text.length;
   return text;
 }
-module.exports = { RemoteValues, inspect, format, byValue, protocolError, unsupported };
+// The CDP scope a frame binding belongs to, or undefined for bindings V8 never lists:
+// the receiver, engine-internal names (new.target, <home_object>) and cached globals.
+const IDENTIFIER = /^[\p{ID_Start}$_][\p{ID_Continue}$\u200c\u200d]*$/u;
+function scopeType(binding) {
+  if (binding.kind === 0 || binding.kind === 5 || binding.name === 'this' || !IDENTIFIER.test(binding.name)) return undefined;
+  if (binding.kind === 4) return 'module';
+  if (binding.kind === 3) return 'closure';
+  return binding.isLocal ? 'local' : 'block';
+}
+module.exports = { scopeType, RemoteValues, inspect, format, byValue, protocolError, unsupported };

@@ -60,6 +60,7 @@ struct silk_inspector {
     uint64_t next_connection;
     char uuid[37], url[320], authority[280], browser[64];
     uint16_t port;
+    int publish_http;
     client clients[MAX_CLIENTS];
 };
 
@@ -327,6 +328,9 @@ static void http_input(silk_inspector *s, client *c) {
     /* As Node's inspector_socket_server.cc: the listing names the endpoint by the
      * Host the client used, and anything else that is not a WebSocket upgrade of
      * the target path gets Node's plain-text refusal. */
+    /* --inspect-publish-uid without http: every plain GET is answered 404
+     * (InspectorSocketServer::HandleGetRequest). */
+    if (!s->publish_http && !(upgrade && !strcasecmp(upgrade, "websocket"))) { http_reply(c, 404, "Not Found", ""); return; }
     if (!strcmp(path, "/json") || !strcmp(path, "/json/list")) {
         char body[1600];
         snprintf(body, sizeof(body), "[ {\n  \"description\": \"node.js instance\",\n  \"devtoolsFrontendUrl\": \"devtools://devtools/bundled/js_app.html?experiments=true&v8only=true&ws=%s/%s\",\n  \"devtoolsFrontendUrlCompat\": \"devtools://devtools/bundled/inspector.html?experiments=true&v8only=true&ws=%s/%s\",\n  \"faviconUrl\": \"https://nodejs.org/static/images/favicons/favicon.ico\",\n  \"id\": \"%s\",\n  \"title\": \"node[%d]\",\n  \"type\": \"node\",\n  \"url\": \"\",\n  \"webSocketDebuggerUrl\": \"ws://%s/%s\"\n} ]\n\n", host, s->uuid, host, s->uuid, s->uuid, (int)getpid(), host, s->uuid);
@@ -455,7 +459,7 @@ silk_inspector *silk_inspector_create(void *wake) {
     atomic_init(&s->pending, 0);
     return s;
 }
-int silk_inspector_start(silk_inspector *s, const unsigned char *host, size_t length, uint16_t port, const unsigned char *browser, size_t browser_length) {
+int silk_inspector_start(silk_inspector *s, const unsigned char *host, size_t length, uint16_t port, const unsigned char *browser, size_t browser_length, int publish_http) {
     if (!s || length >= 256 || (length && !host)) return EINVAL;
     /* The /json/version Browser: printable ASCII without quotes or backslashes. */
     if (browser_length >= sizeof(s->browser) || (browser_length && !browser)) return EINVAL;
@@ -463,6 +467,7 @@ int silk_inspector_start(silk_inspector *s, const unsigned char *host, size_t le
     if (browser_length) memcpy(s->browser, browser, browser_length);
     s->browser[browser_length] = 0;
     if (s->running) return EALREADY;
+    s->publish_http = publish_http;
     char address[256]; if (length) memcpy(address, host, length); address[length] = 0;
     if (length && memchr(host, 0, length)) return EINVAL;
     if (!length || !strcmp(address, "localhost")) strcpy(address, "127.0.0.1");
