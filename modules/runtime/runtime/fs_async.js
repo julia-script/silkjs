@@ -57,12 +57,13 @@ module.exports = function createAsyncFS(native) {
   async function readdir(requestKind, filename, options = {}) {
     const result = [];
     async function visit(directory, relative) {
-      const entries = await primitive(requestKind, 'scandir', [directory]);
+      const raw = !options.recursive && c().rawNames(options.encoding);
+      const entries = await primitive(requestKind, 'scandir', [directory, raw]);
       for (const entry of entries) {
-        const name = typeof entry === 'string' ? entry : entry.name;
+        const name = typeof entry === 'string' || raw ? entry : entry.name;
         if (name === '.' || name === '..') continue;
-        const full = path().join(directory, name), rel = relative ? path().join(relative, name) : name;
-        let mode = typeof entry === 'string' ? 0 : entry.mode;
+        const full = raw ? c().rawEntryPath(directory, name) : path().join(directory, name), rel = relative ? path().join(relative, name) : name;
+        let mode = typeof entry === 'string' || raw ? 0 : entry.mode;
         if ((options.withFileTypes || options.recursive) && !mode) mode = (await stat(requestKind, 'lstat', full)).mode;
         result.push(options.withFileTypes ? { name, mode, parentPath: directory } : rel);
         if (options.recursive && (Number(mode) & 0o170000) === 0o040000) await visit(full, rel);
@@ -74,13 +75,14 @@ module.exports = function createAsyncFS(native) {
   async function remove(requestKind, filename, options = {}) {
     async function attempt(current) {
       let info;
-      try { info = await stat(requestKind, 'lstat', current); }
+      try { info = await stat(requestKind, 'lstat', c().path(current)); }
       catch (error) { if (options.force && error.code === 'ENOENT') return; throw error; }
       if (kind(info, 0o040000)) {
         if (!options.recursive) { const error = c().error('ERR_FS_EISDIR', 'rm', current); error.info = { code: 'EISDIR', syscall: 'rm', path: current }; throw error; }
-        for (const name of await readdir(requestKind, current)) await remove(requestKind, path().join(current, name), options);
-        await primitive(requestKind, 'rmdir', [current]);
-      } else await primitive(requestKind, 'unlink', [current]);
+        // Raw names: an entry whose name is not valid UTF-8 is removed too.
+        for (const name of await primitive(requestKind, 'scandir', [c().path(current), true])) await remove(requestKind, c().rawEntryPath(current, name), options);
+        await primitive(requestKind, 'rmdir', [c().path(current)]);
+      } else await primitive(requestKind, 'unlink', [c().path(current)]);
     }
     for (let count = 0;; count++) {
       try { return await attempt(filename); }

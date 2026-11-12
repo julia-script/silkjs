@@ -219,20 +219,20 @@ function workerOptions(filename, options) {
     if (explicitEnv && errors.length)
       throw clone().codedError('ERR_WORKER_INVALID_EXEC_ARGV', errors.map(error => error.message).join(', '), Error);
   }
+  let workerArgs;
   if (explicitExecArgv) {
-    result.execArgv = new Array(execArgv.length);
-    for (let index = 0; index < result.execArgv.length; index++) result.execArgv[index] = optionString(execArgv[index]);
+    workerArgs = new Array(execArgv.length);
+    for (let index = 0; index < workerArgs.length; index++) workerArgs[index] = optionString(execArgv[index]);
+    let checked;
+    try { checked = runtimeOptions().invalidWorkerArguments(workerArgs); }
+    catch (error) { throw new (nodeErrors().codes.ERR_WORKER_INVALID_EXEC_ARGV)([error.message]); }
+    if (checked.invalid.length) throw new (nodeErrors().codes.ERR_WORKER_INVALID_EXEC_ARGV)(checked.invalid);
+    result.execArgv = checked.execArgv;
   } else {
     result.execArgv = host.initialExecArgv.slice();
   }
-  if (explicitExecArgv) {
-    let invalid;
-    try { invalid = runtimeOptions().invalidWorkerArguments(result.execArgv); }
-    catch (error) { throw new (nodeErrors().codes.ERR_WORKER_INVALID_EXEC_ARGV)([error.message]); }
-    if (invalid.length) throw new (nodeErrors().codes.ERR_WORKER_INVALID_EXEC_ARGV)(invalid);
-  }
   if (explicitEnv || explicitExecArgv) {
-    result.runtimeArgs = environment.slice(0, accepted).concat(result.execArgv);
+    result.runtimeArgs = environment.slice(0, accepted).concat(workerArgs ?? result.execArgv);
   } else {
     // Native options are snapshots, independent of later mutations to the public
     // execArgv array or NODE_OPTIONS environment string.

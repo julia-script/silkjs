@@ -76,6 +76,10 @@ class TLSTransport {
     // TLSWrap::EncOut: nothing leaves while a server waits for 'newSession'.
     if (this.awaitingSession) { if (callback) this.flushWaiters.push(callback); return; }
     const data = Buffer.from(op('drain', this.id));
+    // After DoShutdown the carrier's write side is shut: like TLSWrap's EncOut, what OpenSSL
+    // still makes (a client's Finished after an early end()) goes nowhere, and the read
+    // side stays open so the peer's answer and end still arrive.
+    if (data.length && this.carrier.writableEnded) { if (callback) process.nextTick(callback); return; }
     if (data.length) { this.socket._refreshTimeout(); this.carrier.write(data, callback); }
     else if (callback) process.nextTick(callback);
   }
