@@ -330,6 +330,11 @@ host.diagnostics = {
     const channels = dc.tracingChannel(name);
     return channels.hasSubscribers ? channels : undefined;
   },
+  // Node's SetChannelStatusCallback: native publishers that must switch work on and off with
+  // a channel's subscribers (SQLite tracing) watch it; diagnostics_channel calls status().
+  watchers: new Map(),
+  watch(name, callback) { this.watchers.set(name, callback); },
+  status(name, active) { const callback = this.watchers.get(name); if (callback !== undefined) callback(active); },
 };
 host.nextTick = function nextTick(callback, ...args) {
   if (typeof callback !== 'function') throw new (internalRequire('internal/errors').codes.ERR_INVALID_ARG_TYPE)('callback', 'function', callback);
@@ -854,6 +859,7 @@ const prefixOnlyBuiltinHas = Set.prototype.has.bind(new Set(['test', 'test/repor
 const defineBuiltinName = Object.defineProperty;
 function publicBuiltin(name) {
   if (!publicBuiltinHas(name)) return host.exposeInternals === true && exposedInternal(name);
+  if (name === 'sqlite') return host.sqliteDisabled !== true;
   return (name !== 'stream/iter' && name !== 'zlib/iter') || host.experimentalStreamIter === true;
 }
 // With --expose-internals, Node's internal/* modules load like public ones
@@ -1074,6 +1080,10 @@ function runtimeFlag(arg) {
   if (arg === '--zero-fill-buffers') { host.zeroFillBuffers = true; return true; }
   if (arg === '--experimental-webstorage' || arg === '--no-experimental-webstorage') {
     host.experimentalWebStorage = arg === '--experimental-webstorage'; return true;
+  }
+  // node:sqlite is on by default; --no-experimental-sqlite takes it out of the builtins.
+  if (arg === '--experimental-sqlite' || arg === '--no-experimental-sqlite') {
+    host.sqliteDisabled = arg === '--no-experimental-sqlite'; return true;
   }
   if (arg === '--experimental-stream-iter' || arg === '--no-experimental-stream-iter') {
     host.experimentalStreamIter = arg === '--experimental-stream-iter'; return true;
