@@ -1307,6 +1307,10 @@ function runtimeFlag(arg) {
       arg === '--require-module' || arg === '--no-require-module') {
     host.requireModuleDisabled = arg.startsWith('--no-'); return true;
   }
+  // --no-experimental-detect-module: an ambiguous .js file is CommonJS (get_format.js detectModuleFormat).
+  if (arg === '--experimental-detect-module' || arg === '--no-experimental-detect-module') {
+    host.detectModuleDisabled = arg === '--no-experimental-detect-module'; return true;
+  }
   if (arg === '--experimental-import-meta-resolve') { host.importMetaResolveParent = true; return true; }
   if (arg === '--experimental-print-required-tla') { host.printRequiredTLA = true; return true; }
   if (arg === '--experimental-import-text') { host.importText = true; return true; }
@@ -1804,7 +1808,7 @@ function run(restored = false) {
     return afterMain(loader.Module.runMain(path));
   }
   // Only a preload can register a hook or a mock that resolves it differently.
-  const resolved = early !== undefined && !requirePreloads.length && !importPreloads.length ? early : loader.resolveMain(path);
+  const resolved = early !== undefined && !requirePreloads.length && !importPreloads.length && !loaderPreloads.length ? early : loader.resolveMain(path);
   mainModuleName = resolved.filename;
   armInspectorEntry();
   return afterMain(loader.runMain(path, inputTypeSet, resolved));
