@@ -1453,8 +1453,37 @@ function createLoader(host, builtins) {
     try { source = text(filesystemName(url)); } catch (_) { return; }
     host.attachArrow(cause, url, cleanSource(source), 0);
   }
+  // Node's ModuleJob._instantiate: a named import the root module asks of a CommonJS
+  // module that lacks it gets the hint to import the default export, with the import's
+  // braces as a destructuring when its source line (the link error's arrow line) has them.
+  function commonJSNamedExportHint(cause, filename) {
+    if (cause === null || typeof cause !== 'object' || cause.name !== 'SyntaxError' || typeof cause.message !== 'string') return;
+    const match = /module '(.*)' does not provide an export named '(.+)'/.exec(cause.message);
+    if (match === null) return;
+    if (process.sourceMapsEnabled) return;
+    const site = host.captureCallSites(-4, cause);
+    if (site === undefined || asURL(site[0]) !== asURL(filename)) return;
+    const { 1: childSpecifier, 2: name } = match;
+    let format;
+    try { format = resolve(childSpecifier, filesystemName(filename), 'import').format; } catch { return; }
+    if (format !== 'commonjs') return;
+    const oneLineNamedImports = typeof site[3] === 'string' ? /{.*}/.exec(site[3]) : null;
+    const destructuringAssignment = oneLineNamedImports && String(oneLineNamedImports).replace(/\s+as\s+/g, ': ');
+    const previous = cause.message;
+    cause.message = `Named export '${name}' not found. The requested module` +
+      ` '${childSpecifier}' is a CommonJS module, which may not support` +
+      ' all module.exports as named exports.\nCommonJS modules can ' +
+      'always be imported via the default export, for example using:' +
+      `\n\nimport pkg from '${childSpecifier}';\n${
+        destructuringAssignment ? `const ${destructuringAssignment} = pkg;\n` : ''}`;
+    const stack = cause.stack;
+    const head = `SyntaxError: ${previous}`;
+    if (typeof stack === 'string' && stack.startsWith(head)) cause.stack = `SyntaxError: ${cause.message}${stack.slice(head.length)}`;
+  }
+
   function decorateModuleError(cause, filename) {
     moduleSyntaxArrow(cause);
+    commonJSNamedExportHint(cause, filename);
     if (cause === null || typeof cause !== 'object' || cause.name !== 'ReferenceError') return cause;
     const match = /^(require|module|exports|__filename|__dirname) is not defined$/.exec(cause.message);
     if (!match) return cause;
