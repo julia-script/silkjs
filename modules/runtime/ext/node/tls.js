@@ -294,6 +294,8 @@ function onSocketCloseDestroySSL() { setImmediate(destroySSL, this); }
 function destroySSL(self) { self._destroySSL(); }
 TLSSocket.prototype._destroySSL = function() {
   closeSingleUseContext(this._secureContext);
+  // Node's _destroySSL: the TLSWrap is gone from socket.ssl.
+  this.ssl = null;
   if (!this._tls?.id) return;
   this._tls.destroySSL();
   this[kPendingSession] = null;

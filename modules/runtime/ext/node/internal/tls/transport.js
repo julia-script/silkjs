@@ -20,7 +20,7 @@ class TLSTransport {
   constructor(socket, carrier, context, options, owned) {
     // As TLSWrap's constructor, a handle made without a socket wraps no session.
     if (socket === undefined) { this.id = 0; this.closed = true; this.closing = true; return; }
-    this.socket = socket; this.carrier = carrier; this.options = options;
+    this.socket = socket; this.carrier = carrier; this.options = options; this.owned = !!owned;
     this.kind = carrier._transport?.kind || 1; this.closed = false; this.closing = false;
     this.reading = true; this.ready = false; this.selecting = false; this.pumping = false;
     this.writes = []; this.pendingShutdown = null; this.shutdownInFlight = false;
@@ -378,9 +378,11 @@ class TLSTransport {
     if (this.id) { answering.delete(this.id); native('release', this.id); this.id = 0; }
     for (const item of this.writes.splice(0)) item.callback(canceled());
     const done = this.pendingShutdown; this.pendingShutdown = null; if (done) done(null);
-    // HandleWrap::OnClose runs from libuv's close callback, after the ticks queued so far: a
-    // socket destroyed with an error emits 'error' before 'close'.
-    process.nextTick(() => this.onEvent?.(6, 0));
+    // HandleWrap::OnClose for a TLS socket that owns its TCP handle runs from libuv's close
+    // callback, after the ticks queued so far (a socket destroyed with an error emits 'error'
+    // before 'close'); a wrapped stream closes it as its own 'close' is emitted.
+    if (this.owned) process.nextTick(() => this.onEvent?.(6, 0));
+    else this.onEvent?.(6, 0);
   }
   close(reset = false) {
     if (this.closing) return 0;
@@ -400,7 +402,8 @@ class TLSTransport {
     if (!peer) return this.carrier.address?.();
     return this.carrier.remoteAddress ? { address: this.carrier.remoteAddress, port: this.carrier.remotePort, family: this.carrier.remoteFamily } : undefined;
   }
-  call(op, ...args) { return this.carrier._transport?.call(op, ...args) ?? 0; }
+  // A closed carrier has no descriptor (TLSWrap's fd is then -1, as libuv's).
+  call(op, ...args) { return this.carrier._transport?.call(op, ...args) ?? (op === 'fileno' ? -1 : 0); }
   getAsyncId() { return this.carrier._handle?.getAsyncId?.() ?? -1; }
   ref() { this.carrier.ref?.(); }
   unref() { this.carrier.unref?.(); }
