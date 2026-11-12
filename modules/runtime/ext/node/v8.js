@@ -59,8 +59,11 @@ function writeHeapSnapshot(filename, options) {
 function getHeapStatistics() {
   const heap = JSON.parse(host.heapMetrics());
   // Individually owned live allocations, not reserved V8 arenas. Omit metrics
-  // the engine does not measure rather than inventing limits, spaces or zeros.
-  return { total_heap_size: heap.heapTotal, used_heap_size: heap.heapUsed, external_memory: heap.external, silk: heap.silk };
+  // the engine does not measure rather than inventing limits or zeros: the heap
+  // limit is there only with a budget (a worker's resourceLimits).
+  const statistics = { total_heap_size: heap.heapTotal, used_heap_size: heap.heapUsed, external_memory: heap.external, silk: heap.silk };
+  if (heap.silk.limitBytes !== null) statistics.heap_size_limit = heap.silk.limitBytes;
+  return statistics;
 }
 function queryObjects(ctor, options = {}) {
   if (typeof ctor !== 'function') throw error('ERR_INVALID_ARG_TYPE', 'The "constructor" argument must be a function', TypeError);
@@ -99,8 +102,21 @@ function startCpuProfile() {
   if (!host.cpuProfileStart()) throw error('ERR_INVALID_STATE', 'A native CPU profile is already active in this thread');
   return new SyncCPUProfileHandle();
 }
+// The engine's own generations under V8's space names: new_space is what was
+// allocated since the last collection, old_space what collections kept. There is
+// no machine code, so code_space is empty. Sizes are the bytes in use (the
+// allocator reserves no space ahead); space_available_size is what the heap
+// budget (a worker's resourceLimits) leaves, and is absent without one.
 function getHeapSpaceStatistics() {
-  unsupported('getHeapSpaceStatistics', 'the runtime has individually owned allocations, not V8 heap spaces');
+  const heap = JSON.parse(host.heapMetrics());
+  const limit = heap.silk.limitBytes;
+  const left = limit === null ? undefined : Math.max(0, limit - heap.silk.allocatorUsedBytes);
+  const space = (space_name, used) => {
+    const entry = { space_name, space_size: used, space_used_size: used, physical_space_size: used };
+    if (left !== undefined) entry.space_available_size = space_name === 'code_space' ? 0 : left;
+    return entry;
+  };
+  return [space('new_space', heap.youngUsed), space('old_space', heap.heapUsed - heap.youngUsed), space('code_space', 0)];
 }
 function getHeapCodeStatistics() {
   unsupported('getHeapCodeStatistics', 'the runtime does not measure V8 code and metadata categories');
