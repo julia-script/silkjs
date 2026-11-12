@@ -181,11 +181,12 @@ function createReport(process) {
       // lib/internal/process/report.js checks before the native writer runs.
       const permission = host.builtinLoaded('internal/permission') ? require('internal/permission') : undefined;
       if (permission?.enabled()) {
-        let resource = file;
+        // The report goes to file, else to report.filename, inside report.directory.
+        let resource = file !== undefined ? file : settings.filename || undefined;
         if (resource !== undefined) {
           if (settings.directory !== '') resource = `${settings.directory}${require('path').sep}${resource}`;
         } else {
-          resource = process.cwd();
+          resource = settings.directory || process.cwd();
         }
         if (!permission.has('fs.write', resource)) {
           throw permission.accessDenied('Access to this API has been restricted', 'fs.write', resource);

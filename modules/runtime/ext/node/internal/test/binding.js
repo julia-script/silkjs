@@ -53,7 +53,8 @@ const kBindings = {
 
 function internalBinding(module) {
   const binding = kBindings[module];
-  if (binding === undefined) throw new Error(`No such binding: ${module}`);
+  // getInternalBinding (node_binding.cc) throws ERR_INVALID_MODULE.
+  if (binding === undefined) throw Object.assign(new Error(`No such binding: ${module}`), { code: 'ERR_INVALID_MODULE' });
   return binding();
 }
 

@@ -44,6 +44,20 @@ const hook = createHook({
   destroy(id) { pairing.delete(id); entered.delete(id); }
 });
 function clear() { stack.length = 0; setActive(null); }
+let sentMakeCallbackDeprecation = false;
+// lib/domain.js topLevelDomainCallback, the trampoline of native callbacks with no async context.
+host.domainCallback = function topLevelDomainCallback(cb, ...args) {
+  const domain = this.domain;
+  if (exports.active && domain && !sentMakeCallbackDeprecation) {
+    sentMakeCallbackDeprecation = true;
+    process.emitWarning('Using a domain property in MakeCallback is deprecated. Use the async_context variant of MakeCallback or the AsyncResource class instead. ' +
+      `(Triggered by calling ${cb?.name || '<anonymous>'} on ${this?.constructor?.name}.)`, 'DeprecationWarning', 'DEP0097');
+  }
+  if (domain) domain.enter();
+  const ret = Reflect.apply(cb, this, args);
+  if (domain) domain.exit();
+  return ret;
+};
 
 class Domain extends EventEmitter {
   constructor() { super(); this.members = []; hook.enable(); }

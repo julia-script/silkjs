@@ -384,6 +384,13 @@ host.attachArrow = (error, scriptName, source, prefix) => {
   }
   host.errorArrows.set(error, scriptName + ':' + line + '\n' + text + '\n' + caret);
 };
+// node_errors.cc DecorateErrorStack: the arrow, a blank line, then the stack, once.
+host.decorateErrorStack = error => {
+  const arrow = host.errorArrows.get(error);
+  if (arrow === undefined || host.decoratedErrors.has(error) || typeof error.stack !== 'string') return;
+  error.stack = arrow + '\n' + error.stack;
+  host.decoratedErrors.add(error);
+};
 // Runs a timer or immediate callback; true when it threw (and was reported).
 function invokeReporting(callback, receiver, args) {
   try { Reflect.apply(callback, receiver, args); return false; }
@@ -580,6 +587,14 @@ host.performanceLoopStats = () => {
   const end = performanceMilestones.loopExit < 0 ? native.now() - startTime : performanceMilestones.loopExit;
   return { idle, active: Math.max(0, end - performanceMilestones.loopStart - idle) };
 };
+// Node's ProcessEmit: a MakeCallback of process.emit with no async context, which goes through
+// the domain module's trampoline (host.domainCallback) once that module is loaded.
+host.processEmit = (name, value) => {
+  const emit = process.emit, trampoline = host.domainCallback;
+  return trampoline === undefined ? emit.call(process, name, value) : trampoline.call(process, emit, name, value);
+};
+// node_perf.cc GetUvMetricsInfo: [loop_count, events, events_waiting].
+host.performanceUvMetrics = () => [native.loopMetrics(0), native.loopMetrics(1), native.loopMetrics(2)];
 host.performanceNodeTiming = () => ({ ...performanceMilestones, idleTime: host.performanceLoopStats().idle });
 host.performanceAddLoopListener = callback => {
   loopListeners.add(callback);

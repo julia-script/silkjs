@@ -73,7 +73,8 @@ fs.existsSync = function existsSync(path) {
     }
     return false;
   }
-  try { c.native('access', [path, constants.F_OK]); return true; } catch { return false; }
+  // Node's binding checks fs.read before it looks at the file, so a denial throws.
+  try { c.native('access', [path, constants.F_OK]); return true; } catch (err) { if (err?.code === 'ERR_ACCESS_DENIED') throw err; return false; }
 };
 
 function defaultCloseCallback(err) { if (err != null) throw err; }
@@ -339,6 +340,8 @@ fs.rm = function rm(path, options, callback) {
 fs.rmSync = function rmSync(path, options) {
   path = c.path(path);
   const o = validateRmOptionsSync(path, options, false);
+  // The rmSync binding checks fs.write on the path before it removes anything.
+  if (c.host.builtinLoaded('internal/permission')) require('internal/permission').check('fs.write', path);
   return removeSync(path, o);
 };
 for (const name of ['fsync', 'fdatasync']) {
@@ -461,12 +464,12 @@ fs.symlink = function symlink(target, path, type, callback) {
   if (callback === undefined) { callback = makeCallback(type); type = undefined; }
   else validateOneOf(type, 'type', ['dir', 'file', 'junction', null, undefined]);
   target = c.path(target, 'target'); path = c.path(path);
-  c.submit('symlink', [target, path, type], callback);
+  c.submit('symlink', [c.preprocessSymlinkDestination(target, type, path), path, type], callback);
 };
 fs.symlinkSync = function symlinkSync(target, path, type) {
   validateOneOf(type, 'type', ['dir', 'file', 'junction', null, undefined]);
   target = c.path(target, 'target'); path = c.path(path);
-  c.fail(os.symlink(target, path), 'symlink', target, path);
+  c.fail(os.symlink(c.preprocessSymlinkDestination(target, type, path), path), 'symlink', target, path);
 };
 fs.link = function link(existingPath, newPath, callback) {
   callback = makeCallback(callback);
@@ -635,6 +638,14 @@ fs.realpathSync = function realpathSync(path, options) {
   if (typeof path !== 'string') path += '';
   path = c.path(path);
   path = p.resolve(path);
+  // Check the resolved input path up front so that the lstat walk below cannot
+  // be used to probe the existence of paths outside the granted set.
+  if (c.host.builtinLoaded('internal/permission')) {
+    const permission = require('internal/permission');
+    if (permission.enabled() && !permission.has('fs.read', path)) {
+      throw permission.accessDenied('Access to this API has been restricted. Use --allow-fs-read to manage permissions.', 'fs.read', path);
+    }
+  }
   const cache = options[realpathCacheKey];
   const cached = cache?.get(path);
   if (cached) return cached;

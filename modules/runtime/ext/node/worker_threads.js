@@ -42,7 +42,8 @@ module.exports = {
   locks: undefined,
 };
 
-for (const [name, load] of [
+// Indexed, not for-of: user code may replace Array.prototype[Symbol.iterator] before this loads.
+const lazyExports = [
   ['MessagePort', () => io().MessagePort], ['MessageChannel', () => io().MessageChannel],
   ['BroadcastChannel', () => io().BroadcastChannel],
   ['moveMessagePortToContext', () => io().moveMessagePortToContext],
@@ -51,7 +52,9 @@ for (const [name, load] of [
   ['isMarkedAsUntransferable', () => require('internal/buffer').isMarkedAsUntransferable],
   ['postMessageToThread', () => require('internal/worker/messaging').postMessageToThread],
   ['locks', () => require('internal/worker/locks').locks],
-]) {
+];
+for (let index = 0; index < lazyExports.length; index++) {
+  const name = lazyExports[index][0], load = lazyExports[index][1];
   Object.defineProperty(module.exports, name, {
     enumerable: true, configurable: true,
     get() { const value = load(); Object.defineProperty(module.exports, name, { value, writable: true, enumerable: true, configurable: true }); return value; },
