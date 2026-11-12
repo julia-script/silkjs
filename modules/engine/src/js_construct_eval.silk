@@ -23,7 +23,7 @@ import silk.num.i64
 import silk.num.usize
 import js_heap { HeapCell, HeapHeader }
 import js_value { ValueBits }
-import js_core_types { ObjectData, ObjectPayload, FunctionBytecode, FrameSlots, RuntimeState, ShapeData, SlotBits, ConstructCacheEntry, ConstructRecipe, blankRecipe }
+import js_core_types { ObjectData, ObjectPayload, FunctionBytecode, FrameSlots, RuntimeState, ShapeData, SlotBits, ConstructCacheEntry, ConstructRecipe, blankRecipe, JS_PROP_C_W_E }
 import js_shapes as shapes
 import js_primitives as primitives
 import js_class_data as classes
@@ -33,6 +33,8 @@ import js_object_allocate as objects
 import js_opcode_data as op
 import js_bytecode as bytecodes
 import js_var_refs as varRefs
+import js_class_fields as classFields
+import js_class_fields { FieldList }
 import js_realm { Realm }
 import runtime_memory { AllocationObserver }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
@@ -322,7 +324,8 @@ fn analyze(bytes: &[u8], pool: &FunctionBytecode, recipe: &mut ConstructRecipe) 
   while pc < length {
     let opcode = bytes[pc]
     if opcode == 41 { // OP_return_undef
-      if symbols.depth != 0 || recipe.stores == 0 { return false }
+      // A class constructor may only add its fields.
+      if symbols.depth != 0 || (recipe.stores == 0 && recipe.fieldsReference == 255) { return false }
       simplify(&mut recipe)
       return selfFree(&recipe)
     }
@@ -380,13 +383,16 @@ fn analyze(bytes: &[u8], pool: &FunctionBytecode, recipe: &mut ConstructRecipe) 
     } else if opcode == op.OP_check_ctor {
       // new.target is always defined in a construct.
       pc = pc + 1
-    } else if opcode == op.OP_get_var_ref_check {
+    } else if opcode == op.OP_get_var_ref_check || opcode == op.OP_fuse_prefix {
       // The field initializer call: guarded by fieldsReference instead.
-      if !bytecodes.fieldsInit(bytes, pc) || recipe.fieldsReference != 255 { return false }
-      let index = u8.toU32(bytes[pc + 1]) | u32.shiftLeft(u8.toU32(bytes[pc + 2]), 8)
+      let size = bytecodes.fieldsInitSize(bytes, pc)
+      if size == 0 || recipe.fieldsReference != 255 { return false }
+      let mut at = pc
+      if opcode == op.OP_fuse_prefix { at = pc + bytecodes.FIELDS_PREFIX_SIZE }
+      let index = u8.toU32(bytes[at + 1]) | u32.shiftLeft(u8.toU32(bytes[at + 2]), 8)
       if index >= 255 { return false }
       recipe.fieldsReference = u32.toU8(index)
-      pc = pc + bytecodes.FIELDS_INIT_SIZE
+      pc = pc + size
     } else {
       pc = straight(bytes, pc, &mut recipe, &mut constants, &mut symbols, receiver, undefined, &pool)
       if pc == usize.MAX { return false }
@@ -396,25 +402,41 @@ fn analyze(bytes: &[u8], pool: &FunctionBytecode, recipe: &mut ConstructRecipe) 
 }
 
 /// Whether recipe applies to closure, the function object running its body:
-/// a class constructor's field initializer reference must hold undefined.
+/// a class constructor's field initializer reference must hold undefined (no
+/// fields; fields stays empty) or a constant-only initializer, whose fields
+/// are read into fields.
 @inlineAlways
-unsafe fn fieldsAbsent(recipe: &ConstructRecipe, closure: *mut HeapHeader) -> bool {
+unsafe fn fieldsOf(runtime: *mut HeapHeader, recipe: &ConstructRecipe, closure: *mut HeapHeader, fields: &mut FieldList) -> bool {
   if recipe.fieldsReference == 255 { return true }
-  return unsafe fieldsUndefined(closure, u8.toUsize(recipe.fieldsReference))
+  return unsafe readFields(runtime, closure, u8.toUsize(recipe.fieldsReference), &mut fields)
 }
 @inlineNever
-unsafe fn fieldsUndefined(closure: *mut HeapHeader, index: usize) -> bool {
+unsafe fn readFields(runtime: *mut HeapHeader, closure: *mut HeapHeader, index: usize, fields: &mut FieldList) -> bool {
   let anchor = () let object = unsafe HeapCell.payload<ObjectData, ()>(&anchor, closure)
-  return match &object.payload {
+  let initializer = match &object.payload {
     ObjectPayload.BytecodeFunction { function } => {
       if index >= function.varRefs.length() { return false }
-      return match Pointer.nonNullMut<HeapHeader>(function.varRefs.asSlice()[index]) {
-        Option<*mut HeapHeader>.Some { value } => match unsafe varRefs.read(value) { ValueBits.Undefined => true _ => false }
-        Option<*mut HeapHeader>.None => false
+      match Pointer.nonNullMut<HeapHeader>(function.varRefs.asSlice()[index]) {
+        Option<*mut HeapHeader>.Some { value } => unsafe varRefs.read(value)
+        Option<*mut HeapHeader>.None => { return false }
       }
     }
+    _ => { return false }
+  }
+  drop object
+  return match initializer {
+    ValueBits.Undefined => true
+    ValueBits.Object { reference } => unsafe classFields.decode(runtime, reference, &mut fields)
     _ => false
   }
+}
+/// Whether entry's final shape was built for fields' keys.
+@inlineAlways
+fn sameFields(entry: &ConstructCacheEntry, fields: &FieldList) -> bool {
+  if u8.toUsize(entry.fieldCount) != fields.count { return false }
+  let mut index: usize = 0
+  while index < fields.count { if entry.fieldAtoms[index & 7] != fields.atoms[index & 7] { return false } index = index + 1 }
+  return true
 }
 /// Runs function's body (a base-class bytecode constructor of form
 /// CONSTRUCT_EVAL) on receiver, a new ordinary object, with arguments argv.
@@ -445,17 +467,24 @@ pub unsafe fn construct<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader, o
     // previous body reached.
     let old = entry.final
     entry.code = address entry.final = Pointer.null<HeapHeader>() entry.base = 0
-    if !analyze(unsafe code.code.asSlice(), &code, &mut entry.recipe) { entry.recipe.stores = 0 }
+    if !analyze(unsafe code.code.asSlice(), &code, &mut entry.recipe) { entry.recipe = blankRecipe() }
     drop entry drop state drop code
     match Pointer.nonNullMut<HeapHeader>(old) { Option<*mut HeapHeader>.Some { value } => { unsafe gc.releaseHeader(&mut hooks, runtime, value) } Option<*mut HeapHeader>.None => () }
     return unsafe construct(&mut hooks, runtime, owner, function, receiver, argv, note)
   }
   drop code
   let stores = u8.toUsize(entry.recipe.stores)
-  if stores == 0 || !unsafe fieldsAbsent(&entry.recipe, callee) { return false }
+  // A blank recipe: analyze declined the body.
+  if stores == 0 && entry.recipe.fieldsReference == 255 { return false }
+  let mut fields = FieldList.make()
+  if !unsafe fieldsOf(runtime, &entry.recipe, callee, &mut fields) { return false }
+  let total = fields.count + stores
+  // A class with no fields and a body with no stores: the receiver is done.
+  if total == 0 { return true }
+  if total > STORES_MAX { return false }
   let data = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut anchor, node)
   if data.classId() != classes.JS_CLASS_OBJECT || data.isExotic() || !data.extensible() || data.isStandardArrayPrototype() { return false }
-  if data.slotCount() != 0 || data.slotCapacity() < stores { return false }
+  if data.slotCount() != 0 || data.slotCapacity() < total { return false }
   let mut values = FrameSlots { data: unsafe Intrinsic.pointerRequalify<[*]mut ValueBits, *mut ValueBits>(unsafe Intrinsic.stackAllocate<ValueBits>(NODES_MAX)), count: NODES_MAX }
   unsafe evaluate(&entry.recipe, receiver, argv, &mut values)
   let base = data.shape
@@ -467,21 +496,27 @@ pub unsafe fn construct<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader, o
   if unsafe headerCount(base) <= 1 { return false }
   let baseAddress = Pointer.address<HeapHeader>(base)
   let mut final = Pointer.null<HeapHeader>()
-  if entry.base == baseAddress && entry.baseVersion == baseVersion {
+  if entry.base == baseAddress && entry.baseVersion == baseVersion && sameFields(&entry, &fields) {
     // An unchanged epoch: no prototype changed since the chain last matched.
     if entry.epoch == epoch || unsafe chainMatches(&entry, prototype) { entry.epoch = epoch final = entry.final }
   }
   let mut old = Pointer.null<HeapHeader>()
   if Pointer.isNull<HeapHeader>(final) {
-    // Every add must follow a verified memo entry; a repeated key would
-    // overwrite rather than add.
+    // Every add must follow a memo entry, verified for a store; a repeated
+    // key would overwrite rather than add. The fields come first.
+    let mut keys: [u32; 16] = [0; 16]
     let mut shape = base
     let mut index: usize = 0
-    while index < stores {
-      let atom = entry.recipe.atoms[index]
+    while index < total {
+      let mut atom: u32 = 0
+      if index < fields.count { atom = fields.atoms[index & 7] } else { atom = entry.recipe.atoms[(index - fields.count) & 7] }
       let mut earlier: usize = 0
-      while earlier < index { if entry.recipe.atoms[earlier] == atom { return false } earlier = earlier + 1 }
-      let found = unsafe shapes.verifiedAdd(runtime, shape, atom)
+      while earlier < index { if keys[earlier & 15] == atom { return false } earlier = earlier + 1 }
+      keys[index & 15] = atom
+      // A field's define adds whatever the prototypes hold: any memoized add.
+      let mut found = Pointer.null<HeapHeader>()
+      if index < fields.count { found = unsafe shapes.memoTarget(runtime, shape, atom, u32.toU8(JS_PROP_C_W_E)) }
+      else { found = unsafe shapes.verifiedAdd(runtime, shape, atom) }
       if Pointer.isNull<HeapHeader>(found) { return false }
       shape = unsafe Intrinsic.pointerRequalify<?*mut HeapHeader, *mut HeapHeader>(found)
       index = index + 1
@@ -492,16 +527,16 @@ pub unsafe fn construct<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader, o
     unsafe HeapCell.retain(shape)
     old = entry.final
     entry.base = baseAddress entry.baseVersion = baseVersion entry.final = shape entry.chain = chain entry.depth = usize.toU8(links)
-    entry.epoch = epoch
+    entry.epoch = epoch entry.fieldCount = usize.toU8(fields.count) entry.fieldAtoms = fields.atoms
     final = shape
   }
   let roots = entry.recipe.roots
   drop entry drop state drop data
   let reached = unsafe Intrinsic.pointerRequalify<?*mut HeapHeader, *mut HeapHeader>(final)
-  unsafe install(node, base, reached, &roots, &values, stores)
+  unsafe install(node, base, reached, &fields, &roots, &values, stores)
   // Shapes are freed only by the collector's release path, never by JS.
   unsafe releaseOptional(&mut hooks, runtime, old)
-  if note { unsafe gc.notePlan(&mut hooks, runtime, owner, base, reached, Pointer.address<HeapHeader>(bytecode), stores, [0; 8]) }
+  if note { unsafe gc.notePlan(&mut hooks, runtime, owner, base, reached, Pointer.address<HeapHeader>(bytecode), total, [0; 8]) }
   return true
 }
 /// construct, after growing receiver's slots when they are what declined it: a
@@ -522,7 +557,8 @@ pub unsafe effect fn constructGrowing<H: HeapHooks>(hooks: &mut H, runtime: *mut
     Result<(), OutOfMemoryError>.Failure { error } => { drop error false }
   }
 }
-/// The stores of the recipe cached for function's body, or 0.
+/// The slots the recipe cached for function's body adds (its class's fields
+/// and its stores), or 0.
 unsafe fn cachedStores(runtime: *mut HeapHeader, function: ValueBits) -> usize {
   let callee = match function { ValueBits.Object { reference } => reference _ => { return 0 } }
   let anchor = ()
@@ -536,7 +572,11 @@ unsafe fn cachedStores(runtime: *mut HeapHeader, function: ValueBits) -> usize {
   let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, runtime)
   let entry = &state.constructCache[cacheWay(&state.*, address)]
   if entry.code != address { return 0 }
-  return u8.toUsize(entry.recipe.stores)
+  let stores = u8.toUsize(entry.recipe.stores)
+  if entry.recipe.fieldsReference == 255 { return stores }
+  let mut fields = FieldList.make()
+  if !unsafe fieldsOf(runtime, &entry.recipe, callee, &mut fields) { return 0 }
+  return stores + fields.count
 }
 fn invariant() -> never { return Intrinsic.trap("QuickJS invariant violated") }
 @inlineAlways
@@ -593,16 +633,18 @@ pub unsafe effect fn planned<'a, H: HeapHooks>(hooks: &mut H, memory: &Allocatio
   let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, runtime)
   let entry = &state.constructCache[cacheWay(&state.*, address)]
   let stores = u8.toUsize(entry.recipe.stores)
-  if entry.code != address || stores != plan.stores || entry.base != Pointer.address<HeapHeader>(empty)
+  let fieldCount = u8.toUsize(entry.fieldCount)
+  if entry.code != address || fieldCount + stores != plan.stores || entry.base != Pointer.address<HeapHeader>(empty)
     || Pointer.address<HeapHeader>(unsafe Intrinsic.pointerRequalify<?*mut HeapHeader, *mut HeapHeader>(entry.final)) != Pointer.address<HeapHeader>(final) {
     drop entry drop state
     // plannedShape's reference to final.
     unsafe gc.releaseHeader(&mut hooks, runtime, final)
     return ValueBits.Uninitialized
   }
-  // No fieldsAbsent test: a plan is noted only after construct passed it for
-  // this bytecode, and whether a class has instance fields is fixed by its
-  // source (the initializer reference is stored before the class can be named).
+  if fieldCount != 0 {
+    drop entry drop state
+    return run unsafe plannedFields(&mut hooks, memory, realm, function, address, final, empty, argv)
+  }
   // The recipe is selfFree, so the receiver is never a store value here.
   let mut values = FrameSlots { data: unsafe Intrinsic.pointerRequalify<[*]mut ValueBits, *mut ValueBits>(unsafe Intrinsic.stackAllocate<ValueBits>(NODES_MAX)), count: NODES_MAX }
   unsafe evaluate(&entry.recipe, ValueBits.Undefined, argv, &mut values)
@@ -619,10 +661,44 @@ pub unsafe effect fn planned<'a, H: HeapHooks>(hooks: &mut H, memory: &Allocatio
   }
   return created
 }
+/// planned for a plan whose final shape holds the class's fields too (the
+/// entry at address passed the plan's checks): their values go first. The
+/// plan's owner is function, so its fields are those final was built with.
+@inlineNever
+unsafe effect fn plannedFields<'a, H: HeapHooks>(hooks: &mut H, memory: &AllocationObserver, realm: Realm<'a>, function: *mut HeapHeader,
+  address: usize, final: *mut HeapHeader, empty: *mut HeapHeader, argv: &FrameSlots) -> ValueBits ! OutOfMemoryError ? &mut Allocator {
+  let runtime = realm.runtime()
+  let anchor = ()
+  let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, runtime)
+  let entry = &state.constructCache[cacheWay(&state.*, address)]
+  let stores = u8.toUsize(entry.recipe.stores)
+  let mut fields = FieldList.make()
+  if !unsafe fieldsOf(runtime, &entry.recipe, function, &mut fields) || !sameFields(&entry, &fields) {
+    drop entry drop state
+    unsafe gc.releaseHeader(&mut hooks, runtime, final)
+    return ValueBits.Uninitialized
+  }
+  let mut values = FrameSlots { data: unsafe Intrinsic.pointerRequalify<[*]mut ValueBits, *mut ValueBits>(unsafe Intrinsic.stackAllocate<ValueBits>(NODES_MAX)), count: NODES_MAX }
+  unsafe evaluate(&entry.recipe, ValueBits.Undefined, argv, &mut values)
+  let roots = entry.recipe.roots
+  drop entry drop state
+  let created = run unsafe objects.ordinaryFromPlan(&mut hooks, memory, realm, final, empty, fields.count + stores)
+  let node = match created { ValueBits.Object { reference } => reference _ => invariant() }
+  let mut nodeAnchor = ()
+  let data = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut nodeAnchor, node)
+  let mut index: usize = 0
+  while index < fields.count { data.setSlot(index, SlotBits.value(unsafe (fields.values[index & 7]).retained())) index = index + 1 }
+  index = 0
+  while index < stores {
+    data.setSlot(fields.count + index, SlotBits.value(unsafe (unsafe values.get(u8.toUsize(roots[index & 7]))).retained()))
+    index = index + 1
+  }
+  return created
+}
 /// Gives node the final shape (the empty base keeps other holders) and the
 /// recipe's store values, retained, as its slots.
 @inlineAlways
-unsafe fn install(node: *mut HeapHeader, base: *mut HeapHeader, final: *mut HeapHeader, roots: &[u8; 8], values: &FrameSlots, stores: usize) -> () {
+unsafe fn install(node: *mut HeapHeader, base: *mut HeapHeader, final: *mut HeapHeader, fields: &FieldList, roots: &[u8; 8], values: &FrameSlots, stores: usize) -> () {
   unsafe HeapCell.retain(final)
   let mut headerAnchor = ()
   let header = unsafe Pointer.borrowMut<(), HeapHeader>(&mut headerAnchor, base)
@@ -632,6 +708,8 @@ unsafe fn install(node: *mut HeapHeader, base: *mut HeapHeader, final: *mut Heap
   let data = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut dataAnchor, node)
   data.shape = final
   let mut index: usize = 0
+  while index < fields.count { unsafe data.pushSlotUnchecked(SlotBits.value(unsafe (fields.values[index & 7]).retained())) index = index + 1 }
+  index = 0
   while index < stores {
     unsafe data.pushSlotUnchecked(SlotBits.value(unsafe (unsafe values.get(u8.toUsize(roots[index & 7]))).retained()))
     index = index + 1
