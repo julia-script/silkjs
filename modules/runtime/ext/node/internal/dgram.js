@@ -21,7 +21,9 @@ const EVENT_SENT = 4;
 const EVENT_CLOSED = 6;
 
 class UDP {
-  constructor(family) {
+  // Node's new UDP() has no family until bind; its bind() is the IPv4 one (bind6 is IPv6),
+  // so a handle made without one is an IPv4 socket.
+  constructor(family = 4) {
     this.family = family;
     this.owner = null;
     this.onmessage = null;
