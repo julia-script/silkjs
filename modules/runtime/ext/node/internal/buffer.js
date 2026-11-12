@@ -65,7 +65,7 @@ float32Array[0] = -1; // 0xBF800000
 const bigEndian = uInt8Float32Array[3] === 0;
 
 function checkBounds(buf, offset, byteLength) {
-  validateNumber(offset, 'offset');
+  if (typeof offset !== 'number') validateNumber(offset, 'offset');
   if (buf[offset] === undefined || buf[offset + byteLength] === undefined)
     boundsError(offset, buf.length - (byteLength + 1));
 }
@@ -105,7 +105,7 @@ function boundsError(value, length, type) {
 
 // Read integers.
 function readBigUInt64LE(offset = 0) {
-  validateNumber(offset, 'offset');
+  if (typeof offset !== 'number') validateNumber(offset, 'offset');
   const first = this[offset];
   const last = this[offset + 7];
   if (first === undefined || last === undefined)
@@ -125,7 +125,7 @@ function readBigUInt64LE(offset = 0) {
 }
 
 function readBigUInt64BE(offset = 0) {
-  validateNumber(offset, 'offset');
+  if (typeof offset !== 'number') validateNumber(offset, 'offset');
   const first = this[offset];
   const last = this[offset + 7];
   if (first === undefined || last === undefined)
@@ -145,7 +145,7 @@ function readBigUInt64BE(offset = 0) {
 }
 
 function readBigInt64LE(offset = 0) {
-  validateNumber(offset, 'offset');
+  if (typeof offset !== 'number') validateNumber(offset, 'offset');
   const first = this[offset];
   const last = this[offset + 7];
   if (first === undefined || last === undefined)
@@ -163,7 +163,7 @@ function readBigInt64LE(offset = 0) {
 }
 
 function readBigInt64BE(offset = 0) {
-  validateNumber(offset, 'offset');
+  if (typeof offset !== 'number') validateNumber(offset, 'offset');
   const first = this[offset];
   const last = this[offset + 7];
   if (first === undefined || last === undefined)
@@ -200,7 +200,7 @@ function readUIntLE(offset, byteLength) {
 }
 
 function readUInt48LE(buf, offset = 0) {
-  validateNumber(offset, 'offset');
+  if (typeof offset !== 'number') validateNumber(offset, 'offset');
   const first = buf[offset];
   const last = buf[offset + 5];
   if (first === undefined || last === undefined)
@@ -214,7 +214,7 @@ function readUInt48LE(buf, offset = 0) {
 }
 
 function readUInt40LE(buf, offset = 0) {
-  validateNumber(offset, 'offset');
+  if (typeof offset !== 'number') validateNumber(offset, 'offset');
   const first = buf[offset];
   const last = buf[offset + 4];
   if (first === undefined || last === undefined)
@@ -228,7 +228,7 @@ function readUInt40LE(buf, offset = 0) {
 }
 
 function readUInt32LE(buf, offset = 0) {
-  validateNumber(offset, 'offset');
+  if (typeof offset !== 'number') validateNumber(offset, 'offset');
   const first = buf[offset];
   const last = buf[offset + 3];
   if (first === undefined || last === undefined)
@@ -241,7 +241,7 @@ function readUInt32LE(buf, offset = 0) {
 }
 
 function readUInt24LE(buf, offset = 0) {
-  validateNumber(offset, 'offset');
+  if (typeof offset !== 'number') validateNumber(offset, 'offset');
   const first = buf[offset];
   const last = buf[offset + 2];
   if (first === undefined || last === undefined)
@@ -251,7 +251,7 @@ function readUInt24LE(buf, offset = 0) {
 }
 
 function readUInt16LE(buf, offset = 0) {
-  validateNumber(offset, 'offset');
+  if (typeof offset !== 'number') validateNumber(offset, 'offset');
   const first = buf[offset];
   const last = buf[offset + 1];
   if (first === undefined || last === undefined)
@@ -261,7 +261,7 @@ function readUInt16LE(buf, offset = 0) {
 }
 
 function readUInt8(buf, offset = 0) {
-  validateNumber(offset, 'offset');
+  if (typeof offset !== 'number') validateNumber(offset, 'offset');
   const val = buf[offset];
   if (val === undefined)
     boundsError(offset, buf.length - 1);
@@ -289,7 +289,7 @@ function readUIntBE(offset, byteLength) {
 }
 
 function readUInt48BE(buf, offset = 0) {
-  validateNumber(offset, 'offset');
+  if (typeof offset !== 'number') validateNumber(offset, 'offset');
   const first = buf[offset];
   const last = buf[offset + 5];
   if (first === undefined || last === undefined)
@@ -303,7 +303,7 @@ function readUInt48BE(buf, offset = 0) {
 }
 
 function readUInt40BE(buf, offset = 0) {
-  validateNumber(offset, 'offset');
+  if (typeof offset !== 'number') validateNumber(offset, 'offset');
   const first = buf[offset];
   const last = buf[offset + 4];
   if (first === undefined || last === undefined)
@@ -317,7 +317,7 @@ function readUInt40BE(buf, offset = 0) {
 }
 
 function readUInt32BE(buf, offset = 0) {
-  validateNumber(offset, 'offset');
+  if (typeof offset !== 'number') validateNumber(offset, 'offset');
   const first = buf[offset];
   const last = buf[offset + 3];
   if (first === undefined || last === undefined)
@@ -330,7 +330,7 @@ function readUInt32BE(buf, offset = 0) {
 }
 
 function readUInt24BE(buf, offset = 0) {
-  validateNumber(offset, 'offset');
+  if (typeof offset !== 'number') validateNumber(offset, 'offset');
   const first = buf[offset];
   const last = buf[offset + 2];
   if (first === undefined || last === undefined)
@@ -340,7 +340,7 @@ function readUInt24BE(buf, offset = 0) {
 }
 
 function readUInt16BE(buf, offset = 0) {
-  validateNumber(offset, 'offset');
+  if (typeof offset !== 'number') validateNumber(offset, 'offset');
   const first = buf[offset];
   const last = buf[offset + 1];
   if (first === undefined || last === undefined)
@@ -369,7 +369,7 @@ function readIntLE(offset, byteLength) {
 }
 
 function readInt48LE(buf, offset = 0) {
-  validateNumber(offset, 'offset');
+  if (typeof offset !== 'number') validateNumber(offset, 'offset');
   const first = buf[offset];
   const last = buf[offset + 5];
   if (first === undefined || last === undefined)
@@ -384,7 +384,7 @@ function readInt48LE(buf, offset = 0) {
 }
 
 function readInt40LE(buf, offset = 0) {
-  validateNumber(offset, 'offset');
+  if (typeof offset !== 'number') validateNumber(offset, 'offset');
   const first = buf[offset];
   const last = buf[offset + 4];
   if (first === undefined || last === undefined)
@@ -398,7 +398,7 @@ function readInt40LE(buf, offset = 0) {
 }
 
 function readInt32LE(buf, offset = 0) {
-  validateNumber(offset, 'offset');
+  if (typeof offset !== 'number') validateNumber(offset, 'offset');
   const first = buf[offset];
   const last = buf[offset + 3];
   if (first === undefined || last === undefined)
@@ -411,7 +411,7 @@ function readInt32LE(buf, offset = 0) {
 }
 
 function readInt24LE(buf, offset = 0) {
-  validateNumber(offset, 'offset');
+  if (typeof offset !== 'number') validateNumber(offset, 'offset');
   const first = buf[offset];
   const last = buf[offset + 2];
   if (first === undefined || last === undefined)
@@ -422,7 +422,7 @@ function readInt24LE(buf, offset = 0) {
 }
 
 function readInt16LE(buf, offset = 0) {
-  validateNumber(offset, 'offset');
+  if (typeof offset !== 'number') validateNumber(offset, 'offset');
   const first = buf[offset];
   const last = buf[offset + 1];
   if (first === undefined || last === undefined)
@@ -433,7 +433,7 @@ function readInt16LE(buf, offset = 0) {
 }
 
 function readInt8(buf, offset = 0) {
-  validateNumber(offset, 'offset');
+  if (typeof offset !== 'number') validateNumber(offset, 'offset');
   const val = buf[offset];
   if (val === undefined)
     boundsError(offset, buf.length - 1);
@@ -461,7 +461,7 @@ function readIntBE(offset, byteLength) {
 }
 
 function readInt48BE(buf, offset = 0) {
-  validateNumber(offset, 'offset');
+  if (typeof offset !== 'number') validateNumber(offset, 'offset');
   const first = buf[offset];
   const last = buf[offset + 5];
   if (first === undefined || last === undefined)
@@ -476,7 +476,7 @@ function readInt48BE(buf, offset = 0) {
 }
 
 function readInt40BE(buf, offset = 0) {
-  validateNumber(offset, 'offset');
+  if (typeof offset !== 'number') validateNumber(offset, 'offset');
   const first = buf[offset];
   const last = buf[offset + 4];
   if (first === undefined || last === undefined)
@@ -490,7 +490,7 @@ function readInt40BE(buf, offset = 0) {
 }
 
 function readInt32BE(buf, offset = 0) {
-  validateNumber(offset, 'offset');
+  if (typeof offset !== 'number') validateNumber(offset, 'offset');
   const first = buf[offset];
   const last = buf[offset + 3];
   if (first === undefined || last === undefined)
@@ -503,7 +503,7 @@ function readInt32BE(buf, offset = 0) {
 }
 
 function readInt24BE(buf, offset = 0) {
-  validateNumber(offset, 'offset');
+  if (typeof offset !== 'number') validateNumber(offset, 'offset');
   const first = buf[offset];
   const last = buf[offset + 2];
   if (first === undefined || last === undefined)
@@ -514,7 +514,7 @@ function readInt24BE(buf, offset = 0) {
 }
 
 function readInt16BE(buf, offset = 0) {
-  validateNumber(offset, 'offset');
+  if (typeof offset !== 'number') validateNumber(offset, 'offset');
   const first = buf[offset];
   const last = buf[offset + 1];
   if (first === undefined || last === undefined)
@@ -526,7 +526,7 @@ function readInt16BE(buf, offset = 0) {
 
 // Read floats
 function readFloatBackwards(offset = 0) {
-  validateNumber(offset, 'offset');
+  if (typeof offset !== 'number') validateNumber(offset, 'offset');
   const first = this[offset];
   const last = this[offset + 3];
   if (first === undefined || last === undefined)
@@ -540,7 +540,7 @@ function readFloatBackwards(offset = 0) {
 }
 
 function readFloatForwards(offset = 0) {
-  validateNumber(offset, 'offset');
+  if (typeof offset !== 'number') validateNumber(offset, 'offset');
   const first = this[offset];
   const last = this[offset + 3];
   if (first === undefined || last === undefined)
@@ -554,7 +554,7 @@ function readFloatForwards(offset = 0) {
 }
 
 function readDoubleBackwards(offset = 0) {
-  validateNumber(offset, 'offset');
+  if (typeof offset !== 'number') validateNumber(offset, 'offset');
   const first = this[offset];
   const last = this[offset + 7];
   if (first === undefined || last === undefined)
@@ -572,7 +572,7 @@ function readDoubleBackwards(offset = 0) {
 }
 
 function readDoubleForwards(offset = 0) {
-  validateNumber(offset, 'offset');
+  if (typeof offset !== 'number') validateNumber(offset, 'offset');
   const first = this[offset];
   const last = this[offset + 7];
   if (first === undefined || last === undefined)
@@ -748,7 +748,7 @@ function writeUInt16LE(value, offset = 0) {
 function writeU_Int8(buf, value, offset, min, max) {
   value = +value;
   // `checkInt()` can not be used here because it checks two entries.
-  validateNumber(offset, 'offset');
+  if (typeof offset !== 'number') validateNumber(offset, 'offset');
   if (value > max || value < min) {
     throw new ERR_OUT_OF_RANGE('value', `>= ${min} and <= ${max}`, value);
   }
