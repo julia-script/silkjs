@@ -903,6 +903,8 @@ function keyFromPrepared(prepared, type) {
   }
   if (prepared.format === 'jwk') return require('internal/crypto_keys').importJwk(prepared.data, type);
   if (prepared.format === 'store') {
+    // Node checks openssl.store (resource '') before it opens any OSSL_STORE URI, file: included.
+    if (require('internal/host').builtinLoaded('internal/permission')) require('internal/permission').check('openssl.store', '');
     const { uri, properties } = prepared.data;
     return newKeyObject('private', call('storeLoad', [uri, properties ?? '', packed(storePassphraseBlock(prepared.passphrase)), 0]));
   }

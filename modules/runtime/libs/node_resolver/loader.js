@@ -448,7 +448,7 @@ function createLoader(host, builtins) {
         }
       }
       for (let i3 = 0, a3 = keys; i3 < a3.length; i3++) { const condition = a3[i3];
-        if (condition === 'default' || (activeConditions ? activeConditions.includes(condition) : condition === 'node' || condition === 'node-addons' || condition === mode || (condition === 'module-sync' && requireModuleEnabled()) || (host.moduleConditions && host.moduleConditions.includes(condition)))) {
+        if (condition === 'default' || (activeConditions ? activeConditions.includes(condition) : condition === 'node' || (condition === 'node-addons' && !host.noAddons) || condition === mode || (condition === 'module-sync' && requireModuleEnabled()) || (host.moduleConditions && host.moduleConditions.includes(condition)))) {
           const result = packageTarget(pkg, target[condition], replacement, key, pattern, internal, parent, mode, seen);
           if (result !== undefined) return result;
         }
@@ -653,7 +653,8 @@ function createLoader(host, builtins) {
   }
 
   function conditions(mode) {
-    const values = mode === 'require' ? ['require', 'node', 'node-addons'] : ['node', 'import', 'node-addons'];
+    const values = mode === 'require' ? ['require', 'node'] : ['node', 'import'];
+    if (!host.noAddons) values.push('node-addons');
     if (requireModuleEnabled()) values.push('module-sync');
     if (host.moduleConditions) for (let index = 0; index < host.moduleConditions.length; index++) values.push(host.moduleConditions[index]);
     return values;
@@ -962,9 +963,15 @@ function createLoader(host, builtins) {
     require(specifier) { return makeRequire(this.filename || path.join(host.tryGetCwd(), '__entry__.js'), this, moduleAsyncModes.get(this) === true)(specifier); }
     _compile(source, filename) {
       const compiledSource = cleanSource(source);
-      const wrapper = wrapperPatched
-        ? host.compileFunction(Module.wrap(compiledSource), filename, undefined, undefined, true)
-        : host.compileFunction(wrapperPrefix + compiledSource + wrapperSuffix, filename, compiledSource, wrapperPrefix.length);
+      let wrapper;
+      try {
+        wrapper = wrapperPatched
+          ? host.compileFunction(Module.wrap(compiledSource), filename, undefined, undefined, true)
+          : host.compileFunction(wrapperPrefix + compiledSource + wrapperSuffix, filename, compiledSource, wrapperPrefix.length);
+      } catch (error) {
+        host.attachArrow(error, filename, compiledSource, wrapperPatched ? Module.wrap(compiledSource).indexOf(compiledSource) : wrapperPrefix.length);
+        throw error;
+      }
       const metadata = host.getScriptMetadata(wrapper);
       host.registerSource(filename, compiledSource, {
         owner: this, scriptId: metadata?.scriptId, sourceURL: metadata?.sourceURL ?? null, sourceMapURL: metadata?.sourceMapURL ?? null,

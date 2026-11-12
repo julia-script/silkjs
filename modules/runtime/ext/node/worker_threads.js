@@ -237,6 +237,7 @@ function workerOptions(filename, options) {
   }
   for (const key of ['stdin', 'stdout', 'stderr']) result[key] = !!options[key];
   result.processExposeGC = !!host.exposeGC;
+  result.processClock = { start: host.performanceStartTime, origin: host.performanceTimeOrigin };
   return { metadata: result, options };
 }
 class WorkerHandle {
@@ -401,6 +402,7 @@ function bootstrap() {
   module.exports.parentPort = data.parentPort;
   module.exports.workerData = data.workerData;
   const nativeMetadata = JSON.parse(info.metadata);
+  if (nativeMetadata.processClock) host.adoptProcessClock(nativeMetadata.processClock.start, nativeMetadata.processClock.origin);
   bootstrapResult = { ...nativeMetadata, ...data.options, threadId: info.threadId };
   module.exports.threadName = bootstrapResult.name;
   module.exports.resourceLimits = { ...bootstrapResult.resourceLimits };
