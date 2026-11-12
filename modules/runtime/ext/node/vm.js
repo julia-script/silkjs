@@ -9,9 +9,9 @@ const {
   DataViewPrototypeGetByteLength, TypedArrayPrototypeGetBuffer,
   TypedArrayPrototypeGetByteOffset, TypedArrayPrototypeGetByteLength, Uint8Array,
 } = require('internal/streams/iter/primordials');
-const { isDataView, isNativeError } = require('util/types');
+const { isDataView } = require('util/types');
 const {
-  contexts, error, invalid, contextData, isContext, syntaxDiagnostic, run, terminationErrors,
+  contexts, error, invalid, contextData, isContext, syntaxDiagnostic, run,
 } = require('internal/vm');
 const scripts = new WeakMap();
 const cacheMagic = Buffer.from('SILKVM01');
@@ -251,8 +251,7 @@ class Script {
   runInThisContext(value) {
     const data = scriptData(this);
     const execution = runOptions(value);
-    try { return run(data.handle, execution, false); }
-    catch (cause) { if (execution.displayErrors) decorateErrorStack(cause, data); throw cause; }
+    return run(data.handle, execution, false, true, execution.displayErrors ? data : undefined);
   }
   runInContext(contextifiedObject, value) {
     const data = scriptData(this);
@@ -264,8 +263,7 @@ class Script {
       host.vmSetImportModuleDynamically(handle, data.dynamicImport);
       data.realms.set(contextifiedObject, handle);
     }
-    try { return run(handle, execution, context.afterEvaluate); }
-    catch (cause) { if (execution.displayErrors) decorateErrorStack(cause, data); throw cause; }
+    return run(handle, execution, context.afterEvaluate, true, execution.displayErrors ? data : undefined);
   }
   runInNewContext(sandbox, value) {
     // As in Node, the context takes its options under context-prefixed names.
@@ -273,26 +271,17 @@ class Script {
       name: value.contextName, origin: value.contextOrigin,
       codeGeneration: value.contextCodeGeneration, microtaskMode: value.microtaskMode,
     };
+    // getContextOptions validates under the names the caller gave.
+    if (contextOptions !== undefined) {
+      if (contextOptions.name !== undefined && typeof contextOptions.name !== 'string') throw invalid('options.contextName', 'string', contextOptions.name);
+      if (contextOptions.origin !== undefined && typeof contextOptions.origin !== 'string') throw invalid('options.contextOrigin', 'string', contextOptions.origin);
+    }
     return this.runInContext(createContext(sandbox, contextOptions), value);
   }
   createCachedData() {
     const data = scriptData(this);
     return writeCache(data.handle, data.source, 0);
   }
-}
-// DecorateErrorStack (node_errors.cc), for a script run with displayErrors: a
-// native error leaving the script gets the arrow of where it was thrown before
-// its stack, once. A timeout or interrupt is Node's own error and gets none.
-function decorateErrorStack(cause, data) {
-  try {
-    if (!isNativeError(cause) || terminationErrors.has(cause) || host.decoratedErrors.has(cause)) return;
-    const stack = cause.stack;
-    if (typeof stack !== 'string') return;
-    const arrow = require('internal/fatal_report').arrow(cause, false, data.filename, data.line, data.column);
-    if (arrow === undefined) return;
-    cause.stack = arrow + '\n' + stack;
-    host.decoratedErrors.add(cause);
-  } catch {}
 }
 function scriptData(value) {
   const data = scripts.get(value);
