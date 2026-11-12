@@ -16,7 +16,7 @@ import silk.num.usize
 import silk.num.f64
 import silkjs.js_engine { Engine }
 import silkjs.js_engine_host { EngineServices }
-import silkjs.js_heap { HeapCell, HeapHeader }
+import silkjs.js_heap { HeapCell, HeapHeader, HeapKind }
 import silkjs.js_core_types { FrameSlots, NativeErrorKind }
 import silkjs.js_value { ValueBits }
 import silkjs.js_exceptions { JsException }
@@ -44,7 +44,7 @@ import ext.profile_transport as transport
 import ext.diagnostics_hub { Mailbox }
 
 pub const BASE: u32 = 18000
-pub const COUNT: u32 = 12
+pub const COUNT: u32 = 13
 pub fn name(operation: u32) -> &'static [u8] {
   return match operation {
     0 => b"cpuProfileStart" 1 => b"cpuProfileStop"
@@ -52,7 +52,7 @@ pub fn name(operation: u32) -> &'static [u8] {
     4 => b"heapCensus" 5 => b"queryObjects" 6 => b"allocationProfile"
     7 => b"collectGarbage"
     8 => b"profileRequest" 9 => b"profilePoll"
-    10 => b"heapMetrics" 11 => b"heapSnapshotDevtools"
+    10 => b"heapMetrics" 11 => b"heapSnapshotDevtools" 12 => b"measureMemory"
     _ => Intrinsic.trap("unknown profiling operation")
   }
 }
@@ -139,6 +139,85 @@ unsafe effect fn censusBody<'m, S: EngineServices>(engine: &mut Engine<'m, S>, c
   run unsafe common.define(&mut engine, context, array, b"identity", identity.intoBits(), 7)
   return scope.take(0)
 }
+// vm.measureMemory's estimates, as V8 attributes the heap to native contexts:
+// [whole heap, the calling context, then every other live context]. A context
+// owns what its strong edges reach without passing through another context;
+// the calling context claims first, so an object two contexts share counts once.
+effect fn measured(graph: &Graph, current: usize) -> List<usize> ! OutOfMemoryError ? &mut Allocator {
+  let count = graph.nodes.length()
+  let mut first = List<usize>.make() run first.reserveExact(count + 1)
+  let mut i: usize = 0
+  while i <= count { run first.append(0) i = i + 1 }
+  i = 0
+  while i < graph.edges.length() {
+    let edge = graph.edges.get(i)
+    if edge.strength == Strength.Strong { let n = first.get(edge.from + 1) + 1 first.set(edge.from + 1, n) }
+    i = i + 1
+  }
+  i = 0
+  while i < count { let n = first.get(i + 1) + first.get(i) first.set(i + 1, n) i = i + 1 }
+  let mut targets = List<usize>.make() run targets.reserveExact(first.get(count))
+  i = 0
+  while i < first.get(count) { run targets.append(0) i = i + 1 }
+  let mut fill = List<usize>.make() run fill.reserveExact(count)
+  i = 0
+  while i < count { run fill.append(first.get(i)) i = i + 1 }
+  i = 0
+  while i < graph.edges.length() {
+    let edge = graph.edges.get(i)
+    if edge.strength == Strength.Strong { let at = fill.get(edge.from) targets.set(at, edge.to) fill.set(edge.from, at + 1) }
+    i = i + 1
+  }
+  let mut owned = List<bool>.make() run owned.reserveExact(count)
+  let mut total: usize = 0
+  i = 0
+  while i < count {
+    run owned.append(false)
+    total = total + graph.nodes.get(i).selfBytes + graph.nodes.get(i).nativeBytes
+    i = i + 1
+  }
+  let mut result = List<usize>.make()
+  run result.append(total)
+  let mut stack = List<usize>.make()
+  let mut order: usize = 0
+  // The calling context, then the others in heap order.
+  while order <= count {
+    let start = if order == 0 { current } else { order - 1 }
+    order = order + 1
+    if order != 1 && (start == current || graph.nodes.get(start).kind != HeapKind.Context) { continue }
+    let mut bytes: usize = 0
+    owned.set(start, true)
+    run stack.append(start)
+    while stack.length() != 0 {
+      let node = stack.get(stack.length() - 1)
+      let top = stack.length() - 1
+      stack.truncate(top)
+      bytes = bytes + graph.nodes.get(node).selfBytes + graph.nodes.get(node).nativeBytes
+      let mut e = first.get(node)
+      while e < first.get(node + 1) {
+        let to = targets.get(e)
+        if !owned.get(to) && graph.nodes.get(to).kind != HeapKind.Context { owned.set(to, true) run stack.append(to) }
+        e = e + 1
+      }
+    }
+    run result.append(bytes)
+  }
+  return move result
+}
+unsafe effect fn measureBody<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader,
+  sizes: &List<usize>, scope: &mut Scope) -> ValueBits ! OutOfMemoryError | JsException ? &mut Allocator {
+  let memory = engine.memory
+  scope.values[0] = run objects.array(&mut engine, memory, unsafe lendRealm(&context, context))
+  let array = scope.values[0]
+  run arrays.reserve(&mut engine, unsafe lendRealm(&context, context), unsafe lendFor(array), usize.toI64(sizes.length()))
+  let mut i: usize = 0
+  while i < sizes.length() {
+    run arrays.appendReserved(unsafe lendFor(array), unsafe Value.adoptBits(ValueBits.number(usize.toF64(sizes.get(i)))))
+    i = i + 1
+  }
+  arrays.publishLength(unsafe lendFor(array), usize.toI64(sizes.length()))
+  return scope.take(0)
+}
 unsafe effect fn census<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader,
   graph: &Graph) -> ValueBits ! OutOfMemoryError | JsException ? &mut Allocator {
   let mut scope = Scope.make()
@@ -220,6 +299,20 @@ pub unsafe effect fn dispatch<'m, S: EngineServices>(engine: &mut Engine<'m, S>,
     }
     let matches = run unsafe heap.queryObjects(&graph, prototype) |> Effect.provideMut<Allocator>(&mut system)
     return run unsafe matchingArray(&mut engine, context, &matches)
+  }
+  if operation == 12 {
+    // execution 'eager' collects first, as V8's eager measurement does.
+    if let ValueBits.Bool { value: eager } = unsafe common.argument(argv, 0) { if eager { run unsafe gc.collect(&mut engine, rt, true) } }
+    let mut graph = run unsafe snapshot(&mut engine, context)
+    let current = run unsafe graph.node(context) |> Effect.provideMut<Allocator>(&mut system)
+    let sizes = run measured(&graph, current) |> Effect.provideMut<Allocator>(&mut system)
+    let mut scope = Scope.make()
+    let result = run Effect.result(unsafe measureBody(&mut engine, context, &sizes, &mut scope))
+    unsafe owners.cleanup(&mut engine, context, move scope)
+    return match move result {
+      Result<ValueBits, OutOfMemoryError | JsException>.Success { value } => value
+      Result<ValueBits, OutOfMemoryError | JsException>.Failure { error } => { fail move error }
+    }
   }
   if operation == 7 {
     // collectGarbage(true) collects only the young generation, as gc({ type: 'minor' }) asks.
