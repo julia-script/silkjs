@@ -51,6 +51,9 @@ list under `packages`. The packages are installed together:
 - A dependency written `workspace:*`, `workspace:^`, `workspace:~` or `workspace:<range>` is
   another package of the workspace, by name, and becomes a link to its directory. A range has
   to allow the version of that package. `workspace:<name>@*` links it under another name.
+- `catalog:` as a range stands for the range the root project keeps for that name, in `catalog`
+  or `workspaces.catalog`; `catalog:<name>` reads `catalogs.<name>`. The lockfile records the
+  catalogs, so changing one resolves again.
 - Every command works from the directory of any package and installs for the whole workspace.
   `add` and `remove` change the package they are run in; `--filter <name>` (`-F`) picks another
   one by name, and `-w` the root project.
