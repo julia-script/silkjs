@@ -201,6 +201,9 @@ class TLSTransport {
       const done = this.pendingShutdown; this.pendingShutdown = null;
       if (done) done(null);
     };
+    // A carrier its peer already ended takes no more writes; as with TLSWrap's
+    // StreamBase write, that failure stays out of the socket's errors.
+    if (this.carrier.writable === false) { process.nextTick(finish); return; }
     if (data.length) this.carrier.write(data);
     this.carrier.end(finish);
   }

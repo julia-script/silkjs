@@ -7,6 +7,10 @@ const builtinPrefix = Function.prototype.call.bind(String.prototype.startsWith);
 const builtinSlice = Function.prototype.call.bind(String.prototype.slice);
 // Node's kFirstModuleParent: internal/errors reads it for require stacks.
 const kModuleParent = require('internal/host').kFirstModuleParent;
+// Captured before user code runs: the main module's evaluation promise is
+// observed without a user-replaced Promise.prototype.then.
+const ReflectApply = Reflect.apply;
+const PromisePrototypeThen = Promise.prototype.then;
 
 // Embedding contract: compileFunction evaluates the complete wrapper expression;
 // evaluateModule(source, filename, isEntry) runs a real native ESM graph; the
@@ -307,11 +311,13 @@ function createLoader(host, builtins) {
       return error('ERR_MODULE_NOT_FOUND', packageName ?? specifier, parent, null);
     }
     const stack = [];
-    let current = cache[parent];
+    // The module being resolved for, when the caller passed one the cache does not
+    // hold under this name (the REPL's '<repl>' module has no filename).
+    let current = resolvingModule && parentName(resolvingModule) === parent ? resolvingModule : cache[parent];
     const visited = new Set();
     while (current && !visited.has(current)) {
       visited.add(current);
-      stack.push(current.filename);
+      stack.push(current.filename || current.id);
       current = current[kModuleParent];
     }
     if (!stack.length && parent) stack.push(parent);
@@ -514,6 +520,7 @@ function createLoader(host, builtins) {
     return { name, subpath: separator === -1 ? '.' : '.' + specifier.slice(separator) };
   }
 
+  let resolvingModule = null;
   function resolveInternal(specifier, parent, mode, options, seen, isMain) {
     if (typeof specifier !== 'string') throw invalidArgType('id', 'string', specifier);
     if (specifier.length === 0) throw invalidArgValue('id', specifier, 'must be a non-empty string');
@@ -529,6 +536,8 @@ function createLoader(host, builtins) {
     const recursion = mode + '\0' + parent + '\0' + specifier;
     if (seen.has(recursion)) throw error('ERR_INVALID_MODULE_SPECIFIER', specifier, 'maps back to itself through package "exports" or "imports"', parent || undefined);
     seen.add(recursion);
+    const previousModule = resolvingModule;
+    if (parentObject) resolvingModule = parentObject;
     try {
       // As in Node, a require of '#name' whose package has no "imports" looks in node_modules.
       if (specifier.startsWith('#') && (mode === 'import' || (packageScope(parent)?.data.imports ?? null) !== null)) {
@@ -599,7 +608,7 @@ function createLoader(host, builtins) {
         if (known !== undefined) return { ...known };
       }
       return remember(key, findPackage(search, parsed, specifier, parent, mode, seen, isMain));
-    } finally { seen.delete(recursion); }
+    } finally { seen.delete(recursion); resolvingModule = previousModule; }
   }
 
   // Whether resolveInternal may keep what it finds in foundPaths: a plain require, as
@@ -1320,7 +1329,7 @@ function createLoader(host, builtins) {
       try { result = host.evaluateModule(loaded.source, loaded.filename, true); }
       catch (cause) { throw decorateModuleError(cause, resolved.filename); }
       if (result !== null && typeof result === 'object' && typeof result.then === 'function') {
-        return result.then(undefined, (cause) => { throw decorateModuleError(cause, resolved.filename); });
+        return ReflectApply(PromisePrototypeThen, result, [undefined, (cause) => { throw decorateModuleError(cause, resolved.filename); }]);
       }
       return result;
     }

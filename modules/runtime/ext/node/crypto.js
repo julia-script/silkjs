@@ -809,6 +809,8 @@ function prepareAsymmetricKey(key, ctx, name = 'key') {
   const isPrivateKeyInput = ctx === kConsumePrivate || ctx === kCreatePrivate;
   if (isKeyObject(key)) { validateAsymmetricKeyType(keySlotsOf(key).type, ctx, key); return { keyObject: key }; }
   if (isCryptoKey(key)) { emitDEP0203(); const object = cryptoKeyObject(key); validateAsymmetricKeyType(keySlotsOf(object).type, ctx, key); return { keyObject: object }; }
+  // A private key referenced by a URI for an OpenSSL STORE loader.
+  if (isPrivateKeyInput && webURL().isURLInstance(key)) return prepareStorePrivateKey(key, name);
   if (isAnyArrayBuffer(key)) return { format: 'pem', data: key };
   if (typeof key === 'object' && key !== null) return prepareAsymmetricKeyOptions(key, ctx, name, isPrivateKeyInput);
   throw codes.ERR_INVALID_ARG_TYPE(name, keyTypes(ctx !== kCreatePrivate, isPrivateKeyInput), key);
@@ -819,6 +821,8 @@ function prepareAsymmetricKeyOptions(key, ctx, name, isPrivateKeyInput) {
   if (!isData && isKeyObject(data)) { validateAsymmetricKeyType(keySlotsOf(data).type, ctx, data); return { keyObject: data }; }
   if (!isData && isCryptoKey(data)) { emitDEP0203(); const object = cryptoKeyObject(data); validateAsymmetricKeyType(keySlotsOf(object).type, ctx, data); return { keyObject: object }; }
   isData ||= isAnyArrayBuffer(data);
+  // A STORE URI, with an optional passphrase or PIN.
+  if (!isData && isPrivateKeyInput && webURL().isURLInstance(data)) return prepareStorePrivateKey(data, name, key.passphrase, encoding, key.properties);
   if (format === 'jwk') { validate.object(data, `${name}.key`); return { data, format: 'jwk' }; }
   if (format === 'raw-public' || format === 'raw-private' || format === 'raw-seed') {
     if (isPrivateKeyInput && format === 'raw-public') throw codes.ERR_INVALID_ARG_VALUE(`${name}.format`, format);
@@ -832,6 +836,35 @@ function prepareAsymmetricKeyOptions(key, ctx, name, isPrivateKeyInput) {
   const parsed = parseKeyEncoding(key, undefined, isPrivateKeyInput ? false : undefined, name);
   return { data: keyData, format: parsed.format, type: parsed.type, passphrase: parsed.passphrase };
 }
+function webURL() { return require('internal/web/url'); }
+// lib/internal/crypto/keys.js prepareStorePrivateKey: the URI comes from the
+// URL's private state, file: URLs become paths, and NUL bytes are refused
+// because OpenSSL reads both strings as C strings.
+function prepareStorePrivateKey(url, name, passphrase, encoding, properties) {
+  let uri = webURL().getURLHref(url);
+  if (uri.startsWith('file:')) uri = webURL().fileURLToPath(uri);
+  validate.string(uri, name);
+  if (uri.includes('\u0000')) throw codes.ERR_INVALID_ARG_VALUE(name, url, 'must be a URL without null bytes');
+  if (passphrase !== undefined) {
+    if (!isStringOrBuffer(passphrase)) throw codes.ERR_INVALID_ARG_VALUE(option('passphrase', name), passphrase);
+    if (typeof passphrase === 'string') passphrase = encodeKeyString(passphrase, encoding);
+  }
+  if (properties !== undefined) {
+    validate.string(properties, option('properties', name));
+    if (properties.includes('\u0000')) throw codes.ERR_INVALID_ARG_VALUE(option('properties', name), properties, 'must be a string without null bytes');
+  }
+  return { format: 'store', data: { uri, properties: properties ?? null }, passphrase };
+}
+// The passphrase block the native STORE callback reads: has a passphrase,
+// asked without one, length (u32 LE), bytes.
+function storePassphraseBlock(passphrase) {
+  const bytes = passphrase === undefined ? Buffer.alloc(0) : c.bytes(passphrase);
+  const block = Buffer.alloc(6 + bytes.length);
+  block[0] = passphrase === undefined ? 0 : 1;
+  block.writeUInt32LE(bytes.length, 2);
+  bytes.copy(block, 6);
+  return block;
+}
 function newKeyObject(type, value) { return keyObjectFromHandle(type, binding.createHandle(type, value)); }
 // Turns prepared key input into a KeyObject of the given type.
 function keyFromPrepared(prepared, type) {
@@ -841,6 +874,10 @@ function keyFromPrepared(prepared, type) {
     return object;
   }
   if (prepared.format === 'jwk') return require('internal/crypto_keys').importJwk(prepared.data, type);
+  if (prepared.format === 'store') {
+    const { uri, properties } = prepared.data;
+    return newKeyObject('private', call('storeLoad', [uri, properties ?? '', packed(storePassphraseBlock(prepared.passphrase)), 0]));
+  }
   if (prepared.raw !== undefined) return c.providerRawImport(prepared.raw, type);
   const { format, passphrase } = prepared;
   let data = bytes(prepared.data);
@@ -902,7 +939,7 @@ function preparedKeyObject(key, ctx, name, before, anyType = false) {
   const prepared = prepareAsymmetricKey(key, ctx, name);
   if (before !== undefined) before();
   if (prepared.keyObject !== undefined) return { key: prepared.keyObject, owned: false };
-  if (ctx === kConsumePrivate && !anyType) return { key: keyFromPrepared(prepared, 'private'), owned: true };
+  if (prepared.format === 'store' || ctx === kConsumePrivate && !anyType) return { key: keyFromPrepared(prepared, 'private'), owned: true };
   if (anyType) { try { return { key: keyFromPrepared(prepared, 'private'), owned: true }; } catch (e) { try { return { key: keyFromPrepared(prepared, 'public'), owned: true }; } catch { throw e; } } }
   try { return { key: keyFromPrepared(prepared, 'public'), owned: true }; } catch (e) { try { return { key: keyFromPrepared(prepared, 'private'), owned: true }; } catch { throw e; } }
 }
@@ -1400,7 +1437,17 @@ module.exports.getHashes = () => names('hashes');
 module.exports.getCiphers = () => names('ciphers');
 module.exports.getCurves = () => names('curves');
 module.exports.getFips = () => call('getFips', []);
-module.exports.setFips = enabled => { call('setFips', [enabled ? 1 : 0]); binding.noteFipsChange(); };
+// lib/crypto.js setFips: forced FIPS mode stays on, and workers do not own the process state.
+module.exports.setFips = enabled => {
+  if (require('internal/options').getOptionValue('--force-fips')) {
+    if (enabled) return;
+    throw new (require('internal/errors').codes.ERR_CRYPTO_FIPS_FORCED)();
+  }
+  if (!require('worker_threads').isMainThread) {
+    throw new (require('internal/errors').codes.ERR_WORKER_UNSUPPORTED_OPERATION)('Calling crypto.setFips()');
+  }
+  call('setFips', [enabled ? 1 : 0]); binding.noteFipsChange();
+};
 c.keyFromHandle = (type, id) => newKeyObject(type, id);
 c.keyObjectFromHandle = keyObjectFromHandle;
 c.keyObjectHandle = key => keySlotsOf(key).handle;
