@@ -118,6 +118,20 @@ function uuidBytes(unbuffered) {
   uuidBatch = (uuidBatch + 1) % kBatchSize;
   return [uuidData, uuidBatch * 16];
 }
+// Node's lib/internal/crypto/random.js: a snapshot carries no random data of the process that built it.
+if (require('internal/v8/startup_snapshot').namespace.isBuildingSnapshot()) {
+  const snapshot = require('internal/v8/startup_snapshot');
+  const resetRandomCaches = () => {
+    randomCache.fill(0);
+    randomCacheOffset = randomCache.length;
+    if (uuidData !== undefined) { uuidData.fill(0); uuidData = undefined; }
+    uuidBatch = 0;
+  };
+  snapshot.addAfterUserSerializeCallback(resetRandomCaches);
+  // Microtasks and exit handlers can refill the caches after serialization
+  // callbacks, so they are reset again before any user deserialization callback.
+  snapshot.addBeforeUserDeserializeCallback(resetRandomCaches);
+}
 function randomUUID(options) { const [buf, offset] = uuidBytes(uuidOptions(options)); return uuid(buf, 0x40, 0x80, offset); }
 function randomUUIDv7(options) {
   const [buf, offset] = uuidBytes(uuidOptions(options));
@@ -889,6 +903,8 @@ function keyFromPrepared(prepared, type) {
   }
   if (prepared.format === 'jwk') return require('internal/crypto_keys').importJwk(prepared.data, type);
   if (prepared.format === 'store') {
+    // Node checks openssl.store (resource '') before it opens any OSSL_STORE URI, file: included.
+    if (require('internal/host').builtinLoaded('internal/permission')) require('internal/permission').check('openssl.store', '');
     const { uri, properties } = prepared.data;
     return newKeyObject('private', call('storeLoad', [uri, properties ?? '', packed(storePassphraseBlock(prepared.passphrase)), 0]));
   }

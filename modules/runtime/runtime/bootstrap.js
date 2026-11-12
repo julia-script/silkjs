@@ -75,6 +75,17 @@ for (const name of ['dispose', 'asyncDispose']) {
   if (Symbol[name] === undefined) Object.defineProperty(Symbol, name, { value: Symbol.for('nodejs.' + name) });
 }
 const host = { ...native, rawOS, rawStd };
+// Startup snapshots: what Node keeps in internalBinding('mksnapshot') for
+// internal/v8/startup_snapshot. With --build-snapshot (native.snapshotBuild) the
+// heap is saved as the blob when the loop ends; a start from the blob runs
+// runSnapshot instead of run.
+const snapshotState = { building: native.snapshotBuild === true, codeCache: true, serialize: undefined, deserialize: undefined, main: undefined };
+host.startupSnapshot = {
+  isBuildingSnapshotBuffer: new Uint8Array([native.snapshotBuild ? 1 : 0]),
+  setSerializeCallback(callback) { snapshotState.serialize = callback; },
+  setDeserializeCallback(callback) { snapshotState.deserialize = callback; },
+  setDeserializeMainFunction(callback) { snapshotState.main = callback; },
+};
 // Throws value again and keeps the throw site its first throw recorded, as
 // V8's TryCatch::ReThrow does for Node's own catch and rethrow paths.
 host.rethrow = value => { native.captureCallSites(-5, value); };
@@ -281,6 +292,7 @@ host.onHydrate = refresh => { hydrations.push(refresh); };
 const asyncHooks = internalRequire('async_hooks');
 function resource(type, owner) { return asyncHooks._createResource(type, owner); }
 const invokeScoped = asyncHooks._invoke;
+const hidePromises = asyncHooks._hidePromises;
 function invokeResource(scope, callback, receiver, args, destroy = true) {
   try { return invokeScoped(scope, invoke, callback, receiver, args); }
   finally { if (destroy) scope.emitDestroy(); }
@@ -342,6 +354,26 @@ function reportUncaught(error) {
   }
 }
 host.triggerUncaughtException = reportUncaught;
+// node_errors.cc AppendExceptionLine: a compile error carries its arrow,
+// "<script>:<line>\n<source line>\n<caret>\n", which ReportFatalException prints
+// in place of where the error was rethrown. prefix is the length of a wrapper
+// that came before the source on its first line. decorateErrorStack puts the
+// arrow into the stack itself and marks the error decorated: no arrow then.
+host.errorArrows = new WeakMap();
+host.decoratedErrors = new WeakSet();
+host.attachArrow = (error, scriptName, source, prefix) => {
+  if (!(error instanceof SyntaxError) || host.errorArrows.has(error) || !Number.isInteger(error.lineNumber)) return;
+  const line = error.lineNumber;
+  const text = String(source).split(/\r\n|[\n\r\u2028\u2029]/)[line - 1];
+  if (text === undefined) return;
+  const column = error.columnNumber - 1 - (line === 1 ? prefix : 0);
+  let caret = '';
+  if (column >= 0 && column < text.length) {
+    for (let index = 0; index < column; index++) caret += text[index] === '\t' ? '\t' : ' ';
+    caret += '^\n';
+  }
+  host.errorArrows.set(error, scriptName + ':' + line + '\n' + text + '\n' + caret);
+};
 // Runs a timer or immediate callback; true when it threw (and was reported).
 function invokeReporting(callback, receiver, args) {
   try { Reflect.apply(callback, receiver, args); return false; }
@@ -519,6 +551,17 @@ let initialNativeIdleTime = 0;
 const loopListeners = new Set();
 host.performanceStartTime = startTime;
 host.performanceTimeOrigin = Date.now() - (native.now() - startTime);
+// A worker takes the process's clock, as Node: performance.timeOrigin, performance.now(),
+// process.uptime() and the milestones count from when the process started.
+host.adoptProcessClock = (processStart, processOrigin) => {
+  const shift = startTime - processStart;
+  for (const name of ['v8Start', 'environment', 'bootstrapComplete', 'loopStart', 'loopExit']) {
+    if (performanceMilestones[name] >= 0) performanceMilestones[name] += shift;
+  }
+  startTime = processStart;
+  host.performanceStartTime = processStart;
+  host.performanceTimeOrigin = processOrigin;
+};
 host.performanceLoopStats = () => {
   if (performanceMilestones.loopStart < 0) return { idle: 0, active: 0 };
   const idle = native.loopIdleTime() - initialNativeIdleTime;
@@ -615,6 +658,13 @@ Object.assign(process, {
     return true;
   },
   _fatalException: internalRequire('internal/startup_controls').fatalException,
+  // node_binding.cc GetLinkedBinding: the addon permission names the module, then the embedder's
+  // linked modules are searched. This runtime links none.
+  _linkedBinding(module) {
+    module = `${module}`;
+    internalRequire('internal/permission').check('addon', module);
+    throw Object.assign(new Error(`No such binding was linked: ${module}`), { code: 'ERR_INVALID_MODULE' });
+  },
   // Formats like console.log and writes to fd 2 at once: no streams, ticks or console.
   _rawDebug(...args) { host.writeText(2, internalRequire('util').format(...args) + '\n'); },
 });
@@ -701,8 +751,10 @@ for (const name of ['Event', 'CustomEvent', 'EventTarget', 'AbortController', 'A
 const asyncFS = internalRequire('internal/fs_async')(native);
 host.submitIO = (operation, args, callback, requestKind) => {
   const scope = resource(requestKind === 1 ? 'FSREQPROMISE' : requestKind === 2 ? 'FILEHANDLECLOSEREQ' : 'FSREQCALLBACK');
+  hidePromises(1);
   try { return asyncFS.submitIO(operation, args, function oncomplete(...values) { return invokeResource(scope, callback, undefined, values); }, requestKind); }
   catch (error) { scope.emitDestroy(); throw error; }
+  finally { hidePromises(-1); }
 };
 host.watch = (filename, options, callback) => {
   const scope = resource(options.stat ? 'STATWATCHER' : 'FSEVENTWRAP');
@@ -1015,6 +1067,7 @@ function runtimeFlag(arg) {
   if (arg.startsWith('--localstorage-file=')) { host.localStorageFile = arg.slice(20); return true; }
   if (arg.startsWith('--require=')) { requirePreloads.push(arg.slice(10)); return true; }
   if (arg.startsWith('--import=')) { importPreloads.push(arg.slice(9)); return true; }
+  if (arg === '--addons' || arg === '--no-addons') { host.noAddons = arg === '--no-addons'; return true; }
   if (arg.startsWith('--conditions=')) { (host.moduleConditions ||= []).push(arg.slice(13)); return true; }
   if (arg === '--preserve-symlinks' || arg === '--no-preserve-symlinks') {
     host.preserveSymlinks = arg === '--preserve-symlinks'; return true;
@@ -1042,7 +1095,18 @@ function installRuntimeOptions(args, entrypoints = [], preloadEntrypoints = true
   host.typeScriptMode = host.transformTypes ? 'transform' : host.stripTypes === false ? false : 'strip';
   host.initialExecArgv = process.execArgv.slice();
   host.workerRuntimeArgs = args.slice();
-  if (host.exposeGC) Object.defineProperty(globalThis, 'gc', { value: rawStd.gc, writable: true, enumerable: true });
+  if (host.exposeGC) {
+    // A collection gc() asks for is a forced one to 'gc' performance entries.
+    const collect = rawStd.gc;
+    const gc = function gc() {
+      const observer = host.gcObserver;
+      if (observer === undefined) return Reflect.apply(collect, undefined, arguments);
+      observer(false);
+      try { return Reflect.apply(collect, undefined, arguments); }
+      finally { observer(true); }
+    };
+    Object.defineProperty(globalThis, 'gc', { value: gc, writable: true, enumerable: true });
+  }
   if (host.experimentalEventSource) Object.defineProperty(globalThis, 'EventSource', {
     value: internalRequire('internal/web/eventsource').EventSource, writable: true, configurable: true,
   });
@@ -1082,7 +1146,11 @@ function prepareInput(source, filename, inputType, explicit) {
     try { return host.stripTypeScriptModuleTypes(source, filename); }
     catch (strippingError) {
       if (strippingError.code === 'ERR_INVALID_TYPESCRIPT_SYNTAX' ||
-          strippingError.code === 'ERR_UNSUPPORTED_TYPESCRIPT_SYNTAX') throw error;
+          strippingError.code === 'ERR_UNSUPPORTED_TYPESCRIPT_SYNTAX') {
+        // The script is named [eval] or [stdin], as Node compiles it.
+        host.attachArrow(error, host.path.basename(filename), source, 0);
+        throw error;
+      }
       throw strippingError;
     }
   }
@@ -1195,6 +1263,10 @@ const HELP_TEXT = `Usage: silkjsruntime [options] [script.js] [arguments]
   --test-coverage-include=GLOB, --test-coverage-exclude=GLOB
   --test-coverage-lines=N, --test-coverage-branches=N, --test-coverage-functions=N
   --test-reporter=NAME, --test-reporter-destination=PATH
+  --build-snapshot ENTRY.js, --build-snapshot-config=FILE
+                     Run ENTRY.js and save the heap after its loop as a startup snapshot
+  --snapshot-blob=PATH Where --build-snapshot saves the snapshot, or the snapshot to start from
+  -h, --help         Print these options
   -v, --version
 Environment:
   NODE_OPTIONS      Supported runtime flags, applied before CLI flags
@@ -1214,8 +1286,52 @@ function loadRuntimeEnvironment(args, beforeLoading) {
   if (errors.length) return cliError(errors.join('\n' + process.execPath + ': '));
   if (loaded) loader.Module._initPaths();
 }
-function run() {
+// node.cc GenerateAndWriteSnapshotData and LoadSnapshotData, up to the process that
+// does the work: the checks that need no heap, then exec of this executable as
+// `--silk-build-snapshot BLOB` or `--silk-snapshot-blob BLOB` and the same arguments.
+function startSnapshotProcess(build, blob, config, entry, startupEnvironment) {
+  const fail = (text, status) => { host.writeStartupDiagnostic(text); return process.exit(status); };
+  if (build) {
+    if (config === undefined && entry === undefined)
+      return fail('--build-snapshot must be used with an entry point script.\nUsage: node --build-snapshot /path/to/entry.js\n', 9);
+    if (config === undefined && entry === 'node:embedded_snapshot_main')
+      return fail('node:embedded_snapshot_main was specified as snapshot entry point but Node.js was built without embedded snapshot.\n', 9);
+    if (config === undefined) {
+      try { rawOS.close(internalRequire('fs').openSync(entry, 'r')); } catch (error) {
+        return fail(`Cannot read builder script ${entry} for building snapshot. ${error.code}: ${systemMessage(error)}\n`, 1);
+      }
+    }
+  } else if (!internalRequire('fs').existsSync(blob)) {
+    return fail(`Cannot open ${blob}`, 14);
+  }
+  const argv = [native.argv[0], build ? '--silk-build-snapshot' : '--silk-snapshot-blob', blob ?? 'snapshot.blob', ...native.argv.slice(1)];
+  const environment = startupEnvironment ?? process.env, entries = [];
+  for (const key of Object.keys(environment)) entries.push(key + '=' + environment[key]);
+  const errno = native.osNative('execve', [process.execPath, argv, entries]);
+  return fail(`${process.execPath}: unable to start the snapshot process (errno ${errno})\n`, 1);
+}
+// uv_strerror's text, as an fs error message carries it: "ENOENT: no such file or directory, open 'x'".
+function systemMessage(error) {
+  const message = String(error.message), start = message.indexOf(': '), end = message.indexOf(', ', start);
+  return start < 0 ? message : message.slice(start + 2, end < 0 ? undefined : end);
+}
+// Node's V8 installs Error.stackTraceLimit when it deserializes a snapshot, which the
+// builder took it out of (internal/main/mksnapshot). A --stack-trace-limit given to
+// this process has already set it.
+function restoreStackTraceLimit() {
+  if (Object.prototype.hasOwnProperty.call(Error, 'stackTraceLimit')) return;
+  Object.defineProperty(Error, 'stackTraceLimit', { value: 10, writable: true, enumerable: true, configurable: true });
+}
+function runSnapshotBuilder(config) {
+  return internalRequire('internal/main/mksnapshot').run(config, (withoutCodeCache) => { snapshotState.codeCache = !withoutCodeCache; });
+}
+function run(restored = false) {
   if (workerBootstrap) return runWorker();
+  // The heap of a snapshot builder whose loop already ended: start over as this process.
+  if (restored) {
+    snapshotState.building = false; host.startupSnapshot.isBuildingSnapshotBuffer[0] = 0;
+    process._exiting = false; process.exitCode = undefined; process.execArgv.length = 0;
+  }
   if (native.seaNative(0)) return internalRequire('internal/sea').runMain(native.argv.slice(1), runtimeFlag, installRuntimeOptions, runPreloads, loadRuntimeEnvironment);
   // The environment as the process got it, before any environment file: only a
   // watch supervisor needs it, so it is copied only when a file is about to load.
@@ -1247,6 +1363,7 @@ function run() {
   let expression, print = false, inputType = 'commonjs';
   let filename, interactive = false, testMode = false, inputTypeSet = false, check = false;
   let watchMode = false, watchPreserveOutput = false, watchKillSignal = 'SIGTERM', runName;
+  let buildSnapshot = false, snapshotBlob, snapshotConfig;
   const watchPaths = [];
   const testOptions = {}, reporterNames = [], destinations = [];
   const afterMain = result => interactive ? result && typeof result.then === 'function' ? result.then(startRepl) : startRepl() : result;
@@ -1270,6 +1387,9 @@ function run() {
       case '--watch-path': watchPaths.push(value); continue;
       case '--watch-kill-signal': watchKillSignal = value; continue;
       case '--run': runName = value; continue;
+      case '--build-snapshot': buildSnapshot = value; continue;
+      case '--build-snapshot-config': snapshotConfig = value; continue;
+      case '--snapshot-blob': snapshotBlob = value; continue;
       case '--experimental-test-coverage': testOptions.coverage = value; continue;
       // Loaded before parsing, by loadRuntimeEnvironment.
       case '--env-file': case '--env-file-if-exists': continue;
@@ -1312,6 +1432,11 @@ function run() {
     if (runtimeFlag(optionFlag(entry)) || entry.implied) continue;
     return cliError('bad option: ' + entry.raw);
   }
+  // node.cc: --build-snapshot runs the builder, --snapshot-blob alone starts from a blob.
+  // Both take a process of their own (src/runtime/worker.silk), so this one becomes it.
+  if (!restored && !snapshotState.building && (buildSnapshot || snapshotBlob !== undefined)) {
+    return startSnapshotProcess(buildSnapshot, snapshotBlob, snapshotConfig, args[index], startupEnvironment);
+  }
   if (runName !== undefined) {
     const separator = native.argv.indexOf('--', 1);
     return internalRequire('internal/main/run').runPackageScript(runName, separator < 0 ? [] : native.argv.slice(separator + 1));
@@ -1334,6 +1459,29 @@ function run() {
   process._print_eval = print;
   filename = args[index];
   process.argv = [process.execPath, ...args.slice(index)];
+  // As lib/internal/main: an empty script name is no script, so the input is stdin (or the REPL).
+  if (filename === '') filename = undefined;
+  if (snapshotState.building) {
+    installRuntimeOptions(environment.concat(process.execArgv));
+    // node_snapshotable.cc runs the builder under a TryCatch of its own: what it throws
+    // is printed and the build ends with kGenericUserError, with no 'exit' event.
+    return runPreloads(() => {
+      try { return runSnapshotBuilder(snapshotConfig); } catch (error) {
+        host.writeText(2, internalRequire('internal/fatal_report').caught(error) + '\n');
+        return rawStd.exit(1);
+      }
+    });
+  }
+  if (restored) {
+    // Before any preload, as Node's prepareMainThreadExecution runs them.
+    restoreStackTraceLimit();
+    if (snapshotState.deserialize !== undefined) snapshotState.deserialize();
+    const main = snapshotState.main;
+    if (main !== undefined) {
+      installRuntimeOptions(environment.concat(process.execArgv));
+      return runPreloads(() => afterMain(main()));
+    }
+  }
   // `node inspect ...`: the debugger client (lib/internal/main/inspect.js).
   if (filename === 'inspect' && expression === undefined && !testMode && !check && !watchMode && !interactive) {
     installRuntimeOptions(environment.concat(process.execArgv));
@@ -1375,7 +1523,11 @@ function run() {
     const name = fromStdin ? host.path.join(host.tryGetCwd(), '[stdin]') : resolved.filename;
     const source = loader.cleanSource(fromStdin ? rawStd.in.readAsString() : host.Buffer.from(host.readFile(name)).toString('utf8'));
     const module = fromStdin ? inputType === 'module' || (!inputTypeSet && native.detectModuleSyntax(source)) : resolved.format === 'module';
-    native.checkSyntax(module ? source : loader.Module.wrap(source), name, module);
+    // node:internal/main/check_syntax names piped source [stdin].
+    const scriptName = fromStdin ? '[stdin]' : name;
+    const wrapped = module ? source : loader.Module.wrap(source);
+    try { native.checkSyntax(wrapped, scriptName, module); }
+    catch (error) { host.attachArrow(error, scriptName, source, wrapped.indexOf(source)); throw error; }
     return;
   }
   if (testMode) {
@@ -1483,6 +1635,8 @@ function loop() {
     if (!referencedWork()) {
       invoke(emitProcessEvent, undefined, ['beforeExit']);
       checkpoint();
+      // embed_helpers.cc SpinEventLoopInternal: a snapshot builder serializes here.
+      if (snapshotState.serialize !== undefined) { invoke(snapshotState.serialize, undefined, []); checkpoint(); }
       if (!referencedWork()) break;
     }
     loopTurn();
@@ -1493,6 +1647,15 @@ function loop() {
   inspectorBackend._atExit();
   if (moduleHas('internal/heap_prof')) internalRequire('internal/heap_prof').finish();
   if (moduleHas('internal/compile_cache')) internalRequire('internal/compile_cache').flushAtExit();
+  if (snapshotState.building) {
+    // What is left becomes the blob: no serialize callback, and no garbage.
+    snapshotState.serialize = undefined;
+    rawStd.gc();
+    // The cleanup callbacks of what that collected give its native handles back
+    // (src/runtime/worker.silk refuses a snapshot that still holds any).
+    checkpoint();
+    rawStd.gc();
+  }
   return Number(process.exitCode) || 0;
 }
 const imageModules = ['fs', 'fs/promises', 'internal/fs/streams', 'internal/streams/fast-utf8-stream', 'path', 'os',
@@ -1545,6 +1708,10 @@ globalThis.__silkRuntime = {
   drainDestroy: asyncHooks._drainDestroy,
   workerError: workerThreads._reportError,
   run: () => invoke(run, undefined, []), loop, onRejection,
+  runSnapshot: () => invoke(run, undefined, [true]),
+  // Whether the snapshot this builder ends keeps compiled function bodies
+  // (a snapshot configuration's "withoutCodeCache").
+  snapshotCodeCache: () => snapshotState.codeCache,
   // Ends the build of a heap image. Each variable listed here is read again by hydrate.
   seal() {
     // Built-ins most programs load run here, so that a start from the image finds
