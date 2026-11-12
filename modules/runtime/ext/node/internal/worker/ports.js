@@ -329,6 +329,6 @@ function moveMessagePortToContext(port, context) {
   endpoints.set(endpoint, new WeakRef(moved));
   return moved;
 }
-clone.installPortHooks({ isPort: port => states.has(port), id, transferId, wrap, detach: port => dispose(port, true), close });
+clone.installPortHooks({ isPort: port => states.has(port), detached: port => states.get(port).id === null, id, transferId, wrap, detach: port => dispose(port, true), close });
 module.exports = { MessagePort, MessageChannel, receiveMessageOnPort, moveMessagePortToContext,
   wrap, id, dispatch, close, start, ref };
