@@ -355,6 +355,7 @@ function getOptionValue(name) {
     case '--experimental-vm-modules': return !!host.experimentalVmModules;
     case '--experimental-shadow-realm': return !!host.experimentalShadowRealm;
     case '--experimental-eventsource': return !!host.experimentalEventSource;
+    case '--use-env-proxy': return !!host.useEnvProxy;
     case '--experimental-webstorage': return !!host.experimentalWebStorage;
     case '--experimental-websocket': return host.experimentalWebSocket !== false;
     case '--frozen-intrinsics': return !!host.frozenIntrinsics;

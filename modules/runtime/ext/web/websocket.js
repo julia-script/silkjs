@@ -117,7 +117,43 @@ function drain(record) {
   }
   record.sending = false;
 }
-function establish(record, protocols) {
+const kGlobalDispatcher = Symbol.for('undici.globalDispatcher.1');
+// The handshake through an Undici dispatcher (WebSocketInit.dispatcher, or the
+// one setGlobalDispatcher installed), as Node's WebSocket makes it.
+function dispatchUpgrade(record, dispatcher, url, headers, upgraded) {
+  const text = value => typeof value === 'string' ? value : Buffer.from(value).toString('latin1');
+  let abort = null, done = false;
+  record.request = { destroy(reason) { done = true; if (abort) { const call = abort; abort = null; call(reason || new Error('WebSocket closed')); } } };
+  dispatcher.dispatch({
+    origin: (url.protocol === 'wss:' ? 'https://' : 'http://') + url.host, path: url.pathname + url.search, method: 'GET',
+    // Undici writes Upgrade and Connection itself for an upgrade request, and rejects them as fields.
+    headers: Object.fromEntries(Object.entries(headers).filter(([name]) => !/^(upgrade|connection)$/i.test(name))),
+    body: null, upgrade: 'websocket',
+  }, {
+    onConnect(abortRequest) { if (done) abortRequest(new Error('WebSocket closed')); else abort = abortRequest; },
+    onHeaders(status) {
+      if (done) return false;
+      done = true;
+      fail(record, new Error('WebSocket handshake returned HTTP ' + status));
+      return false;
+    },
+    onData() { return false; },
+    onComplete() {},
+    onError(error) { if (!done) { done = true; fail(record, error); } },
+    onUpgrade(status, rawHeaders, socket) {
+      abort = null;
+      if (done) { socket.destroy(); return; }
+      done = true;
+      const flat = [];
+      for (let i = 0; i < rawHeaders.length; i += 2) {
+        const values = Array.isArray(rawHeaders[i + 1]) ? rawHeaders[i + 1] : [rawHeaders[i + 1]];
+        for (const value of values) flat.push(text(rawHeaders[i]), text(value));
+      }
+      upgraded({ statusCode: status, httpVersionMajor: 1, httpVersionMinor: 1, rawHeaders: flat }, socket, Buffer.alloc(0));
+    },
+  });
+}
+function establish(record, protocols, init) {
   if (record.readyState !== 0) return;
   const url = record.parsed;
   if (badPorts.has(Number(url.port))) { fail(record, new Error('WebSocket port is blocked')); return; }
@@ -131,25 +167,15 @@ function establish(record, protocols) {
       'Sec-WebSocket-Extensions': offer, 'Sec-Fetch-Mode': 'websocket',
     };
     if (protocols.length) headers['Sec-WebSocket-Protocol'] = protocols.join(', ');
-    const request = record.request = require(secure ? 'https' : 'http').request({
-      protocol: secure ? 'https:' : 'http:', hostname: url.hostname,
-      port: url.port || (secure ? 443 : 80), path: url.pathname + url.search,
-      method: 'GET', headers, agent: false, ALPNProtocols: ['http/1.1'],
-      auth: url.username || url.password ? decodeURIComponent(url.username) + ':' + decodeURIComponent(url.password) : undefined,
-    });
-    request.on('error', error => fail(record, error));
-    request.on('response', response => {
-      fail(record, new Error('WebSocket handshake returned HTTP ' + response.statusCode));
-      response.destroy();
-    });
-    request.on('close', () => {
-      if (!record.socket && record.readyState !== 3) {
-        if (!record.failure) fail(record, new Error('WebSocket handshake closed before upgrade'));
-        else finish(record);
-      }
-    });
-    request.on('upgrade', (response, socket, head) => {
-      if (record.readyState !== 0) { socket.destroy(); return; }
+    if (init.headers !== undefined) {
+      const { Headers } = require('internal/web/fetch/headers');
+      const extra = {};
+      for (const [name, value] of new Headers(init.headers)) extra[name] = value;
+      for (const name of Object.keys(headers)) extra[name.toLowerCase()] = headers[name];
+      for (const name of Object.keys(headers)) delete headers[name];
+      Object.assign(headers, extra);
+    }
+    const upgraded = (response, socket, head) => {      if (record.readyState !== 0) { socket.destroy(); return; }
       // HTTP parsers may join or discard duplicate fields. Validate the raw
       // single-valued handshake fields rather than trusting that normalization.
       const fields = new Map();
@@ -217,7 +243,27 @@ function establish(record, protocols) {
       record.target.dispatchEvent(new Event('open'));
       if (head.length) receiver.feed(head);
       if (!receiver.paused && !receiver.stopped) socket.resume();
+    };
+    const dispatcher = init.dispatcher ?? globalThis[kGlobalDispatcher];
+    if (dispatcher !== undefined) { dispatchUpgrade(record, dispatcher, url, headers, upgraded); return; }
+    const request = record.request = require(secure ? 'https' : 'http').request({
+      protocol: secure ? 'https:' : 'http:', hostname: url.hostname,
+      port: url.port || (secure ? 443 : 80), path: url.pathname + url.search,
+      method: 'GET', headers, agent: false, ALPNProtocols: ['http/1.1'],
+      auth: url.username || url.password ? decodeURIComponent(url.username) + ':' + decodeURIComponent(url.password) : undefined,
     });
+    request.on('error', error => fail(record, error));
+    request.on('response', response => {
+      fail(record, new Error('WebSocket handshake returned HTTP ' + response.statusCode));
+      response.destroy();
+    });
+    request.on('close', () => {
+      if (!record.socket && record.readyState !== 3) {
+        if (!record.failure) fail(record, new Error('WebSocket handshake closed before upgrade'));
+        else finish(record);
+      }
+    });
+    request.on('upgrade', upgraded);
     request.end();
   } catch (error) { fail(record, error); }
 }
@@ -233,6 +279,12 @@ class WebSocket extends EventTarget {
     else if (parsed.protocol === 'https:') parsed.protocol = 'wss:';
     if (parsed.protocol !== 'ws:' && parsed.protocol !== 'wss:') throw new DOMException('Expected a ws: or wss: URL', 'SyntaxError');
     if (parsed.hash || parsed.href.endsWith('#')) throw new DOMException('WebSocket URL must not contain a fragment', 'SyntaxError');
+    // Node's WebSocket also takes Undici's WebSocketInit: { protocols, dispatcher, headers }.
+    let init = {};
+    if (protocols !== null && typeof protocols === 'object' && typeof protocols[Symbol.iterator] !== 'function') {
+      init = { dispatcher: protocols.dispatcher, headers: protocols.headers };
+      protocols = protocols.protocols === undefined ? [] : protocols.protocols;
+    }
     if (typeof protocols === 'string') protocols = [protocols];
     else if (protocols != null && typeof protocols[Symbol.iterator] === 'function') protocols = Array.from(protocols, string);
     else throw new TypeError('WebSocket protocols must be a string or iterable sequence');
@@ -245,7 +297,7 @@ class WebSocket extends EventTarget {
       failure: null, handlers: Object.create(null),
     };
     records.set(this, record);
-    process.nextTick(() => establish(record, protocols));
+    process.nextTick(() => establish(record, protocols, init));
   }
   get url() { return state(this).parsed.href; }
   get readyState() { return state(this).readyState; }

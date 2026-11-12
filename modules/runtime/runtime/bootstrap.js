@@ -1140,6 +1140,7 @@ function runtimeFlag(arg) {
   if (arg === '--trace-events-enabled') { (host.traceOptions ||= {}).enabled = true; return true; }
   if (arg.startsWith('--trace-event-categories=')) { (host.traceOptions ||= {}).categories = arg.slice(25); return true; }
   if (arg.startsWith('--trace-event-file-pattern=')) { (host.traceOptions ||= {}).filePattern = arg.slice(27); return true; }
+  if (arg === '--use-env-proxy' || arg === '--no-use-env-proxy') { host.useEnvProxy = arg === '--use-env-proxy'; return true; }
   if (arg === '--experimental-eventsource' || arg === '--no-experimental-eventsource') {
     host.experimentalEventSource = arg === '--experimental-eventsource'; return true;
   }
@@ -1288,9 +1289,17 @@ function installRuntimeOptions(args, entrypoints = [], preloadEntrypoints = true
   if (host.experimentalWebStorage) internalRequire('internal/web/storage').install(globalThis, { localStorageFile: host.localStorageFile, inspect: !!host.experimentalStorageInspection });
   if (host.experimentalStreamIter) { internalRequire('fs/promises'); internalRequire('internal/fs/iter').install(); }
   // http is in the heap image, whose global agent was made without this process's options.
+  // node_options.cc: NODE_USE_ENV_PROXY=1 sets it, and the flags override that.
+  if (host.useEnvProxy === undefined) host.useEnvProxy = process.env.NODE_USE_ENV_PROXY === '1';
   if (internalRequire('internal/options').getOptionValue('--use-env-proxy')) {
     const agent = internalRequire('_http_agent');
     agent.globalAgent = internalRequire('internal/http').getGlobalAgent(process.env, agent.Agent);
+    // Node's setupHttpProxy: fetch goes through Undici's EnvHttpProxyAgent.
+    const env = process.env;
+    if (env.HTTP_PROXY || env.HTTPS_PROXY || env.http_proxy || env.https_proxy) {
+      const { setGlobalDispatcher, EnvHttpProxyAgent } = internalRequire('internal/deps/undici/undici');
+      setGlobalDispatcher(new EnvHttpProxyAgent());
+    }
   }
   if (workerThreads.isMainThread) internalRequire('internal/trace_events').initialize(host.traceOptions);
   if (workerThreads.isMainThread && host.traceSigint) internalRequire('util').setTraceSigInt(true);
