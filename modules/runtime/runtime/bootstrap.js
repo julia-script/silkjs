@@ -182,6 +182,7 @@ host.initializeRealmBuiltins = (handle, global, wasmCodeGeneration, isolated = f
   const cache = new Map();
   const bridge = {
     captureCallSites: native.captureCallSites,
+    privateSymbols: host.privateSymbols,
     errorStackState: host.errorStackState,
     builtinLoaded: moduleHas,
     wasmNative: native.vmWasmNative(handle),
@@ -374,6 +375,12 @@ host.triggerUncaughtException = reportUncaught;
 // arrow into the stack itself and marks the error decorated: no arrow then.
 host.errorArrows = new WeakMap();
 host.decoratedErrors = new WeakSet();
+// internalBinding('util').privateSymbols; the arrow is also kept under its private symbol, as Node does.
+host.privateSymbols = {
+  __proto__: null,
+  arrow_message_private_symbol: native.privateSymbol('node:arrowMessage'),
+  decorated_private_symbol: native.privateSymbol('node:decorated'),
+};
 host.attachArrow = (error, scriptName, source, prefix) => {
   if (!(error instanceof SyntaxError) || host.errorArrows.has(error) || !Number.isInteger(error.lineNumber)) return;
   const line = error.lineNumber;
@@ -385,7 +392,12 @@ host.attachArrow = (error, scriptName, source, prefix) => {
     for (let index = 0; index < column; index++) caret += text[index] === '\t' ? '\t' : ' ';
     caret += '^\n';
   }
-  host.errorArrows.set(error, scriptName + ':' + line + '\n' + text + '\n' + caret);
+  const arrow = scriptName + ':' + line + '\n' + text + '\n' + caret;
+  host.errorArrows.set(error, arrow);
+  try {
+    Object.defineProperty(error, host.privateSymbols.arrow_message_private_symbol,
+      { __proto__: null, value: arrow, writable: true, configurable: true });
+  } catch {}
 };
 // node_errors.cc DecorateErrorStack: the arrow, a blank line, then the stack, once.
 host.decorateErrorStack = error => {
@@ -434,10 +446,13 @@ host.mainModuleEvaluated = () => { mainJobsFirst = true; };
 function checkpoint() {
   if (mainJobsFirst) {
     mainJobsFirst = false;
-    native.drainJobs();
+    native.drainJobs(true);
   }
   do {
     while (true) {
+      // Jobs after nextTick callbacks run inside Node's processTicksAndRejections;
+      // otherwise they are V8's own checkpoint, below which no stack shows.
+      const alone = tickHead === ticks.length;
       while (tickHead !== ticks.length) {
         const at = tickHead;
         const callback = ticks[at], args = ticks[at + 1], scope = ticks[at + 2];
@@ -446,7 +461,7 @@ function checkpoint() {
         invokeResource(scope, callback, undefined, args);
       }
       ticks.length = tickHead = 0;
-      native.drainJobs();
+      native.drainJobs(alone);
       if (ticksPending()) continue;
       if (!completionsPending()) { completions.length = completionHead = 0; break; }
       const completion = completions[completionHead];
@@ -1066,6 +1081,11 @@ function runtimeFlag(arg) {
   if (arg === '--insecure-http-parser' || arg === '--no-insecure-http-parser') {
     host.insecureHTTPParser = arg === '--insecure-http-parser'; return true;
   }
+  if (arg === '--extra-info-on-fatal-exception' || arg === '--no-extra-info-on-fatal-exception') {
+    host.extraInfoOnFatalException = arg === '--extra-info-on-fatal-exception'; return true;
+  }
+  // Node checks the value when dns first loads (validateOneOf), not here.
+  if (arg.startsWith('--dns-result-order=')) { host.dnsResultOrder = arg.slice(19); return true; }
   if (arg.startsWith('--max-http-header-size=')) {
     const value = arg.slice(23);
     if (!/^\d+$/.test(value)) { cliError('--max-http-header-size requires a nonnegative integer'); return true; }
@@ -1384,7 +1404,8 @@ const HELP_TEXT = `Usage: silkjsruntime [options] [script.js] [arguments]
   --pending-deprecation, --no-pending-deprecation
   --disable-warning=CODE|NAME, --redirect-warnings=PATH
   --unhandled-rejections=throw|strict|warn|warn-with-error-code|none
-  --insecure-http-parser, --no-insecure-http-parser, --max-http-header-size=SIZE
+  --insecure-http-parser, --no-insecure-http-parser, --max-http-header-size=SIZE,
+  --dns-result-order=ORDER, --no-extra-info-on-fatal-exception
   --async-context-frame, --no-async-context-frame
   --expose-gc, --no-expose-gc
   --experimental-eventsource

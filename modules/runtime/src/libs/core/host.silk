@@ -9,6 +9,7 @@ import silk.num.i32
 import silk.num.f64
 import silk.num.u32
 import silk.num.u64
+import silk.num.u8
 import silk.num.usize
 import silk.mem.pointer { Pointer }
 import silk.core.option { Option }
@@ -17,12 +18,13 @@ import silkjs.js_engine { Engine }
 import silkjs.js_engine_host { EngineServices }
 import silkjs.js_heap { CellRef, HeapCell, HeapHeader }
 import silkjs.js_value { ValueBits }
-import silkjs.js_core_types { RuntimeState, NativeFunctionId, BuiltinFamily, NativeErrorKind, PropertyEnum, ModuleDef }
+import silkjs.js_core_types { StackFrame, JS_MODE_BACKTRACE_BARRIER, RuntimeState, NativeFunctionId, BuiltinFamily, NativeErrorKind, PropertyEnum, ModuleDef }
 import silkjs.js_exceptions { JsException }
 import silkjs.js_coercion_host { CoercionHooks }
 import silkjs.js_property_host { OwnPropertyResult }
 import silkjs.js_property_mutations as mutations
 import silkjs.js_strings { Strings }
+import silkjs.js_buffer_storage { BufferObject }
 import silkjs.js_string_types { StringLengthError }
 import silkjs.js_eval as evaluation
 import silkjs.js_eval_compile as flags
@@ -170,10 +172,34 @@ pub unsafe effect fn text<'m, S: EngineServices>(engine: &mut Engine<'m, S>, con
   unsafe gc.release(&mut engine, unsafe runtime.contextRuntime(context), string)
   return match move encoded { Result<List<u8>, OutOfMemoryError>.Success { value: bytes } => move bytes Result<List<u8>, OutOfMemoryError>.Failure { error } => { fail move error } }
 }
+fn markUntransferable<'a>(value: ValueRef<'a>) -> () {
+  match BufferObject<'a>.of(value) {
+    Option<BufferObject<'a>>.Some { value: buffer } => buffer.markUntransferable()
+    Option<BufferObject<'a>>.None => ()
+  }
+}
 pub unsafe effect fn string<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, bytes: &[u8]) -> ValueBits
   ! JsException ? &mut Allocator {
   let result = run Effect.result(Strings.fromUtf8(bytes))
   return match move result { Result<ValueBits, OutOfMemoryError | StringLengthError>.Success { value } => value Result<ValueBits, OutOfMemoryError | StringLengthError>.Failure { error } => run core.materialize(&mut engine, unsafe lendRealm(&context, context), move error) }
+}
+// Marks the current frame a backtrace barrier when `set`; returns what restoreBarrier puts back.
+unsafe fn barrier(rt: *mut HeapHeader, set: bool) -> u32 {
+  if !set { return 0xffffffff }
+  let mut anchor = () let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, rt)
+  let frame = state.currentStackFrame drop state
+  let pointer = match Pointer.nonNullMut<StackFrame>(frame) { Option<*mut StackFrame>.Some { value } => value _ => { return 0xffffffff } }
+  let sf = unsafe Pointer.borrowMut<(), StackFrame>(&mut anchor, pointer)
+  let saved = sf.mode sf.mode = sf.mode | u8.toU32(JS_MODE_BACKTRACE_BARRIER)
+  return saved
+}
+unsafe fn restoreBarrier(rt: *mut HeapHeader, saved: u32) -> () {
+  if saved == 0xffffffff { return () }
+  let mut anchor = () let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, rt)
+  let frame = state.currentStackFrame drop state
+  let pointer = match Pointer.nonNullMut<StackFrame>(frame) { Option<*mut StackFrame>.Some { value } => value _ => { return () } }
+  let sf = unsafe Pointer.borrowMut<(), StackFrame>(&mut anchor, pointer)
+  sf.mode = saved
 }
 pub unsafe effect fn drain<'m>(engine: &mut Engine<'m, Services>, context: *mut HeapHeader) -> bool
   ! OutOfMemoryError | JsException ? &mut Allocator {
@@ -819,7 +845,16 @@ impl EngineServices for Services {
       return ValueBits.Float64 { value: unsafe lgamma(x) }
     }
     if id == 3 {
-      let ran = run unsafe drain(&mut engine, context)
+      // drainJobs(alone): alone is an automatic microtask checkpoint, which in V8
+      // runs on an empty JavaScript stack, so no job's stack shows its callers.
+      let alone = unsafe primitives.toBoolean(unsafe common.argument(argv, 0)) != 0
+      let saved = unsafe barrier(rt, alone)
+      let drained = run Effect.result(unsafe drain(&mut engine, context))
+      unsafe restoreBarrier(rt, saved)
+      let ran = match move drained {
+        Result<bool, OutOfMemoryError | JsException>.Success { value } => value
+        Result<bool, OutOfMemoryError | JsException>.Failure { error } => { fail move error }
+      }
       run unsafe drainDestroy(&mut engine, context)
       return ValueBits.Bool { value: ran }
     }
@@ -837,6 +872,21 @@ impl EngineServices for Services {
       let field = run unsafe integer(&mut engine, context, unsafe common.argument(argv, 0))
       let value = if field == 0 { metrics.loopCount } else if field == 1 { metrics.events } else { metrics.eventsWaiting }
       return ValueBits.number(u64.toF64(value))
+    }
+    if id == 35 {
+      // privateSymbol(description): a V8-style private symbol (Node's util
+      // privateSymbols). Property keys made from it are left out of every
+      // own-keys listing and copy, as the engine's private names are.
+      let description = unsafe common.argument(argv, 0)
+      if !description.isString() { return ValueBits.Undefined }
+      let mut anchor = () let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, rt)
+      let created = run Effect.result(state.atoms.privateSymbol(description)) drop state
+      return match move created { Result<ValueBits, OutOfMemoryError | StringLengthError>.Success { value } => value Result<ValueBits, OutOfMemoryError | StringLengthError>.Failure { error } => run core.materialize(&mut engine, unsafe lendRealm(&context, context), move error) }
+    }
+    // markUntransferable(arrayBuffer): Node's SetDetachKey on the Buffer pools.
+    if id == 36 {
+      markUntransferable(unsafe lendFor(unsafe common.argument(argv, 0)))
+      return ValueBits.Undefined
     }
     if id == 12 { return run unsafe util_native.errorMap(&mut engine, context) }
     if id == 13 { return run unsafe util_native.errorMessage(&mut engine, context, argv) }
@@ -921,7 +971,7 @@ impl EngineServices for Services {
       let mut index: usize = 0
       while index < builtin_cache.entries() {
         let mut filename = List<u8>.make()
-        if index == embedded.builtinCount() { run filename.appendSlice(b"silk:bootstrap") }
+        if index == embedded.builtinCount() { run filename.appendSlice(b"node:internal/bootstrap/silk") }
         else { run filename.appendSlice(b"node:") run filename.appendSlice(embedded.builtinName(index)) }
         let compiled = run evaluation.evaluate(&mut engine, memory, unsafe lendRealm(&context, context), builtin_cache.source(index),
           filename.asSlice(), flags.TYPE_GLOBAL | flags.FLAG_COMPILE_ONLY | flags.FLAG_HOST_LIBRARY)

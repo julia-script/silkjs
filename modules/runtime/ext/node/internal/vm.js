@@ -57,29 +57,46 @@ function decorateErrorStack(cause, script) {
     host.decoratedErrors.add(cause);
   } catch {}
 }
-// display: the script (filename and offsets) whose errors are decorated, if any.
+// The SIGINT listeners a breakOnSigint run takes away until it ends, if any.
+function runBegin(breakOnSigint, wrapSignals) {
+  if (!breakOnSigint || !wrapSignals || process.listenerCount('SIGINT') === 0) return undefined;
+  const listeners = process.rawListeners('SIGINT');
+  process.removeAllListeners('SIGINT');
+  return listeners;
+}
+function runEnd(listeners) {
+  if (listeners) for (let i = 0; i < listeners.length; i++) process.addListener('SIGINT', listeners[i]);
+}
+// What a run that threw cause throws. display: the script (filename and offsets)
+// whose errors are decorated, if any.
+function runFailure(cause, timeout, display) {
+  if (cause && typeof cause.message === 'string' && cause.message.startsWith('ERR_SCRIPT_EXECUTION_TIMEOUT:')) {
+    return terminationError('ERR_SCRIPT_EXECUTION_TIMEOUT', `Script execution timed out${timeout ? ` after ${timeout}ms` : ''}`);
+  }
+  if (cause && typeof cause.message === 'string' && cause.message.startsWith('ERR_SCRIPT_EXECUTION_INTERRUPTED:')) {
+    return terminationError('ERR_SCRIPT_EXECUTION_INTERRUPTED', 'Script execution was interrupted by `SIGINT`');
+  }
+  if (cause && typeof cause.message === 'string' && cause.message.startsWith('ERR_CANNOT_WATCH_SIGINT:')) {
+    return error('ERR_CANNOT_WATCH_SIGINT', 'Cannot watch for SIGINT signals', Error);
+  }
+  if (display !== undefined) decorateErrorStack(cause, display);
+  return cause;
+}
+// The script's own error leaves as ContextifyScript's TryCatch::ReThrow does: the
+// message (and its arrow) stays where the script threw.
+function rethrow(cause, failure) {
+  if (failure === cause) host.rethrow(cause);
+  throw failure;
+}
+// Script methods call host.vmRun themselves between runBegin and runEnd: in Node
+// the run is ContextifyScript's native method, which no stack shows.
 function run(handle, { timeout, breakOnSigint }, afterEvaluate, wrapSignals = true, display = undefined) {
-  let listeners;
-  if (breakOnSigint && wrapSignals && process.listenerCount('SIGINT') > 0) {
-    listeners = process.rawListeners('SIGINT');
-    process.removeAllListeners('SIGINT');
-  }
-  try { return host.vmRun(handle, timeout, afterEvaluate, breakOnSigint); }
-  catch (cause) {
-    if (cause && typeof cause.message === 'string' && cause.message.startsWith('ERR_SCRIPT_EXECUTION_TIMEOUT:')) {
-      throw terminationError('ERR_SCRIPT_EXECUTION_TIMEOUT', `Script execution timed out${timeout ? ` after ${timeout}ms` : ''}`);
-    }
-    if (cause && typeof cause.message === 'string' && cause.message.startsWith('ERR_SCRIPT_EXECUTION_INTERRUPTED:')) {
-      throw terminationError('ERR_SCRIPT_EXECUTION_INTERRUPTED', 'Script execution was interrupted by `SIGINT`');
-    }
-    if (cause && typeof cause.message === 'string' && cause.message.startsWith('ERR_CANNOT_WATCH_SIGINT:')) {
-      throw error('ERR_CANNOT_WATCH_SIGINT', 'Cannot watch for SIGINT signals', Error);
-    }
-    if (display !== undefined) decorateErrorStack(cause, display);
-    throw cause;
-  } finally {
-    if (listeners) for (let i = 0; i < listeners.length; i++) process.addListener('SIGINT', listeners[i]);
-  }
+  const listeners = runBegin(breakOnSigint, wrapSignals);
+  let result;
+  try { result = host.vmRun(handle, timeout, afterEvaluate, breakOnSigint); }
+  catch (cause) { runEnd(listeners); rethrow(cause, runFailure(cause, timeout, display)); }
+  runEnd(listeners);
+  return result;
 }
 
 
@@ -98,6 +115,6 @@ function makeContextifyScript(code, filename, lineOffset, columnOffset, cachedDa
 }
 
 module.exports = {
-  contexts, error, invalid, contextData, isContext, syntaxDiagnostic, terminationErrors, terminationError, run,
+  contexts, error, invalid, contextData, isContext, syntaxDiagnostic, terminationErrors, terminationError, run, runBegin, runEnd, runFailure, rethrow,
   kInternalImportModuleDynamically, makeContextifyScript,
 };
