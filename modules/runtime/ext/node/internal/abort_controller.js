@@ -1,7 +1,7 @@
 'use strict';
 
 const host = require('internal/host');
-const { AbortController, isAbortSignal, createAbortSignal, closeTransferredSignal, abortSignal, kResistStopPropagation } = require('internal/path_events/event_target');
+const { AbortController, AbortSignal, isAbortSignal, createAbortSignal, closeTransferredSignal, abortSignal, kResistStopPropagation } = require('internal/path_events/event_target');
 const { codes: { ERR_INVALID_ARG_TYPE } } = require('internal/path_events/support');
 const transferable = new WeakSet();
 const abortWaitCleanup = new FinalizationRegistry(disposeWait);
@@ -115,6 +115,8 @@ function receiveTransfer(signal, aborted, value) {
 }
 
 module.exports = {
+  AbortController,
+  AbortSignal,
   util: { transferableAbortController, transferableAbortSignal, aborted },
   isTransferable: value => transferable.has(value),
   prepareTransfer, rollbackTransfer, commitTransfer, createTransferredSignal, receiveTransfer,

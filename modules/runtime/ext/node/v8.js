@@ -123,11 +123,13 @@ function isStringOneByteRepresentation(content) {
   string(content, 'content');
   return host.isOneByteString(content);
 }
+// Node's v8.takeCoverage and v8.stopCoverage are the profiler binding's: they act on the
+// coverage NODE_V8_COVERAGE started and do nothing without it.
 function takeCoverage() {
-  unsupported('takeCoverage', 'NODE_V8_COVERAGE collection is not implemented; native test coverage is a separate facility');
+  require('internal/profiler_binding').takeCoverage();
 }
 function stopCoverage() {
-  unsupported('stopCoverage', 'NODE_V8_COVERAGE collection is not implemented; native test coverage is a separate facility');
+  require('internal/profiler_binding').stopCoverage();
 }
 class GCProfiler {
   start() { unsupported('GCProfiler.start', 'native GC events do not capture the before/after heap statistics required by this profile'); }

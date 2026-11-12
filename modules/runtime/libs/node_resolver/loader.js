@@ -1063,6 +1063,7 @@ function createLoader(host, builtins) {
     const allowAsync = !!parent && moduleAsyncModes.get(parent) === true;
     return loadResolved(resolve(request, parent, 'require', undefined, undefined, !!isMain, allowAsync), parent, !!isMain, allowAsync);
   };
+  const defaultModuleLoad = Module._load;
   Module._initPaths = () => {
     const windows = process.platform === 'win32';
     const home = process.env[windows ? 'USERPROFILE' : 'HOME'];
@@ -1301,6 +1302,8 @@ function createLoader(host, builtins) {
       return load(specifier);
     }
     function load(specifier) {
+      // Module.prototype.require goes through Module._load, so a replaced one sees every require.
+      if (Module._load !== defaultModuleLoad) return Module._load(specifier, parent || cache[filename], false);
       probed = null;
       // Unlike the node: form, ordinary builtin names can be overridden through
       // require.cache, matching Node's documented builtin cache behavior.
