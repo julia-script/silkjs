@@ -74,7 +74,7 @@ pub effect fn mainState(process: &Process, domain: Domain) -> *mut State ! OutOf
   let mut allocator = group.resources.clone()
   let cancellation = run CancellableDomain.make(domain) |> Effect.provideMut<Allocator>(&mut allocator)
   let thread = run transport.allocate<Thread>(&group.resources)
-  unsafe Pointer.put<Thread>(thread, Thread { next: Pointer.null<Thread>(), id: 0, parent: 0, wake: Option<Waker>.none(), cancellation: move cancellation, stopped: false, exitCode: 0, exited: false, online: true, onlinePending: false, exitPending: false, referenced: false, environment: Pointer.null<Environment>(), cpu: Cpu.empty(), stackSize: 0 })
+  unsafe Pointer.put<Thread>(thread, Thread { next: Pointer.null<Thread>(), id: 0, parent: 0, wake: Option<Waker>.none(), cancellation: move cancellation, stopped: false, exitCode: 0, exited: false, online: true, onlinePending: false, exitPending: false, referenced: false, environment: Pointer.null<Environment>(), cpu: Cpu.empty(), stackSize: 0, heapLimit: usize.MAX, youngLimit: usize.MAX, outOfMemory: false })
   let mut guard = group.registry.get().lock() let registry = guard.getMut() registry.threads = thread drop registry drop guard
   return run makeState(move group, 0, 0, List<u8>.make())
 }
@@ -338,7 +338,7 @@ fn nativeThreadName(value: ValueBits) -> [u8; 64] {
   }
   return name
 }
-unsafe effect fn spawn(state: &State, metadata: List<u8>, control: u32, stackSize: usize, name: [u8; 64]) -> u32 ! OutOfMemoryError {
+unsafe effect fn spawn(state: &State, metadata: List<u8>, control: u32, stackSize: usize, limits: HeapLimits, name: [u8; 64]) -> u32 ! OutOfMemoryError {
   let mut allocator = state.group.resources.clone()
   let cancellation = run CancellableDomain.make(state.group.waiters.handle()) |> Effect.provideMut<Allocator>(&mut allocator)
   let packet = run transport.allocate<Start>(&state.group.resources)
@@ -351,7 +351,7 @@ unsafe effect fn spawn(state: &State, metadata: List<u8>, control: u32, stackSiz
   if endpoint.owner != state.id || endpoint.closed { drop endpoint unsafe resources.release(unsafe transport.raw(packet)) unsafe resources.release(unsafe transport.raw(node)) fail OutOfMemoryError {} }
   let id = registry.nextThreadId registry.nextThreadId = id + 1 endpoint.owner = id endpoint.started = false drop endpoint
   let parent = unsafe Pointer.borrow<(), Thread>(&anchor, unsafe nonnull(unsafe transport.thread(&registry.*, state.id))) let environment = parent.environment drop parent
-  unsafe Pointer.put<Thread>(node, Thread { next: registry.threads, id: id, parent: state.id, wake: Option<Waker>.none(), cancellation: move cancellation, stopped: false, exitCode: 0, exited: false, online: false, onlinePending: false, exitPending: false, referenced: true, environment: environment, cpu: Cpu.empty(), stackSize: stackSize }) registry.threads = node drop guard
+  unsafe Pointer.put<Thread>(node, Thread { next: registry.threads, id: id, parent: state.id, wake: Option<Waker>.none(), cancellation: move cancellation, stopped: false, exitCode: 0, exited: false, online: false, onlinePending: false, exitPending: false, referenced: true, environment: environment, cpu: Cpu.empty(), stackSize: stackSize, heapLimit: limits.heap, youngLimit: limits.young, outOfMemory: false }) registry.threads = node drop guard
   unsafe Pointer.put<Start>(packet, Start { group: state.group.clone(), id: id, control: control, metadata: move metadata, name: move name })
   let mut attributes: [u64; 16] = [0; 16] let attr = unsafe Intrinsic.pointerReinterpret<*mut u64, *mut u8>(Pointer.fromMutRef<u64>(&mut attributes[0]))
   let initialized = unsafe pthread_attr_init(attr) let mut status = initialized let mut thread: usize = 0
@@ -371,6 +371,37 @@ unsafe effect fn spawn(state: &State, metadata: List<u8>, control: u32, stackSiz
   return id
 }
 
+/// A worker's heap budgets in bytes (Thread.heapLimit, Thread.youngLimit).
+pub struct HeapLimits { pub heap: usize, pub young: usize }
+/// A whole, non-negative byte count, or usize.MAX (no limit) for anything else.
+fn limitBytes(value: ValueBits) -> usize {
+  if !value.isNumber() { return usize.MAX }
+  let n = value.numericValue()
+  if !(n >= 0.0) || n >= 9007199254740992.0 { return usize.MAX }
+  return f64.toUsize(f64.floor(n))
+}
+/// This isolate's resourceLimits budgets (none for the main thread).
+pub unsafe fn heapLimits(pointer: *mut State) -> HeapLimits {
+  let anchor = () let state = unsafe Pointer.borrow<(), State>(&anchor, pointer) let guard = state.group.registry.get().lock()
+  let entry = unsafe Pointer.borrow<(), Thread>(&anchor, unsafe nonnull(unsafe transport.thread(guard.get(), state.id)))
+  return HeapLimits { heap: entry.heapLimit, young: entry.youngLimit }
+}
+/// Whether this worker has exhausted its resourceLimits heap budget: limited and the
+/// budget refused a request (rejections). The first time, it ends the worker as V8
+/// does, uncatchably, with exit code 1, and the parent reports ERR_WORKER_OUT_OF_MEMORY.
+pub unsafe fn heapExhausted(optional: ?*mut State, rejections: usize) -> bool {
+  if Pointer.isNull<State>(optional) || rejections == 0 { return false }
+  let anchor = () let state = unsafe Pointer.borrow<(), State>(&anchor, unsafe nonnull(optional))
+  if state.id == 0 { return false }
+  let guard = state.group.registry.get().lock()
+  let mut mutable = ()
+  let entry = unsafe Pointer.borrowMut<(), Thread>(&mut mutable, unsafe nonnull(unsafe transport.thread(guard.get(), state.id)))
+  if entry.outOfMemory { return true }
+  if entry.heapLimit == usize.MAX { return false }
+  entry.outOfMemory = true
+  if !entry.stopped { entry.stopped = true entry.exitCode = 1 entry.cancellation.cancel() }
+  return true
+}
 fn number(value: ValueBits) -> u32 { if !value.isNumber() { return 0 } let n = value.numericValue() if n < 0.0 || n > 4294967295.0 || f64.trunc(n) != n { return 0 } return f64.toU32(n) }
 fn boolean(value: ValueBits) -> bool { return match value { ValueBits.Bool { value: flag } => flag _ => false } }
 unsafe effect fn length<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, array: ValueBits) -> u32 ! JsException ? &mut Allocator {
@@ -539,7 +570,7 @@ unsafe effect fn pollInto<'m, S: EngineServices>(engine: &mut Engine<'m, S>, con
   let memory = engine.memory scope.values[0] = run unsafe common.array(&mut engine, memory, context) let mut index: u32 = 0
   while true {
     let guard = state.group.registry.get().lock() let registry = guard.get()
-    let mut cursor = registry.endpoints let mut kind: u32 = 0 let mut id: u32 = 0 let mut code: i32 = 0 let mut initFailed = false let mut anchor = ()
+    let mut cursor = registry.endpoints let mut kind: u32 = 0 let mut id: u32 = 0 let mut code: i32 = 0 let mut initFailed = false let mut outOfMemory = false let mut anchor = ()
     let mut online = registry.threads
     while !Pointer.isNull<Thread>(online) {
       let child = unsafe Pointer.borrowMut<(), Thread>(&mut anchor, unsafe nonnull(online)) online = child.next
@@ -563,7 +594,7 @@ unsafe effect fn pollInto<'m, S: EngineServices>(engine: &mut Engine<'m, S>, con
       let mut threads = registry.threads
       while !Pointer.isNull<Thread>(threads) { let child = unsafe Pointer.borrowMut<(), Thread>(&mut anchor, unsafe nonnull(threads)) threads = child.next
         if child.id != state.id && child.parent == state.id {
-          if child.exitPending { child.exitPending = false kind = 4 id = child.id code = child.exitCode initFailed = code != 0 && !child.online && !child.stopped break }
+          if child.exitPending { child.exitPending = false kind = 4 id = child.id code = child.exitCode initFailed = code != 0 && !child.online && !child.stopped outOfMemory = child.outOfMemory break }
         }
       }
     }
@@ -577,6 +608,7 @@ unsafe effect fn pollInto<'m, S: EngineServices>(engine: &mut Engine<'m, S>, con
     if kind == 4 {
       run unsafe common.define(&mut engine, context, scope.values[1], b"code", ValueBits.Int { value: code }, 7)
       run unsafe common.define(&mut engine, context, scope.values[1], b"initFailed", ValueBits.Bool { value: initFailed }, 7)
+      run unsafe common.define(&mut engine, context, scope.values[1], b"outOfMemory", ValueBits.Bool { value: outOfMemory }, 7)
     }
     run unsafe common.defineIndex(&mut engine, context, scope.values[0], index, scope.take(1)) index = index + 1
     if kind == 2 || kind == 4 {
@@ -897,6 +929,9 @@ unsafe effect fn invoke<'m, S: EngineServices>(engine: &mut Engine<'m, S>, conte
     let metadata = run unsafe host.string(&mut engine, context, state.metadata.asSlice())
     run unsafe common.define(&mut engine, context, scope.values[0], b"metadata", metadata, 7) return scope.take(0)
   }
+  // Before reporting an uncaught error: whether it comes from an exhausted heap budget,
+  // which ends the worker with ERR_WORKER_OUT_OF_MEMORY instead.
+  if equal(op, b"heapExhausted") { drop state return ValueBits.Bool { value: unsafe heapExhausted(pointer, memory.stats().limitRejections) } }
   if equal(op, b"channel") { return run unsafe channel(&mut engine, context, &state) }
   if equal(op, b"activeResources") {
     let guard = state.group.registry.get().lock() let mut cursor = guard.get().endpoints let mut count: u32 = 0
@@ -1001,7 +1036,9 @@ unsafe effect fn invoke<'m, S: EngineServices>(engine: &mut Engine<'m, S>, conte
     if !args.values[3].isString() { return run core.error(&mut engine, unsafe lendRealm(&context, context), b"invalid Worker thread name") }
     // OpenSSL providers are configured before a second thread can use them.
     match Pointer.nonNullMut<crypto_native.State>(state.crypto) { Option<*mut crypto_native.State>.Some { value: crypto } => { unsafe crypto_native.configure(crypto) } _ => () }
-    return ValueBits.number(u32.toF64(run unsafe spawn(&state, move metadata, number(args.values[1]), f64.toUsize(stack), nativeThreadName(args.values[3]))))
+    // resourceLimits.maxOldGenerationSizeMb and maxYoungGenerationSizeMb, in bytes, or undefined.
+    let limits = HeapLimits { heap: limitBytes(args.values[4]), young: limitBytes(args.values[5]) }
+    return ValueBits.number(u32.toF64(run unsafe spawn(&state, move metadata, number(args.values[1]), f64.toUsize(stack), move limits, nativeThreadName(args.values[3]))))
   }
   let guard = state.group.registry.get().lock() let registry = guard.get() let mut mutable = ()
   if equal(op, b"workerStatus") {
@@ -1065,7 +1102,7 @@ pub unsafe effect fn dispatch<'m, S: EngineServices>(engine: &mut Engine<'m, S>,
 unsafe effect fn dispatchInto<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, pointer: *mut State, argv: &FrameSlots, args: &mut owners.Scope, scope: &mut owners.Scope) -> ValueBits ! OutOfMemoryError | JsException ? &mut Allocator {
   let name = run unsafe host.text(&mut engine, context, unsafe common.argument(argv, 0))
   let array = unsafe common.argument(argv, 1) let mut index: u32 = 0
-  let count: u32 = 5
+  let count: u32 = 6
   while index < count { args.values[u32.toUsize(index)] = run unsafe owners.getIndex(&mut engine, context, array, index) index = index + 1 }
   return run unsafe invoke(&mut engine, context, pointer, name.asSlice(), &args, &mut scope)
 }
