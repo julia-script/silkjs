@@ -997,6 +997,11 @@ function armInspectorEntry() {
   inspectorStartupArmed = true;
   inspectorBackend._armStartup();
 }
+// execution.js getEvalModuleUrl: an --eval or stdin module is [evalN] under the cwd's URL.
+let evalIndex = 0;
+function evalModuleURL() {
+  return `${internalRequire('url').pathToFileURL(host.tryGetCwd())}/[eval${++evalIndex}]`;
+}
 function evaluateMain(source, name) {
   mainModuleName = name;
   armInspectorEntry();
@@ -1005,6 +1010,7 @@ function evaluateMain(source, name) {
   let result;
   try { result = native.evaluateModule(source, name, true); }
   catch (cause) { throw loader.decorateModuleError(cause, name); }
+  host.entryModule = { name, source, promise: result };
   // As loader.runMain does for a file entry.
   return result instanceof Promise ? promiseThen(result, undefined, cause => { throw loader.decorateModuleError(cause, name); }) : result;
 }
@@ -1340,7 +1346,7 @@ function runWorker() {
   const moduleEval = evaluate && (inputType?.startsWith('module') || (inputType === undefined && native.detectModuleSyntax(workerSource)));
   return runPreloads(() => {
     if (evaluate) {
-      if (moduleEval) return evaluateMain(workerSource, host.path.join(host.tryGetCwd(), '[eval1]'));
+      if (moduleEval) return evaluateMain(workerSource, evalModuleURL());
       const name = host.path.join(host.tryGetCwd(), '[worker eval]');
       installCommonJSInputGlobals(name, '[worker eval]');
       armInspectorEntry();
@@ -1701,7 +1707,7 @@ function run(restored = false) {
       (print ? 'let crypto=require("node:crypto");{' + expression + '}' : '(crypto=>{{' + expression + '}})(require("node:crypto"))') : expression;
     if (inputType.startsWith('module') || (!inputTypeSet && native.detectModuleSyntax(code))) {
       if (print) throw Object.assign(new Error('--print cannot be used with ESM'), { code: 'ERR_EVAL_ESM_CANNOT_PRINT' });
-      return afterMain(evaluateMain(code, name));
+      return afterMain(evaluateMain(code, evalModuleURL()));
     }
     installCommonJSInputGlobals(name, '[eval]');
     armInspectorEntry();
@@ -1715,7 +1721,7 @@ function run(restored = false) {
     source = prepareInput(source, name, inputType, inputTypeSet);
     if (inputType.startsWith('module') || (!inputTypeSet && native.detectModuleSyntax(source))) {
       if (print) throw Object.assign(new Error('--print cannot be used with ESM'), { code: 'ERR_EVAL_ESM_CANNOT_PRINT' });
-      return afterMain(evaluateMain(source, name));
+      return afterMain(evaluateMain(source, evalModuleURL()));
     }
     installCommonJSInputGlobals(name, '[stdin]');
     armInspectorEntry();
@@ -1793,6 +1799,34 @@ function loopTurn(pendingPromise) {
 }
 // An exception in a 'beforeExit' or 'exit' listener is uncaught like any other.
 function emitProcessEvent(name) { process.emit(name, Number(process.exitCode) || 0); }
+// Node's EmitProcessExitInternal: with no exit code set, an entry module whose
+// evaluation never settled exits with kUnsettledTopLevelAwait (13), after a warning
+// for each await its graph is suspended at (ModuleWrap::CheckUnsettledTopLevelAwait).
+function checkUnsettledTopLevelAwait() {
+  const entry = host.entryModule;
+  if (entry === undefined || (Number(process.exitCode) || 0) !== 0) return;
+  if (!(entry.promise instanceof Promise) || native.promiseState(entry.promise) !== 0) return;
+  const stalled = native.stalledTopLevelAwaits(entry.name);
+  if (stalled.length === 0) return;
+  if (internalRequire('internal/options').getOptionValue('--warnings')) {
+    const url = internalRequire('url');
+    const sources = new Map();
+    for (let index = 0; index < stalled.length; index++) {
+      const { 0: name, 1: line, 2: column } = stalled[index];
+      if (!sources.has(name)) {
+        let text = name === entry.name ? entry.source : undefined;
+        if (text === undefined) { try { text = host.readText(name.startsWith('file:') ? url.fileURLToPath(name) : name); } catch {} }
+        sources.set(name, typeof text === 'string' ? text.split(/\r\n|[\n\r\u2028\u2029]/) : []);
+      }
+      const sourceLine = sources.get(name)[line - 1] ?? '';
+      let caret = '';
+      for (let at = 0; at < column - 1 && at < sourceLine.length; at++) caret += sourceLine[at] === '\t' ? '\t' : ' ';
+      const location = /^[A-Za-z][A-Za-z\d+.-]*:/.test(name) ? name : url.pathToFileURL(name).href;
+      host.writeText(2, `Warning: Detected unsettled top-level await at ${location}:${line}\n${sourceLine}\n${caret}^\n\n\n\n`);
+    }
+  }
+  process.exitCode = 13;
+}
 function loop() {
   performanceMilestones.loopStart = native.now() - startTime;
   initialNativeIdleTime = native.loopIdleTime();
@@ -1813,6 +1847,7 @@ function loop() {
   }
   performanceMilestones.loopExit = native.now() - startTime;
   process._exiting = true;
+  invoke(checkUnsettledTopLevelAwait, undefined, []);
   invoke(emitProcessEvent, undefined, ['exit']);
   // Node's Environment::RunCleanup and RunAtExit: the runtime's cleanup is its exit work below.
   const trace = host.traceEnvironment ? internalRequire('internal/trace_events') : undefined;
