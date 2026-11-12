@@ -308,6 +308,10 @@ const hydrations = [];
 host.onHydrate = refresh => { hydrations.push(refresh); };
 const asyncHooks = internalRequire('async_hooks');
 function resource(type, owner) { return asyncHooks._createResource(type, owner); }
+const newAsyncId = asyncHooks._newAsyncId, queueDestroyId = asyncHooks._queueDestroyId;
+const InternalResourceClass = asyncHooks._InternalResource;
+const asyncHookFields = asyncHooks._hookFields;
+const invokeIdFrom = asyncHooks._invokeIdFrom;
 const invokeScoped = asyncHooks._invoke;
 const hidePromises = asyncHooks._hidePromises;
 function invokeResource(scope, callback, receiver, args, destroy = true) {
@@ -348,10 +352,42 @@ host.diagnostics = {
   watch(name, callback) { this.watchers.set(name, callback); },
   status(name, active) { const callback = this.watchers.get(name); if (callback !== undefined) callback(active); },
 };
-host.nextTick = function nextTick(callback, ...args) {
+host.nextTick = function nextTick(callback) {
   if (typeof callback !== 'function') throw new (internalRequire('internal/errors').codes.ERR_INVALID_ARG_TYPE)('callback', 'function', callback);
-  ticks.push(callback, args, resource('TickObject'));
+  // As Node's nextTick: an arguments array only when there are arguments.
+  const count = arguments.length;
+  let args;
+  if (count > 1) {
+    args = [];
+    for (let index = 1; index < count; index++) args.push(arguments[index]);
+  }
+  ticks.push(callback, args, tickScope());
 };
+// A tick's async scope. With no hooks it is the callback context itself, the TickObject
+// resource: no InternalResource to build and destroy. The run emits before, after and
+// destroy for it once hooks exist by then, as Node's processTicksAndRejections does.
+function tickScope() {
+  if (asyncHookFields[5] !== 0) return resource('TickObject');
+  const context = host.getAsyncContext();
+  const scope = { stores: context?.stores, id: newAsyncId(), trigger: context?.id ?? 1, resource: undefined };
+  scope.resource = scope;
+  return scope;
+}
+function runTick(callback, args, scope) {
+  if (scope instanceof InternalResourceClass) { invokeResource(scope, callback, undefined, args ?? noTickArguments); return; }
+  const previous = host.getAsyncContext();
+  if (asyncHookFields[5] !== 0) {
+    try { invokeIdFrom(previous, scope, scope.id, invokeReporting, callback, undefined, args ?? noTickArguments); }
+    finally { queueDestroyId(scope.id); }
+    return;
+  }
+  host.setAsyncContext(scope);
+  try {
+    try { if (args === undefined) callback(); else Reflect.apply(callback, undefined, args); }
+    catch (error) { reportUncaught(error); }
+  } finally { host.setAsyncContext(previous); }
+}
+const noTickArguments = [];
 host.queueMicrotask = function queueMicrotask(callback) {
   checkCallback(callback);
   const scope = resource('Microtask');
@@ -433,6 +469,9 @@ function exceptionInFatalHandler(error) {
   rawStd.exit(7);
 }
 const rejections = new Map();
+// Set when a rejection is queued, cleared once a checkpoint finds none: checkpoint's
+// fast path tests it rather than rejections.size (a Map getter call).
+let rejectionsQueued = false;
 const reportedRejections = new WeakMap();
 let nextRejectionId = 0;
 function onRejection(promise, reason, handled) {
@@ -448,6 +487,7 @@ function onRejection(promise, reason, handled) {
     }
   } else {
     rejections.set(promise, { reason, id: ++nextRejectionId, domain: process.domain, context: asyncHooks._captureContext() });
+    rejectionsQueued = true;
   }
 }
 // Node evaluates an ES main module inside a microtask checkpoint (its loader awaits
@@ -455,7 +495,14 @@ function onRejection(promise, reason, handled) {
 // settle before the next ticks it queued run (test-esm-dynamic-import-commonjs).
 let mainJobsFirst = false;
 host.mainModuleEvaluated = () => { mainJobsFirst = true; };
+// Node's async_hook_fields: index 5 counts the callbacks of every enabled hook.
 function checkpoint() {
+  // The usual case, nothing queued but promise jobs: drain them once, and leave when they
+  // queued nothing either. With no hook callbacks a queued destroy has no effect.
+  if (!mainJobsFirst && tickHead === ticks.length && completionHead === completions.length && !rejectionsQueued) {
+    native.drainJobs(true);
+    if (tickHead === ticks.length && completionHead === completions.length && !rejectionsQueued && asyncHookFields[5] === 0) return;
+  }
   if (mainJobsFirst) {
     mainJobsFirst = false;
     native.drainJobs(true);
@@ -470,7 +517,7 @@ function checkpoint() {
         const callback = ticks[at], args = ticks[at + 1], scope = ticks[at + 2];
         ticks[at] = ticks[at + 1] = ticks[at + 2] = undefined;
         tickHead = at + 3;
-        invokeResource(scope, callback, undefined, args);
+        runTick(callback, args, scope);
       }
       ticks.length = tickHead = 0;
       native.drainJobs(alone);
@@ -501,6 +548,7 @@ function checkpoint() {
     // These must settle before testing loop liveness or emitting beforeExit.
     if (!ticksPending()) native.drainJobs();
   } while (ticksPending() || rejections.size || completionsPending());
+  rejectionsQueued = false;
 }
 host.checkpoint = checkpoint;
 // Node's lib/timers.js and lib/internal/timers.js run the timers; the loop
@@ -508,12 +556,18 @@ host.checkpoint = checkpoint;
 // Named, as Node's timer frames are: the REPL trims an error's frames below the
 // last one without a function name.
 host.invokeTimer = function invokeTimer(scope, callback, receiver, args) { return invokeScoped(scope, invokeReporting, callback, receiver, args); };
+// An Immediate's callback, in its context (scope) with hooks for its async id, from the
+// immediate queue's context (previous).
+host.invokeImmediate = function invokeTimer(previous, scope, id, callback, receiver, args) { return invokeIdFrom(previous, scope, id, invokeReporting, callback, receiver, args); };
 const timerAPI = internalRequire('timers');
 {
   const { processImmediate, processTimers } = internalRequire('internal/timers').getTimerCallbacks(checkpoint);
   internalRequire('internal/timers_binding').setupTimers(processImmediate, processTimers);
 }
 const timerLoop = host.timerLoop;
+const timerState = timerLoop.state;
+const nativeImmediates = timerLoop.nativeImmediates;
+const immediateInfo = timerLoop.immediateInfo;
 for (const name of ['setTimeout', 'clearTimeout', 'setImmediate', 'clearImmediate', 'setInterval', 'clearInterval']) globalThis[name] = timerAPI[name];
 const Buffer = internalRequire('buffer').Buffer;
 host.Buffer = Buffer;
@@ -607,6 +661,8 @@ const performanceMilestones = {
 host.markBootstrapComplete = () => { performanceMilestones.bootstrapComplete = native.now() - startTime; };
 let initialNativeIdleTime = 0;
 const loopListeners = new Set();
+// loopListeners.size, for the loop turn to test without a Set getter call.
+let loopListenerCount = 0;
 host.performanceStartTime = startTime;
 host.performanceTimeOrigin = Date.now() - (native.now() - startTime);
 // A worker takes the process's clock, as Node: performance.timeOrigin, performance.now(),
@@ -637,7 +693,8 @@ host.performanceUvMetrics = () => [native.loopMetrics(0), native.loopMetrics(1),
 host.performanceNodeTiming = () => ({ ...performanceMilestones, idleTime: host.performanceLoopStats().idle });
 host.performanceAddLoopListener = callback => {
   loopListeners.add(callback);
-  return () => loopListeners.delete(callback);
+  loopListenerCount = loopListeners.size;
+  return () => { const removed = loopListeners.delete(callback); loopListenerCount = loopListeners.size; return removed; };
 };
 // The Node release whose API this runtime implements.
 const nodeVersion = '24.22.1';
@@ -1809,9 +1866,12 @@ function wasmEntry(path) {
   catch { return false; }
 }
 function referencedWork() {
-  return native.hasPendingIO() || timerLoop.hasRef();
+  return timerState.immediateRefed || (timerState.timerRefed && timerState.timerDue !== -1) || timerState.nativeRefs !== 0 || native.hasPendingIO();
 }
 function pollWorkers() {
+  // Worker events need a worker, port, channel, lock or route of this thread: the main
+  // thread polls only once it made one (host.workerActivity).
+  if (host.workerActivity !== true && workerThreads.isMainThread) return;
   // Replenished queues must yield to timers and native I/O. Rearm the wake
   // even for an already-queued burst, since uv_async coalesces notifications.
   for (let count = 0; count < 1000; count++) {
@@ -1825,9 +1885,11 @@ function pollWorkers() {
 function pollTimeout(pendingPromise) {
   if (ticksPending()) return 0;
   if (pendingPromise !== undefined && native.promiseState(pendingPromise) !== 0) return 0;
+  const delay = timerLoop.pollDelay();
+  // Ready immediates: every case below answers 0 then too.
+  if (delay === 0) return 0;
   const referenced = referencedWork();
   if (!referenced && pendingPromise === undefined) return 0;
-  const delay = timerLoop.pollDelay();
   // A hook may await an unreferenced timer or an externally settled promise.
   // Keep nested waits interruptible without emitting main-loop lifecycle events.
   if (!referenced && delay === -1) return 1;
@@ -1841,15 +1903,23 @@ function pollTimeout(pendingPromise) {
 // With keepAlive and nothing referenced the wait is the embedder's: up to the next timer
 // (referenced or not) or `limit`, whichever comes first.
 function loopTurn(pendingPromise, limit, keepAlive) {
-  if (timerLoop.runTimers()) checkpoint();
-  let timeout = keepAlive && !ticksPending() && !referencedWork() ? timerLoop.pollDelay() : pollTimeout(pendingPromise);
+  if (timerState.timerDue !== -1 && timerLoop.runTimers()) checkpoint();
+  // Referenced immediates wait (pollDelay 0): every case of pollTimeout answers 0 then.
+  let timeout = !keepAlive && pendingPromise === undefined && timerState.immediateRefed ? 0
+    : keepAlive && !ticksPending() && !referencedWork() ? timerLoop.pollDelay() : pollTimeout(pendingPromise);
   if (limit !== undefined && limit >= 0 && (timeout === -1 || timeout > limit)) timeout = limit;
   native.pollIO(timeout);
   pollWorkers();
   checkpoint();
-  if (loopListeners.size !== 0) for (const listener of loopListeners) listener();
-  if (timerLoop.checkImmediate()) checkpoint();
+  if (loopListenerCount !== 0) {
+    for (const listener of loopListeners) listener();
+    checkpoint();
+  }
+  if ((immediateInfo[0] !== 0 || nativeImmediates.length !== 0 || host.traceEnvironment) && timerLoop.checkImmediate()) checkpoint();
+  // Every phase ended in a checkpoint: nothing is queued for the next step's.
+  loopSettled = true;
 }
+let loopSettled = false;
 // An exception in a 'beforeExit' or 'exit' listener is uncaught like any other.
 function emitProcessEvent(name) { process.emit(name, Number(process.exitCode) || 0); }
 // Node's EmitProcessExitInternal: with no exit code set, an entry module whose
@@ -1891,9 +1961,11 @@ function loopStart() {
 // own work keeps the process alive, such as open windows) no work left is not an end:
 // the pass polls once and 'beforeExit' waits for loopEnd.
 function loopStep(limit, keepAlive) {
-  checkpoint();
+  // An embedder's own code may have run since the last turn; the executable's has not.
+  if (!loopSettled || limit !== undefined || keepAlive) checkpoint();
+  loopSettled = false;
   pollWorkers();
-  if (workerThreads._exitRequested) return false;
+  if (host.workerExitRequested === true) return false;
   if (!keepAlive && !referencedWork()) {
     const beforeExit = host.traceEnvironment ? internalRequire('internal/trace_events').now() : undefined;
     invoke(emitProcessEvent, undefined, ['beforeExit']);

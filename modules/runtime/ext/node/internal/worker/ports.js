@@ -261,6 +261,7 @@ function MessageChannel() {
   if (new.target === undefined) {
     throw clone.codedError('ERR_CONSTRUCT_CALL_REQUIRED', 'Class constructor MessageChannel cannot be invoked without `new`');
   }
+  host.workerActivity = true;
   const pair = host.workerNative('channel', []);
   this.port1 = wrap(pair[0]);
   this.port2 = wrap(pair[1]);

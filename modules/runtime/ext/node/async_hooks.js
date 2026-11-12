@@ -5,6 +5,8 @@ const RunScope = require('internal/async_local_storage/run_scope');
 const apply = Reflect.apply;
 const hookNames = ['init', 'before', 'after', 'destroy', 'promiseResolve'];
 const hooks = new Set();
+// hooks.size, kept by enable() and disable(): hot paths test it without a Set getter call.
+let hookCount = 0;
 // internalBinding('async_wrap').setPromiseHooks: one function per event, set by
 // internal/promise_hooks (which runs several hooks for one event itself).
 let promiseHookFunctions = [undefined, undefined, undefined, undefined];
@@ -63,7 +65,7 @@ function syncNativeHooks() {
   host.setAsyncHooksEnabled(enabled);
 }
 function emit(name, args, promise = false) {
-  if (emitting || hooks.size === 0) return;
+  if (emitting || hookCount === 0) return;
   // Mutations during dispatch affect the next event, not this event's listeners.
   const listeners = Array.from(hooks);
   emitting = true;
@@ -108,7 +110,7 @@ function emitPromise(name, promise, parent) {
 function enqueueDestroy(state) {
   if (state.destroyed) return;
   state.destroyed = true;
-  if (hooks.size !== 0) pendingDestroy.push(state);
+  if (hookCount !== 0) pendingDestroy.push(state);
 }
 const finalizer = new FinalizationRegistry(enqueueDestroy);
 function drainDestroy() {
@@ -131,11 +133,11 @@ class AsyncHook {
     this.trackPromises = callbacks.trackPromises !== false;
     if (!this.trackPromises && this.callbacks.promiseResolve !== undefined) throw error('ERR_INVALID_ARG_VALUE', 'trackPromises must not be false when promiseResolve is enabled');
   }
-  enable() { hooks.add(this); countHookFields(); syncNativeHooks(); return this; }
-  disable() { hooks.delete(this); countHookFields(); syncNativeHooks(); return this; }
+  enable() { hooks.add(this); hookCount = hooks.size; countHookFields(); syncNativeHooks(); return this; }
+  disable() { hooks.delete(this); hookCount = hooks.size; countHookFields(); syncNativeHooks(); return this; }
 }
 function createHook(callbacks) { return new AsyncHook(callbacks); }
-let enterResource, leaveResource, invokeIn;
+let enterResource, leaveResource, invokeIn, invokeDispatch;
 // What enter/leave/invoke need from a resource: its id, its callback context and a stack
 // of the contexts it interrupted. AsyncResource keeps them private; InternalResource
 // (the runtime's own ticks, timers and requests) keeps them as plain fields.
@@ -159,29 +161,59 @@ class AsyncResource {
       const stack = resource[kStack]();
       stack.push(previous);
       host.setAsyncContext(resource[kScope](omitFrame));
-      if (hooks.size === 0) return;
+      if (hookCount === 0) return;
       try { emit('before', [resource[kId]()]); }
       catch (error) { host.setAsyncContext(stack.pop()); throw error; }
     };
     leaveResource = resource => {
       const stack = resource[kStack]();
       if (!stack.length) throw error('ERR_ASYNC_CALLBACK', 'No active async resource scope');
-      try { if (hooks.size !== 0) emit('after', [resource[kId]()]); }
+      try { if (hookCount !== 0) emit('after', [resource[kId]()]); }
       finally { host.setAsyncContext(stack.pop()); }
     };
     // The runtime's own callbacks: fn(a, b, c) in the resource's scope, with no
     // rest arguments and no scope stack.
+    // A native handle's event: receiver.dispatch(type, status, payload, extra) in the
+    // resource's scope, an exception reported as uncaught inside that scope (before 'after').
+    invokeDispatch = (resource, receiver, type, status, payload, extra) => {
+      const previous = host.getAsyncContext();
+      const scope = resource instanceof InternalResource
+        ? resource.scope ?? internalScope(resource)
+        : resource[kScope](false);
+      host.setAsyncContext(scope);
+      if (hookCount !== 0) {
+        try { emit('before', [resource[kId]()]); }
+        catch (error) { host.setAsyncContext(previous); throw error; }
+      }
+      try {
+        try { receiver.dispatch(type, status, payload, extra); }
+        catch (error) { host.triggerUncaughtException(error); }
+      } finally {
+        if (hookCount === 0) host.setAsyncContext(previous);
+        else {
+          try { emit('after', [resource[kId]()]); }
+          finally { host.setAsyncContext(previous); }
+        }
+      }
+    };
     invokeIn = (resource, fn, a, b, c) => {
-      const previous = captureContext();
-      host.setAsyncContext(resource[kScope](false));
-      if (hooks.size !== 0) {
+      const previous = host.getAsyncContext();
+      // An InternalResource's scope is a plain field: no method call on the hot path.
+      const scope = resource instanceof InternalResource
+        ? resource.scope ?? internalScope(resource)
+        : resource[kScope](false);
+      host.setAsyncContext(scope);
+      if (hookCount !== 0) {
         try { emit('before', [resource[kId]()]); }
         catch (error) { host.setAsyncContext(previous); throw error; }
       }
       try { return fn(a, b, c); }
       finally {
-        try { if (hooks.size !== 0) emit('after', [resource[kId]()]); }
-        finally { host.setAsyncContext(previous); }
+        if (hookCount === 0) host.setAsyncContext(previous);
+        else {
+          try { emit('after', [resource[kId]()]); }
+          finally { host.setAsyncContext(previous); }
+        }
       }
     };
   }
@@ -205,7 +237,7 @@ class AsyncResource {
       finalizer.register(this, this.#destroy, this.#destroy);
       this.#registered = true;
     }
-    if (hooks.size !== 0) emit('init', [this.#id, type, trigger, this.#owner ?? this]);
+    if (hookCount !== 0) emit('init', [this.#id, type, trigger, this.#owner ?? this]);
   }
   asyncId() { return this.#id; }
   triggerAsyncId() { return this.#trigger; }
@@ -240,8 +272,8 @@ class AsyncResource {
 class InternalResource {
   constructor(type, owner, explicitId) {
     if (typeof type !== 'string') throw error('ERR_INVALID_ARG_TYPE', 'The "type" argument must be a string');
-    if (hooks.size !== 0 && type.length === 0 && Array.from(hooks).some(hook => hook.callbacks.init !== undefined)) throw error('ERR_ASYNC_TYPE', 'Invalid name for async "type"');
-    const context = captureContext();
+    if (hookCount !== 0 && type.length === 0 && Array.from(hooks).some(hook => hook.callbacks.init !== undefined)) throw error('ERR_ASYNC_TYPE', 'Invalid name for async "type"');
+    const context = host.getAsyncContext();
     // Only the stores: the whole context would keep the resource that was current alive.
     this.stores = context?.stores;
     this.id = typeof explicitId === 'number' && explicitId !== -1 ? explicitId : nextId++;
@@ -251,13 +283,13 @@ class InternalResource {
     this.promise = false;
     this.scope = undefined;
     this.stack = undefined;
-    if (hooks.size !== 0) emit('init', [this.id, type, this.trigger, owner ?? this]);
+    if (hookCount !== 0) emit('init', [this.id, type, this.trigger, owner ?? this]);
   }
   [kId]() { return this.id; }
   [kStack]() { return this.stack ??= []; }
   [kScope](omitFrame) {
     if (omitFrame && usesContextFrames()) return frameScope(this.id, this.trigger, this.owner ?? this);
-    return this.scope ??= { stores: this.stores, id: this.id, trigger: this.trigger, resource: this.owner ?? this };
+    return this.scope ?? internalScope(this);
   }
   asyncId() { return this.id; }
   triggerAsyncId() { return this.trigger; }
@@ -272,6 +304,10 @@ class InternalResource {
     this.stores = undefined; this.scope = undefined;
     enqueueDestroy(this); return this;
   }
+}
+
+function internalScope(resource) {
+  return resource.scope = { stores: resource.stores, id: resource.id, trigger: resource.trigger, resource: resource.owner ?? resource };
 }
 
 class AsyncContextFrame extends Map {}
@@ -450,11 +486,31 @@ module.exports = { AsyncLocalStorage, AsyncResource, createHook, executionAsyncI
 Object.defineProperties(module.exports, {
   _setPromiseHooks: { value: setPromiseHooks },
   _createResource: { value: (type, owner, id) => new InternalResource(type, owner, id) },
+  _InternalResource: { value: InternalResource },
   _enterResource: { value: (resource, omitFrame = false) => enterResource(resource, omitFrame) },
   _leaveResource: { value: resource => leaveResource(resource) },
   _invoke: { value: invokeIn },
+  _invokeDispatch: { value: invokeDispatch },
+  // A resource kept by its owner as Node's timers keep it (an id, a trigger and the stores on
+  // the owner itself): init for it, and fn(a, b, c) in scope with before and after for id.
+  _emitInit: { value: (id, type, trigger, resource) => { if (hookCount !== 0) emit('init', [id, type, trigger, resource]); } },
+  _invokeIdFrom: { value: (previous, scope, id, fn, a, b, c) => {
+    host.setAsyncContext(scope);
+    if (hookCount !== 0) {
+      try { emit('before', [id]); }
+      catch (error) { host.setAsyncContext(previous); throw error; }
+    }
+    try { return fn(a, b, c); }
+    finally {
+      if (hookCount === 0) host.setAsyncContext(previous);
+      else {
+        try { emit('after', [id]); }
+        finally { host.setAsyncContext(previous); }
+      }
+    }
+  } },
   // Whether any enabled hook observes resource callbacks; a hot runtime path may skip a resource's scope when none does.
-  _hooksActive: { value: () => hooks.size !== 0 },
+  _hooksActive: { value: () => hookCount !== 0 },
   _captureContext: { value: captureContext },
   _runWithContext: { value: runWithContext },
   _nativeEvent: { value: nativeEvent },
@@ -468,5 +524,5 @@ Object.defineProperties(module.exports, {
   _hookFields: { value: hookFields },
   _getPromiseHooks: { value: getPromiseHooks },
   // Node's async_wrap.queueDestroyAsyncId: a destroy event for an id with no resource.
-  _queueDestroyId: { value: id => { if (hooks.size !== 0) pendingDestroy.push({ id, destroyed: true }); } },
+  _queueDestroyId: { value: id => { if (hookCount !== 0) pendingDestroy.push({ id, destroyed: true }); } },
 });
