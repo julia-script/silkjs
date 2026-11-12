@@ -3,9 +3,10 @@
 
 Usage: python3 tools/startup_order.py path/to/silkjsruntime
 
-Runs the given release executable under valgrind's callgrind on an empty script and on
-one console.log, and lists every function either run entered, in the order callgrind
-first names them. tools/build.py hands the list to the linker, which places these
+Runs the given release executable under valgrind's callgrind on a few small starts (an
+empty script, one console.log, a local require, a timer), each from the executable's
+heap image, and lists every function a run entered, in the order callgrind first names
+them. tools/build.py hands the list to the linker, which places these
 functions together (see startup_order there). Function names are hashes of what a
 function is, not of where it lands, so the list stays right across builds; a name that
 no longer exists is ignored by the linker. Run this again when startup changes shape.
@@ -19,12 +20,13 @@ import tempfile
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 NAME = re.compile(r'^c?fn=\(\d+\) (silk_[0-9a-f]{32})$')
-SCRIPTS = ['', 'console.log("hello");\n']
+SCRIPTS = ['', 'console.log("hello");\n', "require('./dependency.js');\n", 'setTimeout(() => {}, 1);\n']
 
 
 def entered(executable, script, directory, seen, order):
     source = directory / 'main.js'
     source.write_text(script)
+    (directory / 'dependency.js').write_text('module.exports = 1;\n')
     profile = directory / 'callgrind.out'
     subprocess.run(
         ['valgrind', '--tool=callgrind', f'--callgrind-out-file={profile}', str(executable), str(source)],
