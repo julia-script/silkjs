@@ -741,6 +741,32 @@ function createLoader(host, builtins) {
     return mode === 'import' && parsed.suffix ? url : parsed.filename;
   }
 
+  // A module whose URL is neither file: nor a builtin's (a data: or http: module).
+  function urlParent(parent) {
+    return /^[A-Za-z][A-Za-z\d+.-]*:/.test(parent) && !parent.startsWith('file:') && !isBuiltinFile(parent);
+  }
+  // Node's moduleResolve for such a parent, after builtins: a relative or absolute path
+  // resolves against the URL, a URL stands for itself (undefined: the caller goes on),
+  // and a bare name has no package to look in.
+  function urlParentResolve(specifier, parent) {
+    if (specifier === '/' || /^(?:\.{1,2}(?:\/|$)|\/)/.test(specifier)) {
+      try { return new (builtins.get('url').URL)(specifier, parent).href; }
+      catch (cause) {
+        const unsupported = error('ERR_UNSUPPORTED_RESOLVE_REQUEST', specifier, parent);
+        unsupported.cause = cause;
+        throw unsupported;
+      }
+    }
+    if (builtins.get('url').URL.canParse(specifier) || builtinName(specifier) !== null) return undefined;
+    if (parent.startsWith('data:')) {
+      const unsupported = error('ERR_UNSUPPORTED_RESOLVE_REQUEST', specifier, parent);
+      unsupported.cause = error('ERR_INVALID_URL', specifier);
+      throw unsupported;
+    }
+    // packageResolve reads package.json files through fileURLToPath, which takes file: only.
+    throw error('ERR_INVALID_URL_SCHEME', 'file');
+  }
+
   function defaultResolve(specifier, context) {
     if (context.conditions !== undefined && !Array.isArray(context.conditions)) throw invalidArgValue('context.conditions', context.conditions, 'expected an array');
     const mode = context.conditions && context.conditions.includes('require') ? 'require' : 'import';
@@ -748,8 +774,9 @@ function createLoader(host, builtins) {
     if (specifier.startsWith('data:')) return { url: specifier, format: textImport ? 'text' : dataFormat(specifier) };
     const builtin = builtinName(specifier);
     if (builtin !== null) return { url: builtinFile(builtin), format: 'builtin' };
-    if (context.parentURL && !context.parentURL.startsWith('file:') && !/^[A-Za-z][A-Za-z\d+.-]*:/.test(specifier) && !path.isAbsolute(specifier)) {
-      throw error('ERR_UNSUPPORTED_RESOLVE_REQUEST', specifier, context.parentURL);
+    if (context.parentURL && urlParent(context.parentURL)) {
+      const href = urlParentResolve(specifier, context.parentURL);
+      if (href !== undefined) return { url: href, format: undefined };
     }
     const previous = activeConditions;
     activeConditions = context.conditions;
@@ -785,11 +812,9 @@ function createLoader(host, builtins) {
     regularFile = null;
     mode = mode === 'import' || mode === 'esm' ? 'import' : 'require';
     if (allowAsync === undefined) allowAsync = mode === 'import';
-    // defaultResolve's check, for the path without hooks that skips it: a module with a URL other than
-    // file: (a data: module) can import only URLs and absolute paths.
-    if (mode === 'import' && !hooks.active(allowAsync) && typeof parent === 'string' && /^[A-Za-z][A-Za-z\d+.-]*:/.test(parent) && !parent.startsWith('file:') &&
-        !isBuiltinFile(parent) && typeof specifier === 'string' && !/^[A-Za-z][A-Za-z\d+.-]*:/.test(specifier) && !path.isAbsolute(specifier) && builtinName(specifier) === null) {
-      throw error('ERR_UNSUPPORTED_RESOLVE_REQUEST', specifier, parent);
+    if (mode === 'import' && !hooks.active(allowAsync) && typeof parent === 'string' && typeof specifier === 'string' && urlParent(parent)) {
+      const href = urlParentResolve(specifier, parent);
+      if (href !== undefined) return { filename: href, format: undefined };
     }
     if (!hooks.active(allowAsync) && !String(specifier).startsWith('data:')) {
       return mockResolution(resolveInternal(specifier, parent, mode, options, new Set(), isMain), mode);
