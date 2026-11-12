@@ -835,6 +835,7 @@ function runPreloads(entry, loadImports = true) {
   // Before any preload: Node applies it when the context is made.
   if (host.disableProto !== undefined) disableProto(globalThis);
   if (host.disallowCodeGeneration) native.vmSetCodeGeneration(undefined, false);
+  if (host.experimentalShadowRealm) internalRequire('internal/shadow_realm').enable();
   // --experimental-loader: each one is module.register(specifier, cwd) before any preload.
   if (loadImports && loaderPreloads.length) {
     const base = internalRequire('url').pathToFileURL(host.cwd() + host.path.sep).href;
@@ -958,6 +959,10 @@ function runtimeFlag(arg) {
   if (arg.startsWith('--experimental-package-map=')) { host.packageMap = arg.slice(27); return true; }
   if (arg.startsWith('--experimental-loader=') || arg.startsWith('--loader=')) {
     loaderPreloads.push(arg.slice(arg.indexOf('=') + 1)); return true;
+  }
+  if (arg === '--experimental-shadow-realm' || arg === '--no-experimental-shadow-realm' ||
+      arg === '--harmony-shadow-realm' || arg === '--no-harmony-shadow-realm') {
+    host.experimentalShadowRealm = !arg.startsWith('--no-'); return true;
   }
   if (arg === '--experimental-vm-modules' || arg === '--no-experimental-vm-modules') {
     host.experimentalVmModules = arg === '--experimental-vm-modules'; return true;
@@ -1134,6 +1139,7 @@ const HELP_TEXT = `Usage: silkjsruntime [options] [script.js] [arguments]
   --experimental-eventsource
   --experimental-webstorage, --localstorage-file=PATH
   --experimental-stream-iter
+  --experimental-shadow-realm, --no-experimental-shadow-realm
   --experimental-vm-modules, --no-experimental-vm-modules
   --experimental-test-module-mocks, --no-experimental-test-module-mocks
   --trace-events-enabled

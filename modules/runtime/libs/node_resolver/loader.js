@@ -71,6 +71,8 @@ function createLoader(host, builtins) {
   const invalidArgType = (name, expected, value) => new codes.ERR_INVALID_ARG_TYPE(name, expected, value);
   const invalidArgValue = (name, value, reason) => new codes.ERR_INVALID_ARG_VALUE(name, value, reason);
   const error = (code, ...args) => new codes[code](...args);
+  // True while realmResolve runs: no bare name is a builtin then.
+  let realmResolving = false;
   const notFound = (message, properties) => Object.assign(new Error(message), { code: 'MODULE_NOT_FOUND' }, properties);
   const filenameOf = url => { try { return filesystemName(url); } catch (_) { return url; } };
   // A package's directory as Node's package errors name it.
@@ -233,7 +235,17 @@ function createLoader(host, builtins) {
       }
       return name;
     }
-    return builtins.listed(specifier) && builtins.has(specifier) ? specifier : null;
+    return !realmResolving && builtins.listed(specifier) && builtins.has(specifier) ? specifier : null;
+  }
+  // A ShadowRealm resolves as Node's defaultResolve in a realm that may load no
+  // builtin: no loader hooks or mocks, node: names are unknown, and a bare builtin
+  // name is looked up as a package.
+  function realmResolve(specifier, parentURL) {
+    if (builtinPrefix(specifier, 'node:') || builtinPrefix(specifier, 'silk:')) throw error('ERR_UNKNOWN_BUILTIN_MODULE', specifier);
+    const previous = realmResolving;
+    realmResolving = true;
+    try { return resolveInternal(specifier, parentURL, 'import', undefined, new Set(), false); }
+    finally { realmResolving = previous; }
   }
 
   // Where a builtin lives: node:fs for Node's modules, the specifier itself for silk: ones.
@@ -1643,7 +1655,7 @@ function createLoader(host, builtins) {
     return { source, format: resolved.format, filename: resolved.filename };
   }
 
-  return { decorateModuleError, moduleEvaluationError, resolveImport, importKey, moduleSource, requireFor, runMain, defaultRunMain, warmMain, resolve, resolveMain, loadESM, cleanSource, prepareSource, bridge, Module, mockModule };
+  return { decorateModuleError, moduleEvaluationError, realmResolve, resolveImport, importKey, moduleSource, requireFor, runMain, defaultRunMain, warmMain, resolve, resolveMain, loadESM, cleanSource, prepareSource, bridge, Module, mockModule };
 }
 
 module.exports = { createLoader };
