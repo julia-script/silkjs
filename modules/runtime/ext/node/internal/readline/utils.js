@@ -32,7 +32,7 @@ const {
   StringPrototypeSplit,
   StringPrototypeToLowerCase,
   Symbol,
-} = require('internal/readline/primordials');
+} = require('internal/per_context/primordials');
 
 const kUTF16SurrogateThreshold = 0x10000; // 2 ** 16
 const kEscape = '\x1b';

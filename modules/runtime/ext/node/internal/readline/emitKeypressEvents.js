@@ -25,7 +25,7 @@
 const {
   SafeStringIterator,
   Symbol,
-} = require('internal/readline/primordials');
+} = require('internal/per_context/primordials');
 
 const {
   charLengthAt,

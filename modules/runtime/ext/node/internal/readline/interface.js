@@ -55,7 +55,7 @@ const {
   Symbol,
   SymbolAsyncIterator,
   SymbolDispose,
-} = require('internal/readline/primordials');
+} = require('internal/per_context/primordials');
 
 const {
   AbortError,
@@ -63,22 +63,22 @@ const {
     ERR_INVALID_ARG_VALUE,
     ERR_USE_AFTER_CLOSE,
   },
-} = require('internal/readline/support');
+} = require('internal/errors');
 
 const {
   validateAbortSignal,
   validateString,
   validateUint32,
-} = require('internal/readline/support');
+} = require('internal/validators');
 const {
   assignFunctionName,
   kEmptyObject,
-} = require('internal/readline/support');
+} = require('internal/util');
 const {
   inspect,
   getStringWidth,
   stripVTControlCharacters,
-} = require('internal/readline/width');
+} = require('internal/util/inspect');
 const EventEmitter = require('events');
 const { addAbortListener } = require('internal/path_events/abort_listener');
 const {

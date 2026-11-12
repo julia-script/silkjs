@@ -25,7 +25,7 @@
 const {
   Promise,
   SymbolDispose,
-} = require('internal/readline/primordials');
+} = require('internal/per_context/primordials');
 
 const {
   Readline,
@@ -41,12 +41,12 @@ const {
 
 const {
   AbortError,
-} = require('internal/readline/support');
-const { validateAbortSignal } = require('internal/readline/support');
+} = require('internal/errors');
+const { validateAbortSignal } = require('internal/validators');
 
 const {
   kEmptyObject,
-} = require('internal/readline/support');
+} = require('internal/util');
 let addAbortListener;
 
 class Interface extends _Interface {
