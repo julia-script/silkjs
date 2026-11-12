@@ -39,6 +39,9 @@ function clonePayload(payload) {
   return copy;
 }
 
+// Node's SourceMap keeps its decoded mappings under this key; coverage reads them.
+const kMappings = Symbol('kMappings');
+
 class SourceMap {
   #payload;
   #mappings = [];
@@ -53,6 +56,7 @@ class SourceMap {
   }
 
   get payload() { return clonePayload(this.#payload); }
+  get [kMappings]() { return this.#mappings; }
   get lineLengths() { return this.#lineLengths?.slice(); }
 
   #parsePayload(payload, line, column) {
@@ -361,7 +365,21 @@ function mapPosition(frame, options = emptyOptions) {
     column: entry.originalColumn + 1, columnNumber: entry.originalColumn + 1 };
 }
 
+// sourceMapCacheToObject of Node's lib/internal/source_map/source_map_cache.js: the
+// module maps a NODE_V8_COVERAGE file carries as its "source-map-cache".
+function sourceMapCacheToObject() {
+  if (moduleEntries.size === 0) return undefined;
+  const obj = { __proto__: null };
+  for (const [key, record] of moduleEntries) {
+    const entry = dereference(record);
+    if (!entry) continue;
+    obj[key] = { __proto__: null, lineLengths: entry.lineLengths, data: entry.data, url: entry.sourceMapURL };
+  }
+  return obj;
+}
+
 module.exports = {
+  kMappings, sourceMapCacheToObject,
   SourceMap, findSourceMap, getSourceMapsSupport, setSourceMapsSupport,
   registerSource, unregisterSource, mapPosition,
 };

@@ -13,4 +13,16 @@ function evalScript(name, body, print) {
   return result;
 }
 
-module.exports = { evalScript };
+// tryGetCwd of Node's lib/internal/process/execution.js.
+function tryGetCwd() {
+  try {
+    return process.cwd();
+  } catch {
+    // getcwd(3) can fail if the current working directory has been deleted.
+    // Fall back to the directory name of the (absolute) executable path.
+    // It's not really correct but what are the alternatives?
+    return require('path').dirname(process.execPath);
+  }
+}
+
+module.exports = { evalScript, tryGetCwd };

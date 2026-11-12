@@ -19,6 +19,7 @@ const kBindings = {
   async_wrap: () => require('internal/async_wrap_binding'),
   buffer: () => require('internal/buffer_binding'),
   constants: () => require('internal/constants_binding'),
+  errors: () => require('internal/errors_binding'),
   crypto: () => require('internal/crypto/binding'),
   http2: () => require('internal/http2/binding'),
   // node_http_parser.cc: HTTPParser, ConnectionsList, methods, allMethods.
