@@ -48,9 +48,12 @@ function copyRequestRecord(record) {
     url: record.url, method: record.method, dispatcher: record.dispatcher, headers: record.headers,
     mode: record.mode, credentials: record.credentials, cache: record.cache, redirect: record.redirect,
     referrer: record.referrer, referrerPolicy: record.referrerPolicy, integrity: record.integrity, keepalive: record.keepalive,
-    signalSource: record.signalSource, followed: record.followed, signal: record.signal, body: record.body,
+    signalSource: record.signalSource, followed: record.followed, body: record.body,
   };
 }
+// What can abort a request: the signal it follows (request.signal only ever aborts with
+// it), or null when it was given none.
+function abortSource(record) { return record.followed ?? record.signalSource ?? null; }
 function signalGetter() { return this.followed ??= followSignal(this.signalSource); }
 function lazySignal(record) { Object.defineProperty(record, 'signal', { get: signalGetter, enumerable: true, configurable: true }); }
 class Request {
@@ -279,4 +282,4 @@ function serverRequest(fields, authority, bytes) {
 }
 body.readStates(value => readRequest(value) ?? readResponse(value));
 body.installBody(Request.prototype); body.installBody(Response.prototype);
-module.exports = { Request, Response, copyRequestRecord, readResponse, takeResponseText, requestState, responseState, makeResponse, serverRequest, nullBodyStatus, redirectStatus };
+module.exports = { Request, Response, copyRequestRecord, abortSource, readResponse, takeResponseText, requestState, responseState, makeResponse, serverRequest, nullBodyStatus, redirectStatus };

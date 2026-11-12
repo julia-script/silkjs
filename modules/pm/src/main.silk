@@ -1,39 +1,36 @@
 //! A development entry point for the package manager while it grows outside the runtime binary.
 //! The runtime's command line will dispatch to the same modules.
 //!
-//! `pm fetch <name> [version, range or tag]` resolves one package against its registry, downloads
-//! the tarball, checks it and unpacks it into the store.
+//! `pm install` installs the dependencies of the `package.json` in the working directory and
+//! keeps the lockfile beside it; `pm ci`, or `--frozen-lockfile`, fails when the lockfile does
+//! not match. `pm add`, `pm remove` and `pm update` change the dependencies and install.
 
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.collections.bytes { Bytes }
+import silk.collections.list { List }
+import silk.concurrency.thread_native { SpawnError }
+import silk.concurrency.thread_pool { Pool, ThreadPool }
 import silk.core.effect { Effect }
 import silk.core.option { Option }
 import silk.core.result { Result }
-import silk.http.client { Http, HttpError }
+import silk.http.client { HttpError }
 import silk.http.client_native { NativeHttp }
 import silk.io.writer { Writer, WriterError }
 import silk.io.writer_native { StdoutWriter }
 import silk.system.host_input { HostInput, HostInputError }
+import silk.system.system_info { SystemInfo }
+import silk.system.system_info_native { OsSystemInfo }
 import silk.text.format { Format }
 import silk.text.string { String }
+import npm.commands { CommandError, addDependencies, installProject, removeDependencies, updateProject }
+import npm.install { InstallError }
+import npm.manifest { DEVELOPMENT, OPTIONAL, PRODUCTION }
 import npm.npmrc { Npmrc }
-import npm.packument { Packument, Published }
-import npm.registry { RegistryError, RegistryErrorKind, fetchPackument, fetchTarball }
+import npm.registry { NetworkRegistry, Registry }
+import npm.resolve { Host, ResolveError }
 import pkg.files { readOptional }
-import pkg.integrity { Integrity }
-import pkg.json_walk { Text }
-import pkg.semver { Range }
-import pkg.store { PackageFiles, Store, StoreError }
+import pkg.store { Store, StoreError }
 import pkg.text { same }
-
-/// Why the command stopped, as a message for the person.
-struct Stop {
-  message: string<'static>,
-}
-
-effect fn stop(message: string<'static>) -> never ! Stop {
-  fail Stop { message: message }
-}
 
 effect fn variable(name: &[u8]) -> Bytes ! HostInputError | OutOfMemoryError ? &mut HostInput | &mut Allocator {
   return match move run HostInput.variable(name) {
@@ -58,125 +55,143 @@ effect fn settings() -> Npmrc ! HostInputError | OutOfMemoryError ? &mut HostInp
   return move config
 }
 
-effect fn choose<'a>(packument: &Packument<'a>, wanted: &[u8]) -> Published<'a> ! Stop | OutOfMemoryError ? &mut Allocator {
-  let tagged = if wanted.length == 0 { Packument.tagged(packument, b"latest") } else { Packument.tagged(packument, wanted) }
-  match tagged {
-    Option.Some { value } => { return value }
-    Option.None => {}
-  }
-  let range = match move run Range.parse(wanted) {
-    Option.None => { run stop("that is not a version, a range or a tag of the package") }
-    Option.Some { value } => move value
-  }
-  return match Packument.pick(packument, &range) {
-    Option.Some { value } => value
-    Option.None => { run stop("no published version satisfies the range") }
-  }
-}
-
-effect fn fetch(name: &[u8], wanted: &[u8]) -> ()
-  ! Stop | RegistryError | HttpError | StoreError | HostInputError | WriterError | OutOfMemoryError
-  ? &mut Http | &mut HostInput | &mut Writer | &mut Allocator {
-  let config = run settings()
-  let document = run fetchPackument(&config, name)
-  let packument = match move run Packument.parse(Bytes.asSlice(&document)) {
-    Option.None => { run stop("the registry did not answer with package metadata") }
-    Option.Some { value } => move value
-  }
-  let published = run choose(&packument, wanted)
-
-  let expected = match Integrity.parse(Text.bytes(&published.integrity)) {
-    Option.Some { value } => value
-    Option.None => match Integrity.fromShasum(Text.bytes(&published.shasum)) {
-      Option.Some { value } => value
-      Option.None => { run stop("the registry gives no digest for the tarball") }
-    }
-  }
-  let url = run Text.decode(&published.tarball)
-  let tarball = run fetchTarball(&config, Bytes.asSlice(&url))
-  if Integrity.matches(&expected, Bytes.asSlice(&tarball)) == false {
-    run stop("the tarball does not have the digest the registry promised")
-  }
-
+// Opens the store named by `SILKJS_STORE`, or the one in the home directory.
+effect fn openStore() -> Store ! CommandError | HostInputError | OutOfMemoryError ? &mut HostInput | &mut Allocator {
   let mut root = run variable(b"SILKJS_STORE")
   if Bytes.length(&root) == 0 {
     root = run variable(b"HOME")
     run root.append(b"/.silkjs/store")
   }
-  let store = run Store.open(Bytes.asSlice(&root))
-  let files = run Store.addTarball(&store, Bytes.asSlice(&tarball))
-  let mut total: u64 = 0
-  let entries = PackageFiles.all(&files)
-  let mut index: usize = 0
-  while index < entries.length {
-    total = total + entries[index].size
-    index = index + 1
+  return match move run Effect.result(Store.open(Bytes.asSlice(&root))) {
+    Result.Success { value } => move value
+    Result.Failure { error } => match move error {
+      StoreError _ => { fail CommandError { message: "the store cannot be opened at", subject: move root } }
+      OutOfMemoryError exhausted => { fail move exhausted }
+    }
   }
-  run Format.format("{name}@{version}: {count} files, {bytes} bytes, from a {packed} byte tarball\n", &.{
-    name: run text(name),
-    version: run text(published.text),
-    count: entries.length,
-    bytes: total,
-    packed: Bytes.length(&tarball),
+}
+
+const USAGE: string<'static> = "usage: pm install [--frozen-lockfile] | ci | add <package>... [-D] [-O] [-E] | remove <package>... | update [package]..."
+
+effect fn usage() -> never ! CommandError {
+  fail CommandError { message: USAGE, subject: Bytes.make() }
+}
+
+fn isOneOf(word: &[u8], first: &[u8], second: &[u8]) -> bool {
+  return same(word, first) || same(word, second)
+}
+
+effect fn command(pool: &Pool) -> ()
+  ! CommandError | ResolveError | InstallError | HostInputError | WriterError | OutOfMemoryError
+  ? &mut Registry | &mut HostInput | &mut Writer | &mut Allocator {
+  let verb = match move run HostInput.argument(1) {
+    Option.None => { run usage() }
+    Option.Some { value } => move value
+  }
+  // The words after the verb: package names, and flags that start with a dash.
+  let mut names = List<Bytes>.make()
+  let mut frozen = false
+  let mut exact = false
+  let mut kind = PRODUCTION
+  let mut position: usize = 2
+  while true {
+    let word = match move run HostInput.argument(position) {
+      Option.None => { break }
+      Option.Some { value } => move value
+    }
+    position = position + 1
+    let text = Bytes.asSlice(&word)
+    if text.length == 0 || text[0] != 45 {
+      run names.append(move word)
+    } else if same(text, b"--frozen-lockfile") {
+      frozen = true
+    } else if isOneOf(text, b"-D", b"--save-dev") {
+      kind = DEVELOPMENT
+    } else if isOneOf(text, b"-O", b"--save-optional") {
+      kind = OPTIONAL
+    } else if isOneOf(text, b"-P", b"--save-prod") {
+      kind = PRODUCTION
+    } else if isOneOf(text, b"-E", b"--save-exact") {
+      exact = true
+    } else {
+      fail CommandError { message: "this flag is not known", subject: move word }
+    }
+  }
+  let wanted = List<Bytes>.asSlice(&names)
+  let word = Bytes.asSlice(&verb)
+  let store = run openStore()
+  let host = Host.current()
+  let outcome = if isOneOf(word, b"install", b"i") && wanted.length == 0 {
+    run installProject(b".", &store, pool, host, frozen)
+  } else if same(word, b"ci") && wanted.length == 0 {
+    run installProject(b".", &store, pool, host, true)
+  } else if same(word, b"add") && wanted.length > 0 {
+    run addDependencies(b".", &store, pool, host, wanted, kind, exact)
+  } else if (isOneOf(word, b"remove", b"rm") || isOneOf(word, b"uninstall", b"un")) && wanted.length > 0 {
+    run removeDependencies(b".", &store, pool, host, wanted)
+  } else if isOneOf(word, b"update", b"up") || same(word, b"upgrade") {
+    run updateProject(b".", &store, pool, host, wanted)
+  } else {
+    run usage()
+  }
+  let changes: string = match move String.fromUtf8(Bytes.asSlice(&outcome.changes)) {
+    Result.Success { value } => move value
+    Result.Failure {..} => ""
+  }
+  run Format.format("{changes}", &.{ changes: changes })
+  if outcome.lockfile {
+    run Format.format("lockfile written\n", &.{})
+  }
+  run Format.format("{packages} packages: {downloaded} downloaded, {linked} linked\n", &.{
+    packages: outcome.summary.packages,
+    downloaded: outcome.summary.downloaded,
+    linked: outcome.summary.linked,
   })
 }
 
-effect fn text(bytes: &[u8]) -> string ! Stop {
-  return match move String.fromUtf8(bytes) {
+effect fn report(message: string<'static>, subject: &[u8]) -> () ! WriterError ? &mut Writer {
+  let about: string = match move String.fromUtf8(subject) {
     Result.Success { value } => move value
-    Result.Failure {..} => { run stop("a name is not valid text") }
+    Result.Failure {..} => ""
+  }
+  if subject.length == 0 {
+    run Format.format("pm: {message}\n", &.{ message: message })
+  } else {
+    run Format.format("pm: {message} {about}\n", &.{ message: message, about: about })
   }
 }
 
-effect fn command() -> ()
-  ! Stop | RegistryError | HttpError | StoreError | HostInputError | WriterError | OutOfMemoryError
-  ? &mut Http | &mut HostInput | &mut Writer | &mut Allocator {
-  let verb = match move run HostInput.argument(1) {
-    Option.None => Bytes.make()
-    Option.Some { value } => move value
-  }
-  let name = match move run HostInput.argument(2) {
-    Option.None => Bytes.make()
-    Option.Some { value } => move value
-  }
-  let wanted = match move run HostInput.argument(3) {
-    Option.None => Bytes.make()
-    Option.Some { value } => move value
-  }
-  if same(Bytes.asSlice(&verb), b"fetch") == false || Bytes.length(&name) == 0 {
-    run stop("usage: pm fetch <name> [version, range or tag]")
-  }
-  run fetch(Bytes.asSlice(&name), Bytes.asSlice(&wanted))
-}
-
-effect fn program() -> i32 ! HttpError | HostInputError | WriterError | OutOfMemoryError ? &mut HostInput | &mut Allocator {
+effect fn program() -> i32 ! HttpError | SpawnError | HostInputError | WriterError | OutOfMemoryError ? &mut HostInput | &mut Allocator {
   let mut writer = StdoutWriter.make()
-  let mut http = run NativeHttp.fromEnvironment()
-  let outcome = run Effect.result(command())
-    |> Effect.provideMut<Http>(&mut http)
+  let config = run settings()
+  let http = (run NativeHttp.fromEnvironment()).withConcurrency(64)
+  let mut registry = NetworkRegistry.make(move config, move http)
+  // One worker per processor for unpacking; the calling thread does the network.
+  let mut system = OsSystemInfo.make()
+  let processors = match run Effect.result(SystemInfo.availableParallelism()) |> Effect.provideMut<SystemInfo>(&mut system) {
+    Result.Success { value } => value
+    Result.Failure {..} => 4
+  }
+  let threads = run ThreadPool.make(processors)
+  let pool = threads.pool()
+  let outcome = run Effect.result(command(&pool))
+    |> Effect.provideMut<Registry>(&mut registry)
     |> Effect.provideMut<Writer>(&mut writer)
-  let message: string = match move outcome {
+  match move outcome {
     Result.Success {..} => { return 0 }
     Result.Failure { error } => match move error {
-      Stop stopped => stopped.message
-      RegistryError failure => match failure.kind {
-        RegistryErrorKind.NotFound => "the registry has no such package"
-        RegistryErrorKind.Unauthorized => "the registry refused the credentials"
-        RegistryErrorKind.Status => "the registry answered with an error status"
-        RegistryErrorKind.Url => "the registry URL is not valid"
-      }
-      HttpError failure => failure.message
-      StoreError _ => "the store could not be written"
+      CommandError stopped => { run report(stopped.message, Bytes.asSlice(&stopped.subject)) |> Effect.provideMut<Writer>(&mut writer) }
+      ResolveError failed => { run report(failed.message, Bytes.asSlice(&failed.subject)) |> Effect.provideMut<Writer>(&mut writer) }
+      InstallError failed => { run report(failed.message, Bytes.asSlice(&failed.subject)) |> Effect.provideMut<Writer>(&mut writer) }
       HostInputError failure => { fail move failure }
       WriterError failure => { fail move failure }
       OutOfMemoryError failure => { fail move failure }
     }
   }
-  run Format.format("pm: {message}\n", &.{ message: message }) |> Effect.provideMut<Writer>(&mut writer)
   return 1
 }
 
-pub effect fn main() -> i32 ! HttpError | HostInputError | WriterError | OutOfMemoryError ? &mut HostInput {
+pub effect fn main() -> i32 ! HttpError | SpawnError | HostInputError | WriterError | OutOfMemoryError ? &mut HostInput {
   let mut allocator = Allocator.systemAllocatorProvider()
   return run program() |> Effect.provideMut<Allocator>(&mut allocator)
 }
