@@ -1453,21 +1453,27 @@ function createLoader(host, builtins) {
     try { source = text(filesystemName(url)); } catch (_) { return; }
     host.attachArrow(cause, url, cleanSource(source), 0);
   }
-  // Node's ModuleJob._instantiate: a named import the root module asks of a CommonJS
+  // Node's ModuleJob._instantiate: a named import a module asks of a CommonJS
   // module that lacks it gets the hint to import the default export, with the import's
   // braces as a destructuring when its source line (the link error's arrow line) has them.
-  function commonJSNamedExportHint(cause, filename) {
+  function commonJSNamedExportHint(cause) {
     if (cause === null || typeof cause !== 'object' || cause.name !== 'SyntaxError' || typeof cause.message !== 'string') return;
     const match = /module '(.*)' does not provide an export named '(.+)'/.exec(cause.message);
     if (match === null) return;
     if (process.sourceMapsEnabled) return;
     const site = host.captureCallSites(-4, cause);
-    if (site === undefined || asURL(site[0]) !== asURL(filename)) return;
+    // A link error's site spans the import name; its script is the importer.
+    if (site === undefined || site[4] === undefined || typeof site[0] !== 'string') return;
+    const parent = site[0];
     const { 1: childSpecifier, 2: name } = match;
     let format;
-    try { format = resolve(childSpecifier, filesystemName(filename), 'import').format; } catch { return; }
+    try { format = resolve(childSpecifier, filesystemName(parent), 'import').format; } catch { return; }
     if (format !== 'commonjs') return;
-    const oneLineNamedImports = typeof site[3] === 'string' ? /{.*}/.exec(site[3]) : null;
+    let line = site[3];
+    if (typeof line !== 'string') {
+      try { line = cleanSource(text(filesystemName(parent))).split(/\r\n|[\n\r\u2028\u2029]/)[site[1] - 1]; } catch { line = undefined; }
+    }
+    const oneLineNamedImports = typeof line === 'string' ? /{.*}/.exec(line) : null;
     const destructuringAssignment = oneLineNamedImports && String(oneLineNamedImports).replace(/\s+as\s+/g, ': ');
     const previous = cause.message;
     cause.message = `Named export '${name}' not found. The requested module` +
@@ -1483,7 +1489,7 @@ function createLoader(host, builtins) {
 
   function decorateModuleError(cause, filename) {
     moduleSyntaxArrow(cause);
-    commonJSNamedExportHint(cause, filename);
+    commonJSNamedExportHint(cause);
     if (cause === null || typeof cause !== 'object' || cause.name !== 'ReferenceError') return cause;
     const match = /^(require|module|exports|__filename|__dirname) is not defined$/.exec(cause.message);
     if (!match) return cause;
