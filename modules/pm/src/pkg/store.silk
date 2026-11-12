@@ -25,6 +25,7 @@ import silk.num.u8
 import silk.num.u32
 import silk.num.u64
 import silk.num.usize
+import pkg.files { readOptional }
 import silk.platform.native.file { NativeFile, NativeFileError, OPEN_CREATE, OPEN_EXCLUSIVE, OPEN_WRITE_ONLY }
 
 /// What went wrong in a store operation.
@@ -201,6 +202,124 @@ fn afterFirstSegment(path: &[u8]) -> usize {
   return path.length
 }
 
+// Whether a path from an archive stays inside the package: relative, without `..` segments
+// and without control characters.
+fn safePath(path: &[u8]) -> bool {
+  if path.length == 0 || path[0] == 47 {
+    return false
+  }
+  let mut start: usize = 0
+  let mut index: usize = 0
+  while index <= path.length {
+    if index == path.length || path[index] == 47 {
+      let length = index - start
+      if length == 0 && index < path.length {
+        return false
+      }
+      if length == 2 && path[start] == 46 && path[start + 1] == 46 {
+        return false
+      }
+      start = index + 1
+    } else if path[index] < 32 {
+      return false
+    }
+    index = index + 1
+  }
+  return true
+}
+
+fn hexValue(byte: u8) -> u8 {
+  if byte >= 48 && byte <= 57 {
+    return byte - 48
+  }
+  if byte >= 97 && byte <= 102 {
+    return byte - 87
+  }
+  return 255
+}
+
+effect fn appendNumber(out: &mut Bytes, value: u64) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut digits: [u8; 20] = [0; 20]
+  let mut at: usize = 20
+  let mut rest = value
+  while true {
+    at = at - 1
+    digits[at] = u64.toU8(48 + rest % 10)
+    rest = rest / 10
+    if rest == 0 {
+      break
+    }
+  }
+  run out.append(Slice.view<u8>(&digits, at, 20 - at))
+}
+
+// Reads the lines of an index file. Returns none when the file is not a complete index.
+effect fn readIndex(text: &[u8]) -> Option<PackageFiles> ! OutOfMemoryError ? &mut Allocator {
+  let mut names = Bytes.make()
+  let mut entries = List<FileEntry>.make()
+  let mut index: usize = 0
+  while index < text.length {
+    let start = index
+    while index < text.length && text[index] != 10 {
+      index = index + 1
+    }
+    if index == text.length {
+      // The last line is cut short.
+      return Option<PackageFiles>.none()
+    }
+    let line = Slice.view<u8>(text, start, index - start)
+    index = index + 1
+    if line.length >= 4 && line[0] == 101 && line[1] == 110 && line[2] == 100 && line[3] == 32 {
+      // `end <count>` closes the index.
+      let mut count: usize = 0
+      let mut digit: usize = 4
+      while digit < line.length {
+        count = count * 10 + u8.toUsize(line[digit] - 48)
+        digit = digit + 1
+      }
+      if count != List<FileEntry>.length(&entries) || index != text.length {
+        return Option<PackageFiles>.none()
+      }
+      return Option<PackageFiles>.some(PackageFiles { names: move names, entries: move entries })
+    }
+    // `<64 hex> <x or -> <size> <path>`
+    if line.length < 70 || line[64] != 32 || line[66] != 32 {
+      return Option<PackageFiles>.none()
+    }
+    let mut key: [u8; 32] = [0; 32]
+    let mut byte: usize = 0
+    while byte < 32 {
+      let high = hexValue(line[byte * 2])
+      let low = hexValue(line[byte * 2 + 1])
+      if high == 255 || low == 255 {
+        return Option<PackageFiles>.none()
+      }
+      key[byte] = high * 16 + low
+      byte = byte + 1
+    }
+    let mut size: u64 = 0
+    let mut at: usize = 67
+    while at < line.length && line[at] != 32 {
+      if line[at] < 48 || line[at] > 57 {
+        return Option<PackageFiles>.none()
+      }
+      size = size * 10 + u8.toU64(line[at] - 48)
+      at = at + 1
+    }
+    if at + 1 >= line.length {
+      return Option<PackageFiles>.none()
+    }
+    let name = Slice.view<u8>(line, at + 1, line.length - at - 1)
+    if safePath(name) == false {
+      return Option<PackageFiles>.none()
+    }
+    let nameStart = Bytes.length(&names)
+    run names.append(name)
+    run entries.append(FileEntry { nameStart: nameStart, nameLength: name.length, key: key, size: size, executable: line[65] == 120 })
+  }
+  return Option<PackageFiles>.none()
+}
+
 impl Store {
   /// Opens the store at `root`, creating the directory when it is missing.
   pub effect fn open(root: &[u8]) -> Store ! StoreError | OutOfMemoryError ? &mut Allocator {
@@ -340,7 +459,10 @@ impl Store {
                 run Bytes.append(&mut names, Slice.view<u8>(member.name, skip, member.name.length - skip))
               }
               let nameLength = Bytes.length(&names) - nameStart
-              if nameLength > 0 {
+              if safePath(Slice.view<u8>(Bytes.asSlice(&names), nameStart, nameLength)) == false {
+                // A path that would land outside the package directory is not installed.
+                Bytes.truncate(&mut names, nameStart)
+              } else {
                 let key = run Store.addFile(self, member.content, member.executable)
                 run entries.append(FileEntry {
                   nameStart: nameStart,
@@ -356,5 +478,122 @@ impl Store {
       }
     }
     return PackageFiles { names: move names, entries: move entries }
+  }
+
+  // The path of the index file of the package identified by `id`.
+  effect fn indexPath(self: &Self, id: &[u8]) -> Bytes ! OutOfMemoryError ? &mut Allocator {
+    let key = Sha256.hash(id)
+    let mut path = run Bytes.copy(Bytes.asSlice(&self.root))
+    run path.append(b"/index/")
+    let mut hex: [u8; 65] = [0; 65]
+    let mut index: usize = 0
+    let mut at: usize = 0
+    while index < 32 {
+      if index == 1 {
+        hex[at] = 47
+        at = at + 1
+      }
+      hex[at] = hexDigit(u8.shiftRight(key[index], 4))
+      hex[at + 1] = hexDigit(key[index] & 15)
+      at = at + 2
+      index = index + 1
+    }
+    run path.append(&hex)
+    return move path
+  }
+
+  /// The files of a package that was unpacked before, by the identifier it was recorded under,
+  /// such as the integrity string of its archive. Returns none when the package is not recorded.
+  pub effect fn recorded(self: &Self, id: &[u8]) -> Option<PackageFiles> ! OutOfMemoryError ? &mut Allocator {
+    let path = run Store.indexPath(self, id)
+    return match move run readOptional(Bytes.asSlice(&path)) {
+      Option.None => Option<PackageFiles>.none()
+      Option.Some { value: text } => run readIndex(Bytes.asSlice(&text))
+    }
+  }
+
+  /// Records the files of a package under `id`, so a later [`Store.recorded`] finds them without
+  /// the archive.
+  ///
+  /// # Errors
+  /// - [`StoreError`] with `Io` when the record cannot be written.
+  pub effect fn record(self: &Self, id: &[u8], files: &PackageFiles) -> () ! StoreError | OutOfMemoryError ? &mut Allocator {
+    let mut text = Bytes.make()
+    let entries = PackageFiles.all(files)
+    let mut index: usize = 0
+    while index < entries.length {
+      let entry = entries[index]
+      let mut hex: [u8; 64] = [0; 64]
+      let mut byte: usize = 0
+      while byte < 32 {
+        hex[byte * 2] = hexDigit(u8.shiftRight(entry.key[byte], 4))
+        hex[byte * 2 + 1] = hexDigit(entry.key[byte] & 15)
+        byte = byte + 1
+      }
+      run text.append(&hex)
+      if entry.executable {
+        run text.append(b" x ")
+      } else {
+        run text.append(b" - ")
+      }
+      run appendNumber(&mut text, entry.size)
+      run text.append(b" ")
+      run text.append(PackageFiles.name(files, &entry))
+      run text.append(b"\n")
+      index = index + 1
+    }
+    run text.append(b"end ")
+    run appendNumber(&mut text, usize.toU64(entries.length))
+    run text.append(b"\n")
+
+    // Written under another name and renamed, so a reader never sees half a record.
+    let path = run Store.indexPath(self, id)
+    let target = Bytes.asSlice(&path)
+    let mut staging = run Bytes.copy(target)
+    run staging.append(b".new")
+    run makeDirectories(Slice.view<u8>(target, 0, target.length - 63))
+    drop run Effect.result(NativeFile.remove(Bytes.asSlice(&staging)))
+    let fd = match run Effect.result(NativeFile.open(Bytes.asSlice(&staging), OPEN_WRITE_ONLY | OPEN_CREATE | OPEN_EXCLUSIVE, 420)) {
+      Result.Success { value } => value
+      Result.Failure { error } => {
+        // Another process is writing the same record.
+        if error.code == EXISTS {
+          return ()
+        }
+        fail io(&error)
+      }
+    }
+    let outcome = run Effect.result(writeAll(fd, Bytes.asSlice(&text)))
+    drop run Effect.result(NativeFile.close(fd))
+    match move outcome {
+      Result.Failure { error } => {
+        drop run Effect.result(NativeFile.remove(Bytes.asSlice(&staging)))
+        fail io(&error)
+      }
+      Result.Success {..} => {}
+    }
+    match run Effect.result(NativeFile.rename(Bytes.asSlice(&staging), target)) {
+      Result.Failure { error } => { fail io(&error) }
+      Result.Success {..} => {}
+    }
+  }
+
+  /// Makes sure the executable variant of a store file exists, for a file that has to be
+  /// executable where it is linked though its archive did not mark it so.
+  ///
+  /// # Errors
+  /// - [`StoreError`] with `Io` when the store file cannot be read or written.
+  pub effect fn makeExecutable(self: &Self, key: &[u8; 32]) -> () ! StoreError | OutOfMemoryError ? &mut Allocator {
+    let variant = run Store.filePath(self, key, true)
+    match run Effect.result(NativeFile.status(Bytes.asSlice(&variant), false)) {
+      Result.Success {..} => { return () }
+      Result.Failure {..} => {}
+    }
+    let plain = run Store.filePath(self, key, false)
+    let content = match move run readOptional(Bytes.asSlice(&plain)) {
+      Option.Some { value } => move value
+      Option.None => { fail StoreError { kind: StoreErrorKind.Io, code: MISSING } }
+    }
+    drop run Store.addFile(self, Bytes.asSlice(&content), true)
   }
 }
