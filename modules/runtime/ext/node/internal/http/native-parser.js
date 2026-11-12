@@ -71,6 +71,13 @@ function event(parser, state, kind, value, remaining) {
       return state.pauseRequested && !result ? 21 : result | 0;
     }
     case 8: callback(parser, state, HTTPParser.kOnBody, call1, Buffer.from(value)); break;
+    case 14: {
+      // Like Node's TrackHeaderPair: the first field of a request's header section reads
+      // maxHeaderPairs; a number above zero limits the fields to half of it.
+      const limit = parser.maxHeaderPairs;
+      if (typeof limit !== 'number' || !(limit > 0)) return 0;
+      return Math.min(Math.max(1, Math.floor(limit)), 0x7fffffff);
+    }
     case 9:
       if (value !== undefined) callback(parser, state, HTTPParser.kOnHeaders, call2, [value, '']);
       state.headersComplete = false;
@@ -108,7 +115,7 @@ function resetAsync(state, owner, id) {
 class HTTPParser {
   constructor() {
     const state = { id: 0, type: HTTPParser.REQUEST, resource: null, connections: null, messageStart: 0, beingFreed: false, topLevel: false, provider: 0, frame: undefined, consuming: null,
-      currentRead: null, executing: false, pauseRequested: false, remaining: 0, remainder: null, maxHeaderPairs: undefined };
+      currentRead: null, executing: false, pauseRequested: false, remaining: 0, remainder: null };
     resetMessage(state);
     state.callback = (kind, value, remaining) => event(this, state, kind, value, remaining);
     state.id = native(0, new WeakRef(state.callback));
@@ -139,12 +146,6 @@ class HTTPParser {
       // Like Node, a connection that never sends a byte still has a deadline.
       connectionsList._begin(this, state);
     }
-  }
-  get maxHeaderPairs() { return states.get(this)?.maxHeaderPairs; }
-  set maxHeaderPairs(value) {
-    const state = stateOf(this);
-    state.maxHeaderPairs = value;
-    if (state.id) native(11, state.id, typeof value === 'number' && value > 0 ? value : 0);
   }
   getAsyncId() { return stateOf(this).resource?.asyncId() ?? -1; }
   getProviderType() { const state = stateOf(this); return state.id ? state.provider : 0; }

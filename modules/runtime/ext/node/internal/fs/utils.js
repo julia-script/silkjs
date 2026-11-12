@@ -46,12 +46,12 @@ function integer(value, name, min = 0, max = Number.MAX_SAFE_INTEGER) { v.valida
 function toPathIfFileURL(value) {
   if (value == null || typeof value !== 'object' || value.href === undefined || value.protocol === undefined) return value;
   if (value.protocol !== 'file:') { throw new ERR_INVALID_URL_SCHEME('file'); }
-  if (value.hostname !== '' && value.hostname !== 'localhost') throw new ERR_INVALID_FILE_URL_HOST(process.platform);
+  if (value.hostname !== '') throw new ERR_INVALID_FILE_URL_HOST(process.platform);
   const pathname = value.pathname;
   for (let n = 0; n < pathname.length; n++) {
-    if (pathname[n] === '%') { const third = pathname.codePointAt(n + 2) | 0x20; if (pathname[n + 1] === '2' && third === 102) throw new ERR_INVALID_FILE_URL_PATH('must not include encoded / characters'); }
+    if (pathname[n] === '%') { const third = pathname.codePointAt(n + 2) | 0x20; if (pathname[n + 1] === '2' && third === 102) throw new ERR_INVALID_FILE_URL_PATH('must not include encoded / characters', value); }
   }
-  return decodeURIComponent(pathname);
+  return pathname.includes('%') ? decodeURIComponent(pathname) : pathname;
 }
 function path(value, name = 'path') {
   value = toPathIfFileURL(value);
