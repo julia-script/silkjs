@@ -8,7 +8,10 @@ const { RemoteValues, inspect, protocolError, unsupported } = require('internal/
 const debuggerAgent = require('internal/inspector_debugger');
 const profiles = require('internal/inspector_profiles');
 const network = require('internal/inspector_network');
-const sessions = new Map();
+// Safe collections: exit paths run after user code may have replaced the Map and
+// iterator prototypes' methods (test-worker-terminate-source-map does).
+const { SafeMap } = require('internal/per_context/primordials');
+const sessions = new SafeMap();
 const routed = new Map();
 const workers = require('internal/inspector_workers').create(connectRemote);
 let nextSession = 1;
@@ -171,7 +174,7 @@ function dispatch(session, method, params) {
 }
 function createSession(key, send) {
   // A same-thread Session cannot answer while its thread is paused.
-  const session = { id: nextSession++, local: key.startsWith('local:'), runtime: false, contexts: new Map(), values: null,
+  const session = { id: nextSession++, local: key.startsWith('local:'), runtime: false, contexts: new SafeMap(), values: null,
     send(message) { if (sessions.get(key) === session) send(message); },
     emit(method, params) { if (sessions.get(key) === session) send({ method, params }); },
     evaluation(result, params) { return evaluation(session, result, params); },
@@ -272,17 +275,28 @@ const remoteSessions = () => { for (const key of sessions.keys()) if (key.starts
 // A session that asked for NodeRuntime.waitingForDisconnect keeps the main
 // context alive at exit until the last such session leaves.
 let exitRetained = false;
+// A plain array of the sessions, built without the iterator protocol.
+function sessionList() {
+  const list = [];
+  sessions.forEach(session => { list[list.length] = session; });
+  return list;
+}
 function contextsDestroyed() {
-  for (const session of [...sessions.values()]) if (session.runtime) for (const context of session.contexts.values())
-    session.emit('Runtime.executionContextDestroyed', { executionContextId: context.id, executionContextUniqueId: context.uniqueId });
+  const list = sessionList();
+  for (let i = 0; i < list.length; i++) {
+    const session = list[i];
+    if (session.runtime) session.contexts.forEach(context => session.emit('Runtime.executionContextDestroyed', { executionContextId: context.id, executionContextUniqueId: context.uniqueId }));
+  }
 }
 // Node's Agent::WaitForDisconnect, run after the 'exit' event while the inspector is active.
 function atExit() {
   // A worker's contexts end with its thread, before NodeWorker detaches its sessions.
   const worker = native(10) !== 0;
   if (!worker && !url() && sessions.size === 0) return;
+  if (worker && sessions.size === 0) return;
   if (!worker && remoteSessions()) host.writeStartupDiagnostic('Waiting for the debugger to disconnect...\n');
-  for (const session of [...sessions.values()]) if (session.notifyDisconnect) { session.emit('NodeRuntime.waitingForDisconnect', {}); exitRetained = true; }
+  const list = sessionList();
+  for (let i = 0; i < list.length; i++) if (list[i].notifyDisconnect) { list[i].emit('NodeRuntime.waitingForDisconnect', {}); exitRetained = true; }
   if (!exitRetained) contextsDestroyed();
   // Node's worker Agent::WaitForDisconnect: the thread stays until those sessions detach.
   if (worker) { while (exitRetained) native(4, 10); return; }
