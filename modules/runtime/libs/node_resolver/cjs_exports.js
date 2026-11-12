@@ -153,27 +153,39 @@ function analyzeExports(source) {
     if (text(i) === 'module' && text(i + 1) === '.' && text(i + 2) === 'exports') return i + 3;
     return -1;
   }
+  const identifier = (i) => list[i] !== undefined && list[i].value === undefined && /^[A-Za-z_$][\w$]*$/.test(list[i].text);
+  // cjs-module-lexer's object literal rule: keys whose values are plain identifiers,
+  // shorthand keys and `...require('x')` spreads. Anything else ends the scan, keeping
+  // the names found before it.
+  function objectLiteral(j) {
+    for (;;) {
+      if (identifier(j) || text(j) === '<string>') {
+        const key = j++;
+        const valued = text(j) === ':';
+        if (valued) {
+          if (!identifier(j + 1)) return;
+          j += 2;
+        }
+        if ((valued || identifier(key)) && name(key) !== undefined) names.add(name(key));
+      } else if (text(j) === '.' && text(j + 1) === '.' && text(j + 2) === '.') {
+        j += 3;
+        if (text(j) === 'require' && text(j + 1) === '(' && text(j + 2) === '<string>' && text(j + 3) === ')') {
+          if (name(j + 2) !== undefined) reexports.add(name(j + 2));
+          j += 4;
+        } else if (identifier(j)) j++;
+        else return;
+      } else return;
+      if (text(j) !== ',') return;
+      j++;
+    }
+  }
   for (let i = 0; i < list.length; i++) {
     let end = exportEnd(i);
     if (end !== -1) {
       if (text(end) === '.' && text(end + 2) === '=' && name(end + 1) !== undefined) names.add(name(end + 1));
       if (text(end) === '[' && text(end + 1) === '<string>' && text(end + 2) === ']' && text(end + 3) === '=' && name(end + 1) !== undefined) names.add(name(end + 1));
       if (text(i) === 'module' && text(end) === '=' && text(end + 1) === 'require' && text(end + 2) === '(' && text(end + 3) === '<string>' && text(end + 4) === ')' && name(end + 3) !== undefined) reexports.add(name(end + 3));
-      if (text(i) === 'module' && text(end) === '=' && text(end + 1) === '{') {
-        let depth = 0;
-        let atKey = true;
-        for (let j = end + 2; j < list.length; j++) {
-          const t = text(j);
-          if (depth === 0 && t === '}') break;
-          if (depth === 0 && atKey) {
-            if (name(j) !== undefined && [':', ',', '}', '('].includes(text(j + 1))) names.add(name(j));
-            atKey = false;
-          }
-          if (['{', '[', '('].includes(t)) depth++;
-          else if (['}', ']', ')'].includes(t)) depth--;
-          else if (t === ',' && depth === 0) atKey = true;
-        }
-      }
+      if (text(i) === 'module' && text(end) === '=' && text(end + 1) === '{') objectLiteral(end + 2);
     }
     if (text(i) === 'Object' && text(i + 1) === '.' && text(i + 2) === 'defineProperty' && text(i + 3) === '(') {
       end = exportEnd(i + 4);
