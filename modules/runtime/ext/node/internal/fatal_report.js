@@ -97,7 +97,9 @@ function format(error, fromPromise) {
   const nativeError = object && require('util/types').isNativeError(error);
   let source;
   try {
-    if (!host.decoratedErrors.has(error)) source = host.errorArrows.get(error) ?? arrow(error, fromPromise);
+    // GetErrorSource prints an arrow the error was given (setArrowMessage) first.
+    const given = object ? error[host.privateSymbols.arrow_message_private_symbol] : undefined;
+    if (!host.decoratedErrors.has(error)) source = (typeof given === 'string' ? given : undefined) ?? host.errorArrows.get(error) ?? arrow(error, fromPromise);
   } catch {}
   let text = '';
   // AppendExceptionLine prints the source of anything but an error at once.
