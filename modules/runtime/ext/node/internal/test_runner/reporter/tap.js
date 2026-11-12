@@ -1,25 +1,4 @@
-// Adapted from Node.js v24.22.1 lib/internal/test_runner/reporter/tap.js.
-// Copyright Joyent, Inc. and other Node contributors.
-//
-// Permission is hereby granted, free of charge, to any person obtaining a
-// copy of this software and associated documentation files (the
-// "Software"), to deal in the Software without restriction, including
-// without limitation the rights to use, copy, modify, merge, publish,
-// distribute, sublicense, and/or sell copies of the Software, and to permit
-// persons to whom the Software is furnished to do so, subject to the
-// following conditions:
-//
-// The above copyright notice and this permission notice shall be included
-// in all copies or substantial portions of the Software.
-//
-// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
-// OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
-// MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN
-// NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM,
-// DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR
-// OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE
-// USE OR OTHER DEALINGS IN THE SOFTWARE.
-
+// Adapted from Node.js v24.22.1 lib/internal/test_runner/reporter/tap.js by tools/port_test_runner.py.
 'use strict';
 const {
   ArrayPrototypeForEach,
@@ -34,9 +13,9 @@ const {
   StringPrototypeRepeat,
   StringPrototypeReplaceAll,
 } = require('internal/per_context/primordials');
-const { inspectWithNoCustomRetry } = require('internal/test_runner/support');
-const { isError, kEmptyObject } = require('internal/test_runner/support');
-const { getCoverageReport } = require('internal/test_runner/coverage_report');
+const { inspectWithNoCustomRetry } = require('internal/errors');
+const { isError, kEmptyObject } = require('internal/util');
+const { getCoverageReport } = require('internal/test_runner/utils');
 const kDefaultIndent = '    '; // 4 spaces
 const kFrameStartRegExp = /^ {4}at /;
 const kLineBreakRegExp = /\n|\r\n/;
@@ -45,7 +24,7 @@ const inspectOptions = { __proto__: null, colors: false, breakLength: Infinity }
 let testModule; // Lazy loaded due to circular dependency.
 
 function lazyLoadTest() {
-  testModule ??= require('internal/test_runner/support');
+  testModule ??= require('internal/test_runner/test');
   return testModule;
 }
 
@@ -199,7 +178,7 @@ function jsToYaml(indent, name, value, seen) {
 
   if (name != null) {
     result += prefix;
-    if (require('util').types.isDate(value)) {
+    if (require('internal/util/types').isDate(value)) {
       // YAML uses the ISO-8601 standard to express dates.
       result += ' ' + DatePrototypeToISOString(value);
     }

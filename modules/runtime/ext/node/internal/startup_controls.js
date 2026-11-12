@@ -130,6 +130,13 @@ function emitWarning(warning, type, code, ctor) {
   }
   process.nextTick(() => process.emit('warning', warning));
 }
+// Node's emitWarningSync (ProcessEmitWarningSync from C++): the 'warning' event now.
+function emitWarningSync(warning, type) {
+  warning = new Error(warning);
+  warning.name = type || 'Warning';
+  Error.captureStackTrace(warning, emitWarningSync);
+  process.emit('warning', warning);
+}
 function onWarning(warning) {
   if ((warning?.code && disabledWarnings.has(warning.code)) || (warning?.name && disabledWarnings.has(warning.name))) return;
   if (!(warning instanceof Error) || (warning.name === 'DeprecationWarning' && process.noDeprecation)) return;
@@ -239,7 +246,7 @@ function safeString(value) {
 }
 
 module.exports = {
-  valueError, applyOption, initialize, emitWarning, handleUncaught, fatalException, reportFatal, traceExit,
+  valueError, applyOption, initialize, emitWarning, emitWarningSync, handleUncaught, fatalException, reportFatal, traceExit,
   setUncaughtExceptionCaptureCallback, hasUncaughtExceptionCaptureCallback: () => captureCallback !== null,
   getOptionValue(name) {
     if (name === '--unhandled-rejections') return state.unhandledRejections;
