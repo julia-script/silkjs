@@ -490,6 +490,24 @@ function onRejection(promise, reason, handled) {
 // settle before the next ticks it queued run (test-esm-dynamic-import-commonjs).
 let mainJobsFirst = false;
 host.mainModuleEvaluated = () => { mainJobsFirst = true; };
+// Node's tick queue drain (lib/internal/process/task_queues.js), called with process as
+// its receiver: a tick's callback runs straight from it, so its stack shows
+// process.processTicksAndRejections below the callback, as Node's does.
+function processTicksAndRejections() {
+  while (tickHead !== ticks.length) {
+    const at = tickHead;
+    const callback = ticks[at], args = ticks[at + 1], scope = ticks[at + 2];
+    ticks[at] = ticks[at + 1] = ticks[at + 2] = undefined;
+    tickHead = at + 3;
+    asyncHooks._enterResource(scope);
+    try { Reflect.apply(callback, undefined, args); }
+    catch (error) { reportUncaught(error); }
+    finally {
+      try { asyncHooks._leaveResource(scope); }
+      finally { scope.emitDestroy(); }
+    }
+  }
+}
 function checkpoint() {
   if (mainJobsFirst) {
     mainJobsFirst = false;
@@ -500,13 +518,7 @@ function checkpoint() {
       // Jobs after nextTick callbacks run inside Node's processTicksAndRejections;
       // otherwise they are V8's own checkpoint, below which no stack shows.
       const alone = tickHead === ticks.length;
-      while (tickHead !== ticks.length) {
-        const at = tickHead;
-        const callback = ticks[at], args = ticks[at + 1], scope = ticks[at + 2];
-        ticks[at] = ticks[at + 1] = ticks[at + 2] = undefined;
-        tickHead = at + 3;
-        invokeResource(scope, callback, undefined, args);
-      }
+      if (!alone) native.runTicks(processTicksAndRejections, process);
       ticks.length = tickHead = 0;
       native.drainJobs(alone);
       if (ticksPending()) continue;

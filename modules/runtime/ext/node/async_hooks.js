@@ -62,6 +62,10 @@ function syncNativeHooks() {
   }
   host.setAsyncHooksEnabled(enabled);
 }
+// Read without calling anything that could overflow again.
+function stackOverflow(exception) {
+  return exception instanceof RangeError && exception.message === 'Maximum call stack size exceeded';
+}
 function emit(name, args, promise = false) {
   if (emitting || hooks.size === 0) return;
   // Mutations during dispatch affect the next event, not this event's listeners.
@@ -77,6 +81,9 @@ function emit(name, args, promise = false) {
       if (callback !== undefined) apply(callback, hook, args);
     }
   } catch (exception) {
+    // Node's hook callers catch with kFatalRethrowStackOverflow: a stack overflow goes on
+    // to the code that caused the event, where uncaughtException may still see it.
+    if (stackOverflow(exception)) throw exception;
     host.asyncHookFatal(exception);
   } finally {
     emitting = false;

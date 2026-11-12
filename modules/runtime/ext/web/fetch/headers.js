@@ -17,12 +17,19 @@ function byteString(value) {
   if (/[^\x00-\xff]/.test(text)) throw new TypeError('Header contains a character outside the ByteString range');
   return text;
 }
+// A token is ASCII, so a name that passes the token test is a ByteString too; the
+// ByteString check only decides which error a bad name throws.
 function nameOf(name) {
-  name = byteString(name);
-  if (!token.test(name)) throw new TypeError('Invalid header name: ' + name);
+  name = string(name);
+  if (!token.test(name)) { byteString(name); throw new TypeError('Invalid header name: ' + name); }
   return name.toLowerCase();
 }
+// Bytes a value can hold untouched: no NUL, CR, LF or tab, nothing above 0xff.
+const plain = /[^\x20-\x7e\x80-\xff]/;
 function valueOf(value) {
+  value = string(value);
+  const last = value.length - 1;
+  if (!plain.test(value) && (last < 0 || value.charCodeAt(0) !== 32 && value.charCodeAt(last) !== 32)) return value;
   value = byteString(value).replace(/^[\t\n\r ]+|[\t\n\r ]+$/g, '');
   if (/[\0\r\n]/.test(value)) throw new TypeError('Invalid header value');
   return value;
