@@ -130,7 +130,7 @@ function createContext(sandbox = {}, value) {
   // Node registers the context's importModuleDynamically for an import() with no
   // referrer script; without one, such an import() reports the missing callback.
   host.vmSetImportModuleDynamically(handle, importCallback(config.importModuleDynamically, result,
-    require('path').join(process.cwd(), 'vm-context')), true);
+    require('path').join(host.tryGetCwd(), 'vm-context')), true);
   require('internal/inspector_contexts').register(result, handle, config);
   return result;
 }

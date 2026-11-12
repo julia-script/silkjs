@@ -339,6 +339,26 @@ function reportUncaught(error) {
   }
 }
 host.triggerUncaughtException = reportUncaught;
+// node_errors.cc AppendExceptionLine: a compile error carries its arrow,
+// "<script>:<line>\n<source line>\n<caret>\n", which ReportFatalException prints
+// in place of where the error was rethrown. prefix is the length of a wrapper
+// that came before the source on its first line. decorateErrorStack puts the
+// arrow into the stack itself and marks the error decorated: no arrow then.
+host.errorArrows = new WeakMap();
+host.decoratedErrors = new WeakSet();
+host.attachArrow = (error, scriptName, source, prefix) => {
+  if (!(error instanceof SyntaxError) || host.errorArrows.has(error) || !Number.isInteger(error.lineNumber)) return;
+  const line = error.lineNumber;
+  const text = String(source).split(/\r\n|[\n\r\u2028\u2029]/)[line - 1];
+  if (text === undefined) return;
+  const column = error.columnNumber - 1 - (line === 1 ? prefix : 0);
+  let caret = '';
+  if (column >= 0 && column < text.length) {
+    for (let index = 0; index < column; index++) caret += text[index] === '\t' ? '\t' : ' ';
+    caret += '^\n';
+  }
+  host.errorArrows.set(error, scriptName + ':' + line + '\n' + text + '\n' + caret);
+};
 // Runs a timer or immediate callback; true when it threw (and was reported).
 function invokeReporting(callback, receiver, args) {
   try { Reflect.apply(callback, receiver, args); return false; }
@@ -1074,7 +1094,11 @@ function prepareInput(source, filename, inputType, explicit) {
     try { return host.stripTypeScriptModuleTypes(source, filename); }
     catch (strippingError) {
       if (strippingError.code === 'ERR_INVALID_TYPESCRIPT_SYNTAX' ||
-          strippingError.code === 'ERR_UNSUPPORTED_TYPESCRIPT_SYNTAX') throw error;
+          strippingError.code === 'ERR_UNSUPPORTED_TYPESCRIPT_SYNTAX') {
+        // The script is named [eval] or [stdin], as Node compiles it.
+        host.attachArrow(error, host.path.basename(filename), source, 0);
+        throw error;
+      }
       throw strippingError;
     }
   }
@@ -1366,7 +1390,11 @@ function run() {
     const name = fromStdin ? host.path.join(host.tryGetCwd(), '[stdin]') : resolved.filename;
     const source = loader.cleanSource(fromStdin ? rawStd.in.readAsString() : host.Buffer.from(host.readFile(name)).toString('utf8'));
     const module = fromStdin ? inputType === 'module' || (!inputTypeSet && native.detectModuleSyntax(source)) : resolved.format === 'module';
-    native.checkSyntax(module ? source : loader.Module.wrap(source), name, module);
+    // node:internal/main/check_syntax names piped source [stdin].
+    const scriptName = fromStdin ? '[stdin]' : name;
+    const wrapped = module ? source : loader.Module.wrap(source);
+    try { native.checkSyntax(wrapped, scriptName, module); }
+    catch (error) { host.attachArrow(error, scriptName, source, wrapped.indexOf(source)); throw error; }
     return;
   }
   if (testMode) {
