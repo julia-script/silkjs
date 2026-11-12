@@ -116,7 +116,8 @@ class FileHandle extends EventEmitter {
       async cancel() { await ondone(); },
     });
     this[kRef]();
-    this.once('close', () => { readable.cancel().catch(() => {}); });
+    // Node's readableStreamCancel: the stream is cancelled even while a reader holds its lock.
+    this.once('close', () => { require('internal/webstreams/readablestream').readableStreamCancel(readable); });
     return readable;
   }
   createReadStream(options = undefined) { return new (require('internal/fs/streams').ReadStream)(undefined, { ...options, fd: this }); }
