@@ -21,9 +21,9 @@ const EVENT_SENT = 4;
 const EVENT_CLOSED = 6;
 
 class UDP {
-  // Node's new UDP() has no family until bind; its bind() is the IPv4 one (bind6 is IPv6),
-  // so a handle made without one is an IPv4 socket.
-  constructor(family = 4) {
+  // Like UDPWrap, new UDP() has no family until bind() (IPv4), bind6() (IPv6) or open()
+  // gives it one; dgram makes its handles with the socket type's family.
+  constructor(family) {
     this.family = family;
     this.owner = null;
     this.onmessage = null;
@@ -36,10 +36,17 @@ class UDP {
       host.invokeResource(this.resource, this.dispatch, this, [event, status, payload, extra], false);
       host.checkpoint();
     };
+    this.id = null;
+    if (family !== undefined) this.create(family);
+  }
+  create(family) {
+    this.family = family;
     this.id = host.net('create', [family === 4 ? 3 : 4, this.callback]);
     if (this.id < 0) {
+      const status = this.id;
+      this.id = null;
       this.resource.emitDestroy();
-      throw new (require('internal/errors').ErrnoException)(this.id, 'socket');
+      throw new (require('internal/errors').ErrnoException)(status, 'socket');
     }
   }
   dispatch(event, status, payload, extra) {
@@ -55,7 +62,8 @@ class UDP {
       this.resource.emitDestroy();
     }
   }
-  call(operation, ...args) { return host.net(operation, [this.id, ...args]); }
+  // A handle without a family has no socket yet: libuv answers EBADF for it.
+  call(operation, ...args) { return this.id === null ? UV_EBADF : host.net(operation, [this.id, ...args]); }
   get fd() { const fd = this.closed ? -1 : this.call('fileno'); return fd >= 0 ? fd : -1; }
   // Node's handle.lookup: an IP literal of the socket's family resolves to itself.
   lookup(address, callback) {
@@ -65,8 +73,9 @@ class UDP {
       require('dns').lookup(address, this.family, callback);
     } else this.lookupFunction(address, this.family, callback);
   }
-  bind(ip, port, flags) { return this.call('bind', ip, port, flags); }
-  open(fd) { return this.call('open', fd); }
+  bind(ip, port, flags) { if (this.id === null) this.create(4); return this.call('bind', ip, port, flags); }
+  bind6(ip, port, flags) { if (this.id === null) this.create(6); return this.call('bind', ip, port, flags); }
+  open(fd) { if (this.id === null) this.create(4); return this.call('open', fd); }
   recvStart() { return this.call('recvStart'); }
   recvStop() { return this.closed ? 0 : this.call('recvStop'); }
   connect(ip, port) { return this.call('udpConnect', ip, port); }
@@ -86,7 +95,14 @@ class UDP {
     return status;
   }
   address(peer) { return this.call('address', peer); }
-  option(name, value) { return this.call('udpOption', name, value); }
+  // UDPWrap's getsockname/getpeername fill `out` and return a status.
+  getsockname(out) { const result = this.address(false); if (typeof result === 'number') return result; Object.assign(out, result); return 0; }
+  getpeername(out) { const result = this.address(true); if (typeof result === 'number') return result; Object.assign(out, result); return 0; }
+  option(name, value) {
+    // node_udp.cc BufferSize: a size past INT32_MAX is EINVAL before libuv sees it.
+    if ((name === 'recvBufferSize' || name === 'sendBufferSize') && value > 0x7fffffff) return UV_EINVAL;
+    return this.call('udpOption', name, value);
+  }
   membership(group, iface, join, source) {
     return this.call('membership', group, iface === undefined ? null : iface, join, source === undefined ? null : source);
   }
@@ -98,14 +114,15 @@ class UDP {
     this.closed = true;
     this.requests.clear();
     this.queueSize = 0;
+    if (this.id === null) { this.resource.emitDestroy(); return; }
     host.net('close', [this.id]);
   }
   // UDPWrap's owner, which cluster closes through on a disconnect.
   get [owner_symbol]() { return this.owner; }
   set [owner_symbol](owner) { this.owner = owner; }
-  ref() { if (!this.closed) this.call('ref'); }
-  unref() { if (!this.closed) this.call('unref'); }
-  hasRef() { return !this.closed && !!this.call('hasRef'); }
+  ref() { if (!this.closed && this.id !== null) this.call('ref'); }
+  unref() { if (!this.closed && this.id !== null) this.call('unref'); }
+  hasRef() { return !this.closed && (this.id === null || !!this.call('hasRef')); }
 }
 
 function newHandle(type, lookup) {
@@ -116,7 +133,7 @@ function newHandle(type, lookup) {
   return handle;
 }
 
-const { UV_EINVAL } = require('internal/net/binding').uv;
+const { UV_EINVAL, UV_EBADF } = require('internal/net/binding').uv;
 
 function _createSocketHandle(address, port, addressType, fd, flags) {
   const handle = newHandle(addressType);
