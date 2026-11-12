@@ -166,5 +166,6 @@ function install(process) {
   });
   process.report = require('internal/process_report').createReport(process);
   process.abort = function abort() { native('abort'); };
+  process.execve = require('internal/process/per_thread').execve;
 }
 module.exports = { install };
