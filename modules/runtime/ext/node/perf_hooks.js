@@ -2,7 +2,8 @@
 
 const host = require('internal/host');
 const { EventTarget, Event, DOMException } = require('internal/path_events/event_target');
-const { createHistogram, createSlidingWindowHistogram, importHistogram, monitorEventLoopDelay, isRecordableHistogram } = require('internal/performance_histogram');
+const { createHistogram, createSlidingWindowHistogram, importHistogram, isHistogram } = require('internal/histogram');
+const monitorEventLoopDelay = require('internal/perf/event_loop_delay');
 const trace = require('internal/trace_events');
 const { codes: { ERR_INVALID_ARG_TYPE, ERR_INVALID_ARG_VALUE, ERR_MISSING_ARGS } } = require('internal/errors');
 const { validateFunction, validateObject } = require('internal/validators');
@@ -262,7 +263,7 @@ function timerify(fn, options = {}) {
   validateFunction(fn, 'fn');
   validateObject(options, 'options');
   const histogram = options.histogram;
-  if (histogram !== undefined && !isRecordableHistogram(histogram)) throw new ERR_INVALID_ARG_TYPE('options.histogram', 'RecordableHistogram', histogram);
+  if (histogram !== undefined && (!isHistogram(histogram) || typeof histogram.record !== 'function')) throw new ERR_INVALID_ARG_TYPE('options.histogram', 'RecordableHistogram', histogram);
   function timerified(...args) {
     const start = now();
     const complete = () => {

@@ -12,7 +12,13 @@ let warned = false;
 function parseTypeScript(source, options) {
   // Amaro's bundled Wasm runs in this realm's Silk WebAssembly implementation.
   // Loading lazily avoids compiling the parser for programs without TypeScript.
-  if (parser === undefined) parser = require('internal/deps/amaro/index').transformSync;
+  if (parser === undefined) {
+    // Node's assertTypeScript, when it loads the parser: Amaro is WebAssembly.
+    if (globalThis.WebAssembly === undefined) {
+      throw new (require('internal/errors').codes.ERR_WEBASSEMBLY_NOT_SUPPORTED)('TypeScript');
+    }
+    parser = require('internal/deps/amaro/index').transformSync;
+  }
   try {
     return parser(source, options);
   } catch (cause) {
@@ -25,6 +31,9 @@ function parseTypeScript(source, options) {
     const stack = error.stack;
     const newline = stack.indexOf('\n');
     error.stack = `${cause.filename}:${cause.startLine}\n${cause.snippet}\nSyntaxError [${code}]: ${cause.message}${newline < 0 ? '' : stack.slice(newline)}`;
+    // Node's decorateErrorWithSnippet: the stack leads with where the syntax is, so a
+    // fatal report prints no arrow for where it was thrown.
+    require('internal/host').decoratedErrors.add(error);
     throw error;
   }
 }
