@@ -741,7 +741,6 @@ function createLoader(host, builtins) {
     if (context.parentURL && !context.parentURL.startsWith('file:') && !/^[A-Za-z][A-Za-z\d+.-]*:/.test(specifier) && !path.isAbsolute(specifier)) {
       throw error('ERR_UNSUPPORTED_RESOLVE_REQUEST', specifier, context.parentURL);
     }
-    if (specifier.startsWith('file:') && mode === 'require') specifier = fromFileURL(specifier).filename;
     const previous = activeConditions;
     activeConditions = context.conditions;
     try {
@@ -1222,7 +1221,9 @@ function createLoader(host, builtins) {
     if (resolved.format === 'builtin' && !hooks.active(allowAsync)) return loadBuiltin(resolved.filename);
     const filename = filesystemName(resolved.filename);
     if (host.reportDependency && path.isAbsolute(filename)) host.reportDependency(filename);
-    if (own(cache, filename)) {
+    // A builtin is never looked up under its node: URL (Node's Module._cache holds only the
+    // bare names a user put there); the module mocker's cached entries live under that key.
+    if (resolved.format !== 'builtin' && own(cache, filename)) {
       if ((resolved.format === 'module' || detectedModules.has(cache[filename])) && !cache[filename].loaded) {
         throw cycleError(filename, parent);
       }

@@ -965,7 +965,7 @@ function missingImportCallback() {
   const { ERR_VM_DYNAMIC_IMPORT_CALLBACK_MISSING } = internalRequire('internal/errors').codes;
   return promiseReject(new ERR_VM_DYNAMIC_IMPORT_CALLBACK_MISSING());
 }
-function runPreloads(entry, loadImports = true, loadRequires = true) {
+function runPreloads(entry, loadImports = true, loadRequires = true, runImports = loadImports) {
   if (host.configFile) process.emitWarning('--experimental-config-file is an experimental feature and might change at any time', 'ExperimentalWarning');
   // Before any preload: Node applies it when the context is made.
   native.vmSetImportModuleDynamically(undefined, missingImportCallback, true);
@@ -989,7 +989,7 @@ function runPreloads(entry, loadImports = true, loadRequires = true) {
     process.emitWarning('Frozen intristics is an experimental feature and might change at any time', 'ExperimentalWarning');
     internalRequire('internal/freeze_intrinsics')();
   }
-  if (!loadImports || !importPreloads.length) return entry();
+  if (!runImports || !importPreloads.length) return entry();
   const name = host.path.join(host.tryGetCwd(), '[preload]');
   let pending = Promise.resolve();
   for (const specifier of importPreloads) {
@@ -1158,7 +1158,7 @@ function runtimeFlag(arg) {
   }
   return false;
 }
-function installRuntimeOptions(args, entrypoints = [], preloadEntrypoints = true) {
+function installRuntimeOptions(args, entrypoints = [], preloadEntrypoints = true, startInspector = true) {
   const preloadParent = host.path.join(host.tryGetCwd(), '[preload]');
   if (preloadEntrypoints) for (const [specifiers, mode] of [[requirePreloads, 'require'], [importPreloads, 'import']]) {
     for (const specifier of specifiers) {
@@ -1224,7 +1224,8 @@ function installRuntimeOptions(args, entrypoints = [], preloadEntrypoints = true
     const options = host.inspectorOptions;
     if (options?.port !== undefined) process.debugPort = options.port;
     process._breakFirstLine = !!options?.breakFirst;
-    if (options?.enabled) inspectorBackend._start(options.port, options.host, options.wait, options.breakFirst);
+    // A --test runner opens no endpoint of its own: its test processes get the inspector.
+    if (options?.enabled && startInspector) inspectorBackend._start(options.port, options.host, options.wait, options.breakFirst);
     if (workerThreads.isMainThread) inspectorBackend._installProcess(process, options?.host, !host.disableSigusr1);
     if (!workerThreads.isMainThread) inspectorBackend._waitForWorker();
   }
@@ -1583,12 +1584,13 @@ function run(restored = false) {
   }
   // With --test, --watch is the test runner's own watch mode (run({ watch })), as in Node.
   if (testMode) watchMode = false;
-  installRuntimeOptions(environment.concat(process.execArgv), entrypoints, !watchMode);
+  installRuntimeOptions(environment.concat(process.execArgv), entrypoints, !watchMode, !testMode);
   if (watchMode) return internalRequire('internal/main/watch_mode');
   // Counts start before user code; the harness's setupCoverage then finds coverage active.
   if (testCoverage && !testMode && !check) internalRequire('internal/profiler_binding').startCoverage();
-  // Node's internal/main/test_runner loads the -r modules itself (not with isolation none).
-  if (testMode) return runPreloads(() => internalRequire('internal/main/test_runner'), true, false);
+  // Node's internal/main/test_runner loads the -r modules itself (not with isolation none),
+  // and never runs --import: test files get it in their processes, or run() imports it.
+  if (testMode) return runPreloads(() => internalRequire('internal/main/test_runner'), true, false, false);
   return runPreloads(() => {
   if (check) {
     const fromStdin = filename === undefined || filename === '-';

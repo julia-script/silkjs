@@ -10,8 +10,12 @@ function getOrInitializeCascadedLoader() {
   if (cascadedLoader !== undefined) return cascadedLoader;
   const importers = new Map();
   const importerFor = (parentURL) => {
-    const filename = parentURL === undefined ? require('path').join(process.cwd(), 'repl') :
-      require('url').fileURLToPath(parentURL);
+    const path = require('path');
+    // A directory URL (the test runner imports reporters from `${cwd}/`) resolves inside
+    // that directory, as URL resolution does, so the importer is a file within it.
+    const filename = parentURL === undefined ? path.join(process.cwd(), 'repl') :
+      `${parentURL}`.endsWith('/') ? path.join(require('url').fileURLToPath(parentURL), '__silk_entry__.js') :
+        require('url').fileURLToPath(parentURL);
     let importer = importers.get(filename);
     if (importer === undefined) importers.set(filename, importer = host.vmCreateDefaultImporter(filename));
     return importer;

@@ -418,11 +418,48 @@ EventEmitter.prototype.getMaxListeners = function getMaxListeners() {
   return _getMaxListeners(this);
 };
 
+function enhanceStackTrace(err, own) {
+  let ctorInfo = '';
+  try {
+    const { name } = this.constructor;
+    if (name !== 'EventEmitter')
+      ctorInfo = ` on ${name} instance`;
+  } catch {
+    // Continue regardless of error.
+  }
+  const sep = `\nEmitted 'error' event${ctorInfo} at:\n`;
+
+  const errStack = err.stack.split('\n').slice(1);
+  const ownStack = own.stack.split('\n').slice(1);
+
+  const { identicalSequenceRange } = require('internal/util/inspect');
+  const { 0: len, 1: offset } = identicalSequenceRange(ownStack, errStack);
+  if (len > 0) {
+    ownStack.splice(offset + 1, len - 2,
+                    '    [... lines matching original stack trace ...]');
+  }
+
+  return err.stack + sep + ownStack.join('\n');
+}
+
 function getUnhandledErrorException(ee, args) {
   let er;
   if (args.length > 0)
     er = args[0];
-  if (er instanceof Error) return er;
+  if (er instanceof Error) {
+    try {
+      const capture = {};
+      Error.captureStackTrace(capture, EventEmitter.prototype.emit);
+      Object.defineProperty(er, require('internal/errors').kEnhanceStackBeforeInspector, {
+        __proto__: null,
+        value: enhanceStackTrace.bind(ee, er, capture),
+        configurable: true,
+      });
+    } catch {
+      // Continue regardless of error.
+    }
+    return er;
+  }
 
   let stringifiedEr;
   try {
