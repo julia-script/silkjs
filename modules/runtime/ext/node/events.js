@@ -55,7 +55,7 @@ const { kEmptyObject, spliceOne } = require('internal/path_events/support');
 
 const {
   inspect,
-} = { inspect: (...args) => require('util').inspect(...args) };
+} = { inspect: (...args) => Reflect.apply(require('util').inspect, undefined, args) };
 
 let FixedQueue;
 let kFirstEventParam;

@@ -4,17 +4,15 @@ const host = require('internal/host');
 const native = host.inspectorNative;
 const permission = require('internal/permission');
 const contexts = require('internal/inspector_contexts');
-const { RemoteValues, inspect, format, protocolError, unsupported } = require('internal/inspector_values');
+const { RemoteValues, inspect, protocolError, unsupported } = require('internal/inspector_values');
 const debuggerAgent = require('internal/inspector_debugger');
 const profiles = require('internal/inspector_profiles');
 const network = require('internal/inspector_network');
 const sessions = new Map();
 const routed = new Map();
 const workers = require('internal/inspector_workers').create(connectRemote);
-const previews = new Map();
 let nextSession = 1;
 let nextException = 1;
-let nextPreview = 1;
 let waiting = false;
 let workerWaitConsumed = false;
 const {
@@ -35,8 +33,11 @@ function evaluation(session, result, params) {
     if (params.awaitPromise) return Promise.resolve(result.value).then(value => ({ result: session.values.remote(value, params.objectGroup, !!params.returnByValue, !!params.generatePreview, params._context) }), value => evaluation(session, { status: 'exception', value }, { ...params, awaitPromise: false }));
     return { result: session.values.remote(result.value, params.objectGroup, !!params.returnByValue, !!params.generatePreview, params._context) };
   }
-  const exception = result.status === 'sideEffect' ? new EvalError('Possible side-effect in debug-evaluate') : result.status === 'terminated' || result.status === 'timeout' ? new Error('Execution was terminated') : result.value;
-  const remote = session.values.remote(exception, params.objectGroup);
+  // V8 answers a terminated evaluation with an error response, not an exception.
+  if (result.status === 'terminated' || result.status === 'timeout') throw protocolError(-32000, 'Execution was terminated');
+  const exception = result.status === 'sideEffect' ? new EvalError('Possible side-effect in debug-evaluate') : result.value;
+  // The exception belongs to the context that threw it, as the value of a success would.
+  const remote = session.values.remote(exception, params.objectGroup, false, !!params.generatePreview, params._context);
   return { result: remote, exceptionDetails: exceptionDetails(exception, remote) };
 }
 // V8's exceptionDetails: the throw site and stack come from the frames the error captured.
@@ -330,20 +331,6 @@ function armStartup() {
   if (native(10) === 0 && !url()) return;
   debuggerAgent.armStartup();
 }
-function evaluatePreview(expression, sandbox, timeout = 333) {
-  if (typeof expression !== 'string') return null;
-  const context = contexts.get(sandbox);
-  if (!context) return null;
-  let token;
-  try {
-    const result = native(12, expression, context.handle, true, timeout);
-    if (result.status !== 'success') return null;
-    token = nextPreview++;
-    previews.set(token, result.value);
-    return { token, text: format(result.value) };
-  } catch { if (token !== undefined) previews.delete(token); return null; }
-}
-function releasePreview(token) { previews.delete(token); }
 function broadcast(method, params) {
   // Node's agents check an event only where a session has its domain enabled.
   const isNetwork = method.startsWith('Network.');
@@ -414,4 +401,4 @@ if (native(10) === 0) {
   // Native state does not come with a heap image: a start from one registers again.
   host.onHydrate(() => { native(0, onNative); });
 }
-module.exports = { connect, open, close, url, waitForDebugger, _start: start, _atExit: atExit, _installProcess: installProcess, _waitForWorker: waitForWorkerStart, _armStartup: armStartup, evaluatePreview, releasePreview, broadcast, console: consoleBridge.console, emitConsole: consoleBridge.emitConsole, putNetworkResource: network.put };
+module.exports = { connect, open, close, url, waitForDebugger, _start: start, _atExit: atExit, _installProcess: installProcess, _waitForWorker: waitForWorkerStart, _armStartup: armStartup, broadcast, console: consoleBridge.console, emitConsole: consoleBridge.emitConsole, putNetworkResource: network.put };

@@ -93,7 +93,8 @@ const dotSegment = /\/\.\.?(?:\/|$)/;
 const fileHref = path => host.platform !== 'win32' && plainPath.test(path) && !dotSegment.test(path)
   ? 'file://' + path : internalRequire('url').pathToFileURL(path).href;
 const inspectorNativeOperations = Array.from({ length: 32 }, (_, index) => native['inspectorNative' + index]);
-host.inspectorNative = (operation, ...args) => inspectorNativeOperations[operation](...args);
+const reflectApply = Reflect.apply;
+host.inspectorNative = (operation, ...args) => reflectApply(inspectorNativeOperations[operation], undefined, args);
 host.inspectorEntry = wrapper => host.inspectorNative(15, wrapper);
 host.typeScriptMode = 'strip';
 host.testCoverageStart = () => native.testCoverageNative(0);
@@ -374,9 +375,11 @@ function checkpoint() {
       completion();
     }
     while (rejections.size) {
-      const pending = [...rejections];
-      for (const [promise, info] of pending) {
+      const pending = Array.from(rejections.keys());
+      for (let index = 0; index < pending.length; index++) {
+        const promise = pending[index];
         if (!rejections.has(promise)) continue;
+        const info = rejections.get(promise);
         const { context } = info;
         rejections.delete(promise);
         reportedRejections.set(promise, info);
@@ -396,7 +399,9 @@ function checkpoint() {
 host.checkpoint = checkpoint;
 // Node's lib/timers.js and lib/internal/timers.js run the timers; the loop
 // drives them through internal/timers_binding as Node's Environment does.
-host.invokeTimer = (scope, callback, receiver, args) => invokeScoped(scope, invokeReporting, callback, receiver, args);
+// Named, as Node's timer frames are: the REPL trims an error's frames below the
+// last one without a function name.
+host.invokeTimer = function invokeTimer(scope, callback, receiver, args) { return invokeScoped(scope, invokeReporting, callback, receiver, args); };
 const timerAPI = internalRequire('timers');
 {
   const { processImmediate, processTimers } = internalRequire('internal/timers').getTimerCallbacks(checkpoint);
@@ -663,7 +668,7 @@ for (const name of ['Event', 'CustomEvent', 'EventTarget', 'AbortController', 'A
 const asyncFS = internalRequire('internal/fs_async')(native);
 host.submitIO = (operation, args, callback, requestKind) => {
   const scope = resource(requestKind === 1 ? 'FSREQPROMISE' : requestKind === 2 ? 'FILEHANDLECLOSEREQ' : 'FSREQCALLBACK');
-  try { return asyncFS.submitIO(operation, args, (...values) => invokeResource(scope, callback, undefined, values), requestKind); }
+  try { return asyncFS.submitIO(operation, args, function oncomplete(...values) { return invokeResource(scope, callback, undefined, values); }, requestKind); }
   catch (error) { scope.emitDestroy(); throw error; }
 };
 host.watch = (filename, options, callback) => {
@@ -729,7 +734,8 @@ for (const name of ['Crypto', 'SubtleCrypto', 'CryptoKey']) {
     webGlobals.defineLazy(globalThis, name, loadPerformance, name === 'performance');
 }
 host.path = internalRequire('path');
-const publicBuiltinNames = [...factories.keys()].filter(name => !name.startsWith('internal/'));
+// Sorted, as Node lists builtinModules.
+const publicBuiltinNames = [...factories.keys()].filter(name => !name.startsWith('internal/')).sort();
 const publicBuiltinHas = Set.prototype.has.bind(new Set(publicBuiltinNames));
 const prefixOnlyBuiltinHas = Set.prototype.has.bind(new Set(['test', 'test/reporters', 'sqlite', 'sea']));
 const defineBuiltinName = Object.defineProperty;
@@ -759,13 +765,16 @@ const publicBuiltins = {
     }
     return !prefixOnlyBuiltinHas(name) && publicBuiltin(name);
   },
+  // The modules with a bare name first, then the node:-only ones, as Node lists them.
   names() {
     const names = [];
-    for (let index = 0; index < publicBuiltinNames.length; index++) {
-      const name = publicBuiltinNames[index];
-      if (publicBuiltin(name)) defineBuiltinName(names, names.length, {
-        value: prefixOnlyBuiltinHas(name) ? 'node:' + name : name, enumerable: true, writable: true, configurable: true,
-      });
+    for (let pass = 0; pass < 2; pass++) {
+      for (let index = 0; index < publicBuiltinNames.length; index++) {
+        const name = publicBuiltinNames[index];
+        if (publicBuiltin(name) && prefixOnlyBuiltinHas(name) === (pass === 1)) defineBuiltinName(names, names.length, {
+          value: pass === 1 ? 'node:' + name : name, enumerable: true, writable: true, configurable: true,
+        });
+      }
     }
     return names;
   }
@@ -802,7 +811,12 @@ process.getBuiltinModule = function getBuiltinModule(id) {
   return builtinRequire(id);
 };
 process.loadEnvFile = function loadEnvFile(path = undefined) { return internalRequire('internal/dotenv').loadEnvFile(path); };
-if (workerThreads.isMainThread && process.env.NODE_UNIQUE_ID !== undefined) internalRequire('cluster');
+// Like Node's initializeClusterWorker: a cluster worker joins its primary, then the variable is gone.
+function setupClusterWorker() {
+  internalRequire('cluster')._setupWorker();
+  delete process.env.NODE_UNIQUE_ID;
+}
+if (workerThreads.isMainThread && process.env.NODE_UNIQUE_ID !== undefined) setupClusterWorker();
 Object.defineProperty(globalThis, '__silkModuleBridge', { value: loader.bridge });
 let mainModuleName;
 let inspectorStartupArmed = false;
@@ -854,6 +868,9 @@ function runtimeFlag(arg) {
   }
   if (arg === '--trace-sigint' || arg === '--no-trace-sigint') {
     host.traceSigint = arg === '--trace-sigint'; return true;
+  }
+  if (arg === '--experimental-repl-await' || arg === '--no-experimental-repl-await') {
+    host.replAwait = arg === '--experimental-repl-await'; return true;
   }
   if ((arg.startsWith('--report-') || arg.startsWith('--no-report-') || arg === '--experimental-report') &&
       internalRequire('internal/process_report').applyOption(arg)) return true;
@@ -994,6 +1011,11 @@ function installRuntimeOptions(args, entrypoints = [], preloadEntrypoints = true
   }
   if (host.experimentalWebStorage) internalRequire('internal/web/storage').install(globalThis, { localStorageFile: host.localStorageFile, inspect: !!host.experimentalStorageInspection });
   if (host.experimentalStreamIter) { internalRequire('fs/promises'); internalRequire('internal/fs_iter').install(); }
+  // http is in the heap image, whose global agent was made without this process's options.
+  if (internalRequire('internal/options').getOptionValue('--use-env-proxy')) {
+    const agent = internalRequire('_http_agent');
+    agent.globalAgent = internalRequire('internal/http').getGlobalAgent(process.env, agent.Agent);
+  }
   if (workerThreads.isMainThread) internalRequire('internal/trace_events').initialize(host.traceOptions);
   if (workerThreads.isMainThread && host.traceSigint) internalRequire('util').setTraceSigInt(true);
   if (process.env.NODE_COMPILE_CACHE) internalRequire('internal/compile_cache').initialize();
@@ -1250,9 +1272,17 @@ function run() {
     const separator = native.argv.indexOf('--', 1);
     return internalRequire('internal/main/run').runPackageScript(runName, separator < 0 ? [] : native.argv.slice(separator + 1));
   }
-  // Only a TLS flag loads internal/tls/options, so a plain start skips the check.
-  const tlsErrors = moduleHas('internal/tls/options') ? internalRequire('internal/tls/options').validate() : [];
+  // http loads internal/tls/options into the heap image, so being loaded says nothing:
+  // given() is whether this process had a TLS or OpenSSL option.
+  const tlsOptions = moduleHas('internal/tls/options') && internalRequire('internal/tls/options').given();
+  const tlsErrors = tlsOptions ? internalRequire('internal/tls/options').validate() : [];
   if (tlsErrors.length) return cliError(tlsErrors);
+  // Only an OpenSSL option or OPENSSL_CONF initializes OpenSSL at startup.
+  const opensslError = tlsOptions || process.env.OPENSSL_CONF ? internalRequire('internal/tls/options').processOpenSSLOptions() : undefined;
+  if (opensslError !== undefined) {
+    host.writeStartupDiagnostic(process.execPath + ': ' + opensslError + '\n');
+    return process.exit(1);
+  }
   if (watchMode && expression !== undefined) return cliError('either --watch or --eval can be used, not both');
   if (watchMode && check) return cliError('either --watch or --check can be used, not both');
   if (watchMode && interactive) return cliError('either --watch or --interactive can be used, not both');
@@ -1320,7 +1350,7 @@ function run() {
   if (expression !== undefined) {
     const name = host.path.join(host.cwd(), '[eval]');
     expression = prepareInput(expression, name, inputType, inputTypeSet);
-    internalRequire('internal/loader/builtin_globals')(globalThis, '<eval>');
+    internalRequire('internal/modules/helpers').addBuiltinLibsToObject(globalThis, '<eval>');
     const code = !inputType.startsWith('module') && /\bcrypto\b/.test(expression) ?
       (print ? 'let crypto=require("node:crypto");{' + expression + '}' : '(crypto=>{{' + expression + '}})(require("node:crypto"))') : expression;
     if (inputType.startsWith('module') || (!inputTypeSet && native.detectModuleSyntax(code))) {
@@ -1422,7 +1452,7 @@ function loop() {
   return Number(process.exitCode) || 0;
 }
 const imageModules = ['fs', 'fs/promises', 'internal/fs_streams', 'internal/fs_utf8_stream', 'path', 'os',
-  'events', 'stream', 'stream/promises', 'string_decoder', 'util', 'assert', 'console', 'net', 'tty',
+  'events', 'stream', 'stream/promises', 'string_decoder', 'util', 'assert', 'console', 'net', 'tty', 'http',
   'internal/tty/write', 'url', 'internal/web/url', 'internal/encoding', 'internal/abort_controller',
   'internal/process/execution'];
 globalThis.__silkRuntime = {
@@ -1519,7 +1549,7 @@ globalThis.__silkRuntime = {
     loader.Module._initPaths();
     internalRequire('internal/child_process/ipc').installChild(process);
     internalRequire('internal/watch_mode/dependencies').initialize();
-    if (process.env.NODE_UNIQUE_ID !== undefined) internalRequire('cluster');
+    if (process.env.NODE_UNIQUE_ID !== undefined) setupClusterWorker();
     for (const refresh of hydrations) refresh();
     performanceMilestones.bootstrapComplete = native.now() - startTime;
   }

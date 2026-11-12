@@ -101,6 +101,10 @@ function validateArray(value, name, minLength = 0) {
   if (!Array.isArray(value)) throw new ERR_INVALID_ARG_TYPE(name, 'Array', value);
   if (value.length < minLength) throw new ERR_INVALID_ARG_VALUE(name, value, `must have a length of at least ${minLength}`);
 }
+function validateStringArray(value, name) {
+  validateArray(value, name);
+  for (let i = 0; i < value.length; ++i) validateString(value[i], `${name}[${i}]`);
+}
 function validateOneOf(value, name, oneOf) {
   if (!oneOf.includes(value)) {
     const allowed = oneOf.map(v => typeof v === 'string' ? `'${v}'` : String(v)).join(', ');
@@ -120,7 +124,7 @@ function validateThisInternalField(object, fieldKey, className) {
 function validateBuffer(buffer, name = 'buffer') {
   if (!ArrayBuffer.isView(buffer)) throw new ERR_INVALID_ARG_TYPE(name, ['Buffer', 'TypedArray', 'DataView'], buffer);
 }
-const linkValueRegExp = /^(?:<[^>]*>)(?:\s*;\s*[^;"\s]+(?:=(")?[^;"\s]*\1)?)*$/;
+const linkValueRegExp = /^(?:<[^>\r\n]*>)(?:\s*;\s*[^;"\s]+(?:=(")?[^;"\s]*\1)?)*$/;
 function validateLinkHeaderFormat(value, name) {
   if (typeof value === 'undefined' || !linkValueRegExp.exec(value)) {
     throw new ERR_INVALID_ARG_VALUE(name, value, 'must be an array or string of format "</styles.css>; rel=preload; as=style"');
@@ -208,10 +212,18 @@ function checkRangesOrGetDefault(number, name, lower, upper, def) {
   }
   return number;
 }
+function validateStringWithoutNullBytes(value, name) {
+  validateString(value, name);
+  if (value.includes('\u0000')) {
+    throw new ERR_INVALID_ARG_VALUE(name, value, 'must be a string without null bytes');
+  }
+}
+
 // Node wraps its validators in hideStackFrames(), whose callers inside other
 // hidden frames use fn.withoutStackTrace.
 for (const fn of [validateString, validateBoolean, validateFunction, validatePlainFunction, validateNumber, validateInteger, validateInt32,
-  validateUint32, validateObject, validateArray, validateOneOf, validateAbortSignal, validateBuffer]) {
+  validateUint32, validateObject, validateArray, validateStringArray, validateOneOf, validateAbortSignal, validateBuffer,
+  validateStringWithoutNullBytes]) {
   fn.withoutStackTrace = fn;
 }
 
@@ -221,8 +233,9 @@ module.exports = {
   kValidateObjectAllowNullable, kValidateObjectAllowArray, kValidateObjectAllowFunction,
   kValidateObjectAllowObjects, kValidateObjectAllowObjectsAndNull,
   validateString, validateBoolean, validateFunction, validatePlainFunction, validateNumber, validateInteger, validateInt32,
-  validateUint32, validateObject, validateArray, validateOneOf, validateAbortSignal,
+  validateUint32, validateObject, validateArray, validateStringArray, validateOneOf, validateAbortSignal,
   isUint32, parseFileMode, validateBuffer, validateLinkHeaderValue,
   convertToValidSignal, signalName, toPathIfFileURL, validatePath, getValidatedPath, validatePort,
   validateFiniteNumber, checkRangesOrGetDefault, validateThisInternalField,
+  validateStringWithoutNullBytes,
 };

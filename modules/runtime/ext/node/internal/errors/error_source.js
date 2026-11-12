@@ -105,7 +105,7 @@ let tokenizer;
 function getFirstExpression(code, startColumn) {
   // Lazy load acorn.
   if (tokenizer === undefined) {
-    const Parser = require('internal/repl/acorn').Parser;
+    const Parser = require('internal/deps/acorn/acorn/dist/acorn').Parser;
     tokenizer = FunctionPrototypeBind(Parser.tokenizer, Parser);
   }
 
