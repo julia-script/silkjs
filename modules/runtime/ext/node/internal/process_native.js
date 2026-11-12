@@ -25,6 +25,16 @@ const native = (operation, args = []) => host.osNative(operation, args);
 const { codes: { ERR_INVALID_ARG_TYPE, ERR_INVALID_ARG_VALUE, ERR_UNKNOWN_CREDENTIAL } } = require('internal/errors');
 const { validateUint32 } = require('internal/validators');
 const invalid = (name, expected, value) => new ERR_INVALID_ARG_TYPE(name, expected, value);
+// node_credentials.cc reports a failed set*id/setgroups/initgroups call with
+// env->ThrowErrnoException: "CODE, strerror" and a positive errno.
+function credentialCall(operation, args) {
+  try { return native(operation, args); }
+  catch (cause) {
+    if (typeof cause.errno !== 'number' || cause.syscall !== operation) throw cause;
+    const errno = Math.abs(cause.errno);
+    throw Object.assign(new Error(`${cause.code}, ${host.strerror(errno)}`), { errno, code: cause.code, syscall: operation });
+  }
+}
 function uint32(value, name) {
   validateUint32(value, name);
   return value;
@@ -78,7 +88,7 @@ function install(process) {
     const group = operation.endsWith('gid');
     process[operation] = { [operation](id) {
       validateId(id, 'id');
-      native(operation, [resolve(id, group)]);
+      credentialCall(operation, [resolve(id, group)]);
     } }[operation];
   }
   process.setgroups = function setgroups(groups) {
@@ -86,7 +96,7 @@ function install(process) {
     for (let i = 0; i < groups.length; i++) validateId(groups[i], `groups[${i}]`);
     const ids = [];
     for (let i = 0; i < groups.length; i++) ids.push(resolve(groups[i], true));
-    native('setgroups', [ids]);
+    credentialCall('setgroups', [ids]);
   };
   process.initgroups = function initgroups(user, extraGroup) {
     validateId(user, 'user');
@@ -96,7 +106,7 @@ function install(process) {
     // Node looks the group up before passing a user name to initgroups.
     const gid = resolve(extraGroup, true);
     const uid = resolve(user, false);
-    try { native('initgroups', [uid, gid]); }
+    try { credentialCall('initgroups', [uid, gid]); }
     catch (error) {
       if (error.syscall === 'uv_os_get_passwd2' && (error.code === 'ENOENT' || error.code === 'ESRCH')) throw unknown(user, false);
       throw error;
@@ -165,7 +175,8 @@ function install(process) {
     },
   });
   process.report = require('internal/process_report').createReport(process);
-  process.abort = function abort() { native('abort'); };
+  // A method, as Node's C++ function: no prototype, not a constructor.
+  process.abort = { abort() { native('abort'); } }.abort;
   process.execve = require('internal/process/per_thread').execve;
 }
 module.exports = { install };

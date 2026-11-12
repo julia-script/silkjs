@@ -178,6 +178,19 @@ function createReport(process) {
         if (typeof file !== 'string') throw invalid('file', 'string');
         if (file.includes('\0')) throw Object.assign(new TypeError('The argument \'file\' must be a string without null bytes.'), { code: 'ERR_INVALID_ARG_VALUE' });
       }
+      // lib/internal/process/report.js checks before the native writer runs.
+      const permission = host.builtinLoaded('internal/permission') ? require('internal/permission') : undefined;
+      if (permission?.enabled()) {
+        let resource = file;
+        if (resource !== undefined) {
+          if (settings.directory !== '') resource = `${settings.directory}${require('path').sep}${resource}`;
+        } else {
+          resource = process.cwd();
+        }
+        if (!permission.has('fs.write', resource)) {
+          throw permission.accessDenied('Access to this API has been restricted', 'fs.write', resource);
+        }
+      }
       if (error === undefined) error = synthetic(); else object(error, 'err');
       return write(file, error, 'JavaScript API', 'API');
     },

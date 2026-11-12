@@ -85,6 +85,30 @@ function viewInfo(value) {
   return { index, buffer, offset, length };
 }
 
+// V8's Object::NoSideEffectsToString for the values a serializer rejects: no
+// getter, trap or toString of the value runs.
+function describeValue(value) {
+  switch (typeof value) {
+    case 'function': return Function.prototype.toString.call(value);
+    case 'symbol': return Symbol.prototype.toString.call(value);
+    case 'object': break;
+    default: return String(value);
+  }
+  if (value === null) return 'null';
+  if (types.isProxy(value)) return '#<Object>';
+  let name = 'Object';
+  for (let object = value; object !== null; object = Reflect.getPrototypeOf(object)) {
+    if (types.isProxy(object)) break;
+    const descriptor = Reflect.getOwnPropertyDescriptor(object, 'constructor');
+    if (descriptor !== undefined && typeof descriptor.value === 'function') {
+      const own = Reflect.getOwnPropertyDescriptor(descriptor.value, 'name');
+      if (own !== undefined && typeof own.value === 'string' && own.value !== '') name = own.value;
+      break;
+    }
+  }
+  return `#<${name}>`;
+}
+
 class Serializer {
   constructor() {
     this._buffer = Buffer.allocUnsafe(256);
@@ -93,7 +117,8 @@ class Serializer {
     this._viewsAsHost = false;
     this._transfers = new Map();
   }
-  _fail() { throw new this._getDataCloneError('Value could not be cloned.'); }
+  // V8's kDataCloneError: "%s could not be cloned." over the value's NoSideEffectsToString.
+  _fail(value) { throw new this._getDataCloneError(`${describeValue(value)} could not be cloned.`); }
   _reserve(length) {
     const needed = this._length + length;
     if (!Number.isSafeInteger(needed) || needed > 0xffffffff) throw new RangeError('Serialized data is too large');
@@ -136,9 +161,9 @@ class Serializer {
     if (!types.isArrayBuffer(value)) throw new TypeError('Expected an ArrayBuffer');
     this._transfers.set(value, uint32(id));
   }
-  _writeHostObject() { this._fail(); }
+  _writeHostObject(value) { this._fail(value); }
   _writeViewExtents(info) { this.writeUint32(info.offset); this.writeUint32(info.length); }
-  _getSharedArrayBufferId() { this._fail(); }
+  _getSharedArrayBufferId(value) { this._fail(value); }
   _string(value) {
     let oneByte = true;
     for (let i = 0; i < value.length; i++) if (value.charCodeAt(i) > 255) { oneByte = false; break; }
@@ -194,9 +219,9 @@ class Serializer {
         } else { this._tag('N'); this.writeDouble(value); }
         return;
       case 'object': break;
-      default: this._fail();
+      default: this._fail(value);
     }
-    if (types.isProxy(value)) this._fail();
+    if (types.isProxy(value)) this._fail(value);
     this._validateCloneValue?.(value);
     if (this._objects.has(value)) { this._tag('^'); this.writeUint32(this._objects.get(value)); return; }
     // V8 emits (and assigns an ID to) a native view's buffer before the view.
@@ -270,7 +295,7 @@ class Serializer {
     // prototypes and @@toStringTag are deliberately not used as brands.
     if (types.isSymbolObject(value) ||
         types.isWeakMap(value) || types.isWeakSet(value) || types.isPromise(value) ||
-        host.serializationInfo(value) !== 0) this._fail();
+        host.serializationInfo(value) !== 0) this._fail(value);
     this._tag('o'); const count = this._properties(value, keys(value));
     this._tag('{'); this.writeUint32(count);
   }
@@ -517,7 +542,7 @@ class Deserializer {
 class DefaultSerializer extends Serializer {
   constructor() { super(); this._setTreatArrayBufferViewsAsHostObjects(true); }
   _writeHostObject(value) {
-    if (!ArrayBuffer.isView(value)) this._fail();
+    if (!ArrayBuffer.isView(value)) this._fail(value);
     host.getArrayBufferViewFlags(value);
     const info = viewInfo(value);
     // Buffer is a Uint8Array subclass in Silk; require the true view brand first.

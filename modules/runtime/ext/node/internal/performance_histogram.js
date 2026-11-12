@@ -43,7 +43,8 @@ function updateEwma(s, value) {
   if (s.threshold > 0) s.ewmaErrorRate += s.alpha * ((value > s.threshold ? 1 : 0) - s.ewmaErrorRate);
 }
 function record(s, value, count = 1n, update = true) {
-  if (value < 0n || value > s.limit) { s.exceeds += count; return false; }
+  // hdr_record_values: past highest_trackable_value is out of range, even inside the last bucket.
+  if (value < 0n || value > s.highest) { s.exceeds += count; return false; }
   const { low, width } = bucket(s, value);
   let entry = s.bins.get(low);
   if (!entry) { entry = { low, width, count: 0n }; s.bins.set(low, entry); }
@@ -184,6 +185,11 @@ function bigintValue(value) {
   return value;
 }
 class RecordableHistogram extends Histogram {
+  constructor(key, options) {
+    super(key, options);
+    // lib/internal/histogram.js ClonedRecordableHistogram sets this own property.
+    this.constructor = RecordableHistogram;
+  }
   record(value) {
     const s = state(this);
     if (typeof value !== 'bigint') integer(value, 'val');

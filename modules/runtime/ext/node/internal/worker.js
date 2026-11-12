@@ -244,6 +244,7 @@ function workerOptions(filename, options) {
   }
   for (const key of ['stdin', 'stdout', 'stderr']) result[key] = !!options[key];
   result.processExposeGC = !!host.exposeGC;
+  result.processClock = { start: host.performanceStartTime, origin: host.performanceTimeOrigin };
   return { metadata: result, options };
 }
 class WorkerHandle {
@@ -415,6 +416,7 @@ function bootstrap() {
   workerThreads.parentPort = data.parentPort;
   workerThreads.workerData = data.workerData;
   const nativeMetadata = JSON.parse(info.metadata);
+  if (nativeMetadata.processClock) host.adoptProcessClock(nativeMetadata.processClock.start, nativeMetadata.processClock.origin);
   bootstrapResult = { ...nativeMetadata, ...data.options, threadId: info.threadId };
   workerThreads.threadName = bootstrapResult.name;
   workerThreads.resourceLimits = { ...bootstrapResult.resourceLimits };
@@ -434,10 +436,17 @@ function bootstrap() {
 // are not variables resolve on Object.prototype, values become strings (a
 // Symbol throws), and only plain enumerable, writable, configurable data
 // properties can be defined.
+let environmentWarned = false;
 function workerEnvironment() {
   const lookup = key => host.workerNative('envGet', [key]);
   const store = (key, value) => {
     if (typeof key === 'symbol') throw new TypeError('Cannot convert a Symbol value to a string');
+    // node_env_var.cc EnvSetter: one DEP0104 warning under --pending-deprecation.
+    if (host.pendingDeprecation && !environmentWarned && typeof value !== 'string' && typeof value !== 'number' && typeof value !== 'boolean') {
+      environmentWarned = true;
+      process.emitWarning('Assigning any value other than a string, number, or boolean to a process.env property is deprecated. ' +
+        'Please make sure to convert the value to a string before setting process.env with it.', 'DeprecationWarning', 'DEP0104');
+    }
     host.workerNative('envSet', [key, `${value}`]);
   };
   const invalidDescriptor = message => clone().codedError('ERR_INVALID_OBJECT_DEFINE_PROPERTY', message);

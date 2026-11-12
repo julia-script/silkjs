@@ -43,6 +43,8 @@ function writeHeapSnapshot(filename, options) {
     if (filename.includes('\0')) throw error('ERR_INVALID_ARG_VALUE', 'The "filename" argument must not contain null bytes', TypeError);
   }
   snapshotOptions(options);
+  // heap_utils.cc TriggerHeapSnapshot: fs.write on the name as given, or on the cwd for a generated name.
+  if (host.builtinLoaded('internal/permission')) require('internal/permission').check('fs.write', filename === undefined ? process.cwd() : filename);
   if (filename === undefined) {
     const date = new Date();
     const pad = value => String(value).padStart(2, '0');
@@ -132,9 +134,10 @@ class GCProfiler {
   stop() { unsupported('GCProfiler.stop', 'native GC events do not capture the before/after heap statistics required by this profile'); }
   [Symbol.dispose]() { this.stop(); }
 }
+// lib/internal/v8/startup_snapshot.js: outside --build-snapshot (which this runtime does not
+// take) the process is never building one, so every callback API reports that.
 function snapshotCallback(callback) {
-  if (typeof callback !== 'function') throw error('ERR_INVALID_ARG_TYPE', 'The "callback" argument must be a function', TypeError);
-  unsupported('startupSnapshot', 'the runtime has no startup heap-image serialization; replaying source is not a snapshot');
+  throw new (require('internal/errors').codes.ERR_NOT_BUILDING_SNAPSHOT)();
 }
 const startupSnapshot = {
   isBuildingSnapshot() { return false; },
