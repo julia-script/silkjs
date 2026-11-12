@@ -20,15 +20,15 @@ import silk.concurrency.thread_pool { Pool, PoolFiber }
 import silk.core.effect { Effect }
 import silk.core.option { Option }
 import silk.core.result { Result }
-import silk.platform.native.file { NativeFile, NativeFileError, OPEN_CREATE, OPEN_TRUNCATE, OPEN_WRITE_ONLY }
+import silk.platform.native.file { NativeFile, NativeFileError }
 import npm.manifest { Manifest }
 import npm.registry { Fetched, Registry, RegistryError }
 import npm.resolve { Graph, Host, Tarballs }
-import pkg.files { linkFile, linkTo, makeDirectories }
+import pkg.files { Listed, linkFile, linkTo, list, makeDirectories, readOptional, removeTree, writeFile }
 import pkg.integrity { Integrity }
 import pkg.names { Names }
 import pkg.store { PackageFiles, Store, StoreError }
-import pkg.text { same, startsWith }
+import pkg.text { compare, same, startsWith }
 
 /// The hidden directory in `node_modules` that holds the packages.
 pub const VIRTUAL_STORE: &'static [u8] = b".sjs"
@@ -493,6 +493,184 @@ effect fn expose(graph: &Graph, host: Host, modules: &[u8]) -> () ! InstallError
   }
 }
 
+// Removes the directory at `path` with everything in it.
+effect fn clear(path: &[u8]) -> () ! InstallError | OutOfMemoryError ? &mut Allocator {
+  match move run Effect.result(removeTree(path)) {
+    Result.Success {..} => {}
+    Result.Failure { error } => match move error {
+      NativeFileError _ => { run stop("could not remove", path) }
+      OutOfMemoryError exhausted => { fail move exhausted }
+    }
+  }
+}
+
+// Writes the marker of a package directory.
+effect fn mark(path: &[u8], links: &[u8]) -> () ! InstallError | OutOfMemoryError ? &mut Allocator {
+  match move run Effect.result(writeFile(path, links)) {
+    Result.Success {..} => {}
+    Result.Failure { error } => match move error {
+      NativeFileError _ => { run stop("could not write", path) }
+      OutOfMemoryError exhausted => { fail move exhausted }
+    }
+  }
+}
+
+// The dependencies that are linked beside package `index`, a line each: the name it is linked
+// under and the directory it points into. The marker of a package directory holds this text.
+effect fn linksOf(graph: &Graph, host: Host, index: usize) -> Bytes ! OutOfMemoryError ? &mut Allocator {
+  let edges = Graph.edges(graph, index)
+  // The lines are sorted, so the text does not depend on the order the graph was built in.
+  let mut order = List<usize>.make()
+  let mut each: usize = 0
+  while each < edges.length {
+    if Graph.supports(graph, edges[each].target, host) {
+      let alias = Names.bytes(&graph.names, edges[each].alias)
+      let mut at = List<usize>.length(&order)
+      run order.append(each)
+      let sorted = List<usize>.asMutSlice(&mut order)
+      while at > 0 && compare(Names.bytes(&graph.names, edges[sorted[at - 1]].alias), alias) > 0 {
+        sorted[at] = sorted[at - 1]
+        at = at - 1
+      }
+      sorted[at] = each
+    }
+    each = each + 1
+  }
+  let mut text = Bytes.make()
+  let sorted = List<usize>.asSlice(&order)
+  each = 0
+  while each < sorted.length {
+    let edge = edges[sorted[each]]
+    run text.append(Names.bytes(&graph.names, edge.alias))
+    run text.append(b" ")
+    run appendDirectory(&mut text, graph, edge.target)
+    run text.append(b"\n")
+    each = each + 1
+  }
+  return move text
+}
+
+// Removes the symbolic links in `directory` and in the scope directories in it. Files and other
+// directories stay.
+effect fn unlink(directory: &[u8]) -> () ! InstallError | OutOfMemoryError ? &mut Allocator {
+  let entries = match move run list(directory) {
+    Option.None => { return () }
+    Option.Some { value } => move value
+  }
+  let all = List<Listed>.asSlice(&entries)
+  let mut index: usize = 0
+  while index < all.length {
+    let name = Bytes.asSlice(&all[index].name)
+    let mut path = run Bytes.copy(directory)
+    run path.append(b"/")
+    run path.append(name)
+    if all[index].link {
+      run io<()>(run Effect.result(NativeFile.remove(Bytes.asSlice(&path))), Bytes.asSlice(&path))
+    } else if all[index].directory && name.length > 0 && name[0] == 64 {
+      run unlink(Bytes.asSlice(&path))
+    }
+    index = index + 1
+  }
+}
+
+// Removes from `directory` the symbolic links whose names, with `prefix` before them, are not
+// in `kept`, and goes into its scope directories.
+effect fn pruneLinks(directory: &[u8], prefix: &[u8], kept: &Names) -> () ! InstallError | OutOfMemoryError ? &mut Allocator {
+  let entries = match move run list(directory) {
+    Option.None => { return () }
+    Option.Some { value } => move value
+  }
+  let all = List<Listed>.asSlice(&entries)
+  let mut index: usize = 0
+  while index < all.length {
+    let name = Bytes.asSlice(&all[index].name)
+    index = index + 1
+    if name.length == 0 || name[0] == 46 {
+      continue
+    }
+    let mut path = run Bytes.copy(directory)
+    run path.append(b"/")
+    run path.append(name)
+    let mut full = run Bytes.copy(prefix)
+    run full.append(name)
+    if all[index - 1].link {
+      if Option.isSome(&Names.find(kept, Bytes.asSlice(&full))) == false {
+        run io<()>(run Effect.result(NativeFile.remove(Bytes.asSlice(&path))), Bytes.asSlice(&path))
+      }
+    } else if all[index - 1].directory && name[0] == 64 && prefix.length == 0 {
+      run full.append(b"/")
+      run pruneLinks(Bytes.asSlice(&path), Bytes.asSlice(&full), kept)
+      // Goes when the scope has nothing left in it.
+      drop run Effect.result(NativeFile.removeDirectory(Bytes.asSlice(&path)))
+    }
+  }
+}
+
+// Takes out of `node_modules` what the graph no longer has: links to dependencies the project
+// dropped, package directories no package of the graph lives in, and commands that lead nowhere.
+effect fn prune(graph: &Graph, host: Host, modules: &[u8], virtual: &[u8]) -> () ! InstallError | OutOfMemoryError ? &mut Allocator {
+  let mut kept = Names.make()
+  let edges = Graph.rootEdges(graph)
+  let mut each: usize = 0
+  while each < edges.length {
+    if Graph.supports(graph, edges[each].target, host) {
+      drop run Names.intern(&mut kept, Names.bytes(&graph.names, edges[each].alias))
+    }
+    each = each + 1
+  }
+  run pruneLinks(modules, b"", &kept)
+
+  let mut homes = Names.make()
+  each = 0
+  while each < Graph.count(graph) {
+    if Graph.supports(graph, each, host) {
+      let mut home = Bytes.make()
+      run appendDirectory(&mut home, graph, each)
+      drop run Names.intern(&mut homes, Bytes.asSlice(&home))
+    }
+    each = each + 1
+  }
+  match move run list(virtual) {
+    Option.None => {}
+    Option.Some { value: entries } => {
+      let all = List<Listed>.asSlice(&entries)
+      let mut index: usize = 0
+      while index < all.length {
+        let name = Bytes.asSlice(&all[index].name)
+        if all[index].directory && Option.isSome(&Names.find(&homes, name)) == false {
+          let mut path = run Bytes.copy(virtual)
+          run path.append(b"/")
+          run path.append(name)
+          run clear(Bytes.asSlice(&path))
+        }
+        index = index + 1
+      }
+    }
+  }
+
+  let mut commands = run Bytes.copy(modules)
+  run commands.append(b"/.bin")
+  match move run list(Bytes.asSlice(&commands)) {
+    Option.None => {}
+    Option.Some { value: entries } => {
+      let all = List<Listed>.asSlice(&entries)
+      let mut index: usize = 0
+      while index < all.length {
+        if all[index].link {
+          let mut path = run Bytes.copy(Bytes.asSlice(&commands))
+          run path.append(b"/")
+          run path.append(Bytes.asSlice(&all[index].name))
+          match run Effect.result(NativeFile.status(Bytes.asSlice(&path), true)) {
+            Result.Success {..} => {}
+            Result.Failure {..} => { run io<()>(run Effect.result(NativeFile.remove(Bytes.asSlice(&path))), Bytes.asSlice(&path)) }
+          }
+        }
+        index = index + 1
+      }
+    }
+  }
+}
+
 /// Installs `graph` into the project directory `project`. `downloader` names the store and the
 /// host, and may have fetched packages of `graph` during its resolution already; the others are
 /// fetched now. Packages that are not for the host are left out.
@@ -529,27 +707,38 @@ pub effect fn install(project: &[u8], graph: &Graph, downloader: Downloader<'_>)
       continue
     }
     summary.packages = summary.packages + 1
-    // A package directory is complete when its marker is there; the marker is written last.
-    let mut marker = run Bytes.copy(Bytes.asSlice(&virtual))
-    run marker.append(b"/")
-    run appendDirectory(&mut marker, graph, index)
+    // A package directory is complete when its marker is there and names the dependencies the
+    // graph gives the package now; the marker is written last.
+    let mut home = run Bytes.copy(Bytes.asSlice(&virtual))
+    run home.append(b"/")
+    run appendDirectory(&mut home, graph, index)
+    let mut marker = run Bytes.copy(Bytes.asSlice(&home))
     run marker.append(b"/.linked")
-    let done = match run Effect.result(NativeFile.status(Bytes.asSlice(&marker), false)) {
-      Result.Success {..} => true
-      Result.Failure {..} => false
+    let links = run linksOf(graph, host, index)
+    let done = match move run readOptional(Bytes.asSlice(&marker)) {
+      Option.Some { value: found } => {
+        if same(Bytes.asSlice(&found), Bytes.asSlice(&links)) {
+          true
+        } else {
+          // Linked for another graph: the dependencies beside the package are not these.
+          run home.append(b"/node_modules")
+          run unlink(Bytes.asSlice(&home))
+          false
+        }
+      }
+      Option.None => false
     }
     if done == false {
       match &all[index] {
         Option.Some { value: listed } => { run place(graph, store, host, Bytes.asSlice(&virtual), index, &listed) }
         Option.None => { run stopAt("the store has no files for", graph, index) }
       }
-      let made = run Effect.result(NativeFile.open(Bytes.asSlice(&marker), OPEN_WRITE_ONLY | OPEN_CREATE | OPEN_TRUNCATE, 420))
-      let fd = run io<i32>(move made, Bytes.asSlice(&marker))
-      drop run Effect.result(NativeFile.close(fd))
+      run mark(Bytes.asSlice(&marker), Bytes.asSlice(&links))
       summary.linked = summary.linked + 1
     }
     index = index + 1
   }
+  run prune(graph, host, Bytes.asSlice(&modules), Bytes.asSlice(&virtual))
   run expose(graph, host, Bytes.asSlice(&modules))
   return move summary
 }

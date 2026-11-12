@@ -2,11 +2,12 @@
 //! The runtime's command line will dispatch to the same modules.
 //!
 //! `pm install` installs the dependencies of the `package.json` in the working directory and
-//! keeps the lockfile beside it. With `--frozen-lockfile` it fails when the lockfile does not
-//! match `package.json`, which is what a build server wants.
+//! keeps the lockfile beside it; `pm ci`, or `--frozen-lockfile`, fails when the lockfile does
+//! not match. `pm add`, `pm remove` and `pm update` change the dependencies and install.
 
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.collections.bytes { Bytes }
+import silk.collections.list { List }
 import silk.concurrency.thread_native { SpawnError }
 import silk.concurrency.thread_pool { Pool, ThreadPool }
 import silk.core.effect { Effect }
@@ -21,26 +22,15 @@ import silk.system.system_info { SystemInfo }
 import silk.system.system_info_native { OsSystemInfo }
 import silk.text.format { Format }
 import silk.text.string { String }
-import npm.install { Downloader, InstallError, install }
-import npm.lock { LOCKFILE, Lock, write }
-import npm.manifest { Manifest }
+import npm.commands { CommandError, addDependencies, installProject, removeDependencies, updateProject }
+import npm.install { InstallError }
+import npm.manifest { DEVELOPMENT, OPTIONAL, PRODUCTION }
 import npm.npmrc { Npmrc }
 import npm.registry { NetworkRegistry, Registry }
-import npm.resolve { Graph, Host, ResolveError, Tarballs, resolve }
-import pkg.files { readOptional, writeFile }
-import silk.platform.native.file { NativeFileError }
+import npm.resolve { Host, ResolveError }
+import pkg.files { readOptional }
 import pkg.store { Store, StoreError }
 import pkg.text { same }
-
-/// Why the command stopped: a message for the person, and what it is about.
-struct Stop {
-  message: string<'static>,
-  subject: Bytes,
-}
-
-effect fn stop(message: string<'static>) -> never ! Stop {
-  fail Stop { message: message, subject: Bytes.make() }
-}
 
 effect fn variable(name: &[u8]) -> Bytes ! HostInputError | OutOfMemoryError ? &mut HostInput | &mut Allocator {
   return match move run HostInput.variable(name) {
@@ -65,102 +55,98 @@ effect fn settings() -> Npmrc ! HostInputError | OutOfMemoryError ? &mut HostInp
   return move config
 }
 
-// The graph to install: the lockfile's when it matches package.json, else a new resolution that
-// keeps the lockfile's versions where it can and is written back.
-effect fn plan(project: &Manifest, frozen: bool) -> Graph
-  ! Stop | ResolveError | WriterError | OutOfMemoryError ? &mut Registry | &mut Tarballs | &mut Writer | &mut Allocator {
-  let existing = run readOptional(LOCKFILE)
-  let earlier = match &existing {
-    Option.Some { value: text } => run Lock.read(Bytes.asSlice(&text))
-    Option.None => Option<Lock>.none()
-  }
-  let current = match &earlier {
-    Option.Some { value: lock } => Lock.matches(&lock, project)
-    Option.None => false
-  }
-  if current == false && frozen {
-    run stop("the lockfile does not match package.json")
-  }
-  let previous = match move earlier {
-    Option.Some { value: lock } => {
-      let graph = Lock.intoGraph(move lock)
-      if current {
-        return move graph
-      }
-      Option<Graph>.some(move graph)
-    }
-    Option.None => Option<Graph>.none()
-  }
-  let graph = match &previous {
-    Option.Some { value: pinned } => run resolve(project, Option<&Graph>.some(&pinned))
-    Option.None => run resolve(project, Option<&Graph>.none())
-  }
-  let text = run write(project, &graph)
-  let unchanged = match &existing {
-    Option.Some { value: old } => same(Bytes.asSlice(&old), Bytes.asSlice(&text))
-    Option.None => false
-  }
-  if unchanged == false {
-    match move run Effect.result(writeFile(LOCKFILE, Bytes.asSlice(&text))) {
-      Result.Success {..} => { run Format.format("lockfile written\n", &.{}) }
-      Result.Failure { error } => match move error {
-        NativeFileError _ => { run stop("the lockfile cannot be written") }
-        OutOfMemoryError exhausted => { fail move exhausted }
-      }
-    }
-  }
-  return move graph
-}
-
-effect fn installProject(frozen: bool, pool: &Pool) -> ()
-  ! Stop | ResolveError | InstallError | HostInputError | WriterError | OutOfMemoryError
-  ? &mut Registry | &mut HostInput | &mut Writer | &mut Allocator {
-  let source = match move run readOptional(b"package.json") {
-    Option.Some { value } => move value
-    Option.None => { run stop("there is no package.json in this directory") }
-  }
-  let project = match move run Manifest.parse(Bytes.asSlice(&source)) {
-    Option.Some { value } => move value
-    Option.None => { run stop("package.json is not valid") }
-  }
+// Opens the store named by `SILKJS_STORE`, or the one in the home directory.
+effect fn openStore() -> Store ! CommandError | HostInputError | OutOfMemoryError ? &mut HostInput | &mut Allocator {
   let mut root = run variable(b"SILKJS_STORE")
   if Bytes.length(&root) == 0 {
     root = run variable(b"HOME")
     run root.append(b"/.silkjs/store")
   }
-  let store = match move run Effect.result(Store.open(Bytes.asSlice(&root))) {
+  return match move run Effect.result(Store.open(Bytes.asSlice(&root))) {
     Result.Success { value } => move value
     Result.Failure { error } => match move error {
-      StoreError _ => { fail Stop { message: "the store cannot be opened at", subject: move root } }
+      StoreError _ => { fail CommandError { message: "the store cannot be opened at", subject: move root } }
       OutOfMemoryError exhausted => { fail move exhausted }
     }
   }
-  // The downloads of a resolution start while it still asks for metadata.
-  let mut downloader = Downloader.make(&store, pool, Host.current())
-  let graph = run plan(&project, frozen) |> Effect.provideMut<Tarballs>(&mut downloader)
-  let summary = run install(b".", &graph, move downloader)
-  run Format.format("{packages} packages: {downloaded} downloaded, {linked} linked\n", &.{
-    packages: summary.packages,
-    downloaded: summary.downloaded,
-    linked: summary.linked,
-  })
+}
+
+const USAGE: string<'static> = "usage: pm install [--frozen-lockfile] | ci | add <package>... [-D] [-O] [-E] | remove <package>... | update [package]..."
+
+effect fn usage() -> never ! CommandError {
+  fail CommandError { message: USAGE, subject: Bytes.make() }
+}
+
+fn isOneOf(word: &[u8], first: &[u8], second: &[u8]) -> bool {
+  return same(word, first) || same(word, second)
 }
 
 effect fn command(pool: &Pool) -> ()
-  ! Stop | ResolveError | InstallError | HostInputError | WriterError | OutOfMemoryError
+  ! CommandError | ResolveError | InstallError | HostInputError | WriterError | OutOfMemoryError
   ? &mut Registry | &mut HostInput | &mut Writer | &mut Allocator {
   let verb = match move run HostInput.argument(1) {
-    Option.None => Bytes.make()
+    Option.None => { run usage() }
     Option.Some { value } => move value
   }
-  if same(Bytes.asSlice(&verb), b"install") || same(Bytes.asSlice(&verb), b"i") {
-    let flag = match move run HostInput.argument(2) {
-      Option.None => Bytes.make()
+  // The words after the verb: package names, and flags that start with a dash.
+  let mut names = List<Bytes>.make()
+  let mut frozen = false
+  let mut exact = false
+  let mut kind = PRODUCTION
+  let mut position: usize = 2
+  while true {
+    let word = match move run HostInput.argument(position) {
+      Option.None => { break }
       Option.Some { value } => move value
     }
-    return run installProject(same(Bytes.asSlice(&flag), b"--frozen-lockfile"), pool)
+    position = position + 1
+    let text = Bytes.asSlice(&word)
+    if text.length == 0 || text[0] != 45 {
+      run names.append(move word)
+    } else if same(text, b"--frozen-lockfile") {
+      frozen = true
+    } else if isOneOf(text, b"-D", b"--save-dev") {
+      kind = DEVELOPMENT
+    } else if isOneOf(text, b"-O", b"--save-optional") {
+      kind = OPTIONAL
+    } else if isOneOf(text, b"-P", b"--save-prod") {
+      kind = PRODUCTION
+    } else if isOneOf(text, b"-E", b"--save-exact") {
+      exact = true
+    } else {
+      fail CommandError { message: "this flag is not known", subject: move word }
+    }
   }
-  run stop("usage: pm install [--frozen-lockfile]")
+  let wanted = List<Bytes>.asSlice(&names)
+  let word = Bytes.asSlice(&verb)
+  let store = run openStore()
+  let host = Host.current()
+  let outcome = if isOneOf(word, b"install", b"i") && wanted.length == 0 {
+    run installProject(b".", &store, pool, host, frozen)
+  } else if same(word, b"ci") && wanted.length == 0 {
+    run installProject(b".", &store, pool, host, true)
+  } else if same(word, b"add") && wanted.length > 0 {
+    run addDependencies(b".", &store, pool, host, wanted, kind, exact)
+  } else if (isOneOf(word, b"remove", b"rm") || isOneOf(word, b"uninstall", b"un")) && wanted.length > 0 {
+    run removeDependencies(b".", &store, pool, host, wanted)
+  } else if isOneOf(word, b"update", b"up") || same(word, b"upgrade") {
+    run updateProject(b".", &store, pool, host, wanted)
+  } else {
+    run usage()
+  }
+  let changes: string = match move String.fromUtf8(Bytes.asSlice(&outcome.changes)) {
+    Result.Success { value } => move value
+    Result.Failure {..} => ""
+  }
+  run Format.format("{changes}", &.{ changes: changes })
+  if outcome.lockfile {
+    run Format.format("lockfile written\n", &.{})
+  }
+  run Format.format("{packages} packages: {downloaded} downloaded, {linked} linked\n", &.{
+    packages: outcome.summary.packages,
+    downloaded: outcome.summary.downloaded,
+    linked: outcome.summary.linked,
+  })
 }
 
 effect fn report(message: string<'static>, subject: &[u8]) -> () ! WriterError ? &mut Writer {
@@ -194,7 +180,7 @@ effect fn program() -> i32 ! HttpError | SpawnError | HostInputError | WriterErr
   match move outcome {
     Result.Success {..} => { return 0 }
     Result.Failure { error } => match move error {
-      Stop stopped => { run report(stopped.message, Bytes.asSlice(&stopped.subject)) |> Effect.provideMut<Writer>(&mut writer) }
+      CommandError stopped => { run report(stopped.message, Bytes.asSlice(&stopped.subject)) |> Effect.provideMut<Writer>(&mut writer) }
       ResolveError failed => { run report(failed.message, Bytes.asSlice(&failed.subject)) |> Effect.provideMut<Writer>(&mut writer) }
       InstallError failed => { run report(failed.message, Bytes.asSlice(&failed.subject)) |> Effect.provideMut<Writer>(&mut writer) }
       HostInputError failure => { fail move failure }
