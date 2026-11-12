@@ -234,6 +234,8 @@ class HTTPParser {
     const state = stateOf(this);
     state.resource?.emitDestroy();
     state.resource = null;
+    // AsyncWrap::EmitDestroy drops the context frame, so a pooled parser keeps no stores alive.
+    state.frame = undefined;
   }
   close() {
     const state = stateOf(this);

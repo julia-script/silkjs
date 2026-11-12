@@ -128,12 +128,18 @@ function getCppHeapStatistics(detailLevel = 'detailed') {
 }
 function setFlagsFromString(flags) {
   string(flags, 'flags');
+  // V8 reads --stack-size when an isolate's thread starts, so a running isolate
+  // keeps its limit and a Worker keeps its resourceLimits stack.
+  const tokens = flags.split(/\s+/).filter(Boolean);
+  if (tokens.length && tokens.every(flag => /^--stack[-_]size=\d+$/.test(flag))) return;
   unsupported('setFlagsFromString', 'V8 execution flags do not control the Silk engine');
 }
 function setHeapSnapshotNearHeapLimit(limit) {
   if (typeof limit !== 'number') throw error('ERR_INVALID_ARG_TYPE', 'The "limit" argument must be a number', TypeError);
   if (!Number.isInteger(limit) || limit < 1 || limit > 0xffffffff)
     throw error('ERR_OUT_OF_RANGE', 'The "limit" argument must be a positive uint32', RangeError);
+  // Node's binding checks fs.write (no resource) before it installs the callback.
+  if (host.builtinLoaded('internal/permission')) require('internal/permission').check('fs.write', '');
   unsupported('setHeapSnapshotNearHeapLimit', 'the runtime has no V8 heap-limit callback or reserved heap arena');
 }
 function isStringOneByteRepresentation(content) {

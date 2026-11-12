@@ -68,8 +68,18 @@ impl Profile {
   /// Due observations rejected by full sample storage, not estimated missed ticks.
   pub fn droppedObservations(self: &Self) -> u64 { return self.dropped }
 }
-pub struct State { pub enabled: bool, last: i64, profile: Profile }
-impl State { pub fn make() -> Self { return Self { enabled: false, last: 0, profile: Profile.make() } } }
+/// One profile sharing the recorder (startShared): the samples from `since` on.
+pub struct Window { id: u64, since: i64 }
+impl Copy for Window {}
+pub struct State { pub enabled: bool, last: i64, profile: Profile, windows: List<Window>, nextWindow: u64 }
+impl State {
+  pub fn make() -> Self { return Self { enabled: false, last: 0, profile: Profile.make(), windows: List<Window>.make(), nextWindow: 1 } }
+  /// The recording in progress, read only.
+  pub fn live(self: &Self) -> &Profile { return &self.profile }
+}
+/// V8's kMaxSimultaneousProfiles.
+pub const MAX_SHARED: usize = 100
+pub union SharedStart { Started { pub id: u64 }, Busy, TooMany }
 
 pub effect fn nowMicroseconds() -> i64 {
   return platform.nowNanoseconds() / 1000
@@ -100,13 +110,19 @@ pub unsafe effect fn start(runtime: *mut HeapHeader, intervalMicroseconds: i64,
   profile.interval = intervalMicroseconds profile.start = run nowMicroseconds()
   let last = profile.start
   let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, runtime)
-  state.cpuProfile = State { enabled: true, last: last, profile: move profile }
+  state.cpuProfile.enabled = true state.cpuProfile.last = last state.cpuProfile.profile = move profile
   refreshObservation(&mut state)
   return true
 }
 /// First stop transfers ownership; repeated stops return None and read no clock.
 /// Stopping does not fabricate a final sample or mutate a previously returned profile.
+/// Shared profiles (startShared) are stopped only by stopShared.
 pub unsafe effect fn stop(runtime: *mut HeapHeader) -> Option<Profile> {
+  let anchor = () let current = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, runtime)
+  if current.cpuProfile.windows.length() != 0 { return Option<Profile>.none() } drop current
+  return run unsafe finish(runtime)
+}
+unsafe effect fn finish(runtime: *mut HeapHeader) -> Option<Profile> {
   let mut anchor = () let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, runtime)
   if !state.cpuProfile.enabled { return Option<Profile>.none() }
   state.cpuProfile.enabled = false
@@ -115,6 +131,60 @@ pub unsafe effect fn stop(runtime: *mut HeapHeader) -> Option<Profile> {
   drop state
   result.end = run nowMicroseconds()
   return Option<Profile>.some(move result)
+}
+/// Several profiles over one recorder, as V8's CpuProfiler::Start with an id: each
+/// reports the samples observed while it was open. The first starts the recorder
+/// with these bounds, and its start samples the current stack as start does for its
+/// caller. An exclusive recording (start) refuses these, and they refuse it.
+pub unsafe effect fn startShared(runtime: *mut HeapHeader, intervalMicroseconds: i64,
+  sampleCapacity: usize, frameCapacity: usize, functionCapacity: usize) -> SharedStart
+  ! OutOfMemoryError ? &mut Allocator {
+  let mut anchor = () let current = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, runtime)
+  let running = current.cpuProfile.enabled let open = current.cpuProfile.windows.length() drop current
+  if running && open == 0 { return SharedStart.Busy }
+  if open == MAX_SHARED { return SharedStart.TooMany }
+  if !running {
+    if !run unsafe start(runtime, intervalMicroseconds, sampleCapacity, frameCapacity, functionCapacity) { return SharedStart.Busy }
+  }
+  let since = run nowMicroseconds()
+  let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, runtime)
+  let id = state.cpuProfile.nextWindow state.cpuProfile.nextWindow = id + 1
+  run state.cpuProfile.windows.append(Window { id: id, since: since }) drop state
+  unsafe sampleCurrentStack(runtime)
+  return SharedStart.Started { id: id }
+}
+/// Closes a shared profile: when it was open, the time it opened. The recorder keeps
+/// running while another is open; the last one closed is taken with finishShared.
+pub unsafe fn closeShared(runtime: *mut HeapHeader, id: u64) -> Option<i64> {
+  let mut anchor = () let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, runtime)
+  let mut i: usize = 0
+  while i < state.cpuProfile.windows.length() {
+    let window = state.cpuProfile.windows.get(i)
+    if window.id == id {
+      let last = state.cpuProfile.windows.length() - 1
+      let moved = state.cpuProfile.windows.get(last)
+      state.cpuProfile.windows.set(i, moved)
+      let _removed = state.cpuProfile.windows.pop()
+      return Option<i64>.some(window.since)
+    }
+    i = i + 1
+  }
+  return Option<i64>.none()
+}
+pub unsafe fn sharedOpen(runtime: *mut HeapHeader) -> usize {
+  let anchor = () let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, runtime)
+  return state.cpuProfile.windows.length()
+}
+/// Stops the recorder once no shared profile is open, as stop does for an exclusive one.
+pub unsafe effect fn finishShared(runtime: *mut HeapHeader) -> Option<Profile> {
+  if unsafe sharedOpen(runtime) != 0 { return Option<Profile>.none() }
+  return run unsafe finish(runtime)
+}
+/// The first sample observed at or after `since`.
+pub fn firstSampleSince(profile: &Profile, since: i64) -> usize {
+  let samples = profile.samples() let mut i: usize = 0
+  while i < samples.length && samples[i].timestampMicroseconds < since { i = i + 1 }
+  return i
 }
 unsafe fn functionIndex(state: &mut RuntimeState, bytecode: *mut HeapHeader) -> usize {
   let anchor = () let code = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, bytecode)
@@ -164,7 +234,9 @@ unsafe fn record(runtime: *mut HeapHeader, kind: u8, bytecode: ?*mut HeapHeader,
     return
   }
   let first = state.cpuProfile.profile.frameCount
-  let mut current = state.currentStackFrame let mut depth: usize = 0
+  // An idle embedder waits outside JavaScript: the frames still on the stack are
+  // the host loop's, so V8's (idle) node hangs from the root.
+  let mut current = if kind == IDLE { Pointer.null<StackFrame>() } else { state.currentStackFrame } let mut depth: usize = 0
   let mut top = true
   while !Pointer.isNull<StackFrame>(current) || (top && !Pointer.isNull<HeapHeader>(bytecode)) {
     if depth == MAX_DEPTH || state.cpuProfile.profile.frameCount == state.cpuProfile.profile.frameStorage.length() { break }

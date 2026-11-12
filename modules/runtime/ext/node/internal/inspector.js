@@ -15,6 +15,7 @@ let nextSession = 1;
 let nextException = 1;
 let waiting = false;
 let workerWaitConsumed = false;
+let workerBreakFirst = false;
 const {
   ERR_INSPECTOR_ALREADY_ACTIVATED, ERR_INSPECTOR_CLOSED, ERR_INSPECTOR_NOT_ACTIVE, ERR_INSPECTOR_NOT_AVAILABLE, ERR_INSPECTOR_NOT_WORKER,
 } = require('internal/errors').codes;
@@ -28,8 +29,17 @@ function contextFor(params) {
   if (!context) throw protocolError(-32000, 'Cannot find context with specified id');
   return context;
 }
+// V8's CommandLineAPIScope over the global of the context an evaluation runs in.
+function withCommandLineAPI(session, context) {
+  const global = native(8, 'this', context.handle, false, undefined);
+  if (global.status !== 'success') return () => {};
+  const { commandLineAPI, install } = require('internal/inspector_command_line');
+  return install(global.value, commandLineAPI(session, context.id, consoleBridge));
+}
 function evaluation(session, result, params) {
   if (result.status === 'success') {
+    // InjectedScript::wrapEvaluateResult keeps a console evaluation's value as $_.
+    if (params.objectGroup === 'console' && !params.awaitPromise) session.lastEvaluationResult = result.value;
     if (params.awaitPromise) return Promise.resolve(result.value).then(value => ({ result: session.values.remote(value, params.objectGroup, !!params.returnByValue, !!params.generatePreview, params._context) }), value => evaluation(session, { status: 'exception', value }, { ...params, awaitPromise: false }));
     return { result: session.values.remote(result.value, params.objectGroup, !!params.returnByValue, !!params.generatePreview, params._context) };
   }
@@ -40,7 +50,9 @@ function evaluation(session, result, params) {
   const remote = session.values.remote(exception, params.objectGroup, false, !!params.generatePreview, params._context);
   return { result: remote, exceptionDetails: exceptionDetails(exception, remote) };
 }
-// V8's exceptionDetails: the throw site and stack come from the frames the error captured.
+// V8's exceptionDetails (InjectedScript::createExceptionDetails): the location is the
+// message's, where the throw statement threw (else the error's first frame), with the
+// script id and no url; the stack is the frames the error captured.
 function exceptionDetails(exception, remote) {
   const details = { exceptionId: nextException++, text: 'Uncaught', lineNumber: 0, columnNumber: 0 };
   const frames = require('internal/error_stack').framesOf(exception);
@@ -50,14 +62,18 @@ function exceptionDetails(exception, remote) {
     details.lineNumber = top.lineNumber;
     details.columnNumber = top.columnNumber;
     details.scriptId = top.scriptId;
-    if (top.url) details.url = top.url;
+    const thrown = host.captureCallSites(-4, exception);
+    if (thrown !== undefined && thrown[0] === frames[0].scriptName) {
+      details.lineNumber = thrown[1] - 1;
+      details.columnNumber = thrown[2] - 1;
+    }
     details.stackTrace = trace;
   }
   details.exception = remote;
   return details;
 }
 function validateEvaluation(params, method) {
-  if (params.serializationOptions || params.replMode || params.allowUnsafeEvalBlockedByCSP === false || params.includeCommandLineAPI) unsupported(method);
+  if (params.serializationOptions || params.replMode || params.allowUnsafeEvalBlockedByCSP === false) unsupported(method);
   if (params.timeout !== undefined && (typeof params.timeout !== 'number' || !Number.isFinite(params.timeout) || params.timeout < 0)) throw protocolError(-32602, 'Invalid parameters: timeout');
 }
 function runtime(session, method, params) {
@@ -65,7 +81,8 @@ function runtime(session, method, params) {
     case 'Runtime.enable':
       if (!session.runtime) {
         session.runtime = true;
-        for (const context of contexts.list()) { session.contexts.set(context.id, context); session.emit('Runtime.executionContextCreated', { context: contexts.description(context) }); }
+        for (const context of contexts.list()) { session.contexts.set(context.id, { id: context.id, uniqueId: context.uniqueId }); session.emit('Runtime.executionContextCreated', { context: contexts.description(context) }); }
+        for (const message of consoleMessages) consoleMessage(session, message);
       }
       return {};
     case 'Runtime.disable': session.runtime = false; session.contexts.clear(); return {};
@@ -73,7 +90,11 @@ function runtime(session, method, params) {
       protocolParams(params, 'expression', 'string');
       validateEvaluation(params, method);
       const context = contextFor(params);
-      return evaluation(session, native(8, params.expression, context.handle, !!params.throwOnSideEffect, params.timeout || 0), { ...params, _context: context });
+      const restore = params.includeCommandLineAPI ? withCommandLineAPI(session, context) : undefined;
+      let result;
+      try { result = native(8, params.expression, context.handle, !!params.throwOnSideEffect, params.timeout); }
+      finally { if (restore) restore(); }
+      return evaluation(session, result, { ...params, _context: context });
     }
     case 'Runtime.callFunctionOn': {
       protocolParams(params, 'functionDeclaration', 'string');
@@ -87,11 +108,11 @@ function runtime(session, method, params) {
         if (!argument || typeof argument !== 'object') throw protocolError(-32602, 'Invalid parameters: arguments');
         return session.values.argument(argument);
       });
-      const compiled = native(8, `(${params.functionDeclaration}\n)`, context.handle, !!params.throwOnSideEffect, params.timeout || 0);
+      const compiled = native(8, `(${params.functionDeclaration}\n)`, context.handle, !!params.throwOnSideEffect, params.timeout);
       if (compiled.status !== 'success') return evaluation(session, compiled, params);
       if (typeof compiled.value !== 'function') throw protocolError(-32000, 'Given expression does not evaluate to a function');
       const options = { ...params, _context: context, objectGroup: params.objectGroup === undefined && receiverEntry ? receiverEntry.group : params.objectGroup };
-      return evaluation(session, native(13, compiled.value, receiver, args, context.handle, !!params.throwOnSideEffect, params.timeout || 0), options);
+      return evaluation(session, native(13, compiled.value, receiver, args, context.handle, !!params.throwOnSideEffect, params.timeout), options);
     }
     case 'Runtime.getProperties':
       protocolParams(params, 'objectId', 'string'); return session.values.properties(params.objectId, params);
@@ -112,6 +133,7 @@ function runtime(session, method, params) {
     case 'Runtime.globalLexicalScopeNames': return { names: native(11, contextFor(params).handle) };
     case 'Runtime.getIsolateId': return { id: `silk:${native(10)}` };
     case 'Runtime.runIfWaitingForDebugger': waiting = false; return {};
+    case 'Runtime.discardConsoleEntries': consoleMessages.length = 0; session.values.releaseGroup('console'); return {};
     default: unsupported(method);
   }
 }
@@ -151,7 +173,8 @@ function createSession(key, send) {
   const session = { id: nextSession++, runtime: false, contexts: new Map(), values: null,
     send(message) { if (sessions.get(key) === session) send(message); },
     emit(method, params) { if (sessions.get(key) === session) send({ method, params }); },
-    evaluation(result, params) { return evaluation(session, result, params); } };
+    evaluation(result, params) { return evaluation(session, result, params); },
+    commandLineAPI(context) { return withCommandLineAPI(session, context); } };
   session.values = new RemoteValues(`${native(10)}:${session.id}`);
   sessions.set(key, session);
   native(7, true);
@@ -254,10 +277,14 @@ function contextsDestroyed() {
 }
 // Node's Agent::WaitForDisconnect, run after the 'exit' event while the inspector is active.
 function atExit() {
-  if (native(10) !== 0 || (!url() && sessions.size === 0)) return;
-  if (remoteSessions()) host.writeStartupDiagnostic('Waiting for the debugger to disconnect...\n');
+  // A worker's contexts end with its thread, before NodeWorker detaches its sessions.
+  const worker = native(10) !== 0;
+  if (!worker && !url() && sessions.size === 0) return;
+  if (!worker && remoteSessions()) host.writeStartupDiagnostic('Waiting for the debugger to disconnect...\n');
   for (const session of [...sessions.values()]) if (session.notifyDisconnect) { session.emit('NodeRuntime.waitingForDisconnect', {}); exitRetained = true; }
   if (!exitRetained) contextsDestroyed();
+  // Node's worker Agent::WaitForDisconnect: the thread stays until those sessions detach.
+  if (worker) { while (exitRetained) native(4, 10); return; }
   while (url() && remoteSessions()) native(4, 10);
 }
 function close() {
@@ -265,6 +292,8 @@ function close() {
   for (const key of sessions.keys()) if (!key.startsWith('local:') && key.startsWith('-1:')) closeSession(key);
   waiting = false;
 }
+// The errno of the last failed listen, for the CLI's report.
+let startFailure = 0;
 function open(port = 9229, hostname = '127.0.0.1', wait = false) {
   check();
   if (url()) throw new ERR_INSPECTOR_ALREADY_ACTIVATED();
@@ -273,11 +302,16 @@ function open(port = 9229, hostname = '127.0.0.1', wait = false) {
   if (typeof port !== 'number' || !Number.isInteger(port) || port < 0 || port > 65535) port = 9229;
   if (typeof hostname !== 'string' || !hostname) hostname = '127.0.0.1';
   if (!['127.0.0.1', 'localhost', '::1'].includes(hostname)) process.emitWarning('Binding the inspector to a public IP with an open port is insecure, as it allows external hosts to connect to the inspector and perform a remote code execution attack. Documentation can be found at https://nodejs.org/api/cli.html#--inspecthostport', 'SecurityWarning');
-  if (!native(1, hostname, port, `node.js/${process.version}`)) throw new ERR_INSPECTOR_NOT_AVAILABLE();
+  // --inspect-publish-uid: the listing over HTTP and the banner on stderr.
+  const publish = host.inspectorOptions?.publishUid ?? { stderr: true, http: true };
+  const status = native(1, hostname, port, `node.js/${process.version}`, publish.http);
+  if (status !== 0) { startFailure = status; throw new ERR_INSPECTOR_NOT_AVAILABLE(); }
   const endpoint = url();
   process.debugPort = Number(new URL(endpoint).port);
   // Startup can park immediately below; publish without queued stdio work.
-  host.writeStartupDiagnostic(`Debugger listening on ${endpoint}\nFor help, see: https://nodejs.org/en/docs/inspector\n`);
+  if (publish.stderr) host.writeStartupDiagnostic(`Debugger listening on ${endpoint}\nFor help, see: https://nodejs.org/learn/getting-started/debugging\n`);
+  // Agent::StartIoThread: NotifyClusterWorkersDebugEnabled tells a cluster primary to debug its workers.
+  host.processEmit('internalMessage', { cmd: 'NODE_DEBUG_ENABLED' });
   if (wait) waitForDebugger();
   return { __proto__: null, [Symbol.dispose]() { close(); } };
 }
@@ -299,7 +333,8 @@ function waitWorker() {
 }
 function waitForWorkerStart() {
   if (native(10) === 0 || workerWaitConsumed) return;
-  if (native(18)) { check(); waitWorker(); }
+  // As Node's Agent::Start: a worker its parent waits on also breaks on its first line.
+  if (native(18)) { check(); workerBreakFirst = true; waitWorker(); }
   else native(0, onNative);
 }
 function start(port, hostname, wait, breakFirst) {
@@ -308,7 +343,9 @@ function start(port, hostname, wait, breakFirst) {
     try { open(port, hostname, false); }
     catch (cause) {
       if (cause.code !== 'ERR_INSPECTOR_NOT_AVAILABLE') throw cause;
-      process.stderr.write(`Starting inspector on ${hostname || '127.0.0.1'}:${port === undefined ? 9229 : port} failed\n`);
+      // As Node's InspectorSocketServer::Start: the libuv reason follows.
+      const reason = startFailure > 0 ? `: ${require('util').getSystemErrorMessage(-startFailure)}` : '';
+      process.stderr.write(`Starting inspector on ${hostname || '127.0.0.1'}:${port === undefined ? 9229 : port} failed${reason}\n`);
       return;
     }
     if (wait || breakFirst) waitForDebugger();
@@ -377,12 +414,23 @@ function callerStack(skip) {
   return stackTrace(frames.slice(first));
 }
 function consoleStack() { return callerStack(consoleStack); }
+// V8ConsoleMessageStorage: a session that enables Runtime later is sent the messages
+// logged before, up to V8's 1000 (maxConsoleMessageCount); console.clear() empties it.
+// Node calls the inspector console only while the inspector is active (a server
+// listens or a session is connected).
+const consoleMessages = [];
+function consoleMessage(session, message) {
+  session.emit('Runtime.consoleAPICalled', { type: message.type, args: message.args.map(value => session.values.remote(value, 'console', false, true)), executionContextId: 1, timestamp: message.timestamp, stackTrace: message.stackTrace });
+}
 const consoleBridge = require('internal/inspector_console').create((type, args) => {
-  let stackTrace;
+  if (!url() && sessions.size === 0) return;
+  const message = { type, args, timestamp: Date.now(), stackTrace: consoleStack() };
+  if (type === 'clear') consoleMessages.length = 0;
+  consoleMessages.push(message);
+  if (consoleMessages.length > 1000) consoleMessages.shift();
   for (const session of sessions.values()) if (session.runtime) {
     if (type === 'clear') session.values.releaseGroup('console');
-    stackTrace ??= consoleStack();
-    session.emit('Runtime.consoleAPICalled', { type, args: args.map(value => session.values.remote(value, 'console', false, true)), executionContextId: 1, timestamp: Date.now(), stackTrace });
+    consoleMessage(session, message);
   }
 });
 consoleBridge.console.profile = function profile(title) {
@@ -391,8 +439,11 @@ consoleBridge.console.profile = function profile(title) {
 consoleBridge.console.profileEnd = function profileEnd(title) {
   return profiles.consoleProfileEnd(title, profiles.emitConsoleEvent, profileEnd);
 };
+contexts.onDestroyed(context => {
+  for (const session of sessions.values()) if (session.runtime && session.contexts.delete(context.id)) session.emit('Runtime.executionContextDestroyed', { executionContextId: context.id, executionContextUniqueId: context.uniqueId });
+});
 contexts.subscribe(context => {
-  for (const session of sessions.values()) if (session.runtime) { session.contexts.set(context.id, context); session.emit('Runtime.executionContextCreated', { context: contexts.description(context) }); }
+  for (const session of sessions.values()) if (session.runtime) { session.contexts.set(context.id, { id: context.id, uniqueId: context.uniqueId }); session.emit('Runtime.executionContextCreated', { context: contexts.description(context) }); }
 }, true);
 // Worker owners are announced before bootstrap has installed permissions and
 // startup options. Keep incoming routes queued until _start/_waitForWorker.
@@ -401,4 +452,4 @@ if (native(10) === 0) {
   // Native state does not come with a heap image: a start from one registers again.
   host.onHydrate(() => { native(0, onNative); });
 }
-module.exports = { connect, open, close, url, waitForDebugger, _start: start, _atExit: atExit, _installProcess: installProcess, _waitForWorker: waitForWorkerStart, _armStartup: armStartup, broadcast, console: consoleBridge.console, emitConsole: consoleBridge.emitConsole, putNetworkResource: network.put };
+module.exports = { connect, open, close, url, waitForDebugger, _start: start, _atExit: atExit, _installProcess: installProcess, _waitForWorker: waitForWorkerStart, _armStartup: armStartup, _breakFirstLine: () => workerBreakFirst, broadcast, console: consoleBridge.console, emitConsole: consoleBridge.emitConsole, putNetworkResource: network.put };

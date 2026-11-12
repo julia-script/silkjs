@@ -1,7 +1,7 @@
 'use strict';
 
 const native = require('internal/host').inspectorNative;
-const { protocolError, unsupported } = require('internal/inspector_values');
+const { protocolError, unsupported, scopeType } = require('internal/inspector_values');
 const createHash = algorithm => require('crypto').createHash(algorithm);
 const contexts = require('internal/inspector_contexts');
 const pendingScripts = new Map();
@@ -109,8 +109,8 @@ function frames(session, source) {
     const grouped = new Map();
     const context = contexts.fromToken(frame.contextToken);
     for (const binding of native(30, frame.callFrameId)) {
-      if (binding.kind === 0) continue;
-      const type = binding.kind === 3 ? 'closure' : binding.isLocal ? 'local' : 'block';
+      const type = scopeType(binding);
+      if (type === undefined) continue;
       const key = `${type}:${type === 'block' ? binding.scope : ''}:${binding.depth}`;
       let scope = grouped.get(key);
       if (!scope) {
@@ -119,7 +119,7 @@ function frames(session, source) {
       }
       if (!scope.scope.includes(binding.scope)) scope.scope.push(binding.scope);
     }
-    const scopeChain = Array.from(grouped.values(), scope => ({ type: scope.type, object: session.values.scope(frame.callFrameId, scope.scope, scope.depth, context) }));
+    const scopeChain = Array.from(grouped.values(), scope => ({ type: scope.type, object: session.values.scope(frame.callFrameId, scope.scope, scope.depth, context, scope.type) }));
     scopeChain.push({ type: 'global', object: session.values.remote(frame.global, 'backtrace', false, false, context) });
     return { callFrameId: frame.callFrameId, functionName: frame.functionName, location: locationOnly(frame.location), url: scriptURLs.get(frame.location.scriptId) ?? '', scopeChain, this: session.values.remote(frame.this, 'backtrace', false, false, context) };
   });
@@ -143,7 +143,7 @@ function paused(payload) {
       if (!breakpoint.locations.some(location => location.scriptId === source[0].location.scriptId && location.lineNumber === source[0].location.lineNumber && location.columnNumber === source[0].location.columnNumber)) continue;
       if (breakpoint.condition) {
         conditional = true;
-        const result = native(29, source[0].callFrameId, breakpoint.condition, false, 0);
+        const result = native(29, source[0].callFrameId, breakpoint.condition, false, undefined);
         if (result.status !== 'success' || !result.value) continue;
       }
       hits.push(id);
@@ -156,12 +156,17 @@ function paused(payload) {
       if (data.blackbox.some(pattern => pattern.test(url))) continue;
     }
     delivered = true;
-    const reason = stepped && hits.length === 0 && payload.reason !== 'exception' ? 'step' : payload.reason || 'other';
+    // The pause --inspect-brk arms (V8's schedulePauseOnNextStatement from Node's
+    // agent) reports 'Break on start'.
+    const reason = stepped && hits.length === 0 && payload.reason !== 'exception' ? 'step'
+      : startup && hits.length === 0 && (!payload.reason || payload.reason === 'other') ? 'Break on start' : payload.reason || 'other';
     const asyncStackTrace = data.asyncDepth > 0 ? asyncTasks().asyncStackTrace(data.asyncDepth) : undefined;
     session.emit('Debugger.paused', { callFrames: frames(session, source), reason, hitBreakpoints: hits, ...(asyncStackTrace && { asyncStackTrace }) });
     if (!native(31)) break;
   }
-  if (!delivered && !startup && native(31)) { native(27, 0); activePause = undefined; }
+  // V8 schedules the start pause only for sessions whose debugger is enabled
+  // (V8DebuggerAgentImpl::schedulePauseOnNextStatement): without one it runs on.
+  if (!delivered && (!startup || enabled.size === 0) && native(31)) { native(27, 0); activePause = undefined; }
 }
 // V8 records async tasks for the deepest stack any enabled session asked for.
 let asyncModule;
@@ -280,8 +285,15 @@ function dispatch(session, method, params) {
     case 'Debugger.evaluateOnCallFrame':
       if (typeof params.callFrameId !== 'string' || typeof params.expression !== 'string') throw protocolError(-32602, 'Invalid parameters');
       if (params.timeout !== undefined && (typeof params.timeout !== 'number' || !Number.isFinite(params.timeout) || params.timeout < 0)) throw protocolError(-32602, 'Invalid parameters: timeout');
-      if (params.includeCommandLineAPI) unsupported(method);
-      return session.evaluation(native(29, params.callFrameId, params.expression, !!params.throwOnSideEffect, params.timeout || 0), params);
+      {
+        const frame = params.includeCommandLineAPI && activePause ? (activePause.frames || []).find(item => item.callFrameId === params.callFrameId) : undefined;
+        const context = frame && contexts.fromToken(frame.contextToken);
+        const restore = context ? session.commandLineAPI(context) : undefined;
+        let result;
+        try { result = native(29, params.callFrameId, params.expression, !!params.throwOnSideEffect, params.timeout); }
+        finally { if (restore) restore(); }
+        return session.evaluation(result, params);
+      }
     default: unsupported(method);
   }
 }

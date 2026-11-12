@@ -77,6 +77,9 @@ for (const name of ['dispose', 'asyncDispose']) {
   if (Symbol[name] === undefined) Object.defineProperty(Symbol, name, { value: Symbol.for('nodejs.' + name) });
 }
 const host = { ...native, rawOS, rawStd };
+// Node's internals keep SharedArrayBuffer when the global is left out
+// (--enable-sharedarraybuffer-per-context): a Worker still shares its cwd counter.
+host.SharedArrayBuffer = SharedArrayBuffer;
 // Startup snapshots: what Node keeps in internalBinding('mksnapshot') for
 // internal/v8/startup_snapshot. With --build-snapshot (native.snapshotBuild) the
 // heap is saved as the blob when the loop ends; a start from the blob runs
@@ -384,6 +387,13 @@ host.attachArrow = (error, scriptName, source, prefix) => {
   }
   host.errorArrows.set(error, scriptName + ':' + line + '\n' + text + '\n' + caret);
 };
+// node_errors.cc DecorateErrorStack: the arrow, a blank line, then the stack, once.
+host.decorateErrorStack = error => {
+  const arrow = host.errorArrows.get(error);
+  if (arrow === undefined || host.decoratedErrors.has(error) || typeof error.stack !== 'string') return;
+  error.stack = arrow + '\n' + error.stack;
+  host.decoratedErrors.add(error);
+};
 // Runs a timer or immediate callback; true when it threw (and was reported).
 function invokeReporting(callback, receiver, args) {
   try { Reflect.apply(callback, receiver, args); return false; }
@@ -580,6 +590,14 @@ host.performanceLoopStats = () => {
   const end = performanceMilestones.loopExit < 0 ? native.now() - startTime : performanceMilestones.loopExit;
   return { idle, active: Math.max(0, end - performanceMilestones.loopStart - idle) };
 };
+// Node's ProcessEmit: a MakeCallback of process.emit with no async context, which goes through
+// the domain module's trampoline (host.domainCallback) once that module is loaded.
+host.processEmit = (name, value) => {
+  const emit = process.emit, trampoline = host.domainCallback;
+  return trampoline === undefined ? emit.call(process, name, value) : trampoline.call(process, emit, name, value);
+};
+// node_perf.cc GetUvMetricsInfo: [loop_count, events, events_waiting].
+host.performanceUvMetrics = () => [native.loopMetrics(0), native.loopMetrics(1), native.loopMetrics(2)];
 host.performanceNodeTiming = () => ({ ...performanceMilestones, idleTime: host.performanceLoopStats().idle });
 host.performanceAddLoopListener = callback => {
   loopListeners.add(callback);
@@ -689,6 +707,8 @@ Object.assign(process, {
     internalRequire('internal/permission').check('addon', module);
     throw Object.assign(new Error(`No such binding was linked: ${module}`), { code: 'ERR_INVALID_MODULE' });
   },
+  // lib/internal/bootstrap/realm.js: the bindings still allowed, as this runtime emulates them.
+  binding(module) { return internalRequire('internal/bindings').processBinding(module); },
   // Formats like console.log and writes to fd 2 at once: no streams, ticks or console.
   _rawDebug(...args) { host.writeText(2, internalRequire('util').format(...args) + '\n'); },
 });
@@ -943,7 +963,8 @@ Object.defineProperty(globalThis, '__silkModuleBridge', { value: loader.bridge }
 let mainModuleName;
 let inspectorStartupArmed = false;
 function armInspectorEntry() {
-  if (inspectorStartupArmed || !host.inspectorOptions?.enabled || !host.inspectorOptions.breakFirst) return;
+  if (inspectorStartupArmed) return;
+  if (!(host.inspectorOptions?.enabled && host.inspectorOptions.breakFirst) && !inspectorBackend._breakFirstLine()) return;
   inspectorStartupArmed = true;
   inspectorBackend._armStartup();
 }
@@ -970,6 +991,7 @@ function runPreloads(entry, loadImports = true, loadRequires = true, runImports 
   // Before any preload: Node applies it when the context is made.
   native.vmSetImportModuleDynamically(undefined, missingImportCallback, true);
   if (host.disableProto !== undefined) disableProto(globalThis);
+  if (host.noSharedArrayBuffer) delete globalThis.SharedArrayBuffer;
   if (host.disallowCodeGeneration) native.vmSetCodeGeneration(undefined, false);
   if (host.jitless) delete globalThis.WebAssembly;
   if (host.experimentalShadowRealm) internalRequire('internal/shadow_realm').enable();
@@ -1040,6 +1062,16 @@ function runtimeFlag(arg) {
   if (arg.startsWith('--v8-pool-size=')) return true;
   if (arg === '--async-context-frame' || arg === '--no-async-context-frame') {
     host.asyncContextFrame = arg === '--async-context-frame'; return true;
+  }
+  // V8's --stack-size, in KiB: the main thread's JavaScript stack (worker_native
+  // mainStackBytes). A Worker keeps its resourceLimits stack, as in Node.
+  const stackSize = /^--stack[-_]size=(\d+)$/.exec(arg);
+  if (stackSize) { native.workerNative('setStackSize', [Number(stackSize[1])]); return true; }
+  // V8 with these flags and no embedder callback, as in Node, installs no
+  // SharedArrayBuffer global (runPreloads removes it before user code).
+  if (arg === '--enable-sharedarraybuffer-per-context' || arg === '--no-harmony-sharedarraybuffer' ||
+      arg === '--no-harmony_sharedarraybuffer') {
+    host.noSharedArrayBuffer = true; return true;
   }
   if (arg === '--expose-gc' || arg === '--no-expose-gc') {
     host.exposeGC = arg === '--expose-gc'; return true;

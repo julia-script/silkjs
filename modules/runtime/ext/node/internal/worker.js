@@ -301,7 +301,7 @@ class Worker extends EventEmitter {
       state.user.on('message', value => state.resource.runInAsyncScope(this.emit, this, 'message', value));
       state.user.on('messageerror', error => state.resource.runInAsyncScope(this.emit, this, 'messageerror', error));
       state.user.unref();
-      if (info.isMainThread) cwdCounter ??= new Uint32Array(new SharedArrayBuffer(4));
+      if (info.isMainThread) cwdCounter ??= new Uint32Array(new host.SharedArrayBuffer(4));
       controlChannel.port1.postMessage({ type: messageTypes.LOAD_SCRIPT, cwdCounter: cwdCounter || sharedCwdCounter, workerData: config.options.workerData,
         environmentData: Array.from(environmentData), parentPort: userChannel.port2,
         options: config.metadata }, [userChannel.port2, ...list]);
@@ -554,7 +554,10 @@ function install(proc = process, metadata = bootstrap()) {
     if (typeof code === 'string' && code.trim()) code = Number(code);
     if (!Number.isInteger(code)) throw clone().codedError('ERR_INVALID_ARG_TYPE', 'The code argument must be an integer');
     proc.exitCode = code;
-    if (!exitRequested) { exitRequested = true; proc._exiting = true; proc.emit('exit', code); }
+    if (!exitRequested) {
+      exitRequested = true;
+      if (!proc._exiting) { proc._exiting = true; proc.emit('exit', code); }
+    }
     if (host.builtinLoaded('internal/compile_cache')) require('internal/compile_cache').flushAtExit();
     require('internal/startup_controls').traceExit(code, info.threadId);
     if (host.builtinLoaded('internal/heap_prof')) require('internal/heap_prof').finish();

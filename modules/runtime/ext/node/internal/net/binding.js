@@ -452,7 +452,8 @@ class NativeStreamHandle extends StreamHandle {
   }
   _call(operation, ...args) {
     if (!this._transport || this._transport.closed) return uv.UV_EBADF;
-    return this._transport.call(operation, ...args);
+    // No spread: it would run a user's Array.prototype[Symbol.iterator].
+    return Reflect.apply(this._transport.call, this._transport, [operation].concat(args));
   }
   open(fd) { return this._call('open', fd); }
   listen(backlog) { return this._call('listen', backlog); }

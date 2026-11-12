@@ -68,31 +68,13 @@ function cpus() {
     result.push({ model: data[i], speed: data[i + 1], times: { user: data[i + 2], nice: data[i + 3], sys: data[i + 4], idle: data[i + 5], irq: data[i + 6] } });
   return result;
 }
-function cidr(address, mask, family) {
-  let bytes;
-  if (family === 'IPv4') bytes = mask.split('.').map(Number);
-  else {
-    const halves = mask.split('::');
-    const left = halves[0] ? halves[0].split(':') : [];
-    const right = halves.length > 1 && halves[1] ? halves[1].split(':') : [];
-    const words = halves.length > 1 ? [...left, ...Array(8 - left.length - right.length).fill('0'), ...right] : left;
-    bytes = [];
-    for (const word of words) { const n = parseInt(word, 16); bytes.push(n >>> 8, n & 255); }
-  }
-  let bits = 0;
-  let zero = false;
-  for (const byte of bytes) for (let bit = 7; bit >= 0; bit--) {
-    if (byte & (1 << bit)) { if (zero) return null; bits++; } else zero = true;
-  }
-  return `${address}/${bits}`;
-}
 function networkInterfaces() {
   const data = native('networkInterfaces');
   const result = {};
   for (let i = 0; i < data.length; i += 7) {
     const name = data[i];
     const family = data[i + 3] === 4 ? 'IPv4' : 'IPv6';
-    const entry = { address: data[i + 1], netmask: data[i + 2], family, mac: data[i + 4], internal: data[i + 5], cidr: cidr(data[i + 1], data[i + 2], family) };
+    const entry = { address: data[i + 1], netmask: data[i + 2], family, mac: data[i + 4], internal: data[i + 5], cidr: require('internal/util').getCIDR(data[i + 1], data[i + 2], family) };
     if (data[i + 6] !== -1) entry.scopeid = data[i + 6];
     if (Object.prototype.hasOwnProperty.call(result, name)) result[name].push(entry);
     else Object.defineProperty(result, name, { value: [entry], enumerable: true, configurable: true, writable: true });

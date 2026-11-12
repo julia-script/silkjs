@@ -54,6 +54,11 @@ function initialize() {
   }
   if (!state.deprecation) process.noDeprecation = true;
   host.pendingDeprecation = state.pendingDeprecation ?? process.env.NODE_PENDING_DEPRECATION === '1';
+  // pre_execution.js initializeDeprecations.
+  if (host.pendingDeprecation) {
+    process.binding = require('internal/util').deprecate(process.binding,
+      'process.binding() is deprecated. Please use public APIs instead.', 'DEP0111');
+  }
   state.redirectWarnings ||= process.env.NODE_REDIRECT_WARNINGS;
   if (state.warnings && process.env.NODE_NO_WARNINGS !== '1') process.on('warning', onWarning);
   if (state.abortOnUncaughtException) host.abortOnUncaughtException = abortOnUncaughtException;
@@ -213,24 +218,43 @@ function handleUncaught(error, origin) {
   const fatal = process._fatalException;
   const mainThread = require('worker_threads').isMainThread;
   if (typeof fatal !== 'function') {
-    if (!mainThread) throw error;
     reportFatal(error, fromPromise);
+    if (!mainThread) { require('internal/worker')._requestExit(kInvalidFatalExceptionMonkeyPatching); return; }
     terminate(kInvalidFatalExceptionMonkeyPatching);
   }
   let handled;
   try {
     handled = Reflect.apply(fatal, process, [error, fromPromise]);
   } catch (thrown) {
-    if (!mainThread) throw thrown;
+    if (!mainThread) return workerUncaught(thrown);
     reportFatal(thrown, false);
     terminate(kExceptionInFatalExceptionHandler);
   }
   if (handled) return;
   require('internal/process_report').onUncaughtException(error);
-  if (!mainThread) throw error;
+  if (!mainThread) return workerUncaught(error);
   reportFatal(error, fromPromise);
   const code = process.exitCode;
   terminate(code === undefined ? kGenericUserError : Number(code) | 0);
+}
+// Node's workerOnGlobalUncaughtException (internal/main/worker_thread.js): the
+// worker emits 'exit' with code 1, reports the error to its parent and exits
+// with whatever code the 'exit' listeners left.
+function workerUncaught(error) {
+  // terminate() and process.exit() unwind the thread with an interruption,
+  // which the native side ends without reporting.
+  if (require('internal/worker')._exitRequested || host.workerNative('stopping', [])) throw error;
+  if (!process._exiting) {
+    try {
+      process._exiting = true;
+      process.exitCode = kGenericUserError;
+      process.emit('exit', process.exitCode);
+    } catch {
+      // Continue regardless of error.
+    }
+  }
+  require('internal/worker')._reportError(error);
+  process.exit();
 }
 let printedError = false;
 function reportFatal(error, fromPromise) {

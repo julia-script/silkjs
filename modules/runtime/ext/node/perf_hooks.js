@@ -301,6 +301,13 @@ for (const name of [...reservedMarks, 'idleTime']) Object.defineProperty(Perform
     return -1;
   }
 });
+// A fresh object each read, so an earlier result never changes (lib/internal/perf/nodetiming.js).
+Object.defineProperty(PerformanceNodeTiming.prototype, 'uvMetricsInfo', {
+  configurable: true, enumerable: true, get() {
+    const [loopCount, events, eventsWaiting] = host.performanceUvMetrics();
+    return { loopCount, events, eventsWaiting };
+  },
+});
 const nodeTiming = new PerformanceNodeTiming();
 class Performance extends EventTarget {
   #handler = null;

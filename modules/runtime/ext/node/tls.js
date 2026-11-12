@@ -18,7 +18,7 @@ const { ConnResetException } = require('internal/errors');
 const { checkServerIdentity } = require('internal/tls/identity');
 const { TLSTransport } = require('internal/tls/transport');
 const { kTLSServer } = require('internal/tls/server');
-const { kReinitializeHandle } = require('internal/net');
+const { kReinitializeHandle, kClientSocketOwner } = require('internal/net');
 
 const kConnectOptions = Symbol('connect-options');
 const kErrorEmitted = Symbol('error-emitted');
@@ -224,6 +224,7 @@ TLSSocket.prototype.connect = function(...args) {
   if (this[kPreAborted]) return this;
   this.connecting = true;
   // The TLS socket listens to options.signal itself; aborting it destroys the parent too.
+  this._parent[kClientSocketOwner] = this;
   try { this._parent.connect({ ...options, allowHalfOpen: true, signal: undefined }); } catch (err) { this.destroy(); throw err; }
   return this;
 };

@@ -467,9 +467,11 @@ function commit(prepared) {
 }
 function post(id, value, list) {
   const prepared = prepare(value, list, id);
-  try { host.workerNative('post', [id, prepared.bytes, prepared.buffers, prepared.shared, prepared.ports]); }
+  let postedToItself;
+  try { postedToItself = host.workerNative('post', [id, prepared.bytes, prepared.buffers, prepared.shared, prepared.ports]); }
   catch (error) { rollback(prepared); throw error; }
   commit(prepared);
+  if (postedToItself) process.emitWarning('The target port was posted to itself, and the communication channel was lost');
 }
 // With a ports array, it receives the MessagePorts the message itself carries (Node's
 // MessageEvent#ports), not the internal ports of transferred AbortSignals.
