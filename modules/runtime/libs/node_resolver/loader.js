@@ -1386,17 +1386,23 @@ function createLoader(host, builtins) {
     requireModuleTrace = true;
   }
 
+  // How many require(esm) graphs are loading (Node's importSyncForRequire): while
+  // one is, an ES module there may not import a CommonJS module still executing.
+  let requiringESM = 0;
+  // Import cycles keep their own message through each enclosing require(esm).
+  const importCycles = new WeakSet();
   function requireNamespace(module, filename) {
     if (!requireModuleEnabled()) throw requireESMError(filename, module[kModuleParent]);
     traceRequireModule(module);
     let namespace;
+    requiringESM++;
     try { namespace = host.requireModule(filename); }
     catch (cause) {
       if (cause !== null && typeof cause === 'object' && cause.code === 'ERR_REQUIRE_ASYNC_MODULE') throw asyncModuleError(filename, module[kModuleParent]);
-      if (cause !== null && typeof cause === 'object' && cause.code === 'ERR_REQUIRE_CYCLE_MODULE') throw cycleError(filename, module[kModuleParent]);
+      if (cause !== null && typeof cause === 'object' && cause.code === 'ERR_REQUIRE_CYCLE_MODULE' && !importCycles.has(cause)) throw cycleError(filename, module[kModuleParent]);
       // As Node's C++ ReThrow, which keeps the message of where it was thrown.
       host.rethrow(decorateModuleError(cause, filename));
-    }
+    } finally { requiringESM--; }
     if (own(namespace, 'module.exports')) module.exports = namespace['module.exports'];
     else if (own(namespace, 'default') && !own(namespace, '__esModule')) {
       // As in Node, a facade module re-exports the namespace with __esModule added, so
@@ -1755,6 +1761,12 @@ function createLoader(host, builtins) {
     // whatever the file is (Node's isExperimentalTextImport).
     if (host.importText && attributes && attributes.type === 'text') resolved = { ...resolved, format: 'text' };
     if (resolved.format && !hooks.active()) validateAttributes(resolved.format, asURL(resolved.filename), attributes || {});
+    if (requiringESM > 0 && resolved.format === 'commonjs' && own(cache, resolved.filename) && !cache[resolved.filename].loaded) {
+      const from = typeof parent === 'string' ? ` (from ${filesystemName(parent)})` : '';
+      const cycle = error('ERR_REQUIRE_CYCLE_MODULE', `Cannot import CommonJS Module ${specifier} in a cycle.${from}`);
+      importCycles.add(cycle);
+      throw cycle;
+    }
     return resolved;
   }
   // The engine's module name for an import request.
