@@ -12,7 +12,6 @@ const constructCallInvalid = () => clone.codedError('ERR_CONSTRUCT_CALL_INVALID'
 const states = new WeakMap();
 const endpoints = new Map();
 const retained = new Map();
-const token = {};
 // Ports closed while messages for them were queued, until those are emitted.
 const closing = new Map();
 const finalizer = new FinalizationRegistry(id => {
@@ -121,7 +120,7 @@ function ref(port, enabled) {
   }
   return port;
 }
-function initialize(port, endpoint, realm) {
+function initialize(port, endpoint, realm, fresh = false) {
   const value = { id: endpoint, started: false, refed: false, emitter: new EventEmitter(),
     resource: null, realm, handlers: Object.create(null), closing: false, refedAtClose: false };
   states.set(port, value);
@@ -131,6 +130,7 @@ function initialize(port, endpoint, realm) {
   host.workerNative('ref', [endpoint, false]);
   // Like Node's, the async resource of a port is the port itself.
   value.resource = createResource('MESSAGEPORT', port);
+  if (fresh) require('internal/event_target').initEventTarget(port);
   return port;
 }
 function hasRef(port) {
@@ -202,11 +202,9 @@ class PortEventTarget extends EventTarget {
   getMaxListeners() { return state(this).emitter.getMaxListeners(); }
 }
 class InternalMessagePort extends PortEventTarget {
-  constructor(key, endpoint) {
-    super();
-    if (key !== token) throw constructCallInvalid();
-    initialize(this, endpoint);
-  }
+  // Like Node's native MessagePort, a port is made by wrap(), not by its constructor, so
+  // that the async init hook sees it before its EventTarget fields exist (oninit's order).
+  constructor() { throw constructCallInvalid(); }
   postMessage(value, transferList) {
     if (arguments.length === 0) throw new ERR_MISSING_ARGS('value');
     const data = state(this);
@@ -252,7 +250,7 @@ Object.defineProperty(MessagePort.prototype, inspectCustom, {
 });
 if (Symbol.dispose) MessagePort.prototype[Symbol.dispose] = MessagePort.prototype.close;
 function wrap(endpoint, realm) {
-  if (!realm) return new InternalMessagePort(token, endpoint);
+  if (!realm) return initialize(Object.create(InternalMessagePort.prototype), endpoint, null, true);
   return initialize(realm.makePort({
     post(port, value, list) { const data = state(port); if (data.id !== null) clone.post(data.id, value, list); },
     start, close, ref, retain,
