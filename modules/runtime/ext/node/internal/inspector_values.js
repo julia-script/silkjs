@@ -314,6 +314,9 @@ function preview(value, info, limit, withEntries = true) {
       }
       // V8 leaves entries out of an empty collection's preview.
       if (entries.length) result.entries = entries;
+    } else if ((subtype === 'map' ? mapSize(value) : setSize(value)) > 0) {
+      // A collection inside an entry preview has no entries of its own: V8 marks what it left out.
+      result.overflow = true;
     }
   } else if (subtype === 'promise') {
     const details = host.getPromiseDetails(value);
