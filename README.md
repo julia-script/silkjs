@@ -7,6 +7,7 @@ runtime built on it.
 | --- | --- | --- |
 | [`modules/engine`](modules/engine) | `silkjs` | The JavaScript engine, its embedding API and the `silkjs` command line |
 | [`modules/runtime`](modules/runtime) | `silkjsruntime` | The Node-compatible runtime; depends on the engine by path |
+| [`modules/pm`](modules/pm) | `pm` | The package manager, in Silk on the Silk standard library; it will run as the runtime's `install`, `add` and related commands |
 
 The two are released together. The root [`silk.toml`](silk.toml) is a Silk workspace whose
 `silk-version` pins the one toolchain both modules build with, overriding their own pins; move
