@@ -128,6 +128,26 @@ trace.watch(kSyncCategory, on => {
     else delete os[name];
   }
 });
+// Node's FS_ASYNC_TRACE_BEGIN/END: a nestable async pair per libuv request, named
+// after the request (fs_async names it), while node.fs.async or node.fs_dir.async is on.
+const kAsyncCategory = 'node,node.fs,node.fs.async';
+const kDirAsyncCategory = 'node,node.fs_dir,node.fs_dir.async';
+const asyncTracing = { file: false, dir: false };
+let asyncTraceId = 0;
+const asyncTracer = {
+  begin(name, dir = false) {
+    if (!(dir ? asyncTracing.dir : asyncTracing.file)) return undefined;
+    const id = ++asyncTraceId;
+    trace.emit(dir ? kDirAsyncCategory : kAsyncCategory, name, 'b', {}, id);
+    return id;
+  },
+  end(name, id, dir = false) {
+    if (id !== undefined) trace.emit(dir ? kDirAsyncCategory : kAsyncCategory, name, 'e', {}, id);
+  },
+};
+function syncAsyncTracer() { host.fsAsyncTracer = asyncTracing.file || asyncTracing.dir ? asyncTracer : undefined; }
+trace.watch(kAsyncCategory, on => { asyncTracing.file = on; syncAsyncTracer(); });
+trace.watch(kDirAsyncCategory, on => { asyncTracing.dir = on; syncAsyncTracer(); });
 function callback(value) { v.validateFunction(value, 'cb'); return value; }
 // Native ownership kinds: callback, Promise, and FileHandle-close respectively.
 const promiseCallbacks = new WeakMap();
