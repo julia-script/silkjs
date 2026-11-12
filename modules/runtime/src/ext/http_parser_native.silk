@@ -70,7 +70,7 @@ struct Entry {
   // name start, value start, value end.
   head: ?*mut u8, headLength: usize, headCapacity: usize,
   marks: ?*mut u32, markCount: usize, markCapacity: usize,
-  phase: u8, pairs: u64, maxPairs: u64
+  phase: u8, pairs: u64, maxPairs: u64, pairsKnown: bool
 }
 unsafe fn nn<T>(p: ?*mut T) -> *mut T { return unsafe Intrinsic.pointerRequalify<?*mut T, *mut T>(p) }
 unsafe fn cn<T>(p: ?*const T) -> *const T { return unsafe Intrinsic.pointerRequalify<?*const T, *const T>(p) }
@@ -162,7 +162,7 @@ unsafe effect fn create<'m>(engine: &mut Engine<'m, host.Services>, context: *mu
     input: Pointer.null<u8>(), length: 0,
     head: Pointer.null<u8>(), headLength: 0, headCapacity: 0,
     marks: Pointer.null<u32>(), markCount: 0, markCapacity: 0,
-    phase: 0, pairs: 0, maxPairs: 0
+    phase: 0, pairs: 0, maxPairs: 0, pairsKnown: false
   })
   let s2 = unsafe Pointer.borrowMut<(), State>(&mut a, state)
   let inserted = run Effect.result(s2.handles.insert(Hash.word(id), p)) drop s2
@@ -203,16 +203,20 @@ unsafe fn pushMark(e: &mut Entry) -> bool {
 unsafe fn mark(e: &Entry, index: usize) -> usize {
   return u32.toUsize(unsafe Pointer.read<u32>(unsafe Pointer.at<u32>(unsafe Pointer.assumeMany<u32>(unsafe nn(e.marks)), index)))
 }
+fn isOWS(byte: u8) -> bool { return byte == 32 || byte == 9 }
 unsafe fn resetHead(e: &mut Entry) -> () { e.headLength = 0 e.markCount = 0 e.phase = 0 e.pairs = 0 }
 // Gathers url, status and field bytes (events 1 to 4 and 6) without calling JS.
 // Returns -1 when the event is consumed, else the llhttp status to return.
 unsafe fn gather(e: &mut Entry, event: i32, data: ?*const u8, length: usize) -> i32 {
-  if event == 0 { unsafe resetHead(&mut e) return -2 }
+  if event == 0 { unsafe resetHead(&mut e) e.pairsKnown = false return -2 }
   if event == 3 && e.phase != 1 {
     if e.phase == 2 { return 24 }
+    // Like Node's TrackHeaderPair, a request reads parser.maxHeaderPairs at the first field of
+    // each header section (-3 asks JS), and more fields than it allows overflow.
+    let request = unsafe c.llhttp_get_type(e.parser) == 1
+    if request && !e.pairsKnown { return -3 }
     e.pairs = e.pairs + 1
-    // Like Node, a request with more fields than maxHeaderPairs allows overflows.
-    if e.maxPairs > 0 && e.pairs * 2 > e.maxPairs && unsafe c.llhttp_get_type(e.parser) == 1 {
+    if request && e.maxPairs > 0 && e.pairs * 2 > e.maxPairs {
       unsafe c.silk_http_parser_error(e.parser, 1) return 24
     }
     if !unsafe pushMark(&mut e) { e.outOfMemory = true return 24 }
@@ -223,6 +227,11 @@ unsafe fn gather(e: &mut Entry, event: i32, data: ?*const u8, length: usize) -> 
     e.phase = 2
   }
   if event == 6 {
+    // Like Node, a value loses its trailing whitespace (llhttp drops the leading part).
+    if e.phase == 2 {
+      let start = unsafe mark(&e, e.markCount - 1)
+      while e.headLength > start && isOWS(unsafe Pointer.read<u8>(unsafe Pointer.at<u8>(unsafe Pointer.assumeMany<u8>(unsafe nn(e.head)), e.headLength - 1))) { e.headLength = e.headLength - 1 }
+    }
     if e.phase == 1 && !unsafe pushMark(&mut e) { e.outOfMemory = true return 24 }
     if e.phase != 0 && !unsafe pushMark(&mut e) { e.outOfMemory = true return 24 }
     e.phase = 0
@@ -325,16 +334,34 @@ export "C" fn silkHTTPParserEvent(owner: ?*mut u8, event: i32, data: ?*const u8,
     e.extensionBytes = e.extensionBytes + usize.toU64(length)
     if e.extensionBytes > 16384 { drop e unsafe c.silk_http_parser_error(parser, 2) return 24 }
   }
-  let gathered = unsafe gather(&mut e, event, data, length)
+  if event == 7 { e.pairsKnown = false }
+  let mut gathered = unsafe gather(&mut e, event, data, length)
   drop e
+  if gathered == -3 {
+    let limit = unsafe callJS(entry, state, parser, 14, data, length, position)
+    if limit == JS_FAILED { return 24 }
+    let mut l = () let e5 = unsafe Pointer.borrowMut<(), Entry>(&mut l, entry)
+    if e5.dead { return 21 }
+    e5.maxPairs = i32.toU64(limit) e5.pairsKnown = true
+    gathered = unsafe gather(&mut e5, event, data, length)
+    drop e5
+  }
   if gathered == 24 { return 24 }
   if gathered == -1 { return 0 }
   if event >= 10 || (event == 8 && length == 0) { return 0 }
+  let result = unsafe callJS(entry, state, parser, event, data, length, position)
+  return if result == JS_FAILED { 24 } else { result }
+}
+// What callJS returns when the callback threw or memory ran out (the parser is then in error).
+const JS_FAILED: i32 = -2147483647
+// Calls the parser's JS event callback and returns what it returned.
+unsafe fn callJS(entry: *mut Entry, state: *mut State, parser: *mut u8, event: i32, data: ?*const u8, length: usize, position: ?*const u8) -> i32 {
+  let mut a = ()
   let b = () let s = unsafe Pointer.borrow<(), State>(&b, state)
   let ep = s.engine let cp = s.context let ap = s.allocator drop s
-  if Pointer.isNull<u8>(ep) || Pointer.isNull<HeapHeader>(cp) { return 24 }
+  if Pointer.isNull<u8>(ep) || Pointer.isNull<HeapHeader>(cp) { return JS_FAILED }
   let context = unsafe nn(cp)
-  if unsafe exceptions.has(unsafe runtime.contextRuntime(context)) { return 24 }
+  if unsafe exceptions.has(unsafe runtime.contextRuntime(context)) { return JS_FAILED }
   let mut engineAnchor = () let engine = unsafe Pointer.borrowMut<(), Engine<'static, host.Services>>(&mut engineAnchor, unsafe cast<Engine<'static, host.Services>>(ep))
   let mut allocatorAnchor = () let allocator = unsafe Pointer.borrowMut<(), RuntimeHeap>(&mut allocatorAnchor, ap)
   let mut scope = Scope.make()
@@ -352,7 +379,7 @@ export "C" fn silkHTTPParserEvent(owner: ?*mut u8, event: i32, data: ?*const u8,
         JsException {} => ()
       }
       unsafe c.silk_http_parser_error(parser, 0)
-      return 24
+      return JS_FAILED
     }
   }
 }
@@ -479,7 +506,7 @@ unsafe effect fn dispatchBody<'m>(engine: &mut Engine<'m, host.Services>, contex
     if active { return run engine.throwError(unsafe lendRealm(&context, context), NativeErrorKind.Type, b"Cannot reinitialize an active HTTP parser") }
     unsafe c.silk_http_parser_initialize(parser, u64.toI32(number(unsafe common.argument(argv, 2))), u64.toU32(number(unsafe common.argument(argv, 4))))
     let mut b = () let e2 = unsafe Pointer.borrowMut<(), Entry>(&mut b, entry)
-    e2.maximum = number(unsafe common.argument(argv, 3)) e2.headerBytes = 0 e2.extensionBytes = 0 unsafe resetHead(&mut e2)
+    e2.maximum = number(unsafe common.argument(argv, 3)) e2.headerBytes = 0 e2.extensionBytes = 0 e2.pairsKnown = false unsafe resetHead(&mut e2)
     return ValueBits.Undefined
   }
   if op == 3 {
@@ -513,7 +540,6 @@ unsafe effect fn dispatchBody<'m>(engine: &mut Engine<'m, host.Services>, contex
     return run unsafe buffers.newArrayBufferCopy(&mut engine, memory, unsafe lendRealm(&context, context), input, usize.toU64(length))
   }
   if op == 9 { unsafe c.silk_http_parser_error(parser, u64.toI32(number(unsafe common.argument(argv, 2)))) return ValueBits.Undefined }
-  if op == 11 { let mut m = () let e4 = unsafe Pointer.borrowMut<(), Entry>(&mut m, entry) e4.maxPairs = number(unsafe common.argument(argv, 2)) return ValueBits.Undefined }
   if op == 10 { unsafe c.silk_http_parser_set_upgrade(parser, u64.toI32(number(unsafe common.argument(argv, 2)))) return ValueBits.Undefined }
   return run engine.throwError(unsafe lendRealm(&context, context), NativeErrorKind.Type, b"Unknown HTTP parser operation")
 }

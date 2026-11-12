@@ -802,7 +802,7 @@ host.checkModuleRead = path => internalRequire('internal/permission').check('fs.
 const loader = internalRequire('internal/loader/loader').createLoader(host, publicBuiltins);
 host.loader = loader;
 host.vmCreateDefaultImporter = filename =>
-  native.compileFunction('(specifier, attributes) => import(specifier, { with: attributes })', filename);
+  native.compileFunction('(specifier, attributes, source) => source ? import.source(specifier) : import(specifier, { with: attributes })', filename);
 let builtinRequire;
 process.getBuiltinModule = function getBuiltinModule(id) {
   internalRequire('internal/validators').validateString(id, 'id');
@@ -937,6 +937,9 @@ function runtimeFlag(arg) {
   if (arg === '--no-concurrent-array-buffer-sweeping') return true;
   // V8's flag to run without a JIT: this engine is an interpreter, so it always holds.
   if (arg === '--jitless') return true;
+  // V8 flags that turn on source phase imports and import attributes, which this
+  // engine always implements.
+  if (arg === '--js-source-phase-imports' || arg === '--harmony-import-attributes') return true;
   // Buffer.allocUnsafe memory is always zeroed here, which is what this flag asks for.
   if (arg === '--zero-fill-buffers') { host.zeroFillBuffers = true; return true; }
   if (arg === '--experimental-webstorage' || arg === '--no-experimental-webstorage') {
