@@ -17,6 +17,7 @@
 //  11 ALTSVC (a: origin length)  12 ORIGIN entry  13 ORIGIN end
 //  14 invalid frame (a: library code)                    15 library error (a: code)
 const host = require('internal/host');
+const { JSStream } = require('internal/net/binding').js_stream;
 const perfEntries = require('internal/perf_observers');
 const { Buffer } = require('buffer');
 const { AsyncResource } = require('async_hooks');
@@ -1009,7 +1010,9 @@ class Http2Session {
     for (let i = 0; i < chunks.length; i++) flushed = socket.write(chunks[i], i === chunks.length - 1 ? done : undefined);
     if (corked) socket.uncork();
     if (this.alive()) call('socketMemory', this.id, socket.writableLength || 0);
-    if (flushed || finished) {
+    // A JSStream handle (a JSStreamSocket over a JS duplex) always completes a
+    // write later, from its finishWrite, as Node's JSStream::DoWrite does.
+    if (finished || (flushed && !(socket._handle instanceof JSStream))) {
       finished = true;
       this.writeInProgress = false;
       this.clearOutgoing(0);
