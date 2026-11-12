@@ -345,6 +345,7 @@ host.triggerUncaughtException = reportUncaught;
 // in place of where the error was rethrown. prefix is the length of a wrapper
 // that came before the source on its first line. decorateErrorStack puts the
 // arrow into the stack itself and marks the error decorated: no arrow then.
+host.testOptionValues = new Map();
 host.errorArrows = new WeakMap();
 host.decoratedErrors = new WeakSet();
 host.attachArrow = (error, scriptName, source, prefix) => {
@@ -903,6 +904,7 @@ function evaluateMain(source, name) {
 }
 const requirePreloads = [], importPreloads = [], loaderPreloads = [];
 function runPreloads(entry, loadImports = true) {
+  if (host.configFile) process.emitWarning('--experimental-config-file is an experimental feature and might change at any time', 'ExperimentalWarning');
   // Before any preload: Node applies it when the context is made.
   if (host.disableProto !== undefined) disableProto(globalThis);
   if (host.disallowCodeGeneration) native.vmSetCodeGeneration(undefined, false);
@@ -949,7 +951,10 @@ function runtimeFlag(arg) {
     host.stripTypes = !arg.startsWith('--no-'); return true;
   }
   if (arg === '--experimental-transform-types' || arg === '--no-experimental-transform-types') {
-    host.transformTypes = arg === '--experimental-transform-types'; return true;
+    // Implies("--experimental-transform-types", "--experimental-strip-types"): a later --no- still wins.
+    host.transformTypes = arg === '--experimental-transform-types';
+    if (host.transformTypes) host.stripTypes = true;
+    return true;
   }
   if (arg === '--insecure-http-parser' || arg === '--no-insecure-http-parser') {
     host.insecureHTTPParser = arg === '--insecure-http-parser'; return true;
@@ -968,6 +973,13 @@ function runtimeFlag(arg) {
   // Node's BuiltinModule.exposeInternals: user code may load the internal/*
   // built-ins (see publicBuiltins.listed).
   if (arg === '--expose-internals') { host.exposeInternals = true; return true; }
+  // Read at startup by internal/config_file; pre_execution only warns.
+  if (arg.startsWith('--experimental-config-file=')) { host.configFile = true; return true; }
+  // node.cc: the per-process --title sets the process title before any script runs.
+  if (arg.startsWith('--title=')) {
+    if (workerThreads.isMainThread) internalRequire('internal/process/title').set(arg.slice('--title='.length));
+    return true;
+  }
   if (arg === '--disable-sigusr1') { host.disableSigusr1 = true; return true; }
   if (arg === '--test-update-snapshots' || arg === '--no-test-update-snapshots') {
     host.testUpdateSnapshots = arg === '--test-update-snapshots'; return true;
@@ -1073,7 +1085,7 @@ function installRuntimeOptions(args, entrypoints = [], preloadEntrypoints = true
   const heapProfileProblem = moduleHas('internal/heap_prof') ? internalRequire('internal/heap_prof').start() : undefined;
   if (heapProfileProblem) return cliError(heapProfileProblem);
   if (host.enableSourceMaps || moduleHas('internal/source_maps')) process.setSourceMapsEnabled(!!host.enableSourceMaps);
-  host.typeScriptMode = host.transformTypes ? 'transform' : host.stripTypes === false ? false : 'strip';
+  host.typeScriptMode = host.stripTypes === false ? false : host.transformTypes ? 'transform' : 'strip';
   host.initialExecArgv = process.execArgv.slice();
   host.workerRuntimeArgs = args.slice();
   if (host.exposeGC) {
@@ -1271,13 +1283,22 @@ function run() {
   // A script path first means no flags, so no environment file to look for:
   // the option tables load only for flags or NODE_OPTIONS.
   const flags = native.argv.length < 2 || native.argv[1].charCodeAt(0) === 45;
+  // NODE_OPTIONS in the environment is preferred over a config file's (node.cc).
+  const environmentOptions = process.env.NODE_OPTIONS;
   if (flags) loadRuntimeEnvironment(native.argv.slice(1), () => { startupEnvironment = { ...process.env }; });
+  const args = native.argv.slice(1);
+  // --experimental-config-file: read before NODE_OPTIONS, rewriting its bare forms in args.
+  const config = flags && args.some(arg => arg.startsWith('--experimental-config-file') || arg.startsWith('--experimental-default-config-file'))
+    ? internalRequire('internal/config_file').read(args) : undefined;
+  if (config?.errors.length) return cliError(config.errors);
+  let nodeOptions = process.env.NODE_OPTIONS;
+  if (config && environmentOptions === undefined) nodeOptions = config.nodeOptions + (nodeOptions === undefined ? '' : ' ' + nodeOptions);
   let environment = [], environmentEntries = [];
-  if (process.env.NODE_OPTIONS) {
+  if (nodeOptions) {
     let parsed;
     try {
       const options = internalRequire('internal/options');
-      environment = options.parseEnvironment(process.env.NODE_OPTIONS);
+      environment = options.parseEnvironment(nodeOptions);
       parsed = options.parseArguments(environment, true);
     } catch (error) {
       return cliError(error.message);
@@ -1286,7 +1307,13 @@ function run() {
     environment.length = parsed.index;
     environmentEntries = parsed.entries;
   }
-  const args = native.argv.slice(1);
+  // A config file's namespace flags come after NODE_OPTIONS and before the command line.
+  if (config?.namespaceFlags.length) {
+    const parsed = internalRequire('internal/options').parseArguments(config.namespaceFlags, false);
+    if (parsed.error !== undefined) return cliError(parsed.error);
+    environment = environment.concat(config.namespaceFlags.slice(0, parsed.index));
+    environmentEntries = environmentEntries.concat(parsed.entries);
+  }
   // Without flags the parser and its option table stay unloaded.
   const parsed = flags ? internalRequire('internal/options').parseArguments(args, false) : { entries: [], execArgv: [], index: 0 };
   if (parsed.error !== undefined) return cliError(parsed.error);
@@ -1312,6 +1339,9 @@ function run() {
   // option table has expanded aliases and short forms.
   for (const entry of environmentEntries.concat(parsed.entries)) {
     const { name, value } = entry;
+    // The test runner's options, as getOptionValue reads them (a list collects every value).
+    const info = internalRequire('internal/options_table').options.get(name);
+    if (info?.[4] === 'test') host.testOptionValues.set(name, info[0] === 'StringList' ? [...(host.testOptionValues.get(name) ?? []), value] : value);
     switch (name) {
       case '--watch': watchMode = value; continue;
       case '--watch-preserve-output': watchPreserveOutput = value; continue;

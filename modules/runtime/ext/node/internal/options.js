@@ -290,10 +290,29 @@ function getOptionValue(name) {
     // Addons load through require only; import() of a .node file is unsupported.
     case '--experimental-addon-modules': return false;
     case '--experimental-package-map': return host.packageMap ?? '';
-    default: return startupControls.getOptionValue(name) ?? require('internal/tls/options').getOptionValue(name);
+    default: {
+      const info = table.options.get(name);
+      if (info?.[4] === 'test') return testOptionValue(name, info);
+      return startupControls.getOptionValue(name) ?? require('internal/tls/options').getOptionValue(name);
+    }
   }
 }
 
+// A test runner option as given, or EnvironmentOptions' default (node_options.h):
+// the type's zero value, but test_isolation = "process".
+function testOptionValue(name, [type, , defaultIsTrue]) {
+  if (host.testOptionValues.has(name)) {
+    const value = host.testOptionValues.get(name);
+    return type === 'UInteger' || type === 'Integer' ? Number(value) : value;
+  }
+  if (name === '--test-isolation') return 'process';
+  switch (type) {
+    case 'Boolean': return defaultIsTrue;
+    case 'StringList': return [];
+    case 'String': return '';
+    default: return 0;
+  }
+}
 // Node's process.allowedNodeEnvironmentFlags (lib/internal/process/per_thread.js).
 function buildAllowedFlags() {
   const array = [];
