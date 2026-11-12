@@ -69,7 +69,9 @@ function emit(name, args, promise = false) {
   emitting = true;
   syncNativeHooks();
   try {
-    for (const hook of listeners) {
+    // An index loop: user code may have replaced Array.prototype[Symbol.iterator].
+    for (let i = 0; i < listeners.length; i++) {
+      const hook = listeners[i];
       if (promise && !hook.trackPromises) continue;
       const callback = hook.callbacks[name];
       if (callback !== undefined) apply(callback, hook, args);
@@ -113,7 +115,7 @@ function drainDestroy() {
   if (pendingDestroy.length === 0) return;
   const pending = pendingDestroy;
   pendingDestroy = [];
-  for (const state of pending) emit('destroy', [state.id], state.promise);
+  for (let index = 0; index < pending.length; index++) emit('destroy', [pending[index].id], pending[index].promise);
 }
 
 class AsyncHook {

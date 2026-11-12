@@ -144,15 +144,15 @@ process.setUncaughtExceptionCaptureCallback = function() {
 // their original behavior until domains are explicitly enabled.
 EventEmitter.usingDomains = true;
 const eventInit = EventEmitter.init;
-EventEmitter.init = function(options) {
+EventEmitter.init = function init(options) {
   property(this, 'domain', exports.active && !(this instanceof Domain) ? exports.active : null);
   return eventInit.call(this, options);
 };
 const eventEmit = EventEmitter.prototype.emit;
-EventEmitter.prototype.emit = function(type, ...args) {
+EventEmitter.prototype.emit = function emit(type, ...args) {
   const domain = this.domain;
   if ((type === 'error' && this.listenerCount(type)) || !domain || this === process)
-    return eventEmit.call(this, type, ...args);
+    return Reflect.apply(eventEmit, this, arguments);
   if (type === 'error') {
     const error = args[0] || Object.assign(new Error('Unhandled error.'), { code: 'ERR_UNHANDLED_ERROR' });
     if (typeof error === 'object') {
@@ -167,7 +167,7 @@ EventEmitter.prototype.emit = function(type, ...args) {
     return false;
   }
   domain.enter();
-  const result = eventEmit.call(this, type, ...args);
+  const result = Reflect.apply(eventEmit, this, arguments);
   domain.exit(); return result;
 };
 process.on('newListener', (name, listener) => {

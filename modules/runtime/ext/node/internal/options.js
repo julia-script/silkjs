@@ -284,6 +284,10 @@ function getOptionValue(name) {
     case '--insecure-http-parser': return !!host.insecureHTTPParser;
     case '--max-http-header-size': return host.maxHTTPHeaderSize ?? 16 * 1024;
     case '--experimental-import-text': return !!host.importText;
+    case '--strip-types': return !!host.typeScriptMode;
+    case '--experimental-repl-await': return host.replAwait !== false;
+    // Addons load through require only; import() of a .node file is unsupported.
+    case '--experimental-addon-modules': return false;
     case '--experimental-package-map': return host.packageMap ?? '';
     default: return startupControls.getOptionValue(name) ?? require('internal/tls/options').getOptionValue(name);
   }
