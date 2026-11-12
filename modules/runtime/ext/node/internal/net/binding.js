@@ -182,6 +182,13 @@ class StreamHandle {
     return this._transport.readStop();
   }
   useUserBuffer(buffer) { this._userBuffer = buffer; }
+  // LibuvStreamWrap::HasPendingRead: a read held for JavaScript, queued by the native side, or
+  // still in the kernel buffer, that no 'data' listener has seen yet.
+  hasPendingRead() {
+    if (this._pendingReads.length) return true;
+    if (!this._transport || this._transport.closed) return false;
+    return this._transport.call?.('pendingRead') === 1;
+  }
   shutdown(req) {
     if (!this._transport || this._transport.closing || this._transport.closed) return uv.UV_ENOTCONN;
     let sync = true;
