@@ -110,7 +110,7 @@ function parseForm(bytes, type) {
   const mime = parseMIME(type);
   const result = new FormData();
   if (mime?.essence === 'application/x-www-form-urlencoded') {
-    const { URLSearchParams } = require('internal/web/url');
+    const { URLSearchParams } = require('internal/url');
     for (const [name, value] of new URLSearchParams(new TextDecoder('utf-8', { ignoreBOM: true }).decode(bytes))) result.append(name, value);
     return result;
   }

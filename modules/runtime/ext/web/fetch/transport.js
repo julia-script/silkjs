@@ -2,7 +2,7 @@
 
 const { Buffer } = require('buffer');
 const { ReadableStream } = require('internal/web/streams');
-const { URL } = require('internal/web/url');
+const { URL } = require('internal/url');
 const { Headers, immutable, rawHeaders } = require('internal/web/fetch/headers');
 const { makeResponse, nullBodyStatus } = require('internal/web/fetch/message');
 const { performance } = require('perf_hooks');
