@@ -6,6 +6,8 @@
 // global object lacks as an accessor there and removes it afterwards; assigning
 // one replaces the accessor with a plain property (accessorSetterCallback).
 
+// One console module per thread, as Node installs it once: what it requires shares a parent.
+let required;
 function commandLineAPI(session, contextId, consoleBridge) {
   const inspectRequested = (object, hints) => {
     session.emit('Runtime.inspectRequested', { object: session.values.remote(object, undefined), hints, executionContextId: contextId });
@@ -40,17 +42,21 @@ function commandLineAPI(session, contextId, consoleBridge) {
     // Node never adds inspected objects (addInspectedObject).
     $0: undefined, $1: undefined, $2: undefined, $3: undefined, $4: undefined,
   };
-  let required;
   Object.defineProperty(api, 'require', {
     __proto__: null,
     enumerable: true,
     get() {
       if (required) return required;
-      const { createRequire } = require('module');
+      // Node's installConsoleExtensions: a '<inspector console>' module, the parent
+      // of what it requires, looking up from the working directory.
+      const CJSModule = require('internal/modules/cjs/loader').Module;
+      const { makeRequireFunction } = require('internal/modules/helpers');
       const path = require('path');
       let cwd;
       try { cwd = process.cwd(); } catch { cwd = path.sep; }
-      return (required = createRequire(path.join(cwd, '<inspector console>')));
+      const consoleModule = new CJSModule('<inspector console>');
+      consoleModule.paths = [...CJSModule._nodeModulePaths(cwd), ...CJSModule.globalPaths];
+      return (required = makeRequireFunction(consoleModule));
     },
   });
   return api;

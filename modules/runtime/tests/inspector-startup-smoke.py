@@ -141,12 +141,12 @@ def startup(mode, directory, source_prefix="", expected_position=None):
 with tempfile.TemporaryDirectory(prefix="silk-inspector-startup-") as directory:
     for mode in ("inspect-wait", "inspect-brk"):
         startup(mode, Path(directory))
-    # Debug compilation preserves directive expression instructions: they are
-    # real user source, unlike the enclosing function's generated prologue.
+    # As V8, a directive prologue has no break location: the first pause is the
+    # first statement after it.
     for name, prefix, position in (
         ("unicode", "/* é😀 */", None),
         ("multiline", "/* é😀 */\r\n\n  ", None),
-        ("directives", "'use strict';\r\n/* é😀 */\n  ", (0, 0)),
+        ("directives", "'use strict';\r\n/* é😀 */\n  ", None),
     ):
         variant = Path(directory) / name
         variant.mkdir()

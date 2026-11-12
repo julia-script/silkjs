@@ -170,6 +170,9 @@ function paused(payload) {
   // V8 schedules the start pause only for sessions whose debugger is enabled
   // (V8DebuggerAgentImpl::schedulePauseOnNextStatement): without one it runs on.
   if (!delivered && (!startup || enabled.size === 0) && native(31)) { native(27, 0); activePause = undefined; }
+  // Node's runMessageLoopOnPause has no frontend to wait for when only same-thread
+  // sessions saw the pause: execution continues once they have been notified.
+  else if (delivered && native(31) && [...enabled].every(session => session.local)) { native(27, 0); activePause = undefined; }
 }
 // V8 records async tasks for the deepest stack any enabled session asked for.
 let asyncModule;
