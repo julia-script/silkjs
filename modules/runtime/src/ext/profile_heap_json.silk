@@ -2,7 +2,10 @@
 //! touches only native graph storage: no guest objects, getters, or JS execution.
 //! Standard fields carry nodes and grouped edges; silk.heap.snapshot v2 retains
 //! exact strengths, ephemeron conditions and native-byte decomposition without
-//! duplicating the graph. Edge labels end in [decimal index]; split at the last [.
+//! duplicating the graph. Standard names follow V8: objects by constructor, functions
+//! by name, strings by content, property edges by key and element edges by index.
+//! silk.nodeKinds and silk.edgeLabels keep the native kind and the exact
+//! "label[decimal index]" of every node and edge; split a label at the last [.
 import silk.collections.list { List }
 import silk.collections.hash { Hash, HashKey, HashSeed }
 import silk.collections.hash_map { HashMap }
@@ -12,8 +15,18 @@ import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.collections.slice { Slice }
 import silk.num.usize
 import silk.num.u8
-import silkjs.js_heap { HeapKind }
-import silkjs.js_heap_snapshot_graph { Graph, Strength }
+import silk.num.u16
+import silk.num.u32
+import silk.num.u64
+import silk.mem.pointer { Pointer }
+import silkjs.js_heap { HeapCell, HeapHeader, HeapKind }
+import silkjs.js_heap_snapshot_graph { Graph, Node, Strength }
+import silkjs.js_core_types { RuntimeState, ObjectData, ObjectPayload, ObjectPayloadFamily, ShapeData, PropertySlot, FunctionBytecode }
+import silkjs.js_value { ValueBits }
+import silkjs.js_strings { Strings }
+import silkjs.js_string_types { AtomKind }
+import silkjs.js_atoms { AtomTable }
+import silkjs.js_atom_data as atoms
 
 pub struct SnapshotFormatError {}
 
@@ -79,21 +92,174 @@ effect fn escaped(output: &mut List<u8>, value: &[u8]) -> () ! OutOfMemoryError 
 effect fn quoted(output: &mut List<u8>, value: &[u8]) -> () ! OutOfMemoryError ? &mut Allocator {
   run output.append(34) run escaped(&mut output, value) run output.append(34)
 }
+
+// The strings table, unique by content as DevTools requires. Entries hold escaped
+// JSON text; equal hashes chain through `chain`.
+struct Interner { text: List<u8>, starts: List<usize>, chain: List<usize>, table: HashMap<u64, usize> }
+impl Interner {
+  fn make() -> Self { return Self { text: List<u8>.make(), starts: List<usize>.make(), chain: List<usize>.make(), table: HashMap<u64, usize>.make(Hash.seed(18013)) } }
+  fn entry(self: &Self, index: usize) -> &[u8] {
+    let start = self.starts.get(index)
+    let end = if index + 1 < self.starts.length() { self.starts.get(index + 1) } else { self.text.length() }
+    return Slice.view<u8>(self.text.asSlice(), start, end - start)
+  }
+  effect fn intern(self: &mut Self, escapedText: &[u8]) -> usize ! OutOfMemoryError ? &mut Allocator {
+    let mut hash: u64 = 14695981039346656037
+    let mut i: usize = 0
+    while i < escapedText.length { hash = u64.wrappingMultiply(hash ^ u8.toU64(escapedText[i]), 1099511628211) i = i + 1 }
+    let mut last = usize.MAX
+    if let Option<usize>.Some { value } = self.table.get(hash) {
+      let mut at = value
+      while at != usize.MAX {
+        if bytesEqual(self.entry(at), escapedText) { return at }
+        last = at at = self.chain.get(at)
+      }
+    }
+    let index = self.starts.length()
+    run self.starts.append(self.text.length()) run self.text.appendBytes(escapedText) run self.chain.append(usize.MAX)
+    if last == usize.MAX { let _ignored = run self.table.insert(hash, index) } else { self.chain.set(last, index) }
+    return index
+  }
+}
+fn bytesEqual(left: &[u8], right: &[u8]) -> bool {
+  if left.length != right.length { return false }
+  let mut i: usize = 0
+  while i < left.length { if left[i] != right[i] { return false } i = i + 1 }
+  return true
+}
+// JSON string content for UTF-16 text: escapes quotes, backslashes, controls and
+// lone surrogates; everything else is UTF-8.
+effect fn escapedUnits(output: &mut List<u8>, value: ValueBits) -> () ! OutOfMemoryError ? &mut Allocator {
+  let length = Strings.length(value) let mut i: usize = 0 let digits = b"0123456789abcdef"
+  while i < length {
+    let mut c = u16.toU32(Strings.codeUnit(value, i)) i = i + 1
+    if c == 34 || c == 92 { run output.append(92) run output.append(u32.toU8(c)) continue }
+    if c >= 32 && c < 128 { run output.append(u32.toU8(c)) continue }
+    let mut lone = c < 32 || (c >= 0xdc00 && c <= 0xdfff)
+    if c >= 0xd800 && c <= 0xdbff {
+      let next = if i < length { u16.toU32(Strings.codeUnit(value, i)) } else { 0 }
+      if next >= 0xdc00 && next <= 0xdfff { c = 0x10000 + (c - 0xd800) * 1024 + next - 0xdc00 i = i + 1 } else { lone = true }
+    }
+    if lone {
+      run output.appendBytes(b"\\u")
+      run output.append(digits[u32.toUsize(u32.shiftRight(c, 12) & 15)]) run output.append(digits[u32.toUsize(u32.shiftRight(c, 8) & 15)])
+      run output.append(digits[u32.toUsize(u32.shiftRight(c, 4) & 15)]) run output.append(digits[u32.toUsize(c & 15)])
+    } else if c < 0x800 {
+      run output.append(u32.toU8(0xc0 | u32.shiftRight(c, 6))) run output.append(u32.toU8(0x80 | (c & 63)))
+    } else if c < 0x10000 {
+      run output.append(u32.toU8(0xe0 | u32.shiftRight(c, 12))) run output.append(u32.toU8(0x80 | (u32.shiftRight(c, 6) & 63))) run output.append(u32.toU8(0x80 | (c & 63)))
+    } else {
+      run output.append(u32.toU8(0xf0 | u32.shiftRight(c, 18))) run output.append(u32.toU8(0x80 | (u32.shiftRight(c, 12) & 63)))
+      run output.append(u32.toU8(0x80 | (u32.shiftRight(c, 6) & 63))) run output.append(u32.toU8(0x80 | (c & 63)))
+    }
+  }
+}
+// What names a node: an atom's text, a flat string's content or a fixed spelling.
+union Label { Atom { atom: u32 }, Text { value: ValueBits }, Fixed { bytes: &'static [u8] } }
+impl Copy for Label {}
+// An own data property, read from the slot without getters; Undefined otherwise.
+unsafe fn ownValue(reference: *mut HeapHeader, atom: u32) -> ValueBits {
+  let anchor = () let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, reference)
+  let shape = unsafe HeapCell.payload<ShapeData, ()>(&anchor, data.shape)
+  let mut i: usize = 0
+  while i < shape.properties.length() {
+    let property = shape.properties.get(i)
+    if property.atom == atom {
+      return match data.slot(i).view(property.flags) { PropertySlot.Value { value } => value _ => ValueBits.Undefined }
+    }
+    i = i + 1
+  }
+  return ValueBits.Undefined
+}
+fn callable(payload: &ObjectPayload) -> bool {
+  return match &payload.* {
+    ObjectPayload.BytecodeFunction { .. } => true ObjectPayload.NativeFunction { .. } => true
+    ObjectPayload.Opaque { family, .. } => match family { ObjectPayloadFamily.BoundFunction => true _ => false }
+    _ => false
+  }
+}
+// V8's closure name: the own name string, else the compiled name; empty when anonymous.
+unsafe fn functionLabel(reference: *mut HeapHeader) -> Label {
+  let name = unsafe ownValue(reference, atoms.JS_ATOM_name)
+  if let ValueBits.String { .. } = name { return Label.Text { value: name } }
+  let anchor = () let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, reference)
+  if let ObjectPayload.BytecodeFunction { function } = &data.payload {
+    let code = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, function.bytecode)
+    if code.name != 0 { return Label.Atom { atom: code.name } }
+  }
+  return Label.Fixed { bytes: b"" }
+}
+// V8's object name: its constructor's name, from the prototype's own constructor.
+unsafe fn objectLabel(reference: *mut HeapHeader) -> Label {
+  let anchor = () let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, reference)
+  if callable(&data.payload) { drop data return unsafe functionLabel(reference) }
+  let shape = unsafe HeapCell.payload<ShapeData, ()>(&anchor, data.shape)
+  let prototype = shape.prototype drop shape drop data
+  if let Option<*mut HeapHeader>.Some { value } = Pointer.nonNullMut<HeapHeader>(prototype) {
+    if let ValueBits.Object { reference: constructor } = unsafe ownValue(value, atoms.JS_ATOM_constructor) {
+      let label = unsafe functionLabel(constructor)
+      let empty = match label { Label.Fixed { .. } => true Label.Text { value: text } => Strings.length(text) == 0 _ => false }
+      if !empty { return label }
+    }
+  }
+  return Label.Fixed { bytes: b"Object" }
+}
+// A weak-only retained allocation keeps its cell after payload teardown, as the graph says.
+unsafe fn live(reference: *mut HeapHeader) -> bool {
+  let anchor = () return (unsafe Pointer.borrow<(), HeapHeader>(&anchor, reference)).referenceCount > 0
+}
+unsafe fn functionNode(node: Node) -> bool {
+  if node.kind != HeapKind.Object || !unsafe live(node.reference) { return false }
+  let anchor = () let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, node.reference)
+  return callable(&data.payload)
+}
+unsafe effect fn labelText(output: &mut List<u8>, runtime: ?*mut HeapHeader, label: Label) -> () ! OutOfMemoryError ? &mut Allocator {
+  match label {
+    Label.Fixed { bytes } => { run escaped(&mut output, bytes) }
+    Label.Text { value } => { run escapedUnits(&mut output, value) }
+    Label.Atom { atom } => {
+      let owner = match Pointer.nonNullMut<HeapHeader>(runtime) { Option<*mut HeapHeader>.Some { value } => value _ => { return () } }
+      let anchor = () let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, owner)
+      let mut units: [u16; 1024] = [0; 1024]
+      let length = state.atoms.profileText(atom, &mut units)
+      let symbol = !AtomTable.isInteger(atom) && state.atoms.kind(atom) != AtomKind.String
+      drop state
+      if symbol { run output.appendBytes(b"<symbol ") }
+      let mut i: usize = 0
+      while i < length && i < 1024 {
+        let c = u16.toU32(units[i]) i = i + 1
+        if c == 34 || c == 92 { run output.append(92) run output.append(u32.toU8(c)) }
+        else if c >= 32 && c < 128 { run output.append(u32.toU8(c)) }
+        else if c < 0x800 && c >= 128 { run output.append(u32.toU8(0xc0 | u32.shiftRight(c, 6))) run output.append(u32.toU8(0x80 | (c & 63))) }
+        else if c >= 0x800 && (c < 0xd800 || c > 0xdfff) { run output.append(u32.toU8(0xe0 | u32.shiftRight(c, 12))) run output.append(u32.toU8(0x80 | (u32.shiftRight(c, 6) & 63))) run output.append(u32.toU8(0x80 | (c & 63))) }
+        else { run output.appendBytes(b"\\ufffd") }
+      }
+      if symbol { run output.append(62) }
+    }
+  }
+}
+unsafe effect fn internLabel(names: &mut Interner, scratch: &mut List<u8>, runtime: ?*mut HeapHeader, label: Label) -> usize ! OutOfMemoryError ? &mut Allocator {
+  scratch.clear() run unsafe labelText(&mut scratch, runtime, label)
+  return run names.intern(scratch.asSlice())
+}
+effect fn internRaw(names: &mut Interner, scratch: &mut List<u8>, label: &[u8], index: usize) -> usize ! OutOfMemoryError ? &mut Allocator {
+  scratch.clear() run escaped(&mut scratch, label) run scratch.append(91) run number(&mut scratch, index) run scratch.append(93)
+  return run names.intern(scratch.asSlice())
+}
+fn kindName(kind: HeapKind) -> &'static [u8] {
+  return match kind {
+    HeapKind.Object => b"Silk object" HeapKind.FunctionBytecode => b"Silk bytecode" HeapKind.Shape => b"Silk shape"
+    HeapKind.VarRef => b"Silk binding" HeapKind.AsyncFunction => b"Silk asyncFrame" HeapKind.Context => b"Silk context"
+    HeapKind.Module => b"Silk module" HeapKind.String => b"Silk string" HeapKind.Rope => b"Silk rope"
+    HeapKind.BigInt => b"Silk bigint" HeapKind.Auxiliary => b"Silk native" HeapKind.Scope => b"Silk scope"
+  }
+}
 fn nodeType(kind: HeapKind) -> usize {
   return match kind {
     HeapKind.Object => 3 HeapKind.FunctionBytecode => 4 HeapKind.String => 2
     HeapKind.Rope => 10 HeapKind.BigInt => 13 HeapKind.Auxiliary => 8
     HeapKind.Shape => 0 HeapKind.VarRef => 0 HeapKind.AsyncFunction => 0
     HeapKind.Context => 0 HeapKind.Module => 0 HeapKind.Scope => 0
-  }
-}
-// These IDs index the fixed, unique node-name prefix of strings below.
-fn nodeName(kind: HeapKind) -> usize {
-  return match kind {
-    HeapKind.Object => 1 HeapKind.FunctionBytecode => 2 HeapKind.Shape => 3
-    HeapKind.VarRef => 4 HeapKind.AsyncFunction => 5 HeapKind.Context => 6
-    HeapKind.Module => 7 HeapKind.String => 8 HeapKind.Rope => 9
-    HeapKind.BigInt => 10 HeapKind.Auxiliary => 11 HeapKind.Scope => 12
   }
 }
 fn strength(value: Strength) -> usize {
@@ -111,51 +277,79 @@ pub effect fn encode(graph: &Graph) -> List<u8> ! OutOfMemoryError | SnapshotFor
   run output.appendBytes(b"{\"snapshot\":{\"meta\":{\"node_fields\":[\"type\",\"name\",\"id\",\"self_size\",\"edge_count\",\"trace_node_id\",\"detachedness\"],\"node_types\":[[\"hidden\",\"array\",\"string\",\"object\",\"code\",\"closure\",\"regexp\",\"number\",\"native\",\"synthetic\",\"concatenated string\",\"sliced string\",\"symbol\",\"bigint\"],\"string\",\"number\",\"number\",\"number\",\"number\",\"number\"],\"edge_fields\":[\"type\",\"name_or_index\",\"to_node\"],\"edge_types\":[[\"context\",\"element\",\"property\",\"internal\",\"hidden\",\"shortcut\",\"weak\"],\"string_or_number\",\"node\"],\"trace_function_info_fields\":[\"function_id\",\"name\",\"script_name\",\"script_id\",\"line\",\"column\"],\"trace_node_fields\":[\"id\",\"function_info_index\",\"count\",\"size\",\"children\"],\"sample_fields\":[\"timestamp_us\",\"last_assigned_id\"],\"location_fields\":[\"object_index\",\"script_id\",\"line\",\"column\"]},\"node_count\":")
   run number(&mut output, graph.nodes.length())
   run output.appendBytes(b",\"edge_count\":") run number(&mut output, graph.edges.length())
-  run output.appendBytes(b",\"trace_function_count\":0},\"nodes\":[") i = 0
+  run output.appendBytes(b",\"trace_function_count\":0},\"nodes\":[")
+  let runtime = graph.runtime let named = !Pointer.isNull<HeapHeader>(runtime)
+  let mut names = Interner.make() let mut scratch = List<u8>.make()
+  let mut kinds = List<usize>.make()
+  let mut atomNames = HashMap<u32, usize>.make(Hash.seed(18017))
+  let mut raw = HashMap<Name, usize>.make(Hash.seed(18011))
+  i = 0
   while i < graph.nodes.length() {
     if i != 0 { run output.append(44) }
     let node = graph.nodes.get(i)
-    run number(&mut output, if i == 0 { 9 } else { nodeType(node.kind) }) run output.append(44)
-    run number(&mut output, if i == 0 { 0 } else { nodeName(node.kind) }) run output.append(44)
+    scratch.clear() run escaped(&mut scratch, if i == 0 { b"(Silk roots)" } else { kindName(node.kind) })
+    let kind = run names.intern(scratch.asSlice())
+    run kinds.append(kind)
+    let mut kindType = if i == 0 { 9 } else { nodeType(node.kind) }
+    let mut name = kind
+    if i != 0 && named && unsafe live(node.reference) {
+      if node.kind == HeapKind.Object {
+        if unsafe functionNode(node) { kindType = 5 }
+        name = run unsafe internLabel(&mut names, &mut scratch, runtime, unsafe objectLabel(node.reference))
+      } else if node.kind == HeapKind.String {
+        name = run unsafe internLabel(&mut names, &mut scratch, runtime, Label.Text { value: ValueBits.String { reference: node.reference } })
+      }
+    }
+    run number(&mut output, kindType) run output.append(44)
+    run number(&mut output, name) run output.append(44)
     run number(&mut output, node.id) run output.append(44)
     run number(&mut output, node.selfBytes + node.nativeBytes) run output.append(44)
     run number(&mut output, adjacency.groups.get(i).count) run output.appendBytes(b",0,0")
     i = i + 1
   }
   run output.appendBytes(b"],\"edges\":[")
-  let mut names = List<Name>.make()
-  let mut ids = HashMap<Name, usize>.make(Hash.seed(18011))
+  let mut labels = List<usize>.make()
   let mut first = true i = 0
   while i < graph.nodes.length() {
     let mut at = adjacency.groups.get(i).first
     while at != usize.MAX {
       let edge = graph.edges.get(at)
       let key = Name { label: edge.label, index: edge.index }
-      let name = match ids.get(key) {
+      let label = match raw.get(key) {
         Option<usize>.Some { value } => value
-        Option<usize>.None => {
-          let value = 13 + names.length()
-          let _ignored = run ids.insert(key, value)
-          run names.append(key)
-          value
-        }
+        Option<usize>.None => { let value = run internRaw(&mut names, &mut scratch, edge.label, edge.index) let _ignored = run raw.insert(key, value) value }
       }
+      run labels.append(label)
+      let strong = edge.strength == Strength.Strong
+      let mut edgeType: usize = if strong { 3 } else { 6 }
+      let mut nameOrIndex = label
+      if strong && named && bytesEqual(edge.label, b"property.atom") {
+        edgeType = 2
+        let atom = usize.toU32(edge.index)
+        nameOrIndex = match atomNames.get(atom) {
+          Option<usize>.Some { value } => value
+          Option<usize>.None => { let value = run unsafe internLabel(&mut names, &mut scratch, runtime, Label.Atom { atom: atom }) let _ignored = run atomNames.insert(atom, value) value }
+        }
+      } else if strong && bytesEqual(edge.label, b"element") { edgeType = 1 nameOrIndex = edge.index }
       if !first { run output.append(44) } first = false
-      run number(&mut output, if edge.strength == Strength.Strong { 3 } else { 6 }) run output.append(44)
-      run number(&mut output, name) run output.append(44) run number(&mut output, edge.to * 7)
+      run number(&mut output, edgeType) run output.append(44)
+      run number(&mut output, nameOrIndex) run output.append(44) run number(&mut output, edge.to * 7)
       at = adjacency.next.get(at)
     }
     i = i + 1
   }
-  run output.appendBytes(b"],\"trace_function_infos\":[],\"trace_tree\":[],\"samples\":[],\"locations\":[],\"strings\":[\"(Silk roots)\",\"Silk object\",\"Silk bytecode\",\"Silk shape\",\"Silk binding\",\"Silk asyncFrame\",\"Silk context\",\"Silk module\",\"Silk string\",\"Silk rope\",\"Silk bigint\",\"Silk native\",\"Silk scope\"")
+  run output.appendBytes(b"],\"trace_function_infos\":[],\"trace_tree\":[],\"samples\":[],\"locations\":[],\"strings\":[")
   i = 0
-  while i < names.length() {
-    let name = names.get(i)
-    run output.appendBytes(b",\"") run escaped(&mut output, name.label)
-    run output.append(91) run number(&mut output, name.index) run output.appendBytes(b"]\"")
+  while i < names.starts.length() {
+    if i != 0 { run output.append(44) }
+    run output.append(34) run output.appendBytes(names.entry(i)) run output.append(34)
     i = i + 1
   }
-  run output.appendBytes(b"],\"silk\":{\"format\":\"silk.heap.snapshot\",\"version\":2,\"graphVersion\":1,\"identity\":")
+  run output.appendBytes(b"],\"silk\":{\"nodeKinds\":[")
+  i = 0 while i < kinds.length() { if i != 0 { run output.append(44) } run number(&mut output, kinds.get(i)) i = i + 1 }
+  run output.appendBytes(b"],\"edgeLabels\":[")
+  i = 0 while i < labels.length() { if i != 0 { run output.append(44) } run number(&mut output, labels.get(i)) i = i + 1 }
+  run output.appendBytes(b"],\"format\":\"silk.heap.snapshot\",\"version\":3,\"graphVersion\":1,\"identity\":")
   if graph.allocationIdentity { run quoted(&mut output, b"runtime-allocation-id") }
   else { run quoted(&mut output, b"address-stable-while-live") }
   run output.appendBytes(b",\"root\":0,\"rootKind\":\"native\",\"edgeStrengths\":[")

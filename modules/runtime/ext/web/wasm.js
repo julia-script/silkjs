@@ -125,13 +125,52 @@ function sourceBytes(value, streaming = false) {
   }
   throw new TypeError('Argument 0 must be a buffer source');
 }
+// V8 names the API call a compile or link error came from ("WebAssembly.compile(): ..."),
+// set by the outermost API function while it runs.
+let currentAPI;
+function named(api, body) {
+  if (currentAPI !== undefined) return body();
+  currentAPI = api;
+  try { return body(); } finally { currentAPI = undefined; }
+}
+function apiMessage(message) {
+  return currentAPI === undefined ? message : `${currentAPI}: ${message}`;
+}
+// The engine's lead-ins say nothing an API name does not.
+function engineMessage(message) {
+  return `${message}`.replace(/^WASM module (?:load|instantiate) failed: /, '');
+}
+// V8's trap messages (message-template.h) for the engine's exception texts.
+const trapMessages = {
+  __proto__: null,
+  'unreachable': 'unreachable',
+  'out of bounds memory access': 'memory access out of bounds',
+  'integer divide by zero': 'divide by zero',
+  'invalid conversion to integer': 'float unrepresentable in integer range',
+  'indirect call type mismatch': 'null function or function signature mismatch',
+  'uninitialized element': 'null function or function signature mismatch',
+  'undefined element': 'table index is out of bounds',
+  'out of bounds table access': 'table index is out of bounds',
+  'unaligned atomic': 'operation does not support unaligned accesses',
+  'null function reference': 'dereferencing a null pointer',
+  'null structure reference': 'dereferencing a null pointer',
+  'null array reference': 'dereferencing a null pointer',
+  'null i31 reference': 'dereferencing a null pointer',
+  'null reference': 'dereferencing a null pointer',
+  'cast failure': 'illegal cast',
+  'out of bounds array access': 'array element access out of bounds',
+};
+function trapMessage(message) {
+  const text = `${message}`.replace(/^Exception: /, '');
+  return trapMessages[text] ?? text;
+}
 function checkCodeGeneration() {
-  if (wasmCodeGeneration === false) throw new CompileError('Wasm code generation disallowed by embedder');
+  if (wasmCodeGeneration === false) throw new CompileError(apiMessage('Wasm code generation disallowed by embedder'));
 }
 function compileHandle(source, options) {
   checkCodeGeneration();
   const { buffer, offset, length } = sourceBytes(source);
-  if (!length) throw new CompileError('BufferSource argument is empty');
+  if (!length) throw new CompileError(apiMessage('BufferSource argument is empty'));
   return native('compile', buffer, offset, length, options);
 }
 function makeError(name) {
@@ -165,7 +204,7 @@ class Module extends AbstractModuleSource {
   constructor(source, options = undefined) {
     // AbstractModuleSource cannot be constructed: Module makes its own instance.
     const self = Object.create(new.target.prototype);
-    remember(self, 'module', compileHandle(source, options));
+    remember(self, 'module', named('WebAssembly.Module()', () => compileHandle(source, options)));
     return self;
   }
   static imports(module) {
@@ -183,7 +222,7 @@ class Instance {
   constructor(module, imports = undefined) {
     const handle = brand(module, 'module').handle;
     if (imports !== undefined && !object(imports)) throw new TypeError('Imports argument must be present and must be an object');
-    remember(this, 'instance', native('instantiate', handle, imports));
+    remember(this, 'instance', named('WebAssembly.Instance()', () => native('instantiate', handle, imports)));
     const state = records.get(this);
     state.exports = native('instanceExports', state.handle);
   }
@@ -333,7 +372,7 @@ function promising(callable) {
   return wrap('function', native('promising', state.handle), state.type);
 }
 async function compile(source, options = undefined) {
-  return wrap('module', compileHandle(source, options));
+  return wrap('module', named('WebAssembly.compile()', () => compileHandle(source, options)));
 }
 function validate(source, options = undefined) {
   const { buffer, offset, length } = sourceBytes(source);
@@ -344,9 +383,11 @@ async function instantiate(source, imports = undefined, options = undefined) {
   if (!object(source)) throw new TypeError('Argument 0 must be a buffer source or a WebAssembly.Module object');
   if (imports !== undefined && !object(imports)) throw new TypeError('Argument 1 must be an object');
   const state = records.get(source);
-  if (state && state.kind === 'module') return new Instance(source, imports);
-  const module = wrap('module', compileHandle(source, options));
-  return { module, instance: new Instance(module, imports) };
+  return named('WebAssembly.instantiate()', () => {
+    if (state && state.kind === 'module') return new Instance(source, imports);
+    const module = wrap('module', compileHandle(source, options));
+    return { module, instance: new Instance(module, imports) };
+  });
 }
 function responseError(message) {
   const error = new TypeError('WebAssembly response ' + message);
@@ -386,17 +427,22 @@ async function responseBytes(source) {
   return { bytes: Buffer.concat(chunks, length), url };
 }
 async function compileStreaming(source, options = undefined) {
-  checkCodeGeneration();
+  return streamingModule(source, options, 'WebAssembly.compileStreaming()');
+}
+async function streamingModule(source, options, api) {
+  named(api, checkCodeGeneration);
   const parsed = compileOptions.parse(options);
   const { bytes, url } = await responseBytes(source);
   const { buffer, offset, length } = sourceBytes(bytes);
-  if (!length) throw new CompileError('BufferSource argument is empty');
-  return wrap('module', native('compileParsed', buffer, offset, length, parsed, url));
+  return named(api, () => {
+    if (!length) throw new CompileError(apiMessage('BufferSource argument is empty'));
+    return wrap('module', native('compileParsed', buffer, offset, length, parsed, url));
+  });
 }
 async function instantiateStreaming(source, imports = undefined, options = undefined) {
   if (imports !== undefined && !object(imports)) throw new TypeError('Argument 1 must be an object');
-  const module = await compileStreaming(source, options);
-  return { module, instance: new Instance(module, imports) };
+  const module = await streamingModule(source, options, 'WebAssembly.instantiateStreaming()');
+  return { module, instance: named('WebAssembly.instantiateStreaming()', () => new Instance(module, imports)) };
 }
 
 for (const Constructor of Object.values(constructors).concat(Suspending)) {
@@ -415,6 +461,8 @@ registerWasmRealm(globalThis, {
   error(kind, message) {
     const Constructor = { compile: CompileError, link: LinkError, runtime: RuntimeError, suspend: SuspendError, type: TypeError, range: RangeError }[kind];
     if (!Constructor) throw new TypeError('Invalid native WebAssembly error kind');
+    if (kind === 'runtime') return new Constructor(trapMessage(message));
+    if (kind === 'compile' || kind === 'link') return new Constructor(apiMessage(engineMessage(message)));
     return new Constructor(message);
   },
   unwrap(value, kind) {

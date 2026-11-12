@@ -108,7 +108,7 @@ const plainPath = /^\/[A-Za-z0-9\/._~+@=,-]*$/;
 const dotSegment = /\/\.\.?(?:\/|$)/;
 const fileHref = path => host.platform !== 'win32' && plainPath.test(path) && !dotSegment.test(path)
   ? 'file://' + path : internalRequire('url').pathToFileURL(path).href;
-const inspectorNativeOperations = Array.from({ length: 32 }, (_, index) => native['inspectorNative' + index]);
+const inspectorNativeOperations = Array.from({ length: 33 }, (_, index) => native['inspectorNative' + index]);
 const reflectApply = Reflect.apply;
 host.inspectorNative = (operation, ...args) => reflectApply(inspectorNativeOperations[operation], undefined, args);
 host.inspectorEntry = wrapper => host.inspectorNative(15, wrapper);
@@ -1548,7 +1548,7 @@ function run(restored = false) {
   let filename, interactive = false, testMode = false, inputTypeSet = false, check = false;
   let watchMode = false, runName;
   let buildSnapshot = false, snapshotBlob, snapshotConfig;
-  let testCoverage = false;
+  let testCoverage = false, entryURL = false;
   const afterMain = result => interactive ? result && typeof result.then === 'function' ? result.then(startRepl) : startRepl() : result;
   // Options apply in order, NODE_OPTIONS first. Names are canonical: the
   // option table has expanded aliases and short forms.
@@ -1564,6 +1564,7 @@ function run(restored = false) {
       case '--build-snapshot-config': snapshotConfig = value; continue;
       case '--snapshot-blob': snapshotBlob = value; continue;
       case '--experimental-test-coverage': testCoverage = value; continue;
+      case '--entry-url': entryURL = value; continue;
       // Loaded before parsing, by loadRuntimeEnvironment.
       case '--env-file': case '--env-file-if-exists': continue;
       case '--experimental-sea-config': sea.prepare(value); return;
@@ -1584,7 +1585,8 @@ function run(restored = false) {
     // Node keeps both in its table only to reject them.
     if (entry.name === '--debug' || entry.name === '--debug-brk')
       return cliError('`node --debug` and `node --debug-brk` are invalid. Please use `node --inspect` and `node --inspect-brk` instead.');
-    if (runtimeFlag(optionFlag(entry)) || entry.implied) continue;
+    // Node accepts a NoOp option and does nothing with it.
+    if (entry.type === 'NoOp' || runtimeFlag(optionFlag(entry)) || entry.implied) continue;
     return cliError('bad option: ' + entry.raw);
   }
   // node.cc: --build-snapshot runs the builder, --snapshot-blob alone starts from a blob.
@@ -1647,12 +1649,13 @@ function run(restored = false) {
   if (testMode && (expression !== undefined || interactive || inputTypeSet))
     return cliError('--test cannot be combined with eval, interactive, or input-type');
   // Node's watch supervisor keeps argv[1] as given (prepareMainThreadExecution without expandArgv1).
-  if (expression === undefined && filename !== undefined && filename !== '-' && !testMode && !watchMode)
+  // --entry-url keeps it as given too (prepareMainThreadExecution(!isEntryURL)).
+  if (expression === undefined && filename !== undefined && filename !== '-' && !testMode && !watchMode && !entryURL)
     process.argv[1] = host.path.resolve(filename);
   const entrypoints = [];
   // The main script as resolved before any preload ran.
   let early;
-  if (!watchMode && !testMode && expression === undefined && filename !== undefined && filename !== '-') {
+  if (!watchMode && !testMode && !entryURL && expression === undefined && filename !== undefined && filename !== '-') {
     early = loader.resolveMain(host.path.resolve(filename));
     entrypoints.push(early.filename);
   }
@@ -1718,8 +1721,18 @@ function run(restored = false) {
     armInspectorEntry();
     return afterMain(internalRequire('internal/process/execution').evalScript('[stdin]', source, print));
   }
-  const path = host.path.resolve(filename);
-  process.argv[1] = path;
+  const path = entryURL ? undefined : host.path.resolve(filename);
+  if (!entryURL) process.argv[1] = path;
+  // run_main.js executeUserEntryPoint: --entry-url (a URL against the cwd) and a Wasm
+  // entry run through the ESM loader.
+  if (entryURL) internalRequire('internal/util').emitExperimentalWarning('--entry-url');
+  if (entryURL || (loader.Module.runMain === loader.defaultRunMain && wasmEntry(path))) {
+    const url = entryURL ? new URL(filename, internalRequire('url').pathToFileURL(host.tryGetCwd() + host.path.sep)).href
+      : internalRequire('url').pathToFileURL(path).href;
+    mainModuleName = url;
+    armInspectorEntry();
+    return afterMain(native.compileFunction('import(' + JSON.stringify(url) + ')', host.path.join(host.tryGetCwd(), '[eval]')));
+  }
   // A preload may replace Module.runMain (test-module-run-main-monkey-patch); Node then
   // hands it the entry path instead of running its own loader.
   if (loader.Module.runMain !== loader.defaultRunMain) {
@@ -1733,6 +1746,14 @@ function run(restored = false) {
   armInspectorEntry();
   return afterMain(loader.runMain(path, inputTypeSet, resolved));
   });
+}
+// A .wasm main, or an extensionless one that a module scope makes Wasm.
+function wasmEntry(path) {
+  if (stringEndsWith(path, '.wasm')) return true;
+  if (host.path.extname(path) !== '') return false;
+  // run_main.js shouldUseESMLoader: an extensionless main is ESM only in a module scope.
+  try { return loader.packageType(path) === 'module' && loader.resolve(path, host.path.join(host.tryGetCwd(), '[eval]'), 'import').format === 'wasm'; }
+  catch { return false; }
 }
 function referencedWork() {
   return native.hasPendingIO() || timerLoop.hasRef();

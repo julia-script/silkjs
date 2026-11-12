@@ -53,11 +53,58 @@ function importAssertionAlias(context) {
     set(value) { importAssertionWarning(); return Reflect.set(this, 'importAttributes', value); },
   });
 }
+// Node's Hooks#resolve/#load chain for module.register() hooks (internal/modules/esm/hooks.js):
+// next<Hook> functions from nextHookFactory, one shared context that each call assigns into,
+// the default hook as the chain's first link, and ERR_LOADER_CHAIN_INCOMPLETE when a hook
+// neither calls next nor signals a short circuit.
+function asyncChain(records, kind, input, context, terminal) {
+  const { codes: { ERR_INVALID_ARG_TYPE, ERR_INVALID_ARG_VALUE, ERR_INVALID_RETURN_VALUE,
+    ERR_LOADER_CHAIN_INCOMPLETE, ERR_INTERNAL_ASSERTION } } = require('internal/errors');
+  const { validateString, validateObject } = require('internal/validators');
+  const links = [{ fn: terminal, url: kind === 'resolve' ? 'node:internal/modules/esm/resolve' : 'node:internal/modules/esm/load' }];
+  for (const record of records) if (typeof record[kind] === 'function') links.push({ fn: record[kind], url: record.url });
+  const meta = { chainFinished: null, context: importAssertionAlias({ ...context }), hookErrIdentifier: '', hookUrl: undefined, shortCircuited: false };
+  const validateArgs = kind === 'resolve' ? (identifier, specifier, nextContext) => {
+    validateString(specifier, `${identifier} specifier`);
+    if (nextContext) validateObject(nextContext, `${identifier} context`);
+  } : (identifier, url, nextContext) => {
+    if (typeof url !== 'string') throw new ERR_INVALID_ARG_TYPE(`${identifier} url`, 'a URL string', url);
+    if (!URL.canParse(url)) throw new ERR_INVALID_ARG_VALUE(`${identifier} url`, url, 'should be a URL string');
+    if (nextContext) validateObject(nextContext, `${identifier} context`);
+  };
+  const validateOutput = (identifier, output) => {
+    if (typeof output !== 'object' || output === null) throw new ERR_INVALID_RETURN_VALUE('an object', identifier, output);
+  };
+  const nextHookName = kind === 'resolve' ? 'nextResolve' : 'nextLoad';
+  function nextHookFactory(index) {
+    const { fn: hook, url } = links[index];
+    const nextNextHook = index > 0 ? nextHookFactory(index - 1) : function chainAdvancedTooFar() {
+      throw new ERR_INTERNAL_ASSERTION(`ESM custom loader '${kind}' advanced beyond the end of the chain.`);
+    };
+    return Object.defineProperty(async (arg0 = undefined, nextContext) => {
+      meta.hookErrIdentifier = `${url} '${kind}'`;
+      meta.hookUrl = url;
+      validateArgs(`${meta.hookErrIdentifier} hook's ${nextHookName}()`, arg0, nextContext);
+      const outputErrIdentifier = `${url} '${kind}' hook's ${nextHookName}()`;
+      if (index === 0) meta.chainFinished = true;
+      if (nextContext) Object.assign(meta.context, nextContext);
+      const output = await hook(arg0, meta.context, nextNextHook);
+      validateOutput(outputErrIdentifier, output);
+      if (output?.shortCircuit === true) meta.shortCircuited = true;
+      return output;
+    }, 'name', { __proto__: null, value: nextHookName });
+  }
+  return nextHookFactory(links.length - 1)(input, meta.context).then(result => {
+    validateOutput(meta.hookErrIdentifier, result);
+    if (result?.shortCircuit === true) meta.shortCircuited = true;
+    if (!meta.chainFinished && !meta.shortCircuited) throw new ERR_LOADER_CHAIN_INCOMPLETE(meta.hookErrIdentifier);
+    return validate(kind, result, true, true, meta.hookUrl);
+  });
+}
+// module.registerHooks() hooks run synchronously in this thread (customization_hooks.js).
 function chain(records, kind, input, context, terminal, asynchronous) {
+  if (asynchronous) return asyncChain(records, kind, input, context, terminal);
   const hooks = records.filter(record => typeof record[kind] === 'function');
-  // Like Node's async chain, the module.register() hooks share one context object
-  // that each next() call assigns into.
-  const shared = asynchronous ? importAssertionAlias({ ...context }) : null;
   function dispatch(index, value, current) {
     if (typeof value !== 'string') throw fail('ERR_INVALID_ARG_TYPE', `The "${kind === 'resolve' ? 'specifier' : 'url'}" argument must be a string`);
     contextObject(current, 'context');
@@ -65,14 +112,13 @@ function chain(records, kind, input, context, terminal, asynchronous) {
     let advanced = false;
     const next = (nextValue, nextContext) => {
       advanced = true;
-      if (shared === null) return dispatch(index - 1, nextValue, { ...current, ...nextContext });
-      if (nextContext) Object.assign(shared, nextContext);
-      return dispatch(index - 1, nextValue, shared);
+      return dispatch(index - 1, nextValue, { ...current, ...nextContext });
     };
-    const result = hooks[index][kind](value, current, next);
-    return asynchronous ? Promise.resolve(result).then(value => validate(kind, value, advanced, true, hooks[index].url)) : validate(kind, result, advanced, false);
+    const hook = hooks[index][kind];
+    const result = hook(value, current, next);
+    return validate(kind, result, advanced, false);
   }
-  return dispatch(hooks.length - 1, input, shared === null ? context : shared);
+  return dispatch(hooks.length - 1, input, context);
 }
 function createHooks(defaultResolve, defaultLoad, getThreads, awaitHook, workerStatus, getWorkerExecArgv) {
   const synchronous = [];
@@ -132,7 +178,8 @@ function createHooks(defaultResolve, defaultLoad, getThreads, awaitHook, workerS
     enterWorker() { local = true; },
     async addAsync(namespace, data, url) {
       for (const name of ['resolve', 'load', 'initialize']) if (namespace[name] !== undefined && typeof namespace[name] !== 'function') throw fail('ERR_INVALID_ARG_TYPE', `The hook export "${name}" must be a function`);
-      if (namespace.initialize) await namespace.initialize(data);
+      const { initialize } = namespace;
+      if (initialize) await initialize(data);
       asynchronous.push({ resolve: namespace.resolve, load: namespace.load, url });
     },
   };
