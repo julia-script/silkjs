@@ -21,6 +21,8 @@ import js_coercion_host { CoercionHooks }
 import js_property_host { OwnPropertyHooks, GetPropertyHooks, HasPropertyHooks }
 import js_property_write_host { PropertyWriteHooks }
 import js_constructor_ops as constructors
+import js_shapes as shapes
+import js_object_allocate as objects
 import js_property_mutations as mutations
 import js_property_delete as deletion
 import js_property_get as properties
@@ -44,6 +46,56 @@ pub fn fastCount<'o>(object: ValueRef<'o>) -> i64 {
   if !object.view().isObject() { return -1 }
   let anchor = () let data = ObjectRef.of(object).data(&anchor)
   if data.classId() != classes.JS_CLASS_ARRAY || !data.fastArray() { return -1 }
+  return match &data.payload { ObjectPayload.FastArray { array } => usize.toI64(array.values().length()) _ => -1 }
+}
+/// Whether neither realm's Array.prototype nor Object.prototype (Array.prototype's
+/// parent, with no parent of its own) has a Symbol.isConcatSpreadable: then a
+/// plain Array's flag reads undefined without running code.
+fn concatFlagAbsent<'a>(realm: Realm<'a>) -> bool {
+  let arrays = match realm.classPrototype(classes.JS_CLASS_ARRAY).view() { ValueBits.Object { reference } => reference _ => { return false } }
+  let objects = match realm.classPrototype(classes.JS_CLASS_OBJECT).view() { ValueBits.Object { reference } => reference _ => { return false } }
+  let anchor = ()
+  let arrayData = unsafe HeapCell.payload<ObjectData, ()>(&anchor, arrays)
+  let objectData = unsafe HeapCell.payload<ObjectData, ()>(&anchor, objects)
+  if objectData.isExotic() { return false }
+  if let Option<usize>.Some { .. } = unsafe shapes.lookup(arrayData.shape, atoms.JS_ATOM_Symbol_isConcatSpreadable) { return false }
+  if let Option<usize>.Some { .. } = unsafe shapes.lookup(objectData.shape, atoms.JS_ATOM_Symbol_isConcatSpreadable) { return false }
+  let arrayShape = unsafe HeapCell.payload<ShapeData, ()>(&anchor, arrayData.shape)
+  if Pointer.address<HeapHeader>(unsafe Intrinsic.pointerRequalify<?*mut HeapHeader, *mut HeapHeader>(arrayShape.prototype)) != Pointer.address<HeapHeader>(objects) { return false }
+  let objectShape = unsafe HeapCell.payload<ShapeData, ()>(&anchor, objectData.shape)
+  return Pointer.isNull<HeapHeader>(objectShape.prototype)
+}
+/// The dense count of item when Array.prototype.concat spreads it with no code
+/// run: a fast Array of realm's plain array shape (only length, realm's
+/// Array.prototype as prototype) whose length is that count, while
+/// concatFlagAbsent holds. -1 otherwise.
+pub fn concatDenseCount<'a, 'b>(realm: Realm<'a>, item: ValueRef<'b>) -> i64 {
+  let node = match item.view() { ValueBits.Object { reference } => reference _ => { return -1 } }
+  let anchor = () let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, node)
+  if data.classId() != classes.JS_CLASS_ARRAY || !data.fastArray() { return -1 }
+  let state = realm.state(&anchor)
+  if Pointer.address<HeapHeader>(data.shape) != Pointer.address<HeapHeader>(unsafe Intrinsic.pointerRequalify<?*mut HeapHeader, *mut HeapHeader>(state.arrayShape)) { return -1 }
+  drop state
+  let count = match &data.payload { ObjectPayload.FastArray { array } => array.values().length() _ => { return -1 } }
+  match data.slot(0).valueBits() { ValueBits.Int { value } => { if value < 0 || i32.toUsize(value) != count { return -1 } } _ => { return -1 } }
+  drop data
+  if !concatFlagAbsent(realm) { return -1 }
+  return usize.toI64(count)
+}
+/// Whether object is a fast Array whose length is the Int n (setting length
+/// to n would then change nothing).
+pub fn lengthIs<'o>(object: ValueRef<'o>, n: i64) -> bool {
+  if !object.view().isObject() { return false }
+  let anchor = () let data = ObjectRef.of(object).data(&anchor)
+  if data.classId() != classes.JS_CLASS_ARRAY || !data.fastArray() { return false }
+  return match data.slot(0).valueBits() { ValueBits.Int { value } => i32.toI64(value) == n _ => false }
+}
+/// fastCount, also answering for an unmapped arguments object whose elements
+/// are still its fast storage: slice copies either with copyFastRange.
+pub fn fastSliceCount<'o>(object: ValueRef<'o>) -> i64 {
+  if !object.view().isObject() { return -1 }
+  let anchor = () let data = ObjectRef.of(object).data(&anchor)
+  if (data.classId() != classes.JS_CLASS_ARRAY && data.classId() != classes.JS_CLASS_ARGUMENTS) || !data.fastArray() { return -1 }
   return match &data.payload { ObjectPayload.FastArray { array } => usize.toI64(array.values().length()) _ => -1 }
 }
 /// The first index from start below the dense count of fast Array object whose
@@ -251,9 +303,41 @@ pub effect fn isArray<'a, 'b, H: HeapHooks + CoercionHooks>(hooks: &mut H, realm
   let anchor = () let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, core.reference(resolved))
   return data.classId() == classes.JS_CLASS_ARRAY
 }
+/// Elements new Array(n) reserves storage for up front.
+const PREALLOCATED_MAX: usize = 1024
+/// Whether constructing with newTarget makes a plain Array of realm with no
+/// code run: newTarget is undefined (Array called) or realm's own Array.
+fn ownArray<'a>(realm: Realm<'a>, newTarget: ValueBits) -> bool { let _context = realm.context()
+  let given = match newTarget { ValueBits.Object { reference } => reference ValueBits.Undefined => { return true } _ => { return false } }
+  let anchor = () let state = realm.state(&anchor)
+  let own = match state.arrayConstructor.view() { ValueBits.Object { reference } => reference _ => { return false } }
+  return Pointer.address<HeapHeader>(given) == Pointer.address<HeapHeader>(own)
+}
 effect fn constructorBody<'a, 'b, H: HeapHooks + CoercionHooks + OwnPropertyHooks + PropertyWriteHooks>(hooks: &mut H,
   memory: &AllocationObserver, realm: Realm<'a>, newTarget: ValueRef<'b>, args: Arguments<'a>) -> ValueBits
   ! OutOfMemoryError | StringLengthError | BigIntError | JsException ? &mut Allocator {
+  if ownArray(realm, newTarget.view()) {
+    let count = args.slots().length()
+    if count == 1 {
+      match unsafe args.slots().get(0) {
+        ValueBits.Int { value: length } => {
+          // new Array(n): storage for the first PREALLOCATED_MAX elements comes
+          // now, so the fill that follows appends in place.
+          if length >= 0 {
+            let mut reserve = i32.toUsize(length)
+            if reserve > PREALLOCATED_MAX { reserve = PREALLOCATED_MAX }
+            let made = run objects.arrayWithCapacity(&mut hooks, memory, realm, reserve)
+            let mut anchor = () let data = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut anchor, core.reference(made))
+            data.setSlot(0, SlotBits.value(ValueBits.Int { value: length }))
+            return made
+          }
+        }
+        _ => ()
+      }
+    } else {
+      return run unsafe construction.create(&mut hooks, memory, realm, args.slots(), 0, count)
+    }
+  }
   let array = run constructors.create(&mut hooks, memory, realm, newTarget.borrow(), classes.JS_CLASS_ARRAY)
   if args.slots().length() == 1 && (unsafe args.slots().get(0)).isNumber() {
     let mut length: u32 = 0
