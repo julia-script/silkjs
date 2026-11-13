@@ -122,6 +122,15 @@ class Transport {
       callback(error(status, 'write'));
     }
   }
+  // A plaintext write of the TLS session this handle runs (host.secure op 2): 1 when the records
+  // left now, 0 when callback(err) follows, a negative status, or SECURE_FAILED / NOT_SECURE
+  // when the session must go back to JavaScript (the write did not happen).
+  secureWrite(chunk, callback) {
+    const token = ++this.sequence;
+    const status = host.secure(2, this.id, chunk.buffer, chunk.byteOffset, chunk.byteLength, token);
+    if (status === 0) this.requests.set(token, { callback, chunk });
+    return status;
+  }
   writev(chunks, callback) {
     let pending = chunks.length;
     let failure = null;
