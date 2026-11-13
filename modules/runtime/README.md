@@ -51,6 +51,7 @@ The package manager of [`modules/pm`](../pm) is in the executable. Its commands 
 ./build/silkjsruntime run build          # a script of package.json; arguments follow the name
 ./build/silkjsruntime run -r build       # in every package of the workspace that has the script
 ./build/silkjsruntime exec tsc --noEmit  # a command of the dependencies
+./build/silkjsruntime dlx cowsay hello   # a command of a package the project does not have
 ```
 
 In a workspace, a `package.json` with `workspaces`, the commands install for every package from any of their directories, and `add --filter <name>` or `add -w` choose the package to change.
@@ -59,7 +60,7 @@ A script that calls `node` on a machine without Node.js gets this executable, wh
 
 The install scripts of a dependency run only when `allowBuilds` in the `package.json` of the project names it: `"allowBuilds": { "esbuild": true }`.
 
-A script file named like one of the commands (`install`, `i`, `ci`, `add`, `remove`, `rm`, `uninstall`, `un`, `update`, `up`, `upgrade`, `run`, `run-script`, `exec`) is run with its path: `./build/silkjsruntime ./install`.
+A script file named like one of the commands (`install`, `i`, `ci`, `add`, `remove`, `rm`, `uninstall`, `un`, `update`, `up`, `upgrade`, `run`, `run-script`, `exec`, `dlx`) is run with its path: `./build/silkjsruntime ./install`.
 
 The implementation includes CommonJS and ESM package loading, TypeScript execution, filesystem and process APIs, streams, networking and TLS/HTTP2, crypto and WebCrypto, workers and cluster, SQLite, Intl (SilkJS's ECMA-402 implementation in Silk, with its own CLDR-derived locale data; no ICU), Web APIs, WebAssembly/WASI, Node-API addons, the test runner, REPL, inspector, and native profiling. Feature-specific fixtures in [`tests/`](tests/) exercise these contracts, including cross-process and cross-realm ownership and failure paths.
 

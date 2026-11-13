@@ -19,6 +19,7 @@ silk run -- install                 # install the package.json of the working di
 | `pm update [name]...` | Moves the named packages, or all, to the newest versions the ranges allow. |
 | `pm run <script> [argument]...` | Runs a script of `package.json`, between its `pre` and `post` scripts when it has them. Without a name it lists the scripts. `-r` runs it in every package of the workspace. |
 | `pm exec <command> [argument]...` | Runs a command of the dependencies. |
+| `pm dlx <name>[@range or tag] [argument]...` | Runs the command of a package the project does not have. |
 
 An install resolves the dependencies against the registry, downloads what the store at
 `$SILKJS_STORE` (or `~/.silkjs/store`) does not have, and links an isolated `node_modules`: each
@@ -48,6 +49,11 @@ named below). They end with the exit code of what ran. The words after the scrip
 the script as they are, each as one argument; a `--` before them is left out. In a workspace,
 `--filter <name>` and `-w` before the script name choose the package, and `run -r <script>` runs
 the script in every package that has it, a package after the ones it depends on, until one fails.
+
+`dlx` installs the package in a project of its own in the store, `dlx/<name>@<range>`, and runs
+its command in the working directory: the one command it has, or the one named like the package.
+A range that is one version is installed once; anything else is resolved again each time, so
+`dlx create-thing` gets today's `latest`. Install scripts do not run for it.
 
 The last place on `PATH` is the `commands` directory of the store. The runtime puts itself there
 under the name `node`, so a script that calls `node` works on a machine that has the runtime
