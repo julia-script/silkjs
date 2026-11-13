@@ -120,7 +120,7 @@ function chain(records, kind, input, context, terminal, asynchronous) {
   }
   return dispatch(hooks.length - 1, input, context);
 }
-function createHooks(defaultResolve, defaultLoad, getThreads, awaitHook, workerStatus, getWorkerExecArgv) {
+function createHooks(defaultResolve, defaultLoad, getThreads, awaitHook, workerStatus, getWorkerExecArgv, getDrainWorker) {
   const synchronous = [];
   const asynchronous = [];
   let remote;
@@ -168,7 +168,7 @@ function createHooks(defaultResolve, defaultLoad, getThreads, awaitHook, workerS
     if (parentURL === undefined) parentURL = options.parentURL || 'data:';
     if (typeof parentURL !== 'string') throw fail('ERR_INVALID_ARG_TYPE', 'The "parentURL" argument must be a string or URL');
     if (local) throw fail('ERR_LOADER_HOOK_REENTRANCY', 'module.register() cannot be called from inside a loader hook', Error);
-    if (!remote) remote = require('./hooks_transport').create(getThreads(), workerStatus, getWorkerExecArgv());
+    if (!remote) remote = require('./hooks_transport').create(getThreads(), workerStatus, getWorkerExecArgv(), getDrainWorker());
     remote.call('register', { specifier, parentURL, data: options.data }, options.transferList);
   }
   return { registerHooks, register, run, asyncRun,
