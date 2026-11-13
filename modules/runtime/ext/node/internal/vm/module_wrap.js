@@ -89,7 +89,8 @@ class ModuleWrap {
         }));
         this.#requests.push(request);
         const key = cacheKey(request).id;
-        if (!this.#resolveCache.has(key)) this.#resolveCache.set(key, i);
+        // resolve_cache_[key] = i: the last request of a key is the one the others match.
+        this.#resolveCache.set(key, i);
       }
       this.hasTopLevelAwait = host.vmModule(TOP_LEVEL_AWAIT, this.#handle);
       this.sourceURL = undefined;

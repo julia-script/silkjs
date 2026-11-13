@@ -2065,13 +2065,14 @@ function createLoader(host, builtins) {
   const implicitType = { builtin: true, commonjs: true, module: true, wasm: true, 'commonjs-typescript': true, 'module-typescript': true };
   // (Node's esm/assert.js) Formats Node does not map, such as text without
   // --experimental-import-text, take any attributes.
+  // True when the attributes fit, as Node's returns.
   function validateAttributes(kind, url, attributes) {
     for (let i12 = 0, a12 = Object.keys(attributes); i12 < a12.length; i12++) { const key = a12[i12];
       if (key !== 'type') throw error('ERR_IMPORT_ATTRIBUTE_UNSUPPORTED', key, attributes[key], url);
     }
     const expected = kind === 'json' ? 'json' : kind === 'text' && host.importText ? 'text' : own(implicitType, kind) ? null : undefined;
-    if (expected === undefined) return;
-    if (expected === null ? !own(attributes, 'type') : attributes.type === expected) return;
+    if (expected === undefined) return true;
+    if (expected === null ? !own(attributes, 'type') : attributes.type === expected) return true;
     if (expected !== null && !own(attributes, 'type')) throw error('ERR_IMPORT_ATTRIBUTE_MISSING', url, 'type', expected);
     const type = attributes.type;
     validateString(type, 'type');
@@ -2184,7 +2185,7 @@ function createLoader(host, builtins) {
 
   // A file's package scope "type" (run_main.js shouldUseESMLoader asks for the main).
   const packageType = filename => packageScope(filename)?.data.type;
-  return { packageType, readPackage, packageScopeAt, decorateModuleError, moduleEvaluationError, realmResolve, resolveImport, importKey, moduleSource, requireFor, runMain, defaultRunMain, warmMain, resolve, resolveMain, loadESM, cleanSource, prepareSource, bridge, Module, mockModule };
+  return { packageType, readPackage, packageScopeAt, defaultResolve, validateAttributes, decorateModuleError, moduleEvaluationError, realmResolve, resolveImport, importKey, moduleSource, requireFor, runMain, defaultRunMain, warmMain, resolve, resolveMain, loadESM, cleanSource, prepareSource, bridge, Module, mockModule };
 }
 
 module.exports = { createLoader };

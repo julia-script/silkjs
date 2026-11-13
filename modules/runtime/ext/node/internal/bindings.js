@@ -118,6 +118,8 @@ const kBindings = {
   builtins: () => builtins(),
   // node_modules.cc: package.json reads and package scopes, as the loader keeps them.
   modules: () => require('internal/modules_binding'),
+  // module_wrap.cc: ModuleWrap, the module record vm.Module is built on, and its phases.
+  module_wrap: () => require('internal/vm/module_wrap'),
   // node_options.cc: the option table, by type and by environment setting.
   options: () => {
     const { optionTypes, envVarSettings, getCLIOptionsInfo } = require('internal/options');
