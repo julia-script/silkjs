@@ -98,9 +98,9 @@ const server = http.createServer((request, response) => {
   response.writeHead(200, { 'content-type': 'application/json', 'content-length': Buffer.byteLength(body) }).end(body);
 });
 
-function run(directory, args, home = directory) {
+function run(directory, args, home = directory, search = process.env.PATH) {
   return new Promise((resolve, reject) => {
-    const environment = { PATH: process.env.PATH, HOME: home, SILKJS_STORE: path.join(home, 'store') };
+    const environment = { PATH: search, HOME: home, SILKJS_STORE: path.join(home, 'store') };
     const child = spawn(process.execPath, args, { cwd: directory, env: environment });
     let stdout = '';
     let stderr = '';
@@ -182,6 +182,12 @@ server.listen(0, '127.0.0.1', async () => {
     assert.match(listed.stdout, /^hello: echo hi from \$npm_lifecycle_event\n/);
     const executed = await run(directory, ['exec', 'sh', '-c', 'echo "$npm_package_name in $PWD"']);
     assert.strictEqual(executed.stdout, `app in ${fs.realpathSync(directory)}\n`);
+    // On a machine without Node.js the executable is what a script gets for `node`, and by
+    // that name it runs a file even when the file is named like a command.
+    fs.writeFileSync(path.join(directory, 'install'), 'console.log("ran as", require("node:path").basename(process.argv0));\n');
+    const alone = await run(directory, ['exec', '/bin/sh', '-c', 'node install'], directory, '/nowhere');
+    assert.strictEqual(alone.status, 0, alone.stderr);
+    assert.strictEqual(alone.stdout, 'ran as node\n');
 
     // A workspace: one lockfile and one hidden directory at the root, and a package that depends
     // on another gets a link to its directory.
