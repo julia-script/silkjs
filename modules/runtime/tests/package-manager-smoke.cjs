@@ -251,6 +251,18 @@ server.listen(0, '127.0.0.1', async () => {
     fs.writeFileSync(path.join(repo, 'packages/app/package.json'), '{"name":"app","dependencies":{"@repo/lib":"workspace:*"}}\n');
     fs.writeFileSync(path.join(repo, 'packages/app/main.js'), 'console.log(require("@repo/lib")(), require("greeter")());\n');
     const app = path.join(repo, 'packages/app');
+    // An install that names a package leaves the others alone, until the dots ask for the
+    // packages it depends on.
+    const narrow = await run(repo, ['install', '--filter', 'app'], directory);
+    assert.strictEqual(narrow.status, 0, narrow.stderr);
+    assert.match(narrow.stdout, /0 packages: 0 downloaded, 0 linked\n/);
+    assert.ok(fs.existsSync(path.join(app, 'node_modules/@repo/lib')));
+    assert.ok(!fs.existsSync(path.join(repo, 'packages/lib/node_modules')));
+    const deep = await run(repo, ['install', '--filter', 'app...'], directory);
+    assert.strictEqual(deep.status, 0, deep.stderr);
+    assert.ok(fs.existsSync(path.join(repo, 'packages/lib/node_modules/worder')));
+    fs.rmSync(path.join(repo, 'node_modules'), { recursive: true });
+    fs.rmSync(path.join(repo, 'packages/lib/node_modules'), { recursive: true });
     const shared = await run(app, ['install'], directory);
     assert.strictEqual(shared.status, 0, shared.stderr);
     assert.match(shared.stdout, /1 packages: 0 downloaded, 1 linked\n/);

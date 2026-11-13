@@ -208,12 +208,17 @@ pub struct Downloader<'a> {
   running: List<PoolFiber<Done, OutOfMemoryError>>,
   // The first download that failed.
   failure: Option<InstallError>,
+  // Whether a package is fetched as soon as a resolution names it. When only a part of the
+  // graph is installed, what to fetch is known once the graph is whole.
+  early: bool,
 }
 
 impl<'a> Downloader<'a> {
   /// A downloader into `store` for the packages `host` can run, unpacking on `pool`. `root` is
-  /// the directory of the workspace the packages are for.
-  pub fn make(store: &'a Store, pool: &'a Pool, host: Host, root: Bytes) -> Downloader<'a> {
+  /// the directory of the workspace the packages are for. With `early`, the packages a
+  /// resolution names are fetched while it goes on, which is right when the whole graph is
+  /// installed; without, only what [`install`] asks for is fetched.
+  pub fn make(store: &'a Store, pool: &'a Pool, host: Host, root: Bytes, early: bool) -> Downloader<'a> {
     return Downloader<'a> {
       store: store,
       pool: pool,
@@ -225,6 +230,7 @@ impl<'a> Downloader<'a> {
       asked: List<Wanted>.make(),
       running: List<PoolFiber<Done, OutOfMemoryError>>.make(),
       failure: Option<InstallError>.none(),
+      early: early,
     }
   }
 
@@ -268,6 +274,9 @@ impl<'a> Downloader<'a> {
   }
 
   effect fn expect(self: &mut Self, graph: &Graph, index: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+    if self.early == false {
+      return ()
+    }
     let missing = run Downloader.missing(&mut self, graph, index)
     if missing == false {
       return ()
@@ -388,6 +397,10 @@ impl<'a> Downloader<'a> {
       let Fetched { documents, tarballs } = run Registry.fetch(&graph.names, List<usize>.asSlice(&none), List<Bytes>.asSlice(&urls))
       drop documents
       run Downloader.take(&mut all, move tarballs)
+    }
+    // Packages that were never asked about have no place in the list yet.
+    while List<Option<PackageFiles>>.length(&all.files) < Graph.count(graph) {
+      run all.files.append(Option<PackageFiles>.none())
     }
     let Downloader { pool, root, files: gathered, seen, waiting, asked, running, failure, .. } = move all
     drop root
@@ -964,17 +977,29 @@ effect fn build(workspace: &Workspace, graph: &Graph, store: &Store, host: Host,
   return turns.length
 }
 
+// Whether the package of the workspace that importer `importer` of `graph` is, is among `chosen`.
+fn isChosen(workspace: &Workspace, graph: &Graph, importer: usize, chosen: &[bool]) -> bool {
+  return match Workspace.at(workspace, Graph.importerPath(graph, importer)) {
+    Option.Some { value: member } => member < chosen.length && chosen[member]
+    Option.None => false
+  }
+}
+
 /// Installs `graph`, the resolution of `workspace`, into the directories of the workspace.
 /// `downloader` names the store and the host, and may have fetched packages of `graph` during
 /// its resolution already; the others are fetched now. Packages that are not for the host are
 /// left out. The install scripts of the packages that `allowBuilds` of the root project allows
 /// run at the end.
 ///
+/// `chosen` says, per package of the workspace, whether it is installed. A package that is not
+/// keeps the `node_modules` it has, and what only such packages depend on is neither fetched
+/// nor linked.
+///
 /// # Errors
 ///
 /// - [`InstallError`] when a package cannot be downloaded or does not match its digest, when
 ///   the store or `node_modules` cannot be written, or when an install script fails.
-pub effect fn install(workspace: &Workspace, graph: &Graph, downloader: Downloader<'_>) -> Summary
+pub effect fn install(workspace: &Workspace, graph: &Graph, downloader: Downloader<'_>, chosen: &[bool]) -> Summary
   ! InstallError | OutOfMemoryError ? &mut Registry | &mut ChildProcess | &mut Allocator {
   let mut summary = Summary { packages: 0, downloaded: 0, linked: 0, built: 0, blocked: Bytes.make() }
   let rules = &Workspace.all(workspace)[0].manifest
@@ -984,10 +1009,44 @@ pub effect fn install(workspace: &Workspace, graph: &Graph, downloader: Download
   let mut fetcher = move downloader
   let store = fetcher.store
   let host = fetcher.host
-  // The packages that have a node are the ones that are installed.
+  // The nodes that a chosen package of the workspace reaches are the ones that are installed.
+  let mut reached = List<bool>.make()
+  run reached.appendRepeated(false, Graph.nodeCount(graph))
+  let mut open = List<usize>.make()
   let mut each: usize = 0
+  while each < Graph.importerCount(graph) {
+    if isChosen(workspace, graph, each, chosen) {
+      let edges = Graph.importerEdges(graph, each)
+      let mut edge: usize = 0
+      while edge < edges.length {
+        run open.append(edges[edge].target)
+        edge = edge + 1
+      }
+    }
+    each = each + 1
+  }
+  while true {
+    let node = match List<usize>.pop(&mut open) {
+      Option.Some { value } => value
+      Option.None => { break }
+    }
+    if List<bool>.get(&reached, node) {
+      continue
+    }
+    List<bool>.set(&mut reached, node, true)
+    let edges = Graph.nodeEdges(graph, node)
+    let mut edge: usize = 0
+    while edge < edges.length {
+      run open.append(edges[edge].target)
+      edge = edge + 1
+    }
+  }
+  fetcher.early = true
+  each = 0
   while each < Graph.nodeCount(graph) {
-    run Downloader.expect(&mut fetcher, graph, Graph.nodePackage(graph, each))
+    if List<bool>.get(&reached, each) {
+      run Downloader.expect(&mut fetcher, graph, Graph.nodePackage(graph, each))
+    }
     each = each + 1
   }
   let files = run Downloader.finish(move fetcher, graph, &mut summary)
@@ -1004,7 +1063,7 @@ pub effect fn install(workspace: &Workspace, graph: &Graph, downloader: Download
   while index < Graph.nodeCount(graph) {
     let package = Graph.nodePackage(graph, index)
     run building.append(false)
-    if Graph.supports(graph, package, host) == false {
+    if List<bool>.get(&reached, index) == false || Graph.supports(graph, package, host) == false {
       index = index + 1
       continue
     }
@@ -1074,6 +1133,10 @@ pub effect fn install(workspace: &Workspace, graph: &Graph, downloader: Download
   run prune(graph, host, Bytes.asSlice(&virtual))
   let mut importer: usize = 0
   while importer < Graph.importerCount(graph) {
+    if isChosen(workspace, graph, importer, chosen) == false {
+      importer = importer + 1
+      continue
+    }
     let mut own = run Bytes.copy(Workspace.root(workspace))
     if same(Graph.importerPath(graph, importer), b".") == false {
       run own.append(b"/")
