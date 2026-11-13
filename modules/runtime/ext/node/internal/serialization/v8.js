@@ -261,7 +261,11 @@ const Serializer = constructCallRequired(class Serializer {
     }
     this._objects.set(value, this._objects.size);
     if (ArrayBuffer.isView(value)) { this._tag('\\'); this._writeHostObject(value); return; }
-    if (this._isHostObject?.(value) || isHostObject(value)) { this._tag('\\'); this._writeHostObject(value); return; }
+    // An interceptor object (process.env) is a V8 API object: a host object to V8's own
+    // check, an ordinary object to a delegate that answers it (node_messaging.cc
+    // IsHostObject asks only for BaseObjects), as structuredClone(process.env) is.
+    if (this._isHostObject?.(value) || isHostObject(value) ||
+        (this._isHostObject === undefined && host.isInterceptor(value))) { this._tag('\\'); this._writeHostObject(value); return; }
     if (Array.isArray(value)) {
       // Sparse encoding preserves holes and all enumerable own properties;
       // it is equally valid for packed arrays and avoids materializing holes.
@@ -320,7 +324,7 @@ const Serializer = constructCallRequired(class Serializer {
     // prototypes and @@toStringTag are deliberately not used as brands.
     if (types.isSymbolObject(value) ||
         types.isWeakMap(value) || types.isWeakSet(value) || types.isPromise(value) ||
-        host.serializationInfo(value) !== 0) this._fail(value);
+        (host.serializationInfo(value) !== 0 && !host.isInterceptor(value))) this._fail(value);
     this._tag('o'); const count = this._properties(value, keys(value));
     this._tag('{'); this.writeUint32(count);
   }

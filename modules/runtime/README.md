@@ -60,6 +60,8 @@ A script that calls `node` on a machine without Node.js gets this executable, wh
 
 The install scripts of a dependency run only when `allowBuilds` in the `package.json` of the project names it: `"allowBuilds": { "esbuild": true }`.
 
+A dependency can also be a tarball (`https://…/pad.tgz`, `file:vendor/pad.tgz`), a directory (`file:../pad` copies it, `link:../pad` links it) or a repository on GitHub, GitLab or Bitbucket (`github:owner/repo#v1.0.0`, `owner/repo`, `git+https://…`), which is installed without git. [`modules/pm`](../pm) has the details.
+
 A script file named like one of the commands (`install`, `i`, `ci`, `add`, `remove`, `rm`, `uninstall`, `un`, `update`, `up`, `upgrade`, `run`, `run-script`, `exec`, `dlx`) is run with its path: `./build/silkjsruntime ./install`.
 
 The implementation includes CommonJS and ESM package loading, TypeScript execution, filesystem and process APIs, streams, networking and TLS/HTTP2, crypto and WebCrypto, workers and cluster, SQLite, Intl (SilkJS's ECMA-402 implementation in Silk, with its own CLDR-derived locale data; no ICU), Web APIs, WebAssembly/WASI, Node-API addons, the test runner, REPL, inspector, and native profiling. Feature-specific fixtures in [`tests/`](tests/) exercise these contracts, including cross-process and cross-realm ownership and failure paths.

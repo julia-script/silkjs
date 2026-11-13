@@ -10,7 +10,9 @@ function call(type, args, receiver, method) {
     return Reflect.apply(method, receiver, args);
   } finally { callDepth--; }
 }
-function create(publish) {
+// global: whether calls of the runtime's console reach it (call above); a
+// console.context() console has only its own.
+function create(publish, global = true) {
   const console = Object.create(null);
   const counts = new Map(), timers = new Map();
   let emitting = false;
@@ -43,7 +45,7 @@ function create(publish) {
   for (const name of ['log', 'debug', 'info', 'warn', 'error', 'dir', 'dirxml', 'table', 'trace', 'clear', 'assert', 'count', 'countReset', 'time', 'timeLog', 'timeEnd', 'group', 'groupCollapsed', 'groupEnd']) {
     console[name] = (...args) => { emitConsole(name, args); };
   }
-  currentEmitter = emitConsole;
+  if (global) currentEmitter = emitConsole;
   return { console, emitConsole };
 }
 module.exports = { create, call };

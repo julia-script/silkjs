@@ -89,6 +89,15 @@ function abortOnUncaughtException(error) {
   writeStderr('Uncaught ' + text + '\n');
   host.osNative('abort', []);
 }
+// The V8 flags v8.setFlagsFromString applies at run time; true when flag is one.
+// --abort-on-uncaught-exception holds for the main thread only, as at startup.
+function applyV8Flag(flag, apply) {
+  if (flag !== '--abort-on-uncaught-exception' && flag !== '--no-abort-on-uncaught-exception') return false;
+  if (!apply) return true;
+  state.abortOnUncaughtException = flag === '--abort-on-uncaught-exception' && require('worker_threads').isMainThread;
+  host.abortOnUncaughtException = state.abortOnUncaughtException ? abortOnUncaughtException : undefined;
+  return true;
+}
 // process.exit with --trace-exit names the exit code and prints the current stack, as Node does.
 function traceExit(code, threadId, below = traceExit) {
   if (!state.traceExit) return;
@@ -273,7 +282,7 @@ function safeString(value) {
   try { return String(value); } catch { return '<toString() threw exception>'; }
 }
 
-module.exports = {
+module.exports = { applyV8Flag,
   valueError, applyOption, initialize, emitWarning, emitWarningSync, handleUncaught, fatalException, reportFatal, traceExit,
   setUncaughtExceptionCaptureCallback, hasUncaughtExceptionCaptureCallback: () => captureCallback !== null,
   getOptionValue(name) {

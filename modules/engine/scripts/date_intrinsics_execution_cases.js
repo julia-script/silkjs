@@ -205,14 +205,14 @@
         const tests = [["setMilliseconds", [1001], 1001], ["setSeconds", [1, 2], 1002], ["setMinutes", [1, 2, 3], 62003], ["setHours", [1, 2, 3, 4], 3723004], ["setDate", [2], 86400000], ["setMonth", [1, 1], 2678400000], ["setFullYear", [2000, 0, 1], 946684800000]];
         const setters = tests.every(([method, args, expected]) => { const value = new Date(0); return value[method](...args) === expected && value.getTime() === expected; });
         return out(d.getTimezoneOffset() === 0 && d.getFullYear() === 1970 && d.getYear() === 70 && d.getMonth() === 0 && d.getDate() === 1 && d.getDay() === 4,
-            d.toString() === "Thu Jan 01 1970 00:00:00 GMT+0000" && d.toDateString() === "Thu Jan 01 1970" && d.toTimeString() === "00:00:00 GMT+0000",
+            d.toString() === "Thu Jan 01 1970 00:00:00 GMT+0000 (Coordinated Universal Time)" && d.toDateString() === "Thu Jan 01 1970" && d.toTimeString() === "00:00:00 GMT+0000 (Coordinated Universal Time)",
             d.toLocaleString(ignored, ignored) === "01/01/1970, 12:00:00 AM" && d.toLocaleDateString() === "01/01/1970" && d.toLocaleTimeString() === "12:00:00 AM",
             setters && new Date(NaN).setFullYear(2000) === 946684800000);
     }
     if (operation === 21) {
         const d = new Date("2020-01-01T00:00:00Z"), local = new Date(2020, 0, 1, 0, 0, 0, 0);
         return out(d.getTimezoneOffset() === -345 && d.getHours() === 5 && d.getMinutes() === 45,
-            d.toTimeString() === "05:45:00 GMT+0545" && d.getDate() === 1,
+            d.toTimeString() === "05:45:00 GMT+0545 (Nepal Time)" && d.getDate() === 1,
             local.toISOString() === "2019-12-31T18:15:00.000Z" && Date.parse("2020-01-01T00:00:00") === 1577816100000,
             Date.parse("2020-01-01") === 1577836800000 && new Date("2020-01-01T00:00:00-03:30").getTime() === 1577849400000);
     }
@@ -222,14 +222,14 @@
         return out(before.getTimezoneOffset() === 300 && after.getTimezoneOffset() === 240,
             before.getHours() === 1 && before.getMinutes() === 59 && after.getHours() === 3 && after.getMinutes() === 0,
             skipped.toISOString() === "2021-03-14T07:30:00.000Z" && skipped.getHours() === 3,
-            Date.parse("2021-03-14T02:30:00") === 1615707000000 && skipped.toTimeString() === "03:30:00 GMT-0400");
+            Date.parse("2021-03-14T02:30:00") === 1615707000000 && skipped.toTimeString() === "03:30:00 GMT-0400 (Eastern Daylight Time)");
     }
     if (operation === 23) {
         const before = new Date("2021-11-07T05:59:59.999Z"), after = new Date("2021-11-07T06:00:00.000Z");
         const repeated = new Date(2021, 10, 7, 1, 30);
         return out(before.getTimezoneOffset() === 240 && after.getTimezoneOffset() === 300,
             before.getHours() === 1 && before.getMinutes() === 59 && after.getHours() === 1 && after.getMinutes() === 0,
-            repeated.toISOString() === "2021-11-07T05:30:00.000Z" && repeated.toTimeString() === "01:30:00 GMT-0400",
+            repeated.toISOString() === "2021-11-07T05:30:00.000Z" && repeated.toTimeString() === "01:30:00 GMT-0400 (Eastern Daylight Time)",
             Date.parse("2021-11-07T01:30:00") === 1636263000000);
     }
     if (operation === 24) {

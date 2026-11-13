@@ -33,6 +33,11 @@ asks the registry nothing when it still matches `package.json`. The graph holds 
 every platform, so the file is the same on every machine; the install skips what the host cannot
 run.
 
+The metadata the registry sends is kept in the `metadata` directory of the store. A resolution
+within five minutes of the last one, such as an `add` after an install, asks the registry
+nothing. After that the registry is asked whether each document changed, and sends only the ones
+that did.
+
 A package gets its peer dependencies from what is above it: the nearest package, up to the
 project, that depends on something under that name. When the same version of a package is used
 with different peers, each use is a node of its own in the graph, with its own entry in the
@@ -80,7 +85,43 @@ project on `PATH` and the `npm_lifecycle_event`, `npm_package_name`, `npm_packag
 `npm_package_json`, `npm_config_user_agent` and `INIT_CWD` variables. A package with a
 `binding.gyp` and no `install` script runs `node-gyp rebuild`, which has to be on `PATH`. A
 script that fails stops the install with the end of what it wrote, and the next install tries
-again. The scripts of the project's own packages do not run yet.
+again.
+
+The `preinstall`, `install`, `postinstall` and `prepare` scripts of the project's own packages
+are the project's own commands and need no allowing. They run at the end of every install, in
+that order, a package after the packages of the workspace it depends on and the root project
+last, with the input and the output of the install. One that fails fails the install.
+
+## Dependencies from elsewhere
+
+A dependency does not have to come from the registry. Besides a range or a tag, and
+`npm:<name>@<range>` for a package under another name, its value can be:
+
+| Value | What is installed |
+| --- | --- |
+| `https://example.com/pad-1.0.0.tgz` | The tarball at that address. |
+| `file:vendor/pad-1.0.0.tgz` | A tarball of the project. |
+| `file:../pad` | A copy of the files of a directory, without its `node_modules` and `.git`, with the dependencies its `package.json` declares. A change to the directory reaches the project with the next install. |
+| `link:../pad` | A link to a directory as it is. Nothing of it is installed. |
+| `github:owner/repo`, `owner/repo`, `gitlab:owner/repo`, `bitbucket:owner/repo`, `git+https://github.com/owner/repo.git`, `git+ssh://git@github.com/owner/repo.git`, `git@github.com:owner/repo.git` | The files of one commit of a repository on GitHub, GitLab or Bitbucket. `#` and a branch, a tag or a commit picks it, `#semver:^1.2` takes the highest tag in a range, and nothing is the default branch. |
+
+A path starts from the directory of the `package.json` it is written in, and only the packages
+of the project can use `file:` and `link:`. The lockfile has every such path as seen from the
+root of the workspace.
+
+The package of a tarball, a directory or a repository has the name and version its own
+`package.json` gives, with a `+` and a few digits of its digest after the version, as in
+`pad@1.0.0+3fa94c1e`. The lockfile records where it came from and its digest: for a repository
+that is the tarball of the commit, so every later install gets the same commit, and for a
+directory a digest of its files, so a frozen install refuses a directory that changed.
+
+A repository is installed without git: the host is asked which commit a branch or a tag is at
+and for the tarball of that commit. That is why only the three hosts are known. A repository
+that needs a password, and one that has to be built with its `prepare` script before it can be
+used, are not supported yet.
+
+`add` takes all of these after a name and `@`, and a tarball or a repository without a name
+too: `add github:owner/repo` adds it under the name its `package.json` has.
 
 `add` and `remove` edit `package.json` in its text: the formatting and the order of the keys
 stay as they are.
@@ -108,8 +149,9 @@ list under `packages`. The packages are installed together:
 ## Layout
 
 - `src/pkg` knows nothing about npm: versions and ranges, the content-addressable store,
-  integrity checks, name interning, file linking, a one-pass JSON walker and an editor for JSON
-  text. A package manager for another ecosystem can use it
+  integrity checks, name interning, file linking, the ref list of a git server, kept HTTP
+  documents with their validators, a one-pass JSON
+  walker and an editor for JSON text. A package manager for another ecosystem can use it
   as is.
 - `src/npm` is what is specific to the npm ecosystem: manifests, registry metadata, the registry
   client, `.npmrc`, workspaces, the resolver, the lockfile, the `node_modules` layout, install scripts and

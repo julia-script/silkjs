@@ -536,12 +536,29 @@ for (const prop of Reflect.ownKeys(Console.prototype)) {
   if (typeof desc.value === 'function' && typeof prop === 'string') desc.value = bindMethod(desc.value, globalConsole, prop, desc.value.name);
   Reflect.defineProperty(globalConsole, prop, desc);
 }
+// Legacy: the Console constructor on the global console, before the V8 methods
+// wrapConsole adds.
+globalConsole.Console = Console;
 // lib/internal/util/inspector.js wrapConsole adds the V8 console methods Node's
 // console lacks; they report to inspector sessions only.
-globalConsole.profile = function profile(label) { return require('internal/inspector').console.profile(label); };
-globalConsole.profileEnd = function profileEnd(label) { return require('internal/inspector').console.profileEnd(label); };
+globalConsole.profile = function profile(...args) { return require('internal/inspector').console.profile(args[0]); };
+globalConsole.profileEnd = function profileEnd(...args) { return require('internal/inspector').console.profileEnd(args[0]); };
 // V8 hands the label to the embedder (consoleTimeStamp), which Node does not record.
-globalConsole.timeStamp = function timeStamp(label) {};
+globalConsole.timeStamp = function timeStamp(...args) {};
+// V8's console.context(name): a console of its own, whose calls go to inspector
+// sessions only.
+globalConsole.context = function context(name) { return require('internal/inspector').consoleContext(); };
+// V8's console.createTask(name): a task whose run(f) calls f (async stack
+// tagging, which only an inspector reads).
+globalConsole.createTask = function createTask(...args) {
+  if (typeof args[0] !== 'string' || args[0] === '') throw new Error('First argument must be a non-empty string.');
+  return {
+    run: function run(...callback) {
+      if (typeof callback[0] !== 'function') throw new Error('First argument must be a function.');
+      return Reflect.apply(callback[0], undefined, []);
+    },
+  };
+};
 globalConsole[kBindProperties](true, 'auto');
 globalConsole[kBindStreamsLazy](host);
 // Node binds the global console to the process streams again in every pre-execution
@@ -549,6 +566,4 @@ globalConsole[kBindStreamsLazy](host);
 if (host.startupSnapshot.isBuildingSnapshotBuffer[0]) {
   require('internal/v8/startup_snapshot').namespace.addSerializeCallback(() => globalConsole[kBindStreamsLazy](host));
 }
-// Legacy: the Console constructor on the global console.
-globalConsole.Console = Console;
 module.exports = globalConsole;
