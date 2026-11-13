@@ -50,6 +50,14 @@ const packages = {
       'index.js': 'module.exports = "world";\n',
     },
   },
+  sayer: {
+    version: '3.0.0',
+    dependencies: { worder: '^2.0.0' },
+    files: {
+      'package.json': '{"name":"sayer","version":"3.0.0","bin":"cli.js","dependencies":{"worder":"^2.0.0"}}',
+      'cli.js': '#!/usr/bin/env node\nconsole.log(require("worder"), process.argv.slice(2).join("|"));\n',
+    },
+  },
   builder: {
     version: '1.0.0',
     dependencies: {},
@@ -188,6 +196,11 @@ server.listen(0, '127.0.0.1', async () => {
     const alone = await run(directory, ['exec', '/bin/sh', '-c', 'node install'], directory, '/nowhere');
     assert.strictEqual(alone.status, 0, alone.stderr);
     assert.strictEqual(alone.stdout, 'ran as node\n');
+    // dlx runs the command of a package the project does not have, here without a Node.js.
+    const said = await run(directory, ['dlx', 'sayer', 'two words', '--flag'], directory, '/usr/bin:/bin');
+    assert.strictEqual(said.status, 0, said.stderr);
+    assert.strictEqual(said.stdout, 'world two words|--flag\n');
+    assert.ok(!fs.existsSync(path.join(directory, 'node_modules/sayer')));
 
     // A workspace: one lockfile and one hidden directory at the root, and a package that depends
     // on another gets a link to its directory.
