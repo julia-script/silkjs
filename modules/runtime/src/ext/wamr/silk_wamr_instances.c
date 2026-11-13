@@ -227,7 +227,7 @@ SilkWasmHandle *silk_wasm_instantiate(SilkWasmHandle *module,
         if (!wasm_silk_tag_identity(instance->as.instance.instance, i)) return NULL;
     uint32_t start = module->as.module.module->start_function;
     if (start != UINT32_MAX) {
-        SilkWasmInvocation *invocation = silk_wasm_call(instance->as.instance.functions[start], NULL, 0, false);
+        SilkWasmInvocation *invocation = silk_wasm_call(instance->as.instance.functions[start], NULL, 0, false, 0);
         if (!invocation) return NULL;
         int status = silk_wasm_invocation_status(invocation);
         if (status != SILK_WASM_OK) {

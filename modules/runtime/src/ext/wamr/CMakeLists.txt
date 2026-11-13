@@ -54,6 +54,7 @@ add_library(silk_wamr STATIC
     ${WAMR_RUNTIME_LIB_SOURCE}
     silk_wamr.c
     silk_wamr_calls.c
+    silk_wamr_frames.c
     silk_wamr_compile_options.c
     silk_wamr_exceptions.c
     silk_wamr_instances.c
