@@ -25,11 +25,12 @@ import silk.core.option { Option }
 import silk.core.result { Result }
 import silk.platform.native.file { NativeFileError }
 import silk.system.child_process { ChildProcess }
+import npm.git { Repository }
 import npm.install { Downloader, InstallError, Summary, install }
 import npm.lock { LOCKFILE, Lock, write }
 import npm.manifest { DEVELOPMENT, Manifest, OPTIONAL }
 import npm.registry { Registry }
-import npm.resolve { Graph, Host, ResolveError, Tarballs, resolve }
+import npm.resolve { Graph, Host, ResolveError, Tarballs, directoryDigest, isTarball, resolve }
 import npm.scripts { Runner, Script, ScriptError, commandOf, scriptsOf }
 import npm.workspace { Located, MANIFEST, Workspace, WorkspaceError }
 import pkg.files { makeDirectories, readOptional, removeTree, writeFile }
@@ -37,7 +38,7 @@ import pkg.semver { Version }
 import pkg.json_edit { removeMember, setMember }
 import pkg.names { Names }
 import pkg.store { Store }
-import pkg.text { same }
+import pkg.text { same, startsWith }
 
 /// Why a command stopped, apart from a failed resolution or install.
 pub struct CommandError {
@@ -148,6 +149,25 @@ struct Plan {
   resolved: bool,
 }
 
+// Whether the directories that packages of `graph` were made of have the files they had then.
+effect fn unchanged(graph: &Graph, root: &[u8]) -> bool ! OutOfMemoryError ? &mut Allocator {
+  let mut index: usize = 0
+  while index < Graph.count(graph) {
+    let location = Graph.tarball(graph, index)
+    if startsWith(location, b"file:") && isTarball(location) == false {
+      let kept = match move run directoryDigest(root, location) {
+        Option.Some { value: digest } => same(Bytes.asSlice(&digest), Graph.integrity(graph, index))
+        Option.None => false
+      }
+      if kept == false {
+        return false
+      }
+    }
+    index = index + 1
+  }
+  return true
+}
+
 // The graph for `workspace`. `fresh` names packages that leave their pins.
 effect fn plan(workspace: &Workspace, pins: Pins, fresh: &[Bytes]) -> Plan
   ! CommandError | ResolveError | OutOfMemoryError ? &mut Registry | &mut Tarballs | &mut Allocator {
@@ -157,8 +177,16 @@ effect fn plan(workspace: &Workspace, pins: Pins, fresh: &[Bytes]) -> Plan
     Option.Some { value: text } => run Lock.read(Bytes.asSlice(&text))
     Option.None => Option<Lock>.none()
   }
+  // A lockfile is current when package.json asks for what it did, and the directories that
+  // are dependencies have the files they had.
   let current = match &earlier {
-    Option.Some { value: lock } => Lock.matches(&lock, workspace)
+    Option.Some { value: lock } => {
+      if Lock.matches(&lock, workspace) {
+        run unchanged(&lock.graph, Workspace.root(workspace))
+      } else {
+        false
+      }
+    }
     Option.None => false
   }
   let mut keep = true
@@ -227,7 +255,7 @@ pub effect fn installProject(project: &[u8], store: &Store, pool: &Pool, host: H
   ! CommandError | ResolveError | InstallError | OutOfMemoryError ? &mut Registry | &mut ChildProcess | &mut Allocator {
   let Located { workspace, .. } = run located(project)
   // The downloads of a resolution start while it still asks for metadata.
-  let mut downloader = Downloader.make(store, pool, host)
+  let mut downloader = Downloader.make(store, pool, host, run Bytes.copy(Workspace.root(&workspace)))
   let pins = if frozen { Pins.Frozen } else { Pins.Kept }
   let settled = run plan(&workspace, pins, &[]) |> Effect.provideMut<Tarballs>(&mut downloader)
   return run finish(&workspace, move settled, move downloader, Bytes.make())
@@ -243,7 +271,7 @@ pub effect fn installProject(project: &[u8], store: &Store, pool: &Pool, host: H
 pub effect fn updateProject(project: &[u8], store: &Store, pool: &Pool, host: Host, names: &[Bytes]) -> Outcome
   ! CommandError | ResolveError | InstallError | OutOfMemoryError ? &mut Registry | &mut ChildProcess | &mut Allocator {
   let Located { workspace, .. } = run located(project)
-  let mut downloader = Downloader.make(store, pool, host)
+  let mut downloader = Downloader.make(store, pool, host, run Bytes.copy(Workspace.root(&workspace)))
   let pins = if names.length == 0 { Pins.Dropped } else { Pins.Kept }
   let settled = run plan(&workspace, pins, names) |> Effect.provideMut<Tarballs>(&mut downloader)
   return run finish(&workspace, move settled, move downloader, Bytes.make())
@@ -284,6 +312,30 @@ fn isTag(spec: &[u8]) -> bool {
   return true
 }
 
+// Whether what was asked for is a repository or a tarball with no name before it. Its name is
+// then the one its own package.json has.
+fn nameless(asked: &[u8]) -> bool {
+  return Option.isSome(&Repository.parse(asked)) || startsWith(asked, b"https://") || startsWith(asked, b"http://") || startsWith(asked, b"file:")
+}
+
+// The name of the package that the dependency `alias` of the importer in the directory `path`
+// resolved to.
+fn resolvedName<'g>(graph: &'g Graph, path: &[u8], alias: &[u8]) -> Option<&'g [u8]> {
+  let importer = match Graph.importerAt(graph, path) {
+    Option.Some { value } => value
+    Option.None => { return Option<&'g [u8]>.none() }
+  }
+  let edges = Graph.importerEdges(graph, importer)
+  let mut index: usize = 0
+  while index < edges.length {
+    if same(Names.bytes(&graph.names, edges[index].alias), alias) {
+      return Option<&'g [u8]>.some(Graph.name(graph, Graph.nodePackage(graph, edges[index].target)))
+    }
+    index = index + 1
+  }
+  return Option<&'g [u8]>.none()
+}
+
 // The version the dependency `alias` of the importer in the directory `path` resolved to.
 fn resolvedVersion<'g>(graph: &'g Graph, path: &[u8], alias: &[u8]) -> Option<&'g [u8]> {
   let importer = match Graph.importerAt(graph, path) {
@@ -311,7 +363,9 @@ effect fn edited(result: Option<Bytes>) -> Bytes ! CommandError | OutOfMemoryErr
 /// Adds dependencies to the `package.json` in `project` and installs them. Each of `wanted` is a name, or a name
 /// and what to take: `left-pad`, `left-pad@^1.3.0`, `left-pad@next`, `pad@npm:left-pad@1`. A
 /// name alone means the `latest` tag. A range is written as given; a tag is written as the
-/// version it resolved to, with `^` before it unless `exact`. `kind` is the table, as the
+/// version it resolved to, with `^` before it unless `exact`. A repository or a tarball can come
+/// without a name, as in `github:owner/repo` or `https://example.com/pad.tgz`, and is then
+/// added under the name its own `package.json` has. `kind` is the table, as the
 /// dependency kinds of [`Manifest`]: production, development or optional. A dependency that is
 /// in another table moves.
 ///
@@ -333,12 +387,13 @@ pub effect fn addDependencies(project: &[u8], store: &Store, pool: &Pool, host: 
   let mut index: usize = 0
   while index < wanted.length {
     let asked = Bytes.asSlice(&wanted[index])
-    let end = nameEnd(asked)
+    // What has no name is under its own spec until the resolution says what it is.
+    let end = if nameless(asked) { asked.length } else { nameEnd(asked) }
     let name = Slice.view<u8>(asked, 0, end)
     if name.length == 0 {
       run stop("this is not a package name", asked)
     }
-    let spec: &[u8] = if end + 1 < asked.length { Slice.view<u8>(asked, end + 1, asked.length - end - 1) } else { b"latest" }
+    let spec: &[u8] = if end + 1 < asked.length { Slice.view<u8>(asked, end + 1, asked.length - end - 1) } else if nameless(asked) { asked } else { b"latest" }
     let mut other: usize = 0
     while other < 3 {
       if same(TABLES[other], table) == false {
@@ -351,14 +406,42 @@ pub effect fn addDependencies(project: &[u8], store: &Store, pool: &Pool, host: 
     index = index + 1
   }
   Workspace.replace(&mut workspace, member, run parsed(Bytes.asSlice(&text)))
-  let mut downloader = Downloader.make(store, pool, host)
-  let settled = run plan(&workspace, Pins.Kept, List<Bytes>.asSlice(&names)) |> Effect.provideMut<Tarballs>(&mut downloader)
+  let mut downloader = Downloader.make(store, pool, host, run Bytes.copy(Workspace.root(&workspace)))
+  let mut settled = run plan(&workspace, Pins.Kept, List<Bytes>.asSlice(&names)) |> Effect.provideMut<Tarballs>(&mut downloader)
 
-  // Then with each tag replaced by the range for the version it gave.
+  // Then with each tag replaced by the range for the version it gave, and what had no name
+  // under the name of its package.
   let mut changes = Bytes.make()
   index = 0
   while index < wanted.length {
     let asked = Bytes.asSlice(&wanted[index])
+    if nameless(asked) {
+      let found = match resolvedName(&settled.graph, Bytes.asSlice(&place), asked) {
+        Option.Some { value } => run Bytes.copy(value)
+        Option.None => { run stop("this package could not be resolved", asked) }
+      }
+      let name = Bytes.asSlice(&found)
+      text = run edited(run removeMember(Bytes.asSlice(&text), table, asked))
+      let mut other: usize = 0
+      while other < 3 {
+        if same(TABLES[other], table) == false {
+          text = run edited(run removeMember(Bytes.asSlice(&text), TABLES[other], name))
+        }
+        other = other + 1
+      }
+      text = run edited(run setMember(Bytes.asSlice(&text), table, name, asked))
+      match Graph.importerAt(&settled.graph, Bytes.asSlice(&place)) {
+        Option.Some { value: importer } => { run Graph.renameImporterEdge(&mut settled.graph, importer, asked, name) }
+        Option.None => {}
+      }
+      run changes.append(b"+ ")
+      run changes.append(name)
+      run changes.append(b" ")
+      run changes.append(asked)
+      run changes.append(b"\n")
+      index = index + 1
+      continue
+    }
     let end = nameEnd(asked)
     let name = Slice.view<u8>(asked, 0, end)
     let spec: &[u8] = if end + 1 < asked.length { Slice.view<u8>(asked, end + 1, asked.length - end - 1) } else { b"latest" }
@@ -428,7 +511,7 @@ pub effect fn removeDependencies(project: &[u8], store: &Store, pool: &Pool, hos
   Workspace.replace(&mut workspace, member, run parsed(Bytes.asSlice(&text)))
   let path = run inProject(project, MANIFEST)
   run save(Bytes.asSlice(&path), Bytes.asSlice(&text))
-  let mut downloader = Downloader.make(store, pool, host)
+  let mut downloader = Downloader.make(store, pool, host, run Bytes.copy(Workspace.root(&workspace)))
   let settled = run plan(&workspace, Pins.Kept, &[]) |> Effect.provideMut<Tarballs>(&mut downloader)
   return run finish(&workspace, move settled, move downloader, move changes)
 }

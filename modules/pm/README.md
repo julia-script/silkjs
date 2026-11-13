@@ -82,6 +82,37 @@ project on `PATH` and the `npm_lifecycle_event`, `npm_package_name`, `npm_packag
 script that fails stops the install with the end of what it wrote, and the next install tries
 again. The scripts of the project's own packages do not run yet.
 
+## Dependencies from elsewhere
+
+A dependency does not have to come from the registry. Besides a range or a tag, and
+`npm:<name>@<range>` for a package under another name, its value can be:
+
+| Value | What is installed |
+| --- | --- |
+| `https://example.com/pad-1.0.0.tgz` | The tarball at that address. |
+| `file:vendor/pad-1.0.0.tgz` | A tarball of the project. |
+| `file:../pad` | A copy of the files of a directory, without its `node_modules` and `.git`, with the dependencies its `package.json` declares. A change to the directory reaches the project with the next install. |
+| `link:../pad` | A link to a directory as it is. Nothing of it is installed. |
+| `github:owner/repo`, `owner/repo`, `gitlab:owner/repo`, `bitbucket:owner/repo`, `git+https://github.com/owner/repo.git`, `git+ssh://git@github.com/owner/repo.git`, `git@github.com:owner/repo.git` | The files of one commit of a repository on GitHub, GitLab or Bitbucket. `#` and a branch, a tag or a commit picks it, `#semver:^1.2` takes the highest tag in a range, and nothing is the default branch. |
+
+A path starts from the directory of the `package.json` it is written in, and only the packages
+of the project can use `file:` and `link:`. The lockfile has every such path as seen from the
+root of the workspace.
+
+The package of a tarball, a directory or a repository has the name and version its own
+`package.json` gives, with a `+` and a few digits of its digest after the version, as in
+`pad@1.0.0+3fa94c1e`. The lockfile records where it came from and its digest: for a repository
+that is the tarball of the commit, so every later install gets the same commit, and for a
+directory a digest of its files, so a frozen install refuses a directory that changed.
+
+A repository is installed without git: the host is asked which commit a branch or a tag is at
+and for the tarball of that commit. That is why only the three hosts are known. A repository
+that needs a password, and one that has to be built with its `prepare` script before it can be
+used, are not supported yet.
+
+`add` takes all of these after a name and `@`, and a tarball or a repository without a name
+too: `add github:owner/repo` adds it under the name its `package.json` has.
+
 `add` and `remove` edit `package.json` in its text: the formatting and the order of the keys
 stay as they are.
 
@@ -108,8 +139,8 @@ list under `packages`. The packages are installed together:
 ## Layout
 
 - `src/pkg` knows nothing about npm: versions and ranges, the content-addressable store,
-  integrity checks, name interning, file linking, a one-pass JSON walker and an editor for JSON
-  text. A package manager for another ecosystem can use it
+  integrity checks, name interning, file linking, the ref list of a git server, a one-pass JSON
+  walker and an editor for JSON text. A package manager for another ecosystem can use it
   as is.
 - `src/npm` is what is specific to the npm ecosystem: manifests, registry metadata, the registry
   client, `.npmrc`, workspaces, the resolver, the lockfile, the `node_modules` layout, install scripts and

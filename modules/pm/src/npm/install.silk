@@ -34,13 +34,13 @@ import silk.platform.native.file { NativeFile, NativeFileError }
 import silk.system.child_process { ChildProcess }
 import npm.manifest { Manifest }
 import npm.registry { Fetched, Registry, RegistryError }
-import npm.resolve { Graph, Host, Tarballs }
+import npm.resolve { Graph, Host, Tarballs, isTarball, localPath, localTarball }
 import npm.scripts { Runner, ScriptError }
 import npm.workspace { Workspace }
 import pkg.files { Listed, copyFile, linkFile, linkTo, list, makeDirectories, readOptional, removeTree, writeFile }
 import pkg.integrity { Integrity }
 import pkg.names { Names }
-import pkg.store { PackageFiles, Store, StoreError }
+import pkg.store { PackageFiles, Store, StoreError, directoryFiles }
 import pkg.text { compare, same, startsWith }
 
 /// The hidden directory in `node_modules` that holds the packages.
@@ -195,6 +195,8 @@ pub struct Downloader<'a> {
   store: &'a Store,
   pool: &'a Pool,
   host: Host,
+  // The directory of the workspace, which the path of a `file:` tarball starts from.
+  root: Bytes,
   // Per package of the graph: its files, once the store has them.
   files: List<Option<PackageFiles>>,
   // Per package of the graph: whether `expect` saw it.
@@ -209,12 +211,14 @@ pub struct Downloader<'a> {
 }
 
 impl<'a> Downloader<'a> {
-  /// A downloader into `store` for the packages `host` can run, unpacking on `pool`.
-  pub fn make(store: &'a Store, pool: &'a Pool, host: Host) -> Downloader<'a> {
+  /// A downloader into `store` for the packages `host` can run, unpacking on `pool`. `root` is
+  /// the directory of the workspace the packages are for.
+  pub fn make(store: &'a Store, pool: &'a Pool, host: Host, root: Bytes) -> Downloader<'a> {
     return Downloader<'a> {
       store: store,
       pool: pool,
       host: host,
+      root: move root,
       files: List<Option<PackageFiles>>.make(),
       seen: List<bool>.make(),
       waiting: List<Wanted>.make(),
@@ -224,24 +228,95 @@ impl<'a> Downloader<'a> {
     }
   }
 
-  effect fn expect(self: &mut Self, graph: &Graph, index: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+  // Whether package `index` is one to bring into the store: for this host, not seen before,
+  // and not there already.
+  effect fn missing(self: &mut Self, graph: &Graph, index: usize) -> bool ! OutOfMemoryError ? &mut Allocator {
     while List<bool>.length(&self.seen) <= index {
       run self.seen.append(false)
       run self.files.append(Option<PackageFiles>.none())
     }
     if List<bool>.get(&self.seen, index) {
-      return ()
+      return false
     }
     List<bool>.set(&mut self.seen, index, true)
     if Graph.supports(graph, index, self.host) == false {
-      return ()
+      return false
     }
     let id = run identity(graph, index)
     let found = run Store.recorded(self.store, Bytes.asSlice(&id))
     if Option.isSome(&found) {
       List<Option<PackageFiles>>.set(&mut self.files, index, move found)
+      return false
+    }
+    return true
+  }
+
+  effect fn supply(self: &mut Self, graph: &Graph, index: usize, tarball: Bytes) -> () ! OutOfMemoryError ? &mut Allocator {
+    let missing = run Downloader.missing(&mut self, graph, index)
+    if missing == false {
       return ()
     }
+    let job = Job {
+      package: index,
+      tarball: move tarball,
+      integrity: run Bytes.copy(Graph.integrity(graph, index)),
+      shasum: run Bytes.copy(Graph.shasum(graph, index)),
+      id: run identity(graph, index),
+      store: run Bytes.copy(Store.directory(self.store)),
+    }
+    run self.running.append(run self.pool.fork(work(move job)))
+  }
+
+  effect fn expect(self: &mut Self, graph: &Graph, index: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+    let missing = run Downloader.missing(&mut self, graph, index)
+    if missing == false {
+      return ()
+    }
+    if startsWith(Graph.tarball(graph, index), b"file:") && isTarball(Graph.tarball(graph, index)) == false {
+      // A directory: its files go into the store as they are now, which has to be how the
+      // graph knows them.
+      let path = run localPath(Bytes.asSlice(&self.root), Graph.tarball(graph, index))
+      let mut problem: string<'static> = "the directory cannot be read for"
+      match move run Effect.result(directoryFiles(Bytes.asSlice(&path), Option<&Store>.some(self.store))) {
+        Result.Success { value: found } => match move found {
+          Option.None => {}
+          Option.Some { value: files } => {
+            let digest = run PackageFiles.digest(&files)
+            if same(Bytes.asSlice(&digest), Graph.integrity(graph, index)) {
+              // Recorded like a tarball, so the next install does not read the directory.
+              drop run Effect.result(Store.record(self.store, Bytes.asSlice(&digest), &files))
+              List<Option<PackageFiles>>.set(&mut self.files, index, Option<PackageFiles>.some(move files))
+              return ()
+            }
+            problem = "the directory changed since the lockfile was written:"
+          }
+        }
+        Result.Failure { error } => match move error {
+          StoreError _ => { problem = "the store could not take the files of" }
+          OutOfMemoryError exhausted => { fail move exhausted }
+        }
+      }
+      if Option.isSome(&self.failure) == false {
+        self.failure = Option<InstallError>.some(InstallError { message: problem, subject: run label(graph, index) })
+      }
+      return ()
+    }
+    if startsWith(Graph.tarball(graph, index), b"file:") {
+      // A tarball of the project is read, not asked for.
+      match move run localTarball(Bytes.asSlice(&self.root), Graph.tarball(graph, index)) {
+        Option.Some { value: tarball } => {
+          List<bool>.set(&mut self.seen, index, false)
+          run Downloader.supply(&mut self, graph, index, move tarball)
+        }
+        Option.None => {
+          if Option.isSome(&self.failure) == false {
+            self.failure = Option<InstallError>.some(InstallError { message: "the tarball cannot be read for", subject: run label(graph, index) })
+          }
+        }
+      }
+      return ()
+    }
+    let id = run identity(graph, index)
     let wanted = Wanted {
       package: index,
       label: run label(graph, index),
@@ -314,7 +389,8 @@ impl<'a> Downloader<'a> {
       drop documents
       run Downloader.take(&mut all, move tarballs)
     }
-    let Downloader { pool, files: gathered, seen, waiting, asked, running, failure, .. } = move all
+    let Downloader { pool, root, files: gathered, seen, waiting, asked, running, failure, .. } = move all
+    drop root
     drop seen
     drop waiting
     drop asked
@@ -352,6 +428,7 @@ impl<'a> Downloader<'a> {
 
 impl<'a> Tarballs for Downloader<'a> {
   expect: Downloader.expect
+  supply: Downloader.supply
   next: Downloader.next
   take: Downloader.take
 }
@@ -576,6 +653,41 @@ effect fn expose(workspace: &Workspace, graph: &Graph, host: Host, importer: usi
       Option.None => {}
     }
   }
+  let outside = Graph.importerOutside(graph, importer)
+  each = 0
+  while each < outside.length {
+    let alias = Names.bytes(&graph.names, outside[each].alias)
+    let there = Graph.outsidePath(graph, outside[each])
+    each = each + 1
+    let mut path = run Bytes.copy(modules)
+    run path.append(b"/")
+    run path.append(alias)
+    let mut target = Bytes.make()
+    let mut directory = Bytes.make()
+    if there.length > 0 && there[0] == 47 {
+      run target.append(there)
+      run directory.append(there)
+    } else {
+      if isScoped(alias) {
+        run target.append(b"../")
+      }
+      run target.append(Bytes.asSlice(&up))
+      run target.append(there)
+      run directory.append(Workspace.root(workspace))
+      run directory.append(b"/")
+      run directory.append(there)
+    }
+    run io<()>(run Effect.result(linkTo(Bytes.asSlice(&target), Bytes.asSlice(&path))), Bytes.asSlice(&path))
+    // Its commands, when the directory has a package.json that names any.
+    run directory.append(b"/package.json")
+    match move run readOptional(Bytes.asSlice(&directory)) {
+      Option.None => {}
+      Option.Some { value: document } => match move run Manifest.parse(Bytes.asSlice(&document)) {
+        Option.None => {}
+        Option.Some { value: manifest } => { run exposeBins(modules, alias, &manifest) }
+      }
+    }
+  }
 }
 
 // Removes the directory at `path` with everything in it.
@@ -707,6 +819,12 @@ effect fn pruneImporter(graph: &Graph, host: Host, importer: usize, modules: &[u
   each = 0
   while each < locals.length {
     drop run Names.intern(&mut kept, Names.bytes(&graph.names, locals[each].alias))
+    each = each + 1
+  }
+  let outside = Graph.importerOutside(graph, importer)
+  each = 0
+  while each < outside.length {
+    drop run Names.intern(&mut kept, Names.bytes(&graph.names, outside[each].alias))
     each = each + 1
   }
   run pruneLinks(modules, b"", &kept)
