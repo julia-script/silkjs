@@ -2210,6 +2210,13 @@ globalThis.__silkRuntime = {
   // The loop for an embedder (src/runtime/embed.silk).
   loopStart, loopTimeout, loopEnd,
   loopStep: (limit, keepAlive) => loopStep(limit, keepAlive),
+  // The executable's main thread loop (Node's SpinEventLoop) in one call: every turn
+  // without a return to the native driver. Once the thread made a worker, port or
+  // channel, each turn returns to the driver again (true: more to do).
+  loopRun: keepAlive => {
+    while (loopStep(undefined, keepAlive)) if (host.workerActivity === true) return true;
+    return false;
+  },
   runSnapshot: () => invoke(run, undefined, [true]),
   // Whether the snapshot this builder ends keeps compiled function bodies
   // (a snapshot configuration's "withoutCodeCache").
