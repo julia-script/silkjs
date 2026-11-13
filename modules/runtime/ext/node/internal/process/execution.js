@@ -16,7 +16,8 @@ function evalScript(name, body, print) {
     // runScriptInThisContext(script, true): an error leaving the script carries
     // the arrow of where it was thrown in its stack (DecorateErrorStack).
     require('internal/vm').decorateErrorStack(error, { filename: name, line: 0, column: 0, source: body });
-    throw error;
+    // TryCatch::ReThrow: the uncaught exception keeps the site it was thrown from.
+    host.rethrow(error);
   }
   // As Node, --print logs the result on exit, after the loop has run (a promise
   // settled in a later tick prints settled).

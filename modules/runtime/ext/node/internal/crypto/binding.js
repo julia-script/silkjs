@@ -939,6 +939,21 @@ module.exports = {
   handleSecret,
   isKeyObjectHandle,
   noteFipsChange,
-  // node_crypto.cc's SecureContext: the native TLS context class tls builds on.
-  get SecureContext() { return require('internal/tls/context').NativeSecureContext; },
 };
+
+// node_crypto.cc's SecureContext: the native TLS context class tls builds on. A plain
+// writable data property as in Node, loaded on first use: the first read or write
+// turns the accessor into that data property.
+function defineSecureContext(value) {
+  Object.defineProperty(module.exports, 'SecureContext', { value, writable: true, enumerable: true, configurable: true });
+}
+Object.defineProperty(module.exports, 'SecureContext', {
+  get() {
+    const value = require('internal/tls/context').NativeSecureContext;
+    defineSecureContext(value);
+    return value;
+  },
+  set: defineSecureContext,
+  enumerable: true,
+  configurable: true,
+});
