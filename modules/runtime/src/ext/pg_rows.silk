@@ -11,7 +11,6 @@ import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.mem.pointer { Pointer }
 import silk.core.effect { Effect }
 import silk.core.result { Result }
-import silk.collections.list { List }
 import silk.num.i32
 import silk.num.i64
 import silk.num.u8
@@ -46,8 +45,16 @@ const MAX_COLUMNS: usize = 64
 unsafe fn bytesAt<'a>(anchor: &'a (), state: BufferState, start: u64, length: u64) -> &'a [u8] {
   return unsafe Pointer.borrowMany<(), u8>(anchor, unsafe Pointer.assumeMany<u8>(unsafe buffers.dataAt(state.data, start)), u64.toUsize(length))
 }
-fn word(bytes: &[u8], offset: usize) -> u64 {
-  return u32.toU64(u32.shiftLeft(u8.toU32(bytes[offset]), 24) | u32.shiftLeft(u8.toU32(bytes[offset + 1]), 16) | u32.shiftLeft(u8.toU32(bytes[offset + 2]), 8) | u8.toU32(bytes[offset + 3]))
+@inlineAlways
+unsafe fn at(bytes: &[u8], offset: usize) -> *const u8 {
+  return unsafe Pointer.at<u8>(unsafe Intrinsic.pointerRequalify<?[*]const u8, [*]const u8>(Pointer.fromSlice<u8>(bytes)), offset)
+}
+/// The big-endian u32 at offset, which the caller has checked is at least four
+/// bytes from the end.
+@inlineAlways
+unsafe fn word(bytes: &[u8], offset: usize) -> u64 {
+  let raw = unsafe Pointer.readUnaligned<u32>(unsafe Intrinsic.pointerReinterpret<*const u8, *const align(1) u32>(unsafe at(bytes, offset)))
+  return u32.toU64(u32.shiftLeft(raw, 24) | u32.bitAnd(u32.shiftLeft(raw, 8), 0xff0000) | u32.bitAnd(u32.shiftRight(raw, 8), 0xff00) | u32.shiftRight(raw, 24))
 }
 /// A plain decimal integer of at most 15 digits, or none.
 fn integer(bytes: &[u8], start: usize, end: usize, out: &mut ValueBits) -> bool {
@@ -72,6 +79,11 @@ fn integer(bytes: &[u8], start: usize, end: usize, out: &mut ValueBits) -> bool 
 /// Whether bytes[start..end] are all ASCII.
 fn ascii(bytes: &[u8], start: usize, end: usize) -> bool {
   let mut i = start
+  while end - i >= 8 {
+    let eight = unsafe Pointer.readUnaligned<u64>(unsafe Intrinsic.pointerReinterpret<*const u8, *const align(1) u64>(unsafe at(bytes, i)))
+    if u64.bitAnd(eight, 0x8080808080808080) != 0 { return false }
+    i = i + 8
+  }
   while i < end { if bytes[i] >= 0x80 { return false } i = i + 1 }
   return true
 }
@@ -126,13 +138,14 @@ pub unsafe effect fn dispatch<'m, S: EngineServices>(engine: &mut Engine<'m, S>,
   let bytes = unsafe bytesAt(&bytesAnchor, state, base, count)
   let memory = engine.memory
   let realm = unsafe lendRealm(&context, context)
-  let mut values = List<ValueBits>.make()
-  run values.reserve(width)
+  // The row's values, owned until the row takes them.
+  let mut values: [ValueBits; 64] = [ValueBits.Undefined; 64]
+  let mut filled: usize = 0
   let total = u64.toUsize(count)
   let mut offset: usize = 0
   while total - offset >= 7 {
     if bytes[offset] != 68 { break }
-    let length = word(bytes, offset + 1)
+    let length = unsafe word(bytes, offset + 1)
     if length < 6 || length > usize.toU64(total - offset - 1) { break }
     let end = offset + 1 + u64.toUsize(length)
     let columns = u32.toUsize(u32.shiftLeft(u8.toU32(bytes[offset + 5]), 8) | u8.toU32(bytes[offset + 6]))
@@ -143,18 +156,18 @@ pub unsafe effect fn dispatch<'m, S: EngineServices>(engine: &mut Engine<'m, S>,
     let mut i: usize = 0
     while i < width {
       if end - index < 4 { complete = false break }
-      let size = word(bytes, index)
+      let size = unsafe word(bytes, index)
       index = index + 4
-      if size == 0xffffffff { run values.append(ValueBits.Null) i = i + 1 continue }
+      if size == 0xffffffff { values[i] = ValueBits.Null filled = i + 1 i = i + 1 continue }
       if size > usize.toU64(end - index) { complete = false break }
       let stop = index + u64.toUsize(size)
       let kind = kinds[i]
       if kind == 1 {
         let mut number = ValueBits.Undefined
         if !integer(bytes, index, stop, &mut number) { complete = false break }
-        run values.append(number)
+        values[i] = number
       } else if kind == 2 {
-        run values.append(ValueBits.Bool { value: size == 1 && bytes[index] == 116 })
+        values[i] = ValueBits.Bool { value: size == 1 && bytes[index] == 116 }
       } else {
         let made = if ascii(bytes, index, stop) {
           run Effect.result(Strings.fromLatin1(unsafe bytesAt(&bytesAnchor, state, base + usize.toU64(index), size)))
@@ -162,15 +175,16 @@ pub unsafe effect fn dispatch<'m, S: EngineServices>(engine: &mut Engine<'m, S>,
           run Effect.result(unsafe codec.decode(state, base + usize.toU64(index), base + usize.toU64(stop), false))
         }
         match move made {
-          Result<ValueBits, OutOfMemoryError | StringLengthError>.Success { value } => run values.append(value)
+          Result<ValueBits, OutOfMemoryError | StringLengthError>.Success { value } => { values[i] = value }
           Result<ValueBits, OutOfMemoryError | StringLengthError>.Failure { .. } => { complete = false break }
         }
       }
       index = stop
       i = i + 1
+      filled = i
     }
     if !complete || index != end {
-      let mut r: usize = 0 while r < values.length() { unsafe owners.release(&mut engine, context, values.get(r)) r = r + 1 } values.truncate(0)
+      let mut r: usize = 0 while r < filled { unsafe owners.release(&mut engine, context, values[r]) r = r + 1 }
       break
     }
     unsafe shapes.take(unsafe runtime.contextRuntime(context), shape)
@@ -178,7 +192,7 @@ pub unsafe effect fn dispatch<'m, S: EngineServices>(engine: &mut Engine<'m, S>,
     let node = match move created {
       Result<ValueBits, OutOfMemoryError>.Success { value } => match value { ValueBits.Object { reference } => reference _ => Intrinsic.trap("postgres row is not an object") }
       Result<ValueBits, OutOfMemoryError>.Failure { error } => {
-        let mut r: usize = 0 while r < values.length() { unsafe owners.release(&mut engine, context, values.get(r)) r = r + 1 } values.truncate(0)
+        let mut r: usize = 0 while r < filled { unsafe owners.release(&mut engine, context, values[r]) r = r + 1 }
         fail move error
       }
     }
@@ -186,9 +200,9 @@ pub unsafe effect fn dispatch<'m, S: EngineServices>(engine: &mut Engine<'m, S>,
     let data = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut rowAnchor, node)
     data.slotListMut().clear()
     let mut k: usize = 0
-    while k < width { data.pushSlot(SlotBits.value(values.get(k))) k = k + 1 }
+    while k < width { data.pushSlot(SlotBits.value(values[k])) k = k + 1 }
     drop data
-    values.truncate(0)
+    filled = 0
     let _stored = run unsafe arrays.appendFastElement(&mut engine, realm, resultNode, ValueBits.Object { reference: node })
     offset = end
   }
