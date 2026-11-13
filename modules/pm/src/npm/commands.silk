@@ -220,8 +220,83 @@ effect fn plan(workspace: &Workspace, pins: Pins, fresh: &[Bytes]) -> Plan
   return Plan { graph: move graph, resolved: true }
 }
 
-// Writes the lockfile of a resolved plan when it differs from the one on disk, and installs.
-effect fn finish(workspace: &Workspace, settled: Plan, downloader: Downloader<'_>, changes: Bytes) -> Outcome
+// The scripts of a package of the project that an install runs, in their order.
+const LIFECYCLE: [&'static [u8]; 4] = [b"preinstall", b"install", b"postinstall", b"prepare"]
+
+// Runs the install scripts of the packages of the workspace themselves, each package after
+// the packages of the workspace it depends on and the root project last, with the input and
+// the output of this process. They are the project's own commands, so nothing has to allow them.
+effect fn lifecycle(workspace: &Workspace, store: &Store, host: Host) -> ()
+  ! InstallError | OutOfMemoryError ? &mut Allocator {
+  let members = Workspace.all(workspace)
+  let mut seen = List<bool>.make()
+  run seen.appendRepeated(false, members.length)
+  let mut order = List<usize>.make()
+  let mut member: usize = 1
+  while member < members.length {
+    run after(workspace, member, List<bool>.asMutSlice(&mut seen), &mut order)
+    member = member + 1
+  }
+  run after(workspace, 0, List<bool>.asMutSlice(&mut seen), &mut order)
+  let mut runner = Option<Runner>.none()
+  let mut turn: usize = 0
+  while turn < List<usize>.length(&order) {
+    member = List<usize>.get(&order, turn)
+    turn = turn + 1
+    let directory = run Workspace.directory(workspace, member)
+    let path = run inProject(Bytes.asSlice(&directory), MANIFEST)
+    let scripts = match move run readOptional(Bytes.asSlice(&path)) {
+      Option.Some { value: text } => run scriptsOf(Bytes.asSlice(&text))
+      Option.None => List<Script>.make()
+    }
+    let all = List<Script>.asSlice(&scripts)
+    let manifest = &members[member].manifest
+    let mut event: usize = 0
+    while event < LIFECYCLE.length {
+      let command = commandOf(all, LIFECYCLE[event])
+      event = event + 1
+      if command.length == 0 {
+        continue
+      }
+      if Option.isSome(&runner) == false {
+        let fallback = run Store.commands(store)
+        runner = Option<Runner>.some(run Runner.make(Workspace.root(workspace), Workspace.root(workspace), host, Bytes.asSlice(&fallback)))
+      }
+      let commands = run inProject(Bytes.asSlice(&directory), b"node_modules/.bin")
+      let code = match &runner {
+        Option.Some { value: ready } => run Effect.result(Runner.start(
+          &ready,
+          Manifest.text(manifest, manifest.name),
+          Manifest.text(manifest, manifest.version),
+          Bytes.asSlice(&directory),
+          Bytes.asSlice(&commands),
+          LIFECYCLE[event - 1],
+          command,
+          &[],
+        ))
+        Option.None => { continue }
+      }
+      match move code {
+        Result.Success { value } => {
+          if value != 0 {
+            let mut subject = run Bytes.copy(LIFECYCLE[event - 1])
+            run subject.append(b" in ")
+            run subject.append(Bytes.asSlice(&directory))
+            fail InstallError { message: "a script of the project ended with an error:", subject: move subject }
+          }
+        }
+        Result.Failure { error } => match move error {
+          ScriptError failed => { fail InstallError { message: failed.message, subject: move failed.subject } }
+          OutOfMemoryError exhausted => { fail move exhausted }
+        }
+      }
+    }
+  }
+}
+
+// Writes the lockfile of a resolved plan when it differs from the one on disk, installs, and
+// runs the install scripts of the project.
+effect fn finish(workspace: &Workspace, settled: Plan, downloader: Downloader<'_>, changes: Bytes, store: &Store, host: Host) -> Outcome
   ! CommandError | InstallError | OutOfMemoryError ? &mut Registry | &mut ChildProcess | &mut Allocator {
   let Plan { graph, resolved } = move settled
   let mut written = false
@@ -238,6 +313,7 @@ effect fn finish(workspace: &Workspace, settled: Plan, downloader: Downloader<'_
     }
   }
   let summary = run install(workspace, &graph, move downloader)
+  run lifecycle(workspace, store, host)
   return Outcome { summary: move summary, lockfile: written, changes: move changes }
 }
 
@@ -258,7 +334,7 @@ pub effect fn installProject(project: &[u8], store: &Store, pool: &Pool, host: H
   let mut downloader = Downloader.make(store, pool, host, run Bytes.copy(Workspace.root(&workspace)))
   let pins = if frozen { Pins.Frozen } else { Pins.Kept }
   let settled = run plan(&workspace, pins, &[]) |> Effect.provideMut<Tarballs>(&mut downloader)
-  return run finish(&workspace, move settled, move downloader, Bytes.make())
+  return run finish(&workspace, move settled, move downloader, Bytes.make(), store, host)
 }
 
 /// Moves packages to the newest versions the ranges of the workspace allow, writes the
@@ -274,7 +350,7 @@ pub effect fn updateProject(project: &[u8], store: &Store, pool: &Pool, host: Ho
   let mut downloader = Downloader.make(store, pool, host, run Bytes.copy(Workspace.root(&workspace)))
   let pins = if names.length == 0 { Pins.Dropped } else { Pins.Kept }
   let settled = run plan(&workspace, pins, names) |> Effect.provideMut<Tarballs>(&mut downloader)
-  return run finish(&workspace, move settled, move downloader, Bytes.make())
+  return run finish(&workspace, move settled, move downloader, Bytes.make(), store, host)
 }
 
 // Where the name ends in `name@spec`: the first `@` that is not the one of a scope, or the
@@ -473,7 +549,7 @@ pub effect fn addDependencies(project: &[u8], store: &Store, pool: &Pool, host: 
   }
   let Plan { graph, .. } = move settled
   // The lockfile records the ranges of package.json, which are the final ones only now.
-  return run finish(&workspace, Plan { graph: move graph, resolved: true }, move downloader, move changes)
+  return run finish(&workspace, Plan { graph: move graph, resolved: true }, move downloader, move changes, store, host)
 }
 
 /// Takes dependencies out of the `package.json` in `project`, whatever table they are in, and installs, which
@@ -513,7 +589,7 @@ pub effect fn removeDependencies(project: &[u8], store: &Store, pool: &Pool, hos
   run save(Bytes.asSlice(&path), Bytes.asSlice(&text))
   let mut downloader = Downloader.make(store, pool, host, run Bytes.copy(Workspace.root(&workspace)))
   let settled = run plan(&workspace, Pins.Kept, &[]) |> Effect.provideMut<Tarballs>(&mut downloader)
-  return run finish(&workspace, move settled, move downloader, move changes)
+  return run finish(&workspace, move settled, move downloader, move changes, store, host)
 }
 
 effect fn ran(outcome: Result<i32, ScriptError | OutOfMemoryError>) -> i32 ! CommandError | OutOfMemoryError {
