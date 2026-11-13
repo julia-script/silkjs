@@ -536,6 +536,19 @@ function setPosition(node, pos) {
 }
 
 const noArguments = [];
+// An immediate's callback under async hooks, cleared on a throw as in the inline path.
+function runImmediate() {
+  const argv = this._argv;
+  try {
+    if (argv === undefined) this._onImmediate();
+    else ReflectApply(this._onImmediate, this, argv);
+  } catch (error) {
+    this._onImmediate = undefined;
+    this._argv = undefined;
+    // A plain rethrow would move the throw site the uncaught report prints.
+    host.rethrow(error);
+  }
+}
 
 function getTimerCallbacks(runNextTicks) {
   // Set when a callback threw, until the next callback runs: Node unwinds to the
@@ -598,6 +611,11 @@ function getTimerCallbacks(runNextTicks) {
             else ReflectApply(immediate._onImmediate, immediate, argv);
             afterThrow = false;
           } catch (error) {
+            // Node's processImmediate clears these before the error reaches the
+            // uncaught handler, which formats its stack: V8 looks method names up
+            // then, so the callback's frame reads "Immediate.<anonymous>".
+            immediate._onImmediate = undefined;
+            immediate._argv = undefined;
             host.triggerUncaughtException(error);
             afterThrow = true;
           }
@@ -605,8 +623,7 @@ function getTimerCallbacks(runNextTicks) {
           host.setAsyncContext(context);
         }
       } else {
-        afterThrow = host.invokeImmediate(context, scope, scope.id, immediate._onImmediate,
-                                          immediate, argv === undefined ? noArguments : argv);
+        afterThrow = host.invokeImmediate(context, scope, scope.id, runImmediate, immediate, noArguments);
       }
       if (afterThrow) {
         immediate._onImmediate = undefined;

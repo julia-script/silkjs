@@ -80,7 +80,12 @@ project on `PATH` and the `npm_lifecycle_event`, `npm_package_name`, `npm_packag
 `npm_package_json`, `npm_config_user_agent` and `INIT_CWD` variables. A package with a
 `binding.gyp` and no `install` script runs `node-gyp rebuild`, which has to be on `PATH`. A
 script that fails stops the install with the end of what it wrote, and the next install tries
-again. The scripts of the project's own packages do not run yet.
+again.
+
+The `preinstall`, `install`, `postinstall` and `prepare` scripts of the project's own packages
+are the project's own commands and need no allowing. They run at the end of every install, in
+that order, a package after the packages of the workspace it depends on and the root project
+last, with the input and the output of the install. One that fails fails the install.
 
 ## Dependencies from elsewhere
 

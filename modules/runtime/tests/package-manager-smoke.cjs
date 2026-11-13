@@ -225,6 +225,13 @@ server.listen(0, '127.0.0.1', async () => {
     const mixedRun = await run(path.join(local, 'app'), ['main.js'], directory);
     assert.strictEqual(mixedRun.status, 0, mixedRun.stderr);
     assert.strictEqual(mixedRun.stdout, 'world copied world linked\n');
+    // The install scripts of the project itself run at the end of an install.
+    const scripted = JSON.parse(fs.readFileSync(path.join(local, 'app/package.json'), 'utf8'));
+    scripted.scripts = { postinstall: 'node main.js > ran.txt' };
+    fs.writeFileSync(path.join(local, 'app/package.json'), JSON.stringify(scripted));
+    const own = await run(path.join(local, 'app'), ['install'], directory, '/usr/bin:/bin');
+    assert.strictEqual(own.status, 0, own.stderr);
+    assert.strictEqual(fs.readFileSync(path.join(local, 'app/ran.txt'), 'utf8'), 'world copied world linked\n');
     // A change to the copied directory reaches the project with the next install.
     fs.writeFileSync(path.join(local, 'copied/index.js'), 'module.exports = "changed";\n');
     const refreshed = await run(path.join(local, 'app'), ['install'], directory);
