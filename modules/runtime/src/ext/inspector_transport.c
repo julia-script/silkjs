@@ -403,13 +403,20 @@ static void write_client(client *c) {
     }
     if (c->closing && !c->awaiting_close && !c->first) c->dead = 1;
 }
+static unsigned free_slot(const silk_inspector *s) {
+    unsigned index; for (index = 0; index < MAX_CLIENTS && s->clients[index].fd >= 0; index++) {}
+    return index;
+}
+/* Accepts while a client slot is free. With every slot taken, further connections
+   wait in the listen backlog until one closes, rather than being reset. */
 static void accept_clients(silk_inspector *s) {
     for (unsigned attempt = 0; attempt < MAX_CLIENTS; attempt++) {
+        unsigned index = free_slot(s);
+        if (index == MAX_CLIENTS) break;
         int fd = accept(s->listener, NULL, NULL);
         if (fd < 0) { if (errno == EINTR) continue; break; }
         if (nonblocking(fd)) { close(fd); continue; }
-        unsigned index; for (index = 0; index < MAX_CLIENTS && s->clients[index].fd >= 0; index++) {}
-        if (index == MAX_CLIENTS || s->next_connection == UINT64_MAX) { close(fd); continue; }
+        if (s->next_connection == UINT64_MAX) { close(fd); continue; }
         client *c = &s->clients[index]; c->fd = fd; c->id = ++s->next_connection; c->deadline = milliseconds() + 5000;
     }
 }
@@ -476,8 +483,9 @@ static void *io_thread(void *opaque) {
         struct pollfd descriptors[MAX_CLIENTS + 2]; int indexes[MAX_CLIENTS + 2];
         nfds_t count = 2;
         descriptors[0] = (struct pollfd){ s->notify[0], POLLIN, 0 };
-        /* A terminating server accepts no new connection (InspectorSocketServer::Stop). */
-        descriptors[1] = (struct pollfd){ terminated ? -1 : s->listener, POLLIN, 0 };
+        /* A terminating server accepts no new connection (InspectorSocketServer::Stop),
+           and a full one leaves connections in the backlog. */
+        descriptors[1] = (struct pollfd){ terminated ? -1 : s->listener, (short)(free_slot(s) < MAX_CLIENTS ? POLLIN : 0), 0 };
         uint64_t now = milliseconds();
         for (unsigned i = 0; i < MAX_CLIENTS; i++) {
             client *c = &s->clients[i];
@@ -540,7 +548,7 @@ int silk_inspector_start(silk_inspector *s, const unsigned char *host, size_t le
     int error = nonblocking(fd), one = 1;
     if (!error && setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one)) < 0) error = errno;
     if (!error && bind(fd, (struct sockaddr *)&storage, address_length) < 0) error = errno;
-    if (!error && listen(fd, 32) < 0) error = errno;
+    if (!error && listen(fd, 511) < 0) error = errno;
     if (!error && getsockname(fd, (struct sockaddr *)&storage, &address_length) < 0) error = errno;
     if (error) { close(fd); return error; }
     s->port = ntohs(family == AF_INET ? v4->sin_port : v6->sin6_port);

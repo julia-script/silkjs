@@ -1515,10 +1515,7 @@ module.exports.setFips = enabled => {
   if (!require('worker_threads').isMainThread) {
     throw new (require('internal/errors').codes.ERR_WORKER_UNSUPPORTED_OPERATION)('Calling crypto.setFips()');
   }
-  // ncrypto::setFipsEnabled: the generation moves only when the FIPS state does.
-  const before = call('getFips', []);
   call('setFips', [enabled ? 1 : 0]);
-  if (call('getFips', []) !== before) binding.noteFipsChange();
 };
 c.keyFromHandle = (type, id) => newKeyObject(type, id);
 c.keyObjectFromHandle = keyObjectFromHandle;

@@ -810,13 +810,52 @@ const NamedKeyPairGenJob = keyPairJob('NamedKeyPairGenJob', (name, algorithm, pu
 
 function names(op) { return StringPrototypeSplit(call(op, []), '\n').filter((name) => name); }
 
-let fipsGeneration = 0n;
-function noteFipsChange() { fipsGeneration++; }
+// ncrypto's FIPS generation is one counter for the whole process, so workers see
+// the main thread's setFips.
+function fipsGeneration() { return BigInt(call('fipsGeneration', [])); }
 
 function aliases(list) {
   const result = { __proto__: null };
   for (let i = 0; i < list.length; i++) result[list[i]] = i;
   return result;
+}
+
+// Node's provider cache: one id per cached EVP_MAC, shared by all of its names.
+// The native list ends each MAC's names with an empty line.
+// A FIPS change empties the cache, and MACs fetched after it are new entries.
+let macCache;
+let nextMacId = 0;
+function macAliases() {
+  if (macCache === undefined || macCache.generation !== fipsGeneration()) {
+    const entries = { __proto__: null };
+    const groups = StringPrototypeSplit(call('macs', []), '\n\n');
+    for (let i = 0; i < groups.length; i++) {
+      const list = StringPrototypeSplit(groups[i], '\n').filter((name) => name);
+      if (list.length === 0) continue;
+      const id = nextMacId++;
+      for (let k = 0; k < list.length; k++) entries[list[k]] = id;
+    }
+    macCache = { generation: fipsGeneration(), entries };
+  }
+  return { __proto__: null, ...macCache.entries };
+}
+// crypto_mac.cc GetMacImplementation: a stale cache generation first marks every
+// cached name -1 in the caller's cache object (ResetMacCache); a valid id is used
+// as is; otherwise the name is looked up and its id written back.
+function resolveMacCache(name, id, cache) {
+  if (macCache !== undefined && macCache.generation !== fipsGeneration()) {
+    for (const alias in macCache.entries) cache[alias] = -1;
+    macCache = undefined;
+    id = -1;
+  }
+  const entries = (macAliases(), macCache.entries);
+  if (id !== -1) {
+    for (const alias in entries) if (entries[alias] === id) return;
+  }
+  const lower = StringPrototypeToLowerCase(name);
+  for (const alias in entries) {
+    if (StringPrototypeToLowerCase(alias) === lower) { cache[name] = entries[alias]; return; }
+  }
 }
 
 function getPqcKeyTypes() {
@@ -922,10 +961,11 @@ module.exports = {
   getCurves: () => names('curves'),
   getMacs: () => names('macs'),
   getCachedAliases: () => aliases(names('hashes')),
-  getCachedMacAliases: () => aliases(names('macs')),
+  getCachedMacAliases: macAliases,
+  resolveMacCache,
   getFipsCrypto: () => call('getFips', []),
   testFipsCrypto: () => (call('fipsAvailable', []) === 1 ? 1 : 0),
-  getFipsCryptoGeneration: () => fipsGeneration,
+  getFipsCryptoGeneration: fipsGeneration,
   getOpenSSLSecLevelCrypto: () => call('secLevel', []),
   getPqcKeyTypes,
   secureHeapUsed: () => call('secureHeapUsed', []),
@@ -938,7 +978,6 @@ module.exports = {
   createHandle,
   handleSecret,
   isKeyObjectHandle,
-  noteFipsChange,
 };
 
 // node_crypto.cc's SecureContext: the native TLS context class tls builds on. A plain
