@@ -48,7 +48,7 @@ const {
   knownTimersById,
 } = require('internal/timers');
 const host = require('internal/host');
-const { _newAsyncId: newAsyncId, _hookFields: hookFields } = require('async_hooks');
+const { _newAsyncId: newAsyncId, _hookFields: hookFields, _asyncIds: asyncIds } = require('async_hooks');
 const loopState = host.timerLoop.state;
 const customPromisify = Symbol.for('nodejs.util.promisify.custom');
 let debug = (...args) => {
@@ -217,10 +217,18 @@ function setImmediate(callback, ...args) {
   loopState.immediateRefed = true;
   return immediate;
 }
+// The exported setImmediate is native (host.setImmediate, ext/immediates): it makes a
+// plain Immediate without a JavaScript frame or a rest array, taking the id from the same
+// counter, and calls the function above for anything else. A start from the heap image
+// hands it the function again.
+const nativeSetImmediate = host.setImmediate;
+const registerSetImmediate = () => host.immediateEntry(setImmediate, asyncIds, loopState);
+registerSetImmediate();
+host.onHydrate(registerSetImmediate);
 // Node's declared parameters (callback, arg1, arg2, arg3).
-Object.defineProperty(setImmediate, 'length', { __proto__: null, value: 4 });
+Object.defineProperty(nativeSetImmediate, 'length', { __proto__: null, value: 4 });
 
-Object.defineProperty(setImmediate, customPromisify, {
+Object.defineProperty(nativeSetImmediate, customPromisify, {
   __proto__: null,
   enumerable: true,
   get() {
@@ -260,7 +268,7 @@ Immediate.prototype[Symbol.dispose] = function() {
 module.exports = timers = {
   setTimeout,
   clearTimeout,
-  setImmediate,
+  setImmediate: nativeSetImmediate,
   clearImmediate,
   setInterval,
   clearInterval,

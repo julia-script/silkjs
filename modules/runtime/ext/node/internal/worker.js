@@ -429,6 +429,13 @@ function poll() {
   }
   return profileActivity || events.length > 0;
 }
+// Dispatches the control messages (stdio) a live worker has already posted, as poll() would.
+function drainControl(worker) {
+  const state = workerState(worker);
+  if (state === undefined || state.exited) return;
+  let message;
+  while ((message = ports().receiveMessageOnPort(state.control)) !== undefined) handleControl(worker, message.message);
+}
 function bootstrap() {
   if (bootstrapResult !== undefined) return bootstrapResult;
   if (info.isMainThread) return bootstrapResult = null;
@@ -608,6 +615,6 @@ module.exports = { isMainThread: !!info.isMainThread, isInternalThread: false, t
   getEnvMessagePort: () => (bootstrap() ? control : undefined) };
 Object.defineProperties(module.exports, {
   _bootstrap: { value: bootstrap }, _install: { value: install }, _poll: { value: poll },
-  _reportError: { value: reportError }, _exitRequested: { get: () => exitRequested },
+  _reportError: { value: reportError }, _drainControl: { value: drainControl }, _exitRequested: { get: () => exitRequested },
   _requestExit: { value: code => { exitRequested = true; host.workerExitRequested = true; host.workerNative('requestExit', [code]); } },
 });

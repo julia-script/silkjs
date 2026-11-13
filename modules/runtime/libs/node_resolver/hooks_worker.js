@@ -30,6 +30,9 @@ function start(bridge, threads, worker) {
     // process.exit() cancels the isolate; its interruption is not a hook
     // rejection that user code in the requesting thread can catch.
     if (worker._exitRequested) return;
+    // As in Node, the hook's ticks (a warning's write to stderr) run before the reply is posted.
+    await new Promise(resolve => process.nextTick(resolve));
+    if (worker._exitRequested) return;
     try { port.postMessage(response); }
     catch (error) { port.postMessage({ id, failed: true, error: packError(error) }); }
     finally { Atomics.add(signal, 0, 1); Atomics.notify(signal, 0); }
