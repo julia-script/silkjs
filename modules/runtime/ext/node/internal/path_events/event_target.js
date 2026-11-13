@@ -472,6 +472,7 @@ class AbortController {
 }
 Object.defineProperty(AbortController.prototype, 'signal', { enumerable: true });
 Object.defineProperty(AbortController.prototype, 'abort', { enumerable: true });
+Object.defineProperty(AbortController.prototype, Symbol.toStringTag, { value: 'AbortController', configurable: true });
 
 module.exports = {
   Event, CustomEvent, EventTarget, AbortController, AbortSignal, DOMException,
