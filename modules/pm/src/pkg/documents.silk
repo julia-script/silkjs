@@ -1,0 +1,228 @@
+//! Keeps documents that were fetched over HTTP, so that the next run can do without the fetch.
+//!
+//! A registry answers the same question with the same document most of the time. [`Documents`]
+//! keeps each answer in a file of its own, with the address it came from, the time it was
+//! fetched, and the validator the server gave it, the `ETag`. A reader that finds a young
+//! document uses it as it is; one that finds an old document asks the server whether the
+//! validator still holds, and gets a short "not modified" instead of the document; the file
+//! then only gets a new time.
+//!
+//! The file is the document followed by a trailer: the address, a newline, the validator, the
+//! time as 20 decimal digits and the length of the document as 20 more. With the document at
+//! the front, reading one is reading the file and cutting the end off.
+
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.collections.bytes { Bytes }
+import silk.collections.slice { Slice }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.num.u8
+import silk.num.u64
+import silk.num.usize
+import silk.platform.native.file { NativeFile, NativeFileError, OPEN_CREATE, OPEN_TRUNCATE, OPEN_WRITE_ONLY }
+import pkg.files { makeDirectories, readOptional }
+import pkg.text { same }
+
+/// A document that was kept.
+pub struct Kept {
+  /// The document.
+  pub body: Bytes,
+  /// What the server called this version of the document, or nothing when it gave no name.
+  pub validator: Bytes,
+  /// When it was fetched or last confirmed, in seconds since 1970.
+  pub stored: u64,
+}
+
+/// A directory of kept documents.
+pub struct Documents {
+  root: Bytes,
+  // Tells the files this process is writing from those of another one.
+  writer: u64,
+}
+
+const DIGITS: usize = 20
+
+// `value` as 20 decimal digits.
+fn digits(value: u64) -> [u8; 20] {
+  let mut text: [u8; 20] = [48; 20]
+  let mut rest = value
+  let mut index: usize = DIGITS
+  while index > 0 {
+    index = index - 1
+    text[index] = 48 + u64.toU8(rest % 10)
+    rest = rest / 10
+  }
+  return text
+}
+
+// The number that the decimal digits `text` spell, or none when they are not all digits.
+fn number(text: &[u8]) -> Option<u64> {
+  let mut value: u64 = 0
+  let mut index: usize = 0
+  while index < text.length {
+    if text[index] < 48 || text[index] > 57 {
+      return Option<u64>.none()
+    }
+    // 20 digits can be more than a u64 holds; such a file is not one of ours.
+    if value > 1844674407370955160 {
+      return Option<u64>.none()
+    }
+    value = u64.wrappingAdd(u64.wrappingMultiply(value, 10), u8.toU64(text[index] - 48))
+    index = index + 1
+  }
+  return Option<u64>.some(value)
+}
+
+fn hexDigit(value: u64) -> u8 {
+  let digit = u64.toU8(value)
+  if digit < 10 {
+    return 48 + digit
+  }
+  return 87 + digit
+}
+
+effect fn writeAll(fd: i32, content: &[u8]) -> () ! NativeFileError {
+  let mut written: usize = 0
+  while written < content.length {
+    let count = run NativeFile.write(fd, Slice.view<u8>(content, written, content.length - written), Option<u64>.none())
+    written = written + count
+  }
+  return ()
+}
+
+impl Documents {
+  /// The documents in the directory `root`, which is made when the first document is kept.
+  /// `writer` is a number no other process that writes there at the same time has, such as the
+  /// id of the process.
+  pub fn at(root: Bytes, writer: u64) -> Documents {
+    return Documents { root: move root, writer: writer }
+  }
+
+  // The file of the document at `address`: the directory and 16 hex digits of a hash. Two
+  // addresses can share a file; the address in the trailer says whose turn it is.
+  effect fn path(self: &Self, address: &[u8]) -> Bytes ! OutOfMemoryError ? &mut Allocator {
+    // FNV-1a.
+    let mut hash: u64 = 14695981039346656037
+    let mut index: usize = 0
+    while index < address.length {
+      hash = u64.wrappingMultiply(u64.bitXor(hash, u8.toU64(address[index])), 1099511628211)
+      index = index + 1
+    }
+    let mut path = run Bytes.copy(Bytes.asSlice(&self.root))
+    run path.append(b"/")
+    let mut name: [u8; 16] = [0; 16]
+    index = 16
+    while index > 0 {
+      index = index - 1
+      name[index] = hexDigit(hash % 16)
+      hash = hash / 16
+    }
+    run path.append(&name)
+    return move path
+  }
+
+  /// The document that was kept for `address`, or none when there is none or its file is not
+  /// whole.
+  pub effect fn read(self: &Self, address: &[u8]) -> Option<Kept> ! OutOfMemoryError ? &mut Allocator {
+    let path = run Documents.path(self, address)
+    let mut content = match move run readOptional(Bytes.asSlice(&path)) {
+      Option.Some { value } => move value
+      Option.None => { return Option<Kept>.none() }
+    }
+    let all = Bytes.asSlice(&content)
+    if all.length < 2 * DIGITS + address.length + 1 {
+      return Option<Kept>.none()
+    }
+    let stored = match number(Slice.view<u8>(all, all.length - 2 * DIGITS, DIGITS)) {
+      Option.Some { value } => value
+      Option.None => { return Option<Kept>.none() }
+    }
+    let length = match number(Slice.view<u8>(all, all.length - DIGITS, DIGITS)) {
+      Option.Some { value } => value
+      Option.None => { return Option<Kept>.none() }
+    }
+    let room = usize.toU64(all.length - 2 * DIGITS - address.length - 1)
+    if length > room {
+      return Option<Kept>.none()
+    }
+    let size = u64.toUsize(length)
+    if same(Slice.view<u8>(all, size, address.length), address) == false || all[size + address.length] != 10 {
+      return Option<Kept>.none()
+    }
+    let from = size + address.length + 1
+    let validator = run Bytes.copy(Slice.view<u8>(all, from, all.length - 2 * DIGITS - from))
+    Bytes.truncate(&mut content, size)
+    return Option<Kept>.some(Kept { body: move content, validator: move validator, stored: stored })
+  }
+
+  /// Keeps `body` as the document of `address`, fetched or confirmed at `stored`, in place of
+  /// the one that was there. A document that cannot be written is not kept, and nothing else
+  /// happens: the next run fetches it again.
+  pub effect fn write(self: &Self, address: &[u8], validator: &[u8], stored: u64, body: &[u8]) -> ()
+    ! OutOfMemoryError ? &mut Allocator {
+    let path = run Documents.path(self, address)
+    let mut staging = run Bytes.copy(Bytes.asSlice(&path))
+    run staging.append(b".")
+    let tag = digits(self.writer)
+    run staging.append(&tag)
+    let mut trailer = run Bytes.copy(address)
+    run trailer.append(b"\n")
+    run trailer.append(validator)
+    let time = digits(stored)
+    run trailer.append(&time)
+    let size = digits(usize.toU64(body.length))
+    run trailer.append(&size)
+    let flags = OPEN_WRITE_ONLY | OPEN_CREATE | OPEN_TRUNCATE
+    let fd = match run Effect.result(NativeFile.open(Bytes.asSlice(&staging), flags, 420)) {
+      Result.Success { value } => value
+      Result.Failure {..} => {
+        // The first document: the directory is not there yet.
+        drop run Effect.result(makeDirectories(Bytes.asSlice(&self.root)))
+        match run Effect.result(NativeFile.open(Bytes.asSlice(&staging), flags, 420)) {
+          Result.Success { value } => value
+          Result.Failure {..} => { return () }
+        }
+      }
+    }
+    let mut written = run Effect.result(writeAll(fd, body))
+    match &written {
+      Result.Success {..} => { written = run Effect.result(writeAll(fd, Bytes.asSlice(&trailer))) }
+      Result.Failure {..} => {}
+    }
+    drop run Effect.result(NativeFile.close(fd))
+    let moved = match move written {
+      Result.Success {..} => run Effect.result(NativeFile.rename(Bytes.asSlice(&staging), Bytes.asSlice(&path)))
+      Result.Failure { error } => Result<(), NativeFileError>.failResult(move error)
+    }
+    match move moved {
+      Result.Success {..} => {}
+      Result.Failure {..} => { drop run Effect.result(NativeFile.remove(Bytes.asSlice(&staging))) }
+    }
+    return ()
+  }
+
+  /// Notes that the server confirmed, at `stored`, the document `kept` that was read for
+  /// `address`. Only the time in its file changes. Nothing happens when the file cannot be
+  /// written: the next run asks again.
+  pub effect fn confirm(self: &Self, address: &[u8], kept: &Kept, stored: u64) -> () ! OutOfMemoryError ? &mut Allocator {
+    let path = run Documents.path(self, address)
+    let fd = match run Effect.result(NativeFile.open(Bytes.asSlice(&path), OPEN_WRITE_ONLY, 0)) {
+      Result.Success { value } => value
+      Result.Failure {..} => { return () }
+    }
+    // Another process can have put a newer document there since; its time is after its own
+    // validator, which is at another place only when the size of the file differs.
+    let size = usize.toU64(Bytes.length(&kept.body) + address.length + 1 + Bytes.length(&kept.validator) + 2 * DIGITS)
+    let same = match run Effect.result(NativeFile.statusOf(fd)) {
+      Result.Success { value } => value.size == size
+      Result.Failure {..} => false
+    }
+    if same {
+      let time = digits(stored)
+      drop run Effect.result(NativeFile.write(fd, &time, Option<u64>.some(size - usize.toU64(2 * DIGITS))))
+    }
+    drop run Effect.result(NativeFile.close(fd))
+    return ()
+  }
+}

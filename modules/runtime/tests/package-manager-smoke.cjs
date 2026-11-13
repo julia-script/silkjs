@@ -204,6 +204,41 @@ server.listen(0, '127.0.0.1', async () => {
     assert.strictEqual(said.stdout, 'world two words|--flag\n');
     assert.ok(!fs.existsSync(path.join(directory, 'node_modules/sayer')));
 
+    // Dependencies that are not from the registry: a tarball by its URL, a directory that is
+    // copied with its own dependencies, and a directory that is linked as it is.
+    const local = path.join(directory, 'local');
+    for (const name of ['app', 'copied', 'linked']) fs.mkdirSync(path.join(local, name), { recursive: true });
+    fs.writeFileSync(path.join(local, 'copied/package.json'), '{"name":"copied","version":"1.0.0","main":"index.js","dependencies":{"worder":"^2.0.0"}}\n');
+    fs.writeFileSync(path.join(local, 'copied/index.js'), 'module.exports = "copied " + require("worder");\n');
+    fs.writeFileSync(path.join(local, 'linked/package.json'), '{"name":"linked","main":"index.js"}\n');
+    fs.writeFileSync(path.join(local, 'linked/index.js'), 'module.exports = "linked";\n');
+    const origin = `http://127.0.0.1:${server.address().port}`;
+    fs.writeFileSync(path.join(local, 'app/.npmrc'), `registry=${origin}/\n`);
+    fs.writeFileSync(path.join(local, 'app/package.json'), JSON.stringify({
+      dependencies: { 'by-url': `${origin}/worder/-/worder-2.1.0.tgz`, copied: 'file:../copied', linked: 'link:../linked' },
+    }));
+    fs.writeFileSync(path.join(local, 'app/main.js'), 'console.log(require("by-url"), require("copied"), require("linked"));\n');
+    const mixed = await run(path.join(local, 'app'), ['install'], directory);
+    assert.strictEqual(mixed.status, 0, mixed.stderr);
+    assert.strictEqual(fs.readlinkSync(path.join(local, 'app/node_modules/linked')), '../../linked');
+    assert.ok(fs.lstatSync(path.join(local, 'app/node_modules/copied/index.js')).isFile());
+    const mixedRun = await run(path.join(local, 'app'), ['main.js'], directory);
+    assert.strictEqual(mixedRun.status, 0, mixedRun.stderr);
+    assert.strictEqual(mixedRun.stdout, 'world copied world linked\n');
+    // The install scripts of the project itself run at the end of an install.
+    const scripted = JSON.parse(fs.readFileSync(path.join(local, 'app/package.json'), 'utf8'));
+    scripted.scripts = { postinstall: 'node main.js > ran.txt' };
+    fs.writeFileSync(path.join(local, 'app/package.json'), JSON.stringify(scripted));
+    const own = await run(path.join(local, 'app'), ['install'], directory, '/usr/bin:/bin');
+    assert.strictEqual(own.status, 0, own.stderr);
+    assert.strictEqual(fs.readFileSync(path.join(local, 'app/ran.txt'), 'utf8'), 'world copied world linked\n');
+    // A change to the copied directory reaches the project with the next install.
+    fs.writeFileSync(path.join(local, 'copied/index.js'), 'module.exports = "changed";\n');
+    const refreshed = await run(path.join(local, 'app'), ['install'], directory);
+    assert.strictEqual(refreshed.status, 0, refreshed.stderr);
+    const changedRun = await run(path.join(local, 'app'), ['main.js'], directory);
+    assert.strictEqual(changedRun.stdout, 'world changed linked\n');
+
     // A workspace: one lockfile and one hidden directory at the root, and a package that depends
     // on another gets a link to its directory.
     const repo = path.join(directory, 'repo');

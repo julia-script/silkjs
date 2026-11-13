@@ -825,6 +825,7 @@ Object.assign(process, {
   },
   // What process.exit ends with; replaceable, as in Node.
   reallyExit,
+  // per_thread.js kill: the checks, then process._kill (replaceable, as in Node).
   kill(pid, signal) {
     if (pid != (pid | 0)) throw new (internalRequire('internal/errors').codes.ERR_INVALID_ARG_TYPE)('pid', 'number', pid);
     let number = signal;
@@ -833,17 +834,24 @@ Object.assign(process, {
       number = internalRequire('os').constants.signals[signal];
       if (number === undefined) throw new (internalRequire('internal/errors').codes.ERR_UNKNOWN_SIGNAL)(signal);
     }
+    const code = process._kill(pid, number);
+    if (code) throw new (internalRequire('internal/errors').ErrnoException)(-Math.abs(code), 'kill');
+    return true;
+  },
+  // node_process_methods.cc Kill: sends the signal and returns 0 or the error code.
+  _kill(pid, number) {
+    pid |= 0; number |= 0;
     // A NODE_V8_COVERAGE file is still written when SIGINT or SIGTERM ends the
     // process, as in Node: a signal this process sends itself with no listener
     // to take it writes the coverage first.
     if ((number === 2 || number === 15) && (pid === 0 || pid === process.pid) && moduleHas('internal/profiler_binding') &&
         process.listenerCount(number === 2 ? 'SIGINT' : 'SIGTERM') === 0) internalRequire('internal/profiler_binding').finish();
     const code = rawOS.kill(pid, number);
-    if (code < 0) throw new (internalRequire('internal/errors').ErrnoException)(-Math.abs(code), 'kill');
+    if (code < 0) return code;
     // SIGINT listeners hear it through the interrupt broker's thread: wait for it,
     // so a signal this process sent itself is seen in the next poll as in Node.
     if (number === 2) host.processNative('signalFlush', []);
-    return true;
+    return 0;
   },
   _fatalException: internalRequire('internal/startup_controls').fatalException,
   // realm.js: the allowlisted internal bindings and the natives/util legacy wrappers.
@@ -1274,6 +1282,10 @@ function runtimeFlag(arg) {
   }
   // V8's --use-strict: scripts and eval compile as strict code from here on.
   if (arg === '--use-strict' || arg === '--no-use-strict') { native.workerNative('setUseStrict', [arg === '--use-strict']); return true; }
+  // V8's --allow-natives-syntax: %Name(...) calls of V8's jitless no-op natives parse.
+  if (arg === '--allow-natives-syntax' || arg === '--allow_natives_syntax' || arg === '--no-allow-natives-syntax') {
+    native.workerNative('setAllowNativesSyntax', [arg !== '--no-allow-natives-syntax']); return true;
+  }
   // V8's perf integration writes, at startup, a map of the machine code it generates
   // (perf-PID.map) or a jitdump file (jit-PID.dump). The runtime generates no machine
   // code, so the files it writes list none: perf resolves the interpreter's own frames

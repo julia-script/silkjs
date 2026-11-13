@@ -27,7 +27,9 @@ import silk.num.u8
 import silk.num.u32
 import silk.num.u64
 import silk.num.usize
-import pkg.files { readOptional }
+import pkg.files { Listed, list, readOptional }
+import pkg.integrity { integrityOf }
+import pkg.text { compare, same }
 import silk.platform.native.file { NativeFile, NativeFileError, OPEN_CREATE, OPEN_EXCLUSIVE, OPEN_WRITE_ONLY }
 
 /// What went wrong in a store operation.
@@ -77,6 +79,112 @@ impl PackageFiles {
   pub fn name(self: &Self, entry: &FileEntry) -> &[u8] {
     return Slice.view<u8>(Bytes.asSlice(&self.names), entry.nameStart, entry.nameLength)
   }
+
+  /// A digest of the files, in the form of an integrity string: of the path, the mode and the
+  /// content of each one, in their order. It is what the files of a directory, which have no
+  /// archive, are known by.
+  pub effect fn digest(self: &Self) -> Bytes ! OutOfMemoryError ? &mut Allocator {
+    let mut text = Bytes.make()
+    let entries = PackageFiles.all(self)
+    let mut index: usize = 0
+    while index < entries.length {
+      run text.append(PackageFiles.name(self, &entries[index]))
+      run text.append(if entries[index].executable { b"\x00x" } else { b"\x00-" })
+      run text.append(&entries[index].key)
+      index = index + 1
+    }
+    return run integrityOf(Bytes.asSlice(&text))
+  }
+}
+
+// Gathers the files of the directory at `path`, and of the directories in it, into `names` and
+// `entries`, in the order of their names. `root` is the length of the path of the package
+// directory. With `store`, each file is added to it. False when something cannot be read.
+effect fn gather(store: Option<&Store>, path: &mut Bytes, root: usize, names: &mut Bytes, entries: &mut List<FileEntry>) -> bool
+  ! StoreError | OutOfMemoryError ? &mut Allocator {
+  let listed = match move run list(Bytes.asSlice(&path)) {
+    Option.Some { value } => move value
+    Option.None => { return false }
+  }
+  let all = List<Listed>.asSlice(&listed)
+  let mut order = List<usize>.make()
+  let mut index: usize = 0
+  while index < all.length {
+    run order.append(index)
+    let sorted = List<usize>.asMutSlice(&mut order)
+    let mut at = index
+    while at > 0 && compare(Bytes.asSlice(&all[sorted[at - 1]].name), Bytes.asSlice(&all[index].name)) > 0 {
+      sorted[at] = sorted[at - 1]
+      at = at - 1
+    }
+    sorted[at] = index
+    index = index + 1
+  }
+  let here = Bytes.length(&path)
+  index = 0
+  while index < all.length {
+    let entry = &all[List<usize>.get(&order, index)]
+    let name = Bytes.asSlice(&entry.name)
+    index = index + 1
+    if entry.link {
+      continue
+    }
+    if entry.directory && (same(name, b"node_modules") || same(name, b".git")) {
+      // What the directory has installed for itself, and its history, are not part of it.
+      continue
+    }
+    Bytes.truncate(&mut path, here)
+    run path.append(b"/")
+    run path.append(name)
+    if entry.directory {
+      let whole = run gather(store, &mut path, root, &mut names, &mut entries)
+      if whole == false {
+        return false
+      }
+      continue
+    }
+    let content = match move run readOptional(Bytes.asSlice(&path)) {
+      Option.Some { value } => move value
+      Option.None => { return false }
+    }
+    let executable = match run Effect.result(NativeFile.status(Bytes.asSlice(&path), true)) {
+      Result.Success { value: status } => (status.mode & 73) != 0
+      Result.Failure {..} => false
+    }
+    let key = match store {
+      Option.Some { value: into } => run Store.addFile(into, Bytes.asSlice(&content), executable)
+      Option.None => Sha256.hash(Bytes.asSlice(&content))
+    }
+    let nameStart = Bytes.length(&names)
+    run names.append(Slice.view<u8>(Bytes.asSlice(&path), root + 1, Bytes.length(&path) - root - 1))
+    run entries.append(FileEntry {
+      nameStart: nameStart,
+      nameLength: Bytes.length(&names) - nameStart,
+      key: key,
+      size: usize.toU64(Bytes.length(&content)),
+      executable: executable,
+    })
+  }
+  Bytes.truncate(&mut path, here)
+  return true
+}
+
+/// The files of the directory at `path` as the files of a package: every file in it and below
+/// it, in the order of their names, without links and without the `node_modules` and `.git`
+/// directories. With `store`, the files are added to it, and without, they are only read, which
+/// is enough for [`PackageFiles.digest`]. None when the directory cannot be read.
+///
+/// # Errors
+/// - [`StoreError`] with `Io` when a file cannot be written to the store.
+pub effect fn directoryFiles(path: &[u8], store: Option<&Store>) -> Option<PackageFiles> ! StoreError | OutOfMemoryError ? &mut Allocator {
+  let mut names = Bytes.make()
+  let mut entries = List<FileEntry>.make()
+  let mut walked = run Bytes.copy(path)
+  let whole = run gather(store, &mut walked, path.length, &mut names, &mut entries)
+  if whole == false {
+    return Option<PackageFiles>.none()
+  }
+  return Option<PackageFiles>.some(PackageFiles { names: move names, entries: move entries })
 }
 
 /// A store directory.
@@ -228,6 +336,53 @@ fn safePath(path: &[u8]) -> bool {
     index = index + 1
   }
   return true
+}
+
+// Appends the path of an archive member without its first segment, the directory every file of
+// a package archive is in.
+effect fn appendPath(names: &mut Bytes, prefix: &[u8], name: &[u8]) -> () ! OutOfMemoryError ? &mut Allocator {
+  if prefix.length > 0 {
+    let skip = afterFirstSegment(prefix)
+    if skip < prefix.length {
+      run Bytes.append(&mut names, Slice.view<u8>(prefix, skip, prefix.length - skip))
+      run Bytes.append(&mut names, b"/")
+    }
+    run Bytes.append(&mut names, name)
+  } else {
+    let skip = afterFirstSegment(name)
+    run Bytes.append(&mut names, Slice.view<u8>(name, skip, name.length - skip))
+  }
+}
+
+/// The content of the file at `path` inside the package that the gzip tar archive `tarball`
+/// holds, such as its `package.json`. None when the archive has no such file.
+///
+/// # Errors
+/// - [`StoreError`] with `Gzip` or `Tar` when the archive is not valid.
+pub effect fn fileOf(tarball: &[u8], path: &[u8]) -> Option<Bytes> ! StoreError | OutOfMemoryError ? &mut Allocator {
+  let archive = run gunzip(tarball)
+  let mut reader = TarReader.open(Bytes.asSlice(&archive))
+  let mut name = Bytes.make()
+  while true {
+    match TarReader.next(&mut reader) {
+      Result.Failure {..} => {
+        fail StoreError { kind: StoreErrorKind.Tar, code: 0 }
+      }
+      Result.Success { value: next } => match move next {
+        Option.None => { break }
+        Option.Some { value: member } => {
+          if member.kind == TarKind.File {
+            Bytes.truncate(&mut name, 0)
+            run appendPath(&mut name, member.prefix, member.name)
+            if same(Bytes.asSlice(&name), path) {
+              return Option<Bytes>.some(run Bytes.copy(member.content))
+            }
+          }
+        }
+      }
+    }
+  }
+  return Option<Bytes>.none()
 }
 
 fn hexValue(byte: u8) -> u8 {
@@ -504,17 +659,7 @@ impl Store {
           Option.Some { value: member } => {
             if member.kind == TarKind.File {
               let nameStart = Bytes.length(&names)
-              if member.prefix.length > 0 {
-                let skip = afterFirstSegment(member.prefix)
-                if skip < member.prefix.length {
-                  run Bytes.append(&mut names, Slice.view<u8>(member.prefix, skip, member.prefix.length - skip))
-                  run Bytes.append(&mut names, b"/")
-                }
-                run Bytes.append(&mut names, member.name)
-              } else {
-                let skip = afterFirstSegment(member.name)
-                run Bytes.append(&mut names, Slice.view<u8>(member.name, skip, member.name.length - skip))
-              }
+              run appendPath(&mut names, member.prefix, member.name)
               let nameLength = Bytes.length(&names) - nameStart
               if safePath(Slice.view<u8>(Bytes.asSlice(&names), nameStart, nameLength)) == false {
                 // A path that would land outside the package directory is not installed.
@@ -603,35 +748,24 @@ impl Store {
     run appendNumber(&mut text, usize.toU64(entries.length))
     run text.append(b"\n")
 
-    // Written under another name and renamed, so a reader never sees half a record.
+    // Written in a directory of this writer's own and renamed, so a reader never sees half a
+    // record and two writers of one record do not meet.
     let path = run Store.indexPath(self, id)
     let target = Bytes.asSlice(&path)
-    let mut staging = run Bytes.copy(target)
-    run staging.append(b".new")
     run makeDirectories(Slice.view<u8>(target, 0, target.length - 63))
-    drop run Effect.result(NativeFile.remove(Bytes.asSlice(&staging)))
-    let fd = match run Effect.result(NativeFile.open(Bytes.asSlice(&staging), OPEN_WRITE_ONLY | OPEN_CREATE | OPEN_EXCLUSIVE, 420)) {
-      Result.Success { value } => value
-      Result.Failure { error } => {
-        // Another process is writing the same record.
-        if error.code == EXISTS {
-          return ()
-        }
-        fail io(&error)
-      }
+    let staging = run Store.stage(self)
+    let mut prepared = run Bytes.copy(Bytes.asSlice(&staging))
+    run Bytes.append(&mut prepared, b"/index")
+    let source = Bytes.asSlice(&prepared)
+    let moved = match move run Effect.result(Store.create(source, Bytes.asSlice(&text), 420)) {
+      Result<(), NativeFileError>.Success {..} => run Effect.result(NativeFile.rename(source, target))
+      Result<(), NativeFileError>.Failure { error } => Result<(), NativeFileError>.failResult(move error)
     }
-    let outcome = run Effect.result(writeAll(fd, Bytes.asSlice(&text)))
-    drop run Effect.result(NativeFile.close(fd))
-    match move outcome {
-      Result.Failure { error } => {
-        drop run Effect.result(NativeFile.remove(Bytes.asSlice(&staging)))
-        fail io(&error)
-      }
-      Result.Success {..} => {}
-    }
-    match run Effect.result(NativeFile.rename(Bytes.asSlice(&staging), target)) {
-      Result.Failure { error } => { fail io(&error) }
-      Result.Success {..} => {}
+    drop run Effect.result(NativeFile.remove(source))
+    drop run Effect.result(NativeFile.removeDirectory(Bytes.asSlice(&staging)))
+    match move moved {
+      Result<(), NativeFileError>.Failure { error } => { fail io(&error) }
+      Result<(), NativeFileError>.Success {..} => {}
     }
   }
 
