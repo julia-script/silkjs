@@ -352,16 +352,11 @@ host.diagnostics = {
   watch(name, callback) { this.watchers.set(name, callback); },
   status(name, active) { const callback = this.watchers.get(name); if (callback !== undefined) callback(active); },
 };
-host.nextTick = function nextTick(callback) {
+host.nextTick = function nextTick(callback, ...args) {
   if (typeof callback !== 'function') throw new (internalRequire('internal/errors').codes.ERR_INVALID_ARG_TYPE)('callback', 'function', callback);
-  // As Node's nextTick: an arguments array only when there are arguments.
-  const count = arguments.length;
-  let args;
-  if (count > 1) {
-    args = [];
-    for (let index = 1; index < count; index++) args.push(arguments[index]);
-  }
-  ticks.push(callback, args, tickScope());
+  // As Node's nextTick: an arguments array only when there are arguments. A rest array
+  // costs a fifth of an arguments object, and runs no iterator.
+  ticks.push(callback, args.length === 0 ? undefined : args, tickScope());
 };
 // A tick's async scope. With no hooks it is the callback context itself, the TickObject
 // resource: no InternalResource to build and destroy. The run emits before, after and

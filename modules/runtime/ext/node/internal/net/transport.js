@@ -58,9 +58,9 @@ class Transport {
   }
   // The handle id, then the arguments, in a fresh array built by index: no rest array, and
   // no spread (user code may have replaced Array.prototype[Symbol.iterator]).
-  call(operation) {
+  call(operation, ...rest) {
     const args = [this.id];
-    for (let index = 1; index < arguments.length; index++) args.push(arguments[index]);
+    for (let index = 0; index < rest.length; index++) args.push(rest[index]);
     return host.net(operation, args);
   }
   // A stream handle that an HTTP parser can consume directly (Node's StreamBase).
