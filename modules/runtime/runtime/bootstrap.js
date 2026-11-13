@@ -196,6 +196,7 @@ host.initializeRealmBuiltins = (handle, global, wasmCodeGeneration, isolated = f
   const cache = new Map();
   const bridge = {
     captureCallSites: native.captureCallSites,
+    hideFrames: native.hideFrames,
     privateSymbols: host.privateSymbols,
     errorStackState: host.errorStackState,
     builtinLoaded: moduleHas,

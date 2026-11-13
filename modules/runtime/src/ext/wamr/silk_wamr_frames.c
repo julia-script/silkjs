@@ -144,6 +144,8 @@ int silk_wasm_frame(void *opaque, uintptr_t frame, uint32_t index, SilkWasmFrame
             memset(out, 0, sizeof(*out));
             out->function_index = wasm->import_function_count + defined;
             out->offset = (uint32_t)(entry.instruction - module->as.module.loaded_bytes);
+            out->enclosing = (uint32_t)(function->silk_body - module->as.module.loaded_bytes);
+            out->entry = invocation->function;
             out->url = module->as.module.frame_url;
             out->url_length = module->as.module.frame_url ? module->as.module.frame_url_length : 0;
             if (function->field_name && function->silk_field_name_length) {

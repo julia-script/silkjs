@@ -130,8 +130,12 @@ uint32_t silk_wasm_custom_count(const SilkWasmHandle *, const uint8_t *name,
 const uint8_t *silk_wasm_custom(const SilkWasmHandle *, const uint8_t *name,
                                uint32_t name_length, uint32_t index,
                                uint32_t *length);
+/* frame is the engine StackFrame current at the call: a start function's
+   frames show above it. A start function's trap is kept for its stack until
+   silk_wasm_release_start_trap or the next instantiation. */
 SilkWasmHandle *silk_wasm_instantiate(SilkWasmHandle *,
-                                     const SilkWasmImport *, uint32_t count);
+                                     const SilkWasmImport *, uint32_t count, uintptr_t frame);
+void silk_wasm_release_start_trap(SilkWasmStore *);
 SilkWasmHandle *silk_wasm_export(SilkWasmHandle *, uint32_t index);
 uint8_t silk_wasm_function_type(SilkWasmHandle *, SilkWasmTypeInfo *);
 uint8_t silk_wasm_type(SilkWasmHandle *, SilkWasmTypeInfo *);
@@ -148,12 +152,15 @@ int silk_wasm_invocation_status(SilkWasmInvocation *);
 int silk_wasm_resume(SilkWasmInvocation *, const SilkWasmValue *,
                      uint32_t count, SilkWasmHandle *exception, uintptr_t frame);
 /* One Wasm function frame of a stack trace, as V8 writes it. Strings are
-   borrowed from the module and not NUL-terminated; a null name has none. */
+   borrowed from the module and not NUL-terminated; a null name has none.
+   offset and enclosing (the function body's start) are module byte offsets.
+   entry is the function handle the invocation was called through. */
 typedef struct SilkWasmFrame {
-    uint32_t function_index, offset;
+    uint32_t function_index, offset, enclosing;
     const char *url; size_t url_length;
     const char *name; size_t name_length;
     const char *module; size_t module_length;
+    SilkWasmHandle *entry;
 } SilkWasmFrame;
 /* The index-th Wasm frame, innermost first, of the invocation entered from
    StackFrame `frame` while it runs, or of the trap it ended with. 1 when
