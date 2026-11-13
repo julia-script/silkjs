@@ -276,6 +276,13 @@ host.moduleType = (path, follow) => {
   if (code === 'ENOENT' || code === 'ENOTDIR') return 0;
   throw systemError(result[1], follow ? 'stat' : 'lstat', path);
 };
+// node_file.cc InternalModuleStat: 1 for a directory, 0 for anything else that is
+// there, and the negative errno of a failed stat. Like moduleType, it needs no read grant.
+host.internalModuleStat = path => {
+  const result = moduleStat(path);
+  if (result[1] !== 0) return -Math.abs(result[1]);
+  return (result[0].mode & 0o170000) === 0o040000 ? 1 : 0;
+};
 // Built-ins read the environment where it lives: nothing of it is kept here.
 const environmentHandler = {
   get(target, key) { return typeof key === 'string' ? rawStd.getenv(key) : undefined; },
@@ -495,8 +502,24 @@ const rejections = new Map();
 let rejectionsQueued = false;
 const reportedRejections = new WeakMap();
 let nextRejectionId = 0;
-function onRejection(promise, reason, handled) {
-  if (handled) {
+let multipleResolvesWarned = false;
+// The engine's promise reject callback; event is V8's PromiseRejectEvent:
+// 0 rejected with no handler, 1 handler added after reject, 2 reject after resolved,
+// 3 resolve after resolved (lib/internal/process/promises.js promiseRejectHandler).
+function onRejection(promise, reason, event) {
+  if (event > 1) {
+    if (process.listenerCount('multipleResolves') === 0) return;
+    const type = event === 2 ? 'reject' : 'resolve';
+    // A next tick, or the error could be caught by the promise being executed.
+    host.nextTick(function emitMultipleResolves() {
+      if (process.emit('multipleResolves', type, promise, reason) && !multipleResolvesWarned) {
+        multipleResolvesWarned = true;
+        process.emitWarning('The multipleResolves event has been deprecated.', 'DeprecationWarning', 'DEP0160');
+      }
+    });
+    return;
+  }
+  if (event === 1) {
     rejections.delete(promise);
     const info = reportedRejections.get(promise);
     if (info) {
@@ -575,7 +598,9 @@ function checkpoint() {
       completions[completionHead++] = undefined;
       completion();
     }
-    while (rejections.size) {
+    // Node's processPromiseRejections takes the rejections pending now; one a handler
+    // makes waits for the next turn, after the nextTick queue (which may handle it).
+    if (rejections.size) {
       const pending = Array.from(rejections.keys());
       for (let index = 0; index < pending.length; index++) {
         const promise = pending[index];
@@ -1550,7 +1575,7 @@ function runWorker() {
   process.argv = [process.execPath, evaluate ? '[worker eval]' : filename, ...argv];
   if (evaluate) process._eval = filename;
   const workerSource = evaluate ? prepareInput(filename, '[worker eval]', inputType, inputType !== undefined) : undefined;
-  const moduleEval = evaluate && (inputType?.startsWith('module') || (inputType === undefined && native.detectModuleSyntax(workerSource)));
+  const moduleEval = evaluate && (inputType?.startsWith('module') || (inputType === undefined && !host.detectModuleDisabled && native.detectModuleSyntax(workerSource)));
   return runPreloads(() => {
     if (evaluate) {
       if (moduleEval) return evaluateMain(workerSource, evalModuleURL());
@@ -1821,7 +1846,7 @@ function run(restored = false) {
     const resolved = fromStdin ? null : loader.resolveMain(host.path.resolve(filename));
     const name = fromStdin ? host.path.join(host.tryGetCwd(), '[stdin]') : resolved.filename;
     const source = loader.cleanSource(fromStdin ? rawStd.in.readAsString() : host.Buffer.from(host.readFile(name)).toString('utf8'));
-    const module = fromStdin ? inputType === 'module' || (!inputTypeSet && native.detectModuleSyntax(source)) : resolved.format === 'module';
+    const module = fromStdin ? inputType === 'module' || (!inputTypeSet && !host.detectModuleDisabled && native.detectModuleSyntax(source)) : resolved.format === 'module';
     // node:internal/main/check_syntax names piped source [stdin].
     const scriptName = fromStdin ? '[stdin]' : name;
     const wrapped = module ? source : loader.Module.wrap(source);
@@ -1843,26 +1868,32 @@ function run(restored = false) {
     return startRepl();
   }
   if (expression !== undefined) {
+    // node -i -e: lib/internal/main/repl.js starts the REPL, then evaluates the code.
+    if (interactive) { interactive = false; startRepl(); }
     const name = host.path.join(host.tryGetCwd(), '[eval]');
     expression = prepareInput(expression, name, inputType, inputTypeSet);
     internalRequire('internal/modules/helpers').addBuiltinLibsToObject(globalThis, '<eval>');
     const code = !inputType.startsWith('module') && /\bcrypto\b/.test(expression) ?
       (print ? 'let crypto=require("node:crypto");{' + expression + '}' : '(crypto=>{{' + expression + '}})(require("node:crypto"))') : expression;
-    if (inputType.startsWith('module') || (!inputTypeSet && native.detectModuleSyntax(code))) {
+    if (inputType.startsWith('module') || (!inputTypeSet && !host.detectModuleDisabled && native.detectModuleSyntax(code))) {
       if (print) throw new (internalRequire('internal/errors').codes.ERR_EVAL_ESM_CANNOT_PRINT)();
       return afterMain(evaluateMain(code, evalModuleURL()));
     }
+    // Node's evalScript puts back the module global it found (the REPL's, or the builtin).
+    const origModule = globalThis.module;
     installCommonJSInputGlobals(name, '[eval]');
     armInspectorEntry();
     // As in Node, the script is named [eval] while module.filename is under the cwd.
-    return afterMain(internalRequire('internal/process/execution').evalScript('[eval]', code, print));
+    const result = internalRequire('internal/process/execution').evalScript('[eval]', code, print);
+    if (origModule !== undefined) globalThis.module = origModule;
+    return afterMain(result);
   }
   if (filename === undefined || filename === '-') {
     let source = rawStd.in.readAsString();
     const name = host.path.join(host.tryGetCwd(), '[stdin]');
     process._eval = source;
     source = prepareInput(source, name, inputType, inputTypeSet);
-    if (inputType.startsWith('module') || (!inputTypeSet && native.detectModuleSyntax(source))) {
+    if (inputType.startsWith('module') || (!inputTypeSet && !host.detectModuleDisabled && native.detectModuleSyntax(source))) {
       if (print) throw new (internalRequire('internal/errors').codes.ERR_EVAL_ESM_CANNOT_PRINT)();
       return afterMain(evaluateMain(source, evalModuleURL()));
     }

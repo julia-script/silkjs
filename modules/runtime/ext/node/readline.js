@@ -133,40 +133,30 @@ ObjectSetPrototypeOf(Interface, _Interface);
  */
 Interface.prototype.question = function question(query, options, cb) {
   cb = typeof options === 'function' ? options : cb;
-  if (options === null || typeof options !== 'object') options = kEmptyObject;
-  const signal = options.signal;
-  if (signal) {
-    validateAbortSignal(signal, 'options.signal');
-    if (signal.aborted) return;
+  if (options === null || typeof options !== 'object') {
+    options = kEmptyObject;
   }
-  if (!signal) {
-    if (typeof cb === 'function') this[kQuestion](query, cb);
-    return;
+
+  if (options.signal) {
+    validateAbortSignal(options.signal, 'options.signal');
+    if (options.signal.aborted) {
+      return;
+    }
+
+    const onAbort = () => {
+      this[kQuestionCancel]();
+    };
+    addAbortListener ??= require('internal/path_events/abort_listener').addAbortListener;
+    const disposable = addAbortListener(options.signal, onAbort);
+    const originalCb = cb;
+    cb = typeof cb === 'function' ? (answer) => {
+      disposable[SymbolDispose]();
+      return originalCb(answer);
+    } : disposable[SymbolDispose];
   }
-  if (this[kQuestionCallback]) {
-    this.prompt();
-    return;
-  }
-  let disposable;
-  const cleanup = () => {
-    disposable?.[SymbolDispose]();
-    this.removeListener('close', cleanup);
-  };
-  const onAbort = () => {
-    cleanup();
-    this[kQuestionCancel]();
-  };
-  addAbortListener ??= require('internal/path_events/abort_listener').addAbortListener;
-  disposable = addAbortListener(signal, onAbort);
-  this.once('close', cleanup);
-  try {
-    this[kQuestion](query, (answer) => {
-      cleanup();
-      if (typeof cb === 'function') cb(answer);
-    });
-  } catch (error) {
-    cleanup();
-    throw error;
+
+  if (typeof cb === 'function') {
+    this[kQuestion](query, cb);
   }
 };
 Interface.prototype.question[promisify.custom] = function question(query, options) {

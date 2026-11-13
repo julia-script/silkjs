@@ -5,9 +5,12 @@
 // never run user code (no getters, no proxy traps).
 
 const {
-  ArrayPrototypeFilter,
+  ArrayIsArray,
+  ArrayPrototypePush,
   ObjectPrototypePropertyIsEnumerable,
   ReflectOwnKeys,
+  RegExpPrototypeExec,
+  TypedArrayPrototypeGetSymbolToStringTag,
 } = require('internal/per_context/primordials');
 const host = require('internal/host');
 
@@ -21,9 +24,11 @@ const kFulfilled = 1;
 const kRejected = 2;
 
 // Canonical array index: a uint32 below 2 ** 32 - 1 in its shortest decimal form.
+// The primordial exec, so a replaced %RegExp.prototype% method never runs.
 const arrayIndexRegExp = /^(?:0|[1-9][0-9]*)$/;
 function isArrayIndex(key) {
-  return typeof key === 'string' && key.length <= 10 && arrayIndexRegExp.test(key) && +key < 4294967295;
+  return typeof key === 'string' && key.length <= 10 && RegExpPrototypeExec(arrayIndexRegExp, key) !== null &&
+    +key < 4294967295;
 }
 
 // The own keys of `value` without integer indices, in property order
@@ -32,9 +37,27 @@ function isArrayIndex(key) {
 function getOwnNonIndexProperties(value, filter) {
   const onlyEnumerable = (filter & ONLY_ENUMERABLE) !== 0;
   const skipSymbols = (filter & SKIP_SYMBOLS) !== 0;
-  return ArrayPrototypeFilter(ReflectOwnKeys(value), (key) =>
-    (typeof key === 'symbol' ? !skipSymbols : !isArrayIndex(key)) &&
-    (!onlyEnumerable || ObjectPrototypePropertyIsEnumerable(value, key)));
+  const keys = ReflectOwnKeys(value);
+  // An array or typed array that is not a proxy lists its integer indices first, in
+  // ascending order, so a binary search finds where they end: millions of them are
+  // never filtered one by one.
+  let start = 0;
+  if ((ArrayIsArray(value) || TypedArrayPrototypeGetSymbolToStringTag(value) !== undefined) &&
+    host.getProxyDetails(value) === undefined) {
+    let end = keys.length;
+    while (start < end) {
+      const middle = (start + end) >>> 1;
+      if (isArrayIndex(keys[middle])) start = middle + 1;
+      else end = middle;
+    }
+  }
+  const result = [];
+  for (let i = start; i < keys.length; i++) {
+    const key = keys[i];
+    if ((typeof key === 'symbol' ? !skipSymbols : !isArrayIndex(key)) &&
+      (!onlyEnumerable || ObjectPrototypePropertyIsEnumerable(value, key))) ArrayPrototypePush(result, key);
+  }
+  return result;
 }
 
 // [state, result]; result is undefined while pending.

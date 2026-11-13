@@ -15,7 +15,7 @@ const groups = [
   ['internal/web/fetch', ['fetch', 'Headers', 'Request', 'Response', 'FormData']],
   ['internal/web/structured_clone', ['structuredClone']],
   ['internal/web/compression', ['CompressionStream', 'DecompressionStream']],
-  ['internal/web/navigator', ['Navigator', 'navigator']],
+  ['internal/navigator', ['Navigator', 'navigator']],
   ['internal/web/urlpattern', ['URLPattern']],
   ['internal/url', ['URL', 'URLSearchParams']],
   ['internal/web/blob', ['Blob', 'File']],

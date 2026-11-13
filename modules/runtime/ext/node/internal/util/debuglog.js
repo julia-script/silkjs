@@ -8,10 +8,32 @@ const host = require('internal/host');
 const { format } = require('internal/util/inspect');
 const ReflectApply = Reflect.apply;
 
+const { RegExpPrototypeExec } = require('internal/per_context/primordials');
 const debugWarned = new Set();
-// Whether NODE_DEBUG names the (upper case) section.
+// Node's initializeDebugEnv: NODE_DEBUG as one case-insensitive pattern, "," between
+// sections and "*" as a wildcard. It is read on first use, which can follow user code,
+// so it calls no user-mutable String or RegExp method.
+let debugEnvRegex;
 function testEnabled(section) {
-  return String(host.env.NODE_DEBUG || '').split(/[\s,]+/).filter(Boolean).some(pattern => new RegExp('^' + pattern.replace(/[|\\{}()[\]^$+?.]/g, '\\$&').replace(/\*/g, '.*') + '$', 'i').test(section));
+  if (debugEnvRegex === undefined) {
+    const debugEnv = host.env.NODE_DEBUG;
+    debugEnvRegex = null;
+    if (debugEnv) {
+      let pattern = '';
+      for (let i = 0; i < debugEnv.length; i++) {
+        const c = debugEnv[i];
+        switch (c) {
+          case '*': pattern += '.*'; break;
+          case ',': pattern += '$|^'; break;
+          case '|': case '\\': case '{': case '}': case '(': case ')': case '[': case ']':
+          case '^': case '$': case '+': case '?': case '.': pattern += '\\' + c; break;
+          default: pattern += c;
+        }
+      }
+      debugEnvRegex = new RegExp(`^${pattern}$`, 'i');
+    }
+  }
+  return debugEnvRegex !== null && RegExpPrototypeExec(debugEnvRegex, section) !== null;
 }
 function debuglog(section, callback) {
   section = String(section).toUpperCase();

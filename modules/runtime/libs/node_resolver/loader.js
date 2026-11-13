@@ -11,6 +11,7 @@ const { loaderRequire } = require('internal/modules/helpers');
 // Captured before user code runs: the main module's evaluation promise is
 // observed without a user-replaced Promise.prototype.then.
 const ReflectApply = Reflect.apply;
+const RegExpPrototypeExec = RegExp.prototype.exec;
 const PromisePrototypeThen = Promise.prototype.then;
 const ObjectPrototype = Object.prototype;
 const ObjectGetPrototypeOf = Object.getPrototypeOf;
@@ -1311,7 +1312,8 @@ function createLoader(host, builtins) {
   // implementation (internal/ws), whose frames are read and written natively.
   const substituteEntry = /[\\/]node_modules[\\/]ws[\\/](?:index\.js|wrapper\.mjs)$/;
   function substituteExports(filename) {
-    return substituteEntry.test(filesystemName(filename)) ? builtins.get('internal/ws') : undefined;
+    // Every require runs this, after user code may have replaced %RegExp.prototype%.test.
+    return ReflectApply(RegExpPrototypeExec, substituteEntry, [filesystemName(filename)]) !== null ? builtins.get('internal/ws') : undefined;
   }
 
   function loadResolved(resolved, parent, isMain, allowAsync = false) {

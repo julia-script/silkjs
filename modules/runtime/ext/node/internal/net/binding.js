@@ -111,7 +111,9 @@ function statusOf(error) {
 // The binding's own bookkeeping, which Node keeps in C++: writable but not enumerable, so the
 // handle shows only the properties Node's handles have (util.inspect, v8 serialize errors).
 function internalFields(handle, fields) {
-  for (const key of Object.keys(fields)) {
+  const keys = Object.keys(fields);
+  for (let i = 0; i < keys.length; i++) {
+    const key = keys[i];
     Object.defineProperty(handle, key, { __proto__: null, value: fields[key], writable: true, configurable: true, enumerable: false });
   }
 }
