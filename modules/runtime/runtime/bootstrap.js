@@ -90,7 +90,7 @@ host.SharedArrayBuffer = SharedArrayBuffer;
 // internal/v8/startup_snapshot. With --build-snapshot (native.snapshotBuild) the
 // heap is saved as the blob when the loop ends; a start from the blob runs
 // runSnapshot instead of run.
-const snapshotState = { building: native.snapshotBuild === true, codeCache: true, serialize: undefined, deserialize: undefined, main: undefined };
+const snapshotState = { building: native.snapshotBuild === true, codeCache: true, codeCacheEntries: 0, serialize: undefined, deserialize: undefined, main: undefined };
 host.startupSnapshot = {
   isBuildingSnapshotBuffer: new Uint8Array([native.snapshotBuild ? 1 : 0]),
   setSerializeCallback(callback) { snapshotState.serialize = callback; },
@@ -1168,9 +1168,11 @@ function armInspectorEntry() {
 // execution.js getEvalModuleUrl: an --eval or stdin module is [evalN] under the cwd's URL.
 let evalIndex = 0;
 function evalModuleURL() { return `${internalRequire('url').pathToFileURL(host.tryGetCwd())}/[eval${++evalIndex}]`; }
-function evaluateMain(source, name) {
+// ModuleJob's inspectBrk: --inspect-brk breaks in an entry module, never in an
+// --eval or stdin module (Node evaluates those without it).
+function evaluateMain(source, name, breakFirst = true) {
   mainModuleName = name;
-  armInspectorEntry();
+  if (breakFirst) armInspectorEntry();
   // Node's ModuleJob.run hint for a CommonJS global (an --eval module has no load step
   // that would add it).
   let result;
@@ -1596,10 +1598,11 @@ function runWorker() {
   const moduleEval = evaluate && (inputType?.startsWith('module') || (inputType === undefined && !host.detectModuleDisabled && native.detectModuleSyntax(workerSource)));
   return runPreloads(() => {
     if (evaluate) {
-      if (moduleEval) return evaluateMain(workerSource, evalModuleURL());
+      if (moduleEval) return evaluateMain(workerSource, evalModuleURL(), false);
       const name = host.path.join(host.tryGetCwd(), '[worker eval]');
+      // An eval worker has no main module, so nothing breaks on its start (Node's
+      // break on start wraps the main module's compile).
       installCommonJSInputGlobals(name, '[worker eval]');
-      armInspectorEntry();
       return native.compileFunction(workerSource, '[worker eval]', undefined, undefined, undefined, true);
     }
     if (filename.startsWith('data:')) {
@@ -1834,6 +1837,12 @@ function run(restored = false) {
     });
   }
   if (restored) {
+    // node_snapshotable.cc logs the code cache it found under NODE_DEBUG_NATIVE=CODE_CACHE:
+    // here, the functions the build compiled for the snapshot.
+    const debugNative = process.env.NODE_DEBUG_NATIVE;
+    if (typeof debugNative === 'string' && debugNative.split(',').some(name => name.trim().toUpperCase() === 'CODE_CACHE')) {
+      host.writeText(2, `snapshot contains ${snapshotState.codeCacheEntries} code cache\n`);
+    }
     // Before any preload, as Node's prepareMainThreadExecution runs them.
     restoreStackTraceLimit();
     if (snapshotState.deserialize !== undefined) snapshotState.deserialize();
@@ -1910,7 +1919,7 @@ function run(restored = false) {
       (print ? 'let crypto=require("node:crypto");{' + expression + '}' : '(crypto=>{{' + expression + '}})(require("node:crypto"))') : expression;
     if (inputType.startsWith('module') || (!inputTypeSet && !host.detectModuleDisabled && native.detectModuleSyntax(code))) {
       if (print) throw new (internalRequire('internal/errors').codes.ERR_EVAL_ESM_CANNOT_PRINT)();
-      return afterMain(evaluateMain(code, evalModuleURL()));
+      return afterMain(evaluateMain(code, evalModuleURL(), false));
     }
     // Node's evalScript puts back the module global it found (the REPL's, or the builtin).
     const origModule = globalThis.module;
@@ -1928,7 +1937,7 @@ function run(restored = false) {
     source = prepareInput(source, name, inputType, inputTypeSet);
     if (inputType.startsWith('module') || (!inputTypeSet && !host.detectModuleDisabled && native.detectModuleSyntax(source))) {
       if (print) throw new (internalRequire('internal/errors').codes.ERR_EVAL_ESM_CANNOT_PRINT)();
-      return afterMain(evaluateMain(source, evalModuleURL()));
+      return afterMain(evaluateMain(source, evalModuleURL(), false));
     }
     installCommonJSInputGlobals(name, '[stdin]');
     armInspectorEntry();
@@ -2221,6 +2230,8 @@ globalThis.__silkRuntime = {
   // Whether the snapshot this builder ends keeps compiled function bodies
   // (a snapshot configuration's "withoutCodeCache").
   snapshotCodeCache: () => snapshotState.codeCache,
+  // How many functions the build compiled for the snapshot's code cache.
+  snapshotCodeCached: (count) => { snapshotState.codeCacheEntries = count; },
   // Ends the build of a heap image. Each variable listed here is read again by hydrate.
   seal() {
     // Built-ins most programs load run here, so that a start from the image finds
