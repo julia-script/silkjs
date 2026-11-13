@@ -1243,8 +1243,8 @@ function createLoader(host, builtins) {
   Module._initPaths();
   Module.findPackageJSON = findPackageJSON;
   Module.stripTypeScriptTypes = function stripTypeScriptTypes(code, options) {
-    return arguments.length < 2 ? builtins.get('internal/typescript').stripTypeScriptTypes(code)
-      : builtins.get('internal/typescript').stripTypeScriptTypes(code, options);
+    return arguments.length < 2 ? builtins.get('internal/modules/typescript').stripTypeScriptTypes(code)
+      : builtins.get('internal/modules/typescript').stripTypeScriptTypes(code, options);
   };
   Module.registerHooks = hooks.registerHooks;
   Module.register = hooks.register;
