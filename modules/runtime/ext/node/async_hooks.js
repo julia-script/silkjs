@@ -27,6 +27,8 @@ function countHookFields() {
       if (hook.callbacks[hookNames[index]] !== undefined) { hookFields[index]++; hookFields[5]++; }
     }
   }
+  // The native immediate queue hands every Immediate to JavaScript while a hook is on.
+  host.immediateHooks(hookFields[5] !== 0);
 }
 // Node's getPromiseHooks: the init, before, after and settled functions that
 // setPromiseHooks installed (internal/promise_hooks), undefined where none is.

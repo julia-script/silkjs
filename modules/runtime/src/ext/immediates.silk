@@ -1,0 +1,478 @@
+//! Node's immediate queue (Environment's immediate list and processImmediate) in native code.
+//!
+//! lib/internal/timers.js makes each Immediate. A plain one (no async hook is enabled, the
+//! current async context has no stores, at most MAX_ARGUMENTS arguments) is cloned here from
+//! a template that has the Immediate's own properties in the constructor's order:
+//!   0 _idleNext, 1 _idlePrev, 2 _onImmediate, 3 _argv, 4 _destroyed, 5 [kRefed],
+//!   6 [async_id_symbol], 7 [trigger_async_id_symbol]
+//! Any other Immediate is made by the JavaScript constructor and only queued here.
+//!
+//! run() is the check phase's processImmediate: it takes the queue, calls each plain
+//! Immediate's callback itself inside the async context that Node's processImmediate
+//! sets up ({ stores, id, trigger, resource }, cloned from a second template), and hands
+//! every other one, or one whose shape changed, to the JavaScript runSlow(context,
+//! immediate). Between callbacks it runs the tick queue (runNextTicks), as Node does.
+//! Counts (Environment::ImmediateInfo's kCount and kRefCount) live here.
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.mem.pointer { Pointer }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.collections.list { List }
+import silk.collections.slice { Slice }
+import silk.num.u32
+import silk.num.usize
+import silkjs.js_engine { Engine }
+import silkjs.js_engine_host { EngineServices }
+import silkjs.js_heap { HeapCell, HeapHeader }
+import silkjs.js_core_types { ObjectData, ObjectPayload, RuntimeState, ShapeData, SlotBits }
+import silkjs.js_value { ValueBits }
+import silkjs.js_owned_value { Value, lendFor }
+import silkjs.js_exceptions { JsException }
+import silkjs.js_exceptions as exceptions
+import silkjs.js_realm { lendRealm }
+import silkjs.js_object_allocate as objects
+import silkjs.js_shapes as shapes
+import silkjs.js_class_data as classes
+import silkjs.js_gc as gc
+import silkjs.js_runtime as runtime
+import silkjs.js_promise as promise
+
+const MAX_ARGUMENTS: usize = 8
+const SLOT_CALLBACK: usize = 2
+const SLOT_ARGV: usize = 3
+const SLOT_DESTROYED: usize = 4
+const SLOT_REFED: usize = 5
+const SLOT_ID: usize = 6
+const SLOT_TRIGGER: usize = 7
+const IMMEDIATE_SLOTS: usize = 8
+const SCOPE_STORES: usize = 0
+const SCOPE_ID: usize = 1
+const SCOPE_TRIGGER: usize = 2
+const SCOPE_RESOURCE: usize = 3
+const SCOPE_SLOTS: usize = 4
+
+pub struct State {
+  /// The queued Immediates, each holding a reference.
+  queue: List<ValueBits>,
+  /// The queue a run is taking from, kept for its capacity.
+  spare: List<ValueBits>,
+  count: u32,
+  refCount: u32,
+  /// The template's slots: IMMEDIATE_SLOTS, and one more for [kAsyncContextFrame].
+  slots: usize,
+  /// Some async hook is enabled (async_hook_fields[kTotals] != 0): every Immediate takes runSlow.
+  hooks: bool,
+  running: bool,
+  immediateTemplate: ValueBits,
+  scopeTemplate: ValueBits,
+  runSlow: ValueBits,
+  onThrow: ValueBits,
+  runNextTicks: ValueBits,
+  /// The last callback scope, while only this holds it (see runOne).
+  cachedScope: ValueBits,
+  /// A run Immediate nothing else held, kept for the next create to reuse.
+  spareImmediate: ValueBits,
+  /// Something a native turn cannot see changed (a timer, a loop listener, worker
+  /// messaging, a native immediate, a queued rejection): the next turn asks the loop.
+  attention: bool
+}
+pub fn makeState() -> State { return State.make() }
+impl State {
+  pub fn make() -> Self {
+    return Self { queue: List<ValueBits>.make(), spare: List<ValueBits>.make(), count: 0, refCount: 0, slots: IMMEDIATE_SLOTS, hooks: false, running: false,
+      immediateTemplate: ValueBits.Undefined, scopeTemplate: ValueBits.Undefined, runSlow: ValueBits.Undefined,
+      onThrow: ValueBits.Undefined, runNextTicks: ValueBits.Undefined, cachedScope: ValueBits.Undefined, spareImmediate: ValueBits.Undefined, attention: false }
+  }
+}
+
+unsafe fn borrow<'a>(anchor: &'a mut (), state: *mut State) -> &'a mut State { return unsafe Pointer.borrowMut<(), State>(move anchor, state) }
+
+/// The interned shape of an ordinary object whose slots match its shape's properties, or null.
+unsafe fn templateShape(value: ValueBits, slots: usize) -> ?*mut HeapHeader {
+  let node = match value { ValueBits.Object { reference } => reference _ => { return Pointer.null<HeapHeader>() } }
+  let anchor = ()
+  let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, node)
+  if data.classId() != classes.JS_CLASS_OBJECT || data.slotCount() != slots { return Pointer.null<HeapHeader>() }
+  let shape = data.shape
+  let shapeData = unsafe HeapCell.payload<ShapeData, ()>(&anchor, shape)
+  if !shapeData.isHashed || shapeData.deletedPropertyCount != 0 || shapeData.properties.length() != slots { return Pointer.null<HeapHeader>() }
+  return unsafe Intrinsic.pointerRequalify<*mut HeapHeader, ?*mut HeapHeader>(shape)
+}
+unsafe fn shapeOf(node: *mut HeapHeader) -> *mut HeapHeader {
+  let anchor = () return (unsafe HeapCell.payload<ObjectData, ()>(&anchor, node)).shape
+}
+unsafe fn slot(node: *mut HeapHeader, index: usize) -> ValueBits {
+  let anchor = () return (unsafe (unsafe HeapCell.payload<ObjectData, ()>(&anchor, node)).slotUnchecked(index)).valueBits()
+}
+/// Stores value (whose reference the slot takes) and returns the old value for the caller to release.
+unsafe fn replaceSlot(node: *mut HeapHeader, index: usize, value: ValueBits) -> ValueBits {
+  let mut anchor = ()
+  let data = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut anchor, node)
+  let old = (unsafe data.slotUnchecked(index)).valueBits()
+  unsafe data.setSlotUnchecked(index, SlotBits.value(value))
+  return old
+}
+fn same(a: *mut HeapHeader, b: ?*mut HeapHeader) -> bool { return Pointer.address<HeapHeader>(a) == Pointer.address<HeapHeader>(unsafe Intrinsic.pointerRequalify<?*mut HeapHeader, *mut HeapHeader>(b)) }
+unsafe fn references(node: *mut HeapHeader) -> i32 {
+  let anchor = () return (unsafe Pointer.borrow<(), HeapHeader>(&anchor, node)).referenceCount
+}
+/// Keeps a run Immediate that only the batch holds as the spare, when it still has the
+/// template's shape and no weak reference or extension lock can tell it apart.
+unsafe fn keepSpare(state: *mut State, object: ValueBits) -> bool {
+  let node = match object { ValueBits.Object { reference } => reference _ => { return false } }
+  if unsafe references(node) != 1 { return false }
+  let mut anchor = () let entry = unsafe borrow(&mut anchor, state)
+  let free = match entry.spareImmediate { ValueBits.Undefined => true _ => false }
+  let template = entry.immediateTemplate drop entry
+  if !free { return false }
+  let source = match template { ValueBits.Object { reference } => reference _ => { return false } }
+  let dataAnchor = () let data = unsafe HeapCell.payload<ObjectData, ()>(&dataAnchor, node)
+  if data.weakRefCount != 0 || !data.extensible() || Pointer.address<HeapHeader>(data.shape) != Pointer.address<HeapHeader>(unsafe shapeOf(source)) { return false }
+  drop data
+  let mut keep = () let held = unsafe borrow(&mut keep, state) held.spareImmediate = object
+  return true
+}
+unsafe fn uncatchable(rt: *mut HeapHeader) -> bool {
+  let anchor = () return (unsafe HeapCell.payload<RuntimeState, ()>(&anchor, rt)).currentExceptionIsUncatchable
+}
+
+/// A new object with template's shape and copies of its slots.
+unsafe effect fn clone<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, template: ValueBits, slots: usize) -> *mut HeapHeader
+  ! OutOfMemoryError ? &mut Allocator {
+  let source = match template { ValueBits.Object { reference } => reference _ => Intrinsic.trap("immediate template is not an object") }
+  let shape = unsafe shapeOf(source)
+  let rt = unsafe runtime.contextRuntime(context)
+  unsafe shapes.take(rt, shape)
+  let memory = engine.memory
+  let made = run unsafe objects.ordinaryFromShapeWritten(&mut engine, memory, unsafe lendRealm(&context, context), shape, slots)
+  let node = match made { ValueBits.Object { reference } => reference _ => Intrinsic.trap("immediate clone is not an object") }
+  let mut anchor = ()
+  let data = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut anchor, node)
+  data.slotListMut().clear()
+  let mut i: usize = 0
+  while i < slots { data.pushSlot(SlotBits.value(unsafe (unsafe slot(source, i)).retained())) i = i + 1 }
+  return node
+}
+
+/// setup(immediateTemplate, scopeTemplate, runSlow, onThrow, runNextTicks): false when a
+/// template does not have the layout above (every Immediate then takes the JavaScript path).
+pub unsafe fn setup<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, state: *mut State, immediateTemplate: ValueBits, scopeTemplate: ValueBits,
+  runSlow: ValueBits, onThrow: ValueBits, runNextTicks: ValueBits) -> bool {
+  let slots = if !Pointer.isNull<HeapHeader>(unsafe templateShape(immediateTemplate, IMMEDIATE_SLOTS)) { IMMEDIATE_SLOTS }
+    else if !Pointer.isNull<HeapHeader>(unsafe templateShape(immediateTemplate, IMMEDIATE_SLOTS + 1)) { IMMEDIATE_SLOTS + 1 } else { return false }
+  if Pointer.isNull<HeapHeader>(unsafe templateShape(scopeTemplate, SCOPE_SLOTS)) { return false }
+  let rt = unsafe runtime.contextRuntime(context)
+  let mut anchor = ()
+  let entry = unsafe borrow(&mut anchor, state)
+  entry.slots = slots
+  let old = [entry.immediateTemplate, entry.scopeTemplate, entry.runSlow, entry.onThrow, entry.runNextTicks]
+  entry.immediateTemplate = unsafe immediateTemplate.retained() entry.scopeTemplate = unsafe scopeTemplate.retained()
+  entry.runSlow = unsafe runSlow.retained() entry.onThrow = unsafe onThrow.retained() entry.runNextTicks = unsafe runNextTicks.retained()
+  drop entry
+  let mut i: usize = 0
+  while i < 5 { unsafe gc.release(&mut engine, rt, old[i]) i = i + 1 }
+  return true
+}
+pub unsafe fn ready(state: *mut State) -> bool {
+  let mut anchor = () let entry = unsafe borrow(&mut anchor, state)
+  return match entry.immediateTemplate { ValueBits.Object { .. } => true _ => false }
+}
+pub unsafe fn setHooks(state: *mut State, hooks: bool) -> () { let mut anchor = () let entry = unsafe borrow(&mut anchor, state) entry.hooks = hooks }
+pub unsafe fn count(state: *mut State) -> u32 { let mut anchor = () let entry = unsafe borrow(&mut anchor, state) return entry.count }
+pub unsafe fn refCount(state: *mut State) -> u32 { let mut anchor = () let entry = unsafe borrow(&mut anchor, state) return entry.refCount }
+/// ref() and unref(): delta is +1 or -1; returns the new kRefCount.
+pub unsafe fn addRefs(state: *mut State, delta: i32) -> u32 {
+  let mut anchor = () let entry = unsafe borrow(&mut anchor, state)
+  if delta > 0 { entry.refCount = entry.refCount + 1 } else if delta < 0 && entry.refCount != 0 { entry.refCount = entry.refCount - 1 }
+  return entry.refCount
+}
+/// An Immediate that will not run from the queue (cleared, or taken by runSlow): kCount
+/// drops, and kRefCount too when it was referenced. Returns kRefCount. Once no Immediate
+/// is counted, the queue holds only cleared ones, and gives them up.
+pub unsafe fn settle<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, state: *mut State, refed: bool) -> u32 {
+  let mut anchor = () let entry = unsafe borrow(&mut anchor, state)
+  if entry.count != 0 { entry.count = entry.count - 1 }
+  if refed && entry.refCount != 0 { entry.refCount = entry.refCount - 1 }
+  let refs = entry.refCount
+  let empty = entry.count == 0 && !entry.running && entry.queue.length() != 0
+  drop entry
+  if empty { unsafe dropQueue(&mut engine, context, state) }
+  return refs
+}
+unsafe fn dropQueue<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, state: *mut State) -> () {
+  let rt = unsafe runtime.contextRuntime(context)
+  let mut anchor = () let entry = unsafe borrow(&mut anchor, state)
+  let mut taken = Intrinsic.replace(entry.queue, List<ValueBits>.make()) drop entry
+  let mut i: usize = 0
+  while i < taken.length() { unsafe gc.release(&mut engine, rt, taken.get(i)) i = i + 1 }
+  taken.clear()
+  let mut back = () let again = unsafe borrow(&mut back, state)
+  let fresh = Intrinsic.replace(again.queue, move taken) drop again
+  // Anything queued while releasing (a finalizer cannot run JavaScript) stays queued.
+  let mut j: usize = 0
+  while j < fresh.length() { let mut more = () let last = unsafe borrow(&mut more, state) let _fits = last.queue.appendWithinCapacity(fresh.get(j)) drop last j = j + 1 }
+}
+/// Queues object (the JavaScript constructor's Immediate), taking a reference.
+pub unsafe effect fn enqueue(state: *mut State, object: ValueBits) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut anchor = () let entry = unsafe borrow(&mut anchor, state)
+  run entry.queue.append(unsafe object.retained())
+  entry.count = entry.count + 1
+}
+
+/// The current async context's trigger id (its id, or 1 for the root) when it carries no
+/// stores; none when it does (AsyncLocalStorage needs the JavaScript constructor).
+unsafe fn plainTrigger<'m, S: EngineServices>(engine: &mut Engine<'m, S>, rt: *mut HeapHeader, scopeTemplate: ValueBits) -> Option<ValueBits> {
+  let current = unsafe runtime.getAsyncContext(rt)
+  let bits = current.intoBits()
+  let result = match bits {
+    ValueBits.Undefined => Option<ValueBits>.some(ValueBits.Int { value: 1 })
+    ValueBits.Null => Option<ValueBits>.some(ValueBits.Int { value: 1 })
+    ValueBits.Object { reference } => {
+      let template = match scopeTemplate { ValueBits.Object { reference: t } => t _ => Intrinsic.trap("immediate scope template is not an object") }
+      if Pointer.address<HeapHeader>(unsafe shapeOf(reference)) != Pointer.address<HeapHeader>(unsafe shapeOf(template)) { Option<ValueBits>.none() }
+      else {
+        match unsafe slot(reference, SCOPE_STORES) {
+          ValueBits.Undefined => {
+            let id = unsafe slot(reference, SCOPE_ID)
+            if id.isNumber() { Option<ValueBits>.some(id) } else { Option<ValueBits>.none() }
+          }
+          _ => Option<ValueBits>.none()
+        }
+      }
+    }
+    _ => Option<ValueBits>.none()
+  }
+  unsafe gc.release(&mut engine, rt, bits)
+  return result
+}
+
+/// create(callback, argv, asyncId): a plain Immediate, queued and referenced, or undefined
+/// when it must come from the JavaScript constructor.
+pub unsafe effect fn create<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, state: *mut State, callback: ValueBits, argv: ValueBits, id: ValueBits) -> ValueBits
+  ! OutOfMemoryError ? &mut Allocator {
+  let mut anchor = () let entry = unsafe borrow(&mut anchor, state)
+  let template = entry.immediateTemplate let scopeTemplate = entry.scopeTemplate let hooks = entry.hooks let slots = entry.slots
+  drop entry
+  if hooks || !id.isNumber() { return ValueBits.Undefined }
+  let isReady = match template { ValueBits.Object { .. } => true _ => false }
+  if !isReady { return ValueBits.Bool { value: false } }
+  match argv {
+    ValueBits.Undefined => ()
+    ValueBits.Object { reference } => { if unsafe argumentCount(reference) > MAX_ARGUMENTS { return ValueBits.Undefined } }
+    _ => { return ValueBits.Undefined }
+  }
+  let rt = unsafe runtime.contextRuntime(context)
+  let trigger = match unsafe plainTrigger(&mut engine, rt, scopeTemplate) { Option<ValueBits>.Some { value } => value Option<ValueBits>.None => { return ValueBits.Undefined } }
+  let mut spareAnchor = () let spareEntry = unsafe borrow(&mut spareAnchor, state)
+  let spare = Intrinsic.replace(spareEntry.spareImmediate, ValueBits.Undefined) drop spareEntry
+  let node = match spare {
+    ValueBits.Object { reference } => {
+      // Back to the template's values: the run left its own in some slots.
+      let source = match template { ValueBits.Object { reference: from } => from _ => Intrinsic.trap("immediate template is not an object") }
+      let mut i: usize = 0
+      while i < slots { unsafe gc.release(&mut engine, rt, unsafe replaceSlot(reference, i, unsafe (unsafe slot(source, i)).retained())) i = i + 1 }
+      reference
+    }
+    _ => run unsafe clone(&mut engine, context, template, slots)
+  }
+  let _a = unsafe replaceSlot(node, SLOT_CALLBACK, unsafe callback.retained())
+  let _b = unsafe replaceSlot(node, SLOT_ARGV, unsafe argv.retained())
+  let _c = unsafe replaceSlot(node, SLOT_ID, id)
+  let _d = unsafe replaceSlot(node, SLOT_TRIGGER, trigger)
+  let object = ValueBits.Object { reference: node }
+  let mut back = () let again = unsafe borrow(&mut back, state)
+  let appended = run Effect.result(again.queue.append(unsafe object.retained()))
+  if let Result<(), OutOfMemoryError>.Failure { error } = move appended { drop again unsafe gc.release(&mut engine, rt, object) unsafe gc.release(&mut engine, rt, object) fail move error }
+  again.count = again.count + 1 again.refCount = again.refCount + 1
+  return object
+}
+pub unsafe fn attend(state: *mut State) -> () { let mut anchor = () let held = unsafe borrow(&mut anchor, state) held.attention = true }
+/// Whether attention was asked for since the last call, which clears it.
+pub unsafe fn takeAttention(state: *mut State) -> bool {
+  let mut anchor = () let held = unsafe borrow(&mut anchor, state)
+  let asked = held.attention held.attention = false return asked
+}
+pub unsafe fn attention(state: *mut State) -> bool { let mut anchor = () return (unsafe borrow(&mut anchor, state)).attention }
+pub unsafe fn hooks(state: *mut State) -> bool { let mut anchor = () return (unsafe borrow(&mut anchor, state)).hooks }
+/// Whether value is an empty fast Array (a queue the loop keeps).
+pub unsafe fn emptyArray(value: ValueBits) -> bool {
+  return match value { ValueBits.Object { reference } => unsafe argumentCount(reference) == 0 _ => false }
+}
+/// Elements of a fast Array, or MAX_ARGUMENTS + 1 for anything else.
+unsafe fn argumentCount(array: *mut HeapHeader) -> usize {
+  let anchor = () let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, array)
+  if data.classId() != classes.JS_CLASS_ARRAY { return MAX_ARGUMENTS + 1 }
+  return match &data.payload { ObjectPayload.FastArray { array: fast } => fast.values().length() _ => MAX_ARGUMENTS + 1 }
+}
+unsafe fn argumentAt(array: *mut HeapHeader, index: usize) -> ValueBits {
+  let anchor = () let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, array)
+  return match &data.payload { ObjectPayload.FastArray { array: fast } => { if index < fast.values().length() { unsafe fast.values().getUnchecked(index) } else { ValueBits.Undefined } } _ => ValueBits.Undefined }
+}
+
+/// The check phase's processImmediate. Returns false when another run is already going
+/// (a nested loop), else true. A failure leaves the Immediates not yet run at the front.
+pub unsafe effect fn runQueue<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, state: *mut State) -> bool
+  ! OutOfMemoryError | JsException ? &mut Allocator {
+  let rt = unsafe runtime.contextRuntime(context)
+  let mut anchor = () let entry = unsafe borrow(&mut anchor, state)
+  if entry.running || entry.queue.length() == 0 { return false }
+  entry.running = true
+  // The queue becomes the batch; Immediates made while it runs wait for the next turn.
+  let mut batch = Intrinsic.replace(entry.queue, Intrinsic.replace(entry.spare, List<ValueBits>.make()))
+  drop entry
+  let previous = (unsafe runtime.getAsyncContext(rt)).intoBits()
+  let mut index: usize = 0
+  let mut afterThrow = false
+  let mut failed = false
+  // Whether the Immediate before index is the one that failed (still held here).
+  let mut ranLast = true
+  while index < batch.length() {
+    let object = batch.get(index)
+    if index != 0 && !afterThrow {
+      let mut ticksAnchor = () let ticksEntry = unsafe borrow(&mut ticksAnchor, state) let ticks = ticksEntry.runNextTicks drop ticksEntry
+      let ticked = run Effect.result(promise.call(&mut engine, unsafe lendRealm(&context, context), unsafe lendFor(ticks), unsafe lendFor(ValueBits.Undefined), &[]))
+      // The Immediate at index has not run: it goes back with the rest.
+      match move ticked { Result<Value, JsException>.Success { value } => { unsafe gc.release(&mut engine, rt, value.intoBits()) } Result<Value, JsException>.Failure { .. } => { failed = true ranLast = false break } }
+    }
+    afterThrow = false
+    let outcome = run Effect.result(unsafe runOne(&mut engine, context, state, object, previous))
+    match move outcome {
+      Result<bool, OutOfMemoryError | JsException>.Success { value } => { afterThrow = value }
+      Result<bool, OutOfMemoryError | JsException>.Failure { .. } => { index = index + 1 failed = true break }
+    }
+    if !unsafe keepSpare(state, object) { unsafe gc.release(&mut engine, rt, object) }
+    index = index + 1
+  }
+  if failed {
+    // The failed Immediate is done with (released below); the rest go back to the front.
+    if index != 0 && ranLast { unsafe gc.release(&mut engine, rt, batch.get(index - 1)) }
+    let mut restAnchor = () let restEntry = unsafe borrow(&mut restAnchor, state)
+    let later = Intrinsic.replace(restEntry.queue, List<ValueBits>.make()) drop restEntry
+    let mut rest = List<ValueBits>.make()
+    let mut i = index
+    while i < batch.length() { let _a = run Effect.result(rest.append(batch.get(i))) i = i + 1 }
+    let mut j: usize = 0
+    while j < later.length() { let _b = run Effect.result(rest.append(later.get(j))) j = j + 1 }
+    batch.clear()
+    let mut endAnchor = () let endEntry = unsafe borrow(&mut endAnchor, state)
+    endEntry.queue = move rest endEntry.spare = move batch endEntry.running = false drop endEntry
+    unsafe runtime.setAsyncContext(&mut engine, rt, unsafe Value.adoptBits(previous))
+    fail JsException {}
+  }
+  batch.clear()
+  let mut endAnchor = () let endEntry = unsafe borrow(&mut endAnchor, state)
+  endEntry.spare = move batch endEntry.running = false drop endEntry
+  unsafe runtime.setAsyncContext(&mut engine, rt, unsafe Value.adoptBits(previous))
+  return true
+}
+
+/// One Immediate of a run. Returns whether its callback threw (afterThrow).
+unsafe effect fn runOne<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, state: *mut State, object: ValueBits, previous: ValueBits) -> bool
+  ! OutOfMemoryError | JsException ? &mut Allocator {
+  let rt = unsafe runtime.contextRuntime(context)
+  let node = match object { ValueBits.Object { reference } => reference _ => { return false } }
+  let mut anchor = () let entry = unsafe borrow(&mut anchor, state)
+  let template = entry.immediateTemplate let scopeTemplate = entry.scopeTemplate let hooks = entry.hooks
+  let runSlow = entry.runSlow let onThrow = entry.onThrow let slots = entry.slots
+  drop entry
+  let mut plainShape = match template { ValueBits.Object { reference } => Pointer.address<HeapHeader>(unsafe shapeOf(reference)) == Pointer.address<HeapHeader>(unsafe shapeOf(node)) _ => false }
+  // The constructor's Immediates have the same shape; one with stores is not plain.
+  if plainShape && slots > IMMEDIATE_SLOTS { plainShape = match unsafe slot(node, IMMEDIATE_SLOTS) { ValueBits.Undefined => true _ => false } }
+  let argv = if plainShape { unsafe slot(node, SLOT_ARGV) } else { ValueBits.Undefined }
+  let argc = match argv { ValueBits.Undefined => 0 ValueBits.Object { reference } => unsafe argumentCount(reference) _ => MAX_ARGUMENTS + 1 }
+  if hooks || !plainShape || argc > MAX_ARGUMENTS {
+    let slow = run promise.call(&mut engine, unsafe lendRealm(&context, context), unsafe lendFor(runSlow), unsafe lendFor(ValueBits.Undefined), &[previous, object])
+    let threw = slow.intoBits()
+    let result = match threw { ValueBits.Bool { value } => value _ => false }
+    unsafe gc.release(&mut engine, rt, threw)
+    return result
+  }
+  // Destroyed (cleared, here or by an earlier callback): Node skips it.
+  let alreadyDestroyed = match unsafe slot(node, SLOT_DESTROYED) { ValueBits.Bool { value } => value _ => false }
+  if alreadyDestroyed { return false }
+  let _destroyed = unsafe replaceSlot(node, SLOT_DESTROYED, ValueBits.Bool { value: true })
+  let refed = match unsafe replaceSlot(node, SLOT_REFED, ValueBits.Null) { ValueBits.Bool { value } => value _ => false }
+  let mut countAnchor = () let counts = unsafe borrow(&mut countAnchor, state)
+  if counts.count != 0 { counts.count = counts.count - 1 }
+  if refed && counts.refCount != 0 { counts.refCount = counts.refCount - 1 }
+  drop counts
+  // The callback's async context, as processImmediate builds it: the last one again when
+  // nothing kept it (only the cache holds it), else a new one.
+  let mut cacheAnchor = () let cacheEntry = unsafe borrow(&mut cacheAnchor, state)
+  let cached = cacheEntry.cachedScope drop cacheEntry
+  let mut scope = Pointer.null<HeapHeader>()
+  if let ValueBits.Object { reference } = cached { if unsafe references(reference) == 1 { scope = unsafe Intrinsic.pointerRequalify<*mut HeapHeader, ?*mut HeapHeader>(reference) } }
+  let reused = !Pointer.isNull<HeapHeader>(scope)
+  let scopeNode = if reused { unsafe Intrinsic.pointerRequalify<?*mut HeapHeader, *mut HeapHeader>(scope) } else {
+    let made = run unsafe clone(&mut engine, context, scopeTemplate, SCOPE_SLOTS)
+    let mut setAnchor = () let setEntry = unsafe borrow(&mut setAnchor, state)
+    setEntry.cachedScope = unsafe (ValueBits.Object { reference: made }).retained() drop setEntry
+    unsafe gc.release(&mut engine, rt, cached)
+    made
+  }
+  let _s1 = unsafe replaceSlot(scopeNode, SCOPE_ID, unsafe slot(node, SLOT_ID))
+  let _s2 = unsafe replaceSlot(scopeNode, SCOPE_TRIGGER, unsafe slot(node, SLOT_TRIGGER))
+  let _s3 = unsafe replaceSlot(scopeNode, SCOPE_RESOURCE, unsafe object.retained())
+  // A new scope's own reference becomes the context's; a reused one gets one for it.
+  let scopeValue = ValueBits.Object { reference: scopeNode }
+  unsafe runtime.setAsyncContext(&mut engine, rt, if reused { unsafe Value.retain(scopeValue) } else { unsafe Value.adoptBits(scopeValue) })
+  let callback = unsafe (unsafe slot(node, SLOT_CALLBACK)).retained()
+  let mut arguments: [ValueBits; 8] = [ValueBits.Undefined; 8]
+  let mut i: usize = 0
+  if let ValueBits.Object { reference: array } = argv { while i < argc { arguments[i] = unsafe (unsafe argumentAt(array, i)).retained() i = i + 1 } }
+  let called = run Effect.result(promise.call(&mut engine, unsafe lendRealm(&context, context), unsafe lendFor(callback), unsafe lendFor(object), Slice.view<ValueBits>(&arguments, 0, argc)))
+  let mut r: usize = 0
+  while r < argc { unsafe gc.release(&mut engine, rt, arguments[r]) r = r + 1 }
+  unsafe gc.release(&mut engine, rt, callback)
+  unsafe runtime.setAsyncContext(&mut engine, rt, unsafe Value.retain(previous))
+  // Only the cache holds the scope now: it lets go of the Immediate until the next run.
+  // Something else kept it (a promise's context, a snapshot): the cache gives it up.
+  if unsafe references(scopeNode) == 1 { let resource = unsafe replaceSlot(scopeNode, SCOPE_RESOURCE, ValueBits.Undefined) unsafe gc.release(&mut engine, rt, resource) }
+  else {
+    let mut dropAnchor = () let dropEntry = unsafe borrow(&mut dropAnchor, state)
+    let kept = Intrinsic.replace(dropEntry.cachedScope, ValueBits.Undefined) drop dropEntry
+    unsafe gc.release(&mut engine, rt, kept)
+  }
+  match move called {
+    Result<Value, JsException>.Success { value } => {
+      unsafe gc.release(&mut engine, rt, value.intoBits())
+      // cleanImmediate: a plain Immediate has no stores to remove.
+      let oldCallback = unsafe replaceSlot(node, SLOT_CALLBACK, ValueBits.Undefined)
+      let oldArgv = unsafe replaceSlot(node, SLOT_ARGV, ValueBits.Undefined)
+      unsafe gc.release(&mut engine, rt, oldCallback)
+      unsafe gc.release(&mut engine, rt, oldArgv)
+      return false
+    }
+    Result<Value, JsException>.Failure { error } => {
+      if unsafe uncatchable(rt) { fail move error }
+      drop error
+      let thrown = unsafe exceptions.take(rt)
+      // onThrow(immediate, error) clears the callback and arguments and reports the error
+      // as uncaught (host.triggerUncaughtException); its own failure ends the run.
+      let reported = run Effect.result(promise.call(&mut engine, unsafe lendRealm(&context, context), unsafe lendFor(onThrow), unsafe lendFor(ValueBits.Undefined), &[object, thrown]))
+      unsafe gc.release(&mut engine, rt, thrown)
+      match move reported {
+        Result<Value, JsException>.Success { value } => { unsafe gc.release(&mut engine, rt, value.intoBits()) }
+        Result<Value, JsException>.Failure { error: reportFailed } => { fail move reportFailed }
+      }
+      return true
+    }
+  }
+}
+
+/// Gives up everything the queue and the setup hold (the runtime is closing).
+pub unsafe fn close<'m, S: EngineServices>(engine: &mut Engine<'m, S>, rt: *mut HeapHeader, state: *mut State) -> () {
+  let mut anchor = () let entry = unsafe borrow(&mut anchor, state)
+  let mut queue = Intrinsic.replace(entry.queue, List<ValueBits>.make())
+  let held = [entry.immediateTemplate, entry.scopeTemplate, entry.runSlow, entry.onThrow, entry.runNextTicks, entry.cachedScope, entry.spareImmediate]
+  entry.cachedScope = ValueBits.Undefined entry.spareImmediate = ValueBits.Undefined
+  entry.immediateTemplate = ValueBits.Undefined entry.scopeTemplate = ValueBits.Undefined entry.runSlow = ValueBits.Undefined
+  entry.onThrow = ValueBits.Undefined entry.runNextTicks = ValueBits.Undefined entry.count = 0 entry.refCount = 0
+  drop entry
+  let mut i: usize = 0
+  while i < queue.length() { unsafe gc.release(&mut engine, rt, queue.get(i)) i = i + 1 }
+  queue.clearAndFree()
+  let mut j: usize = 0
+  while j < 7 { unsafe gc.release(&mut engine, rt, held[j]) j = j + 1 }
+}
