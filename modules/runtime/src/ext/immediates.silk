@@ -20,12 +20,14 @@ import silk.core.option { Option }
 import silk.core.result { Result }
 import silk.collections.list { List }
 import silk.collections.slice { Slice }
+import silk.num.i32
 import silk.num.u32
 import silk.num.usize
 import silkjs.js_engine { Engine }
 import silkjs.js_engine_host { EngineServices }
+import silkjs.js_coercion_host { CoercionHooks }
 import silkjs.js_heap { HeapCell, HeapHeader }
-import silkjs.js_core_types { ObjectData, ObjectPayload, RuntimeState, ShapeData, SlotBits }
+import silkjs.js_core_types { FrameSlots, ObjectData, ObjectPayload, RuntimeState, ShapeData, SlotBits }
 import silkjs.js_value { ValueBits }
 import silkjs.js_owned_value { Value, lendFor }
 import silkjs.js_exceptions { JsException }
@@ -37,6 +39,7 @@ import silkjs.js_class_data as classes
 import silkjs.js_gc as gc
 import silkjs.js_runtime as runtime
 import silkjs.js_promise as promise
+import libs.core.common as common
 
 const MAX_ARGUMENTS: usize = 8
 const SLOT_CALLBACK: usize = 2
@@ -51,6 +54,10 @@ const SCOPE_ID: usize = 1
 const SCOPE_TRIGGER: usize = 2
 const SCOPE_RESOURCE: usize = 3
 const SCOPE_SLOTS: usize = 4
+/// async_hooks' { next } and the loop state { timerDue, timerRefed, immediateRefed, nativeRefs }.
+const IDS_SLOTS: usize = 1
+const LOOP_SLOTS: usize = 4
+const LOOP_IMMEDIATE_REFED: usize = 2
 
 pub struct State {
   /// The queued Immediates, each holding a reference.
@@ -73,6 +80,14 @@ pub struct State {
   cachedScope: ValueBits,
   /// A run Immediate nothing else held, kept for the next create to reuse.
   spareImmediate: ValueBits,
+  /// setImmediate (entry): timers.js's own setImmediate for anything but a plain
+  /// Immediate, async_hooks' id counter ({ next }), and the loop state whose
+  /// immediateRefed (slot LOOP_IMMEDIATE_REFED) it sets; the two objects' shapes then.
+  slowSet: ValueBits,
+  ids: ValueBits,
+  loopState: ValueBits,
+  idsShape: usize,
+  loopShape: usize,
   /// Something a native turn cannot see changed (a timer, a loop listener, worker
   /// messaging, a native immediate, a queued rejection): the next turn asks the loop.
   attention: bool
@@ -82,7 +97,8 @@ impl State {
   pub fn make() -> Self {
     return Self { queue: List<ValueBits>.make(), spare: List<ValueBits>.make(), count: 0, refCount: 0, slots: IMMEDIATE_SLOTS, hooks: false, running: false,
       immediateTemplate: ValueBits.Undefined, scopeTemplate: ValueBits.Undefined, runSlow: ValueBits.Undefined,
-      onThrow: ValueBits.Undefined, runNextTicks: ValueBits.Undefined, cachedScope: ValueBits.Undefined, spareImmediate: ValueBits.Undefined, attention: false }
+      onThrow: ValueBits.Undefined, runNextTicks: ValueBits.Undefined, cachedScope: ValueBits.Undefined, spareImmediate: ValueBits.Undefined,
+      slowSet: ValueBits.Undefined, ids: ValueBits.Undefined, loopState: ValueBits.Undefined, idsShape: 0, loopShape: 0, attention: false }
   }
 }
 
@@ -310,6 +326,78 @@ unsafe fn argumentAt(array: *mut HeapHeader, index: usize) -> ValueBits {
   return match &data.payload { ObjectPayload.FastArray { array: fast } => { if index < fast.values().length() { unsafe fast.values().getUnchecked(index) } else { ValueBits.Undefined } } _ => ValueBits.Undefined }
 }
 
+/// entry(slow, ids, loopState): what setImmediate needs (see State.slowSet). An object
+/// whose shape is not the expected one leaves every call to slow.
+pub unsafe fn setEntry<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, state: *mut State, slow: ValueBits, ids: ValueBits, loopState: ValueBits) -> () {
+  let rt = unsafe runtime.contextRuntime(context)
+  let idsShape = Pointer.address<HeapHeader>(unsafe Intrinsic.pointerRequalify<?*mut HeapHeader, *mut HeapHeader>(unsafe templateShape(ids, IDS_SLOTS)))
+  let loopShape = Pointer.address<HeapHeader>(unsafe Intrinsic.pointerRequalify<?*mut HeapHeader, *mut HeapHeader>(unsafe templateShape(loopState, LOOP_SLOTS)))
+  let mut anchor = () let entry = unsafe borrow(&mut anchor, state)
+  let old = [entry.slowSet, entry.ids, entry.loopState]
+  entry.slowSet = unsafe slow.retained() entry.ids = unsafe ids.retained() entry.loopState = unsafe loopState.retained()
+  entry.idsShape = idsShape entry.loopShape = loopShape
+  drop entry
+  let mut i: usize = 0
+  while i < 3 { unsafe gc.release(&mut engine, rt, old[i]) i = i + 1 }
+}
+/// value's object when its shape is at address shape (0: none).
+unsafe fn objectWithShape(value: ValueBits, shape: usize) -> ?*mut HeapHeader {
+  let node = match value { ValueBits.Object { reference } => reference _ => { return Pointer.null<HeapHeader>() } }
+  if shape == 0 || Pointer.address<HeapHeader>(unsafe shapeOf(node)) != shape { return Pointer.null<HeapHeader>() }
+  return unsafe Intrinsic.pointerRequalify<*mut HeapHeader, ?*mut HeapHeader>(node)
+}
+/// setImmediate(callback, ...args), Node's timers.setImmediate: a plain Immediate from the
+/// queue, made here without a JavaScript frame; anything else (hooks on, a callback that is
+/// not a function, a context with stores, many arguments) is the JavaScript setImmediate's.
+pub unsafe effect fn entry<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, state: *mut State, argc: usize, argv: &FrameSlots) -> ValueBits
+  ! OutOfMemoryError | JsException ? &mut Allocator {
+  let count = if argc < argv.length() { argc } else { argv.length() }
+  let mut anchor = () let held = unsafe borrow(&mut anchor, state)
+  let slow = held.slowSet let ids = held.ids let loopState = held.loopState let idsShape = held.idsShape let loopShape = held.loopShape
+  let hooks = held.hooks
+  drop held
+  let idsNode = unsafe objectWithShape(ids, idsShape)
+  let loopNode = unsafe objectWithShape(loopState, loopShape)
+  let callback = if count != 0 { unsafe argv.get(0) } else { ValueBits.Undefined }
+  let plain = !hooks && count != 0 && count - 1 <= MAX_ARGUMENTS && !Pointer.isNull<HeapHeader>(idsNode) && !Pointer.isNull<HeapHeader>(loopNode)
+    && callback.isObject() && engine.isCallable(unsafe lendRealm(&context, context), unsafe lendFor(callback))
+  if plain {
+    let counter = unsafe Intrinsic.pointerRequalify<?*mut HeapHeader, *mut HeapHeader>(idsNode)
+    let id = unsafe slot(counter, 0)
+    let next = match id {
+      ValueBits.Int { value } => { if value < 2147483647 { ValueBits.Int { value: value + 1 } } else { ValueBits.Float64 { value: i32.toF64(value) + 1.0 } } }
+      ValueBits.Float64 { value } => ValueBits.Float64 { value: value + 1.0 }
+      _ => ValueBits.Undefined
+    }
+    if next.isNumber() {
+      let _old = unsafe replaceSlot(counter, 0, next)
+      let mut array = ValueBits.Undefined
+      if count > 1 {
+        let mut values: [ValueBits; 8] = [ValueBits.Undefined; 8]
+        let mut i: usize = 1
+        while i < count { values[i - 1] = unsafe (unsafe argv.get(i)).retained() i = i + 1 }
+        let slots = FrameSlots { data: Pointer.fromMutRef<ValueBits>(&mut values[0]), count: count - 1 }
+        let memory = engine.memory
+        array = run unsafe common.arrayOfOwned(&mut engine, memory, context, &slots, count - 1)
+      }
+      let made = run Effect.result(unsafe create(&mut engine, context, state, callback, array, id))
+      let rt = unsafe runtime.contextRuntime(context)
+      unsafe gc.release(&mut engine, rt, array)
+      let immediate = match move made { Result<ValueBits, OutOfMemoryError>.Success { value } => value Result<ValueBits, OutOfMemoryError>.Failure { error } => { fail move error } }
+      if immediate.isObject() {
+        // binding.toggleImmediateRef(true)
+        let _was = unsafe replaceSlot(unsafe Intrinsic.pointerRequalify<?*mut HeapHeader, *mut HeapHeader>(loopNode), LOOP_IMMEDIATE_REFED, ValueBits.Bool { value: true })
+        return immediate
+      }
+      // Not one the queue takes (not set up yet, or a context with stores): the id goes
+      // back, for the JavaScript setImmediate to take.
+      let _taken = unsafe replaceSlot(counter, 0, id)
+    }
+  }
+  let all = FrameSlots { data: argv.data, count: count }
+  return run unsafe promise.callSlots(&mut engine, unsafe lendRealm(&context, context), unsafe lendFor(slow), unsafe lendFor(ValueBits.Undefined), &all)
+}
+
 /// The check phase's processImmediate. Returns false when another run is already going
 /// (a nested loop), else true. A failure leaves the Immediates not yet run at the front.
 pub unsafe effect fn runQueue<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, state: *mut State) -> bool
@@ -465,8 +553,9 @@ unsafe effect fn runOne<'m, S: EngineServices>(engine: &mut Engine<'m, S>, conte
 pub unsafe fn close<'m, S: EngineServices>(engine: &mut Engine<'m, S>, rt: *mut HeapHeader, state: *mut State) -> () {
   let mut anchor = () let entry = unsafe borrow(&mut anchor, state)
   let mut queue = Intrinsic.replace(entry.queue, List<ValueBits>.make())
-  let held = [entry.immediateTemplate, entry.scopeTemplate, entry.runSlow, entry.onThrow, entry.runNextTicks, entry.cachedScope, entry.spareImmediate]
+  let held = [entry.immediateTemplate, entry.scopeTemplate, entry.runSlow, entry.onThrow, entry.runNextTicks, entry.cachedScope, entry.spareImmediate, entry.slowSet, entry.ids, entry.loopState]
   entry.cachedScope = ValueBits.Undefined entry.spareImmediate = ValueBits.Undefined
+  entry.slowSet = ValueBits.Undefined entry.ids = ValueBits.Undefined entry.loopState = ValueBits.Undefined entry.idsShape = 0 entry.loopShape = 0
   entry.immediateTemplate = ValueBits.Undefined entry.scopeTemplate = ValueBits.Undefined entry.runSlow = ValueBits.Undefined
   entry.onThrow = ValueBits.Undefined entry.runNextTicks = ValueBits.Undefined entry.count = 0 entry.refCount = 0
   drop entry
@@ -474,5 +563,5 @@ pub unsafe fn close<'m, S: EngineServices>(engine: &mut Engine<'m, S>, rt: *mut 
   while i < queue.length() { unsafe gc.release(&mut engine, rt, queue.get(i)) i = i + 1 }
   queue.clearAndFree()
   let mut j: usize = 0
-  while j < 7 { unsafe gc.release(&mut engine, rt, held[j]) j = j + 1 }
+  while j < 10 { unsafe gc.release(&mut engine, rt, held[j]) j = j + 1 }
 }
