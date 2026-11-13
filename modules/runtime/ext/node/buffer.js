@@ -91,6 +91,7 @@ const validateOffset = (value, name, min = 0, max = kMaxLength) =>
 
 const {
   FastBuffer,
+  makeFastBuffer,
   markAsUntransferable,
   addBufferPrototypeMethods,
   createUnsafeBuffer,
@@ -103,6 +104,7 @@ const {
   ArrayBufferIsView,
   ArrayIsArray,
   ArrayPrototypeForEach,
+  MathCeil,
   MathMin,
   MathTrunc,
   NumberIsInteger,
@@ -165,24 +167,39 @@ const constants = ObjectDefineProperties({}, {
 });
 
 Buffer.poolSize = 64 * 1024;
-let poolSize, poolOffset, allocPool, allocBuffer;
+
+// Node's allocPool and poolOffset live in the native pool (bufferCodec.operation
+// 70): poolAllocate(size) takes size bytes from it as allocate() did, making a
+// new pool with createPool when the current one has no room, and fromString's
+// pool path is native too. Slices stay 8-byte aligned.
+function nativeNamed(operation, fallback, length, pool, name) {
+  const method = host.bufferOperation(operation, fallback, length, pool);
+  ObjectDefineProperty(method, 'name', { __proto__: null, value: name, configurable: true });
+  return method;
+}
 
 function createPool() {
-  poolSize = Buffer.poolSize;
-  allocBuffer = createUnsafeBuffer(poolSize);
-  allocPool = allocBuffer.buffer;
-  markAsUntransferable(allocPool);
-  poolOffset = 0;
+  const pool = createUnsafeBuffer(Buffer.poolSize);
+  markAsUntransferable(pool.buffer);
+  return pool;
 }
-createPool();
 
-function alignPool() {
-  // Ensure aligned slices
-  if (poolOffset & 0x7) {
-    poolOffset |= 0x7;
-    poolOffset++;
+// What the native pool leaves to JavaScript: no bytes, a size it does not serve,
+// or a size that is not an integer number (pool offsets advance by whole bytes).
+// An integer size the pool declined (it could not read its pool) gets its own bytes.
+function allocateSlow(size) {
+  if (size <= 0) {
+    return makeFastBuffer();
   }
+  if (size < (Buffer.poolSize >>> 1) && !NumberIsInteger(size)) {
+    const length = MathCeil(size);
+    const b = allocate(length);
+    return length === size ? b : makeFastBuffer(b.buffer, b.byteOffset, size);
+  }
+  return createUnsafeBuffer(size);
 }
+const allocate = host.bufferOperation(70, allocateSlow, 1, createPool, Buffer, FastBuffer, undefined, 0);
+const poolTrim = host.bufferOperation(71, (b, actual) => makeFastBuffer(b.buffer, b.byteOffset, actual), 2, allocate);
 
 let bufferWarningAlreadyEmitted = false;
 let nodeModulesCheckCounter = 0;
@@ -317,7 +334,7 @@ ObjectDefineProperty(Buffer, SymbolSpecies, {
  * @param {number} [length]
  * @returns {Buffer}
  */
-Buffer.from = function from(value, encodingOrOffset, length) {
+function from(value, encodingOrOffset, length) {
   if (typeof value === 'string')
     return fromString(value, encodingOrOffset);
 
@@ -349,7 +366,9 @@ Buffer.from = function from(value, encodingOrOffset, length) {
     ['string', 'Buffer', 'ArrayBuffer', 'Array', 'Array-like Object'],
     value,
   );
-};
+}
+// Strings on the pool natively (bufferCodec.operation 72); the rest as above.
+Buffer.from = nativeNamed(72, from, 3, allocate, 'from');
 
 /**
  * Creates the Buffer as a copy of the underlying ArrayBuffer of the view
@@ -366,7 +385,7 @@ Buffer.copyBytesFrom = function copyBytesFrom(view, offset, length) {
 
   const viewLength = TypedArrayPrototypeGetLength(view);
   if (viewLength === 0) {
-    return new FastBuffer();
+    return makeFastBuffer();
   }
 
   let start = 0;
@@ -374,7 +393,7 @@ Buffer.copyBytesFrom = function copyBytesFrom(view, offset, length) {
 
   if (offset !== undefined) {
     validateInteger(offset, 'offset', 0);
-    if (offset >= viewLength) return new FastBuffer();
+    if (offset >= viewLength) return makeFastBuffer();
     start = offset;
   }
 
@@ -384,7 +403,7 @@ Buffer.copyBytesFrom = function copyBytesFrom(view, offset, length) {
     end = MathMin(start + length, viewLength);
   }
 
-  if (end <= start) return new FastBuffer();
+  if (end <= start) return makeFastBuffer();
 
   const viewByteLength = TypedArrayPrototypeGetByteLength(view);
   const elementSize = viewByteLength / viewLength;
@@ -406,7 +425,7 @@ Buffer.copyBytesFrom = function copyBytesFrom(view, offset, length) {
 // Refs: https://esdiscuss.org/topic/isconstructor#content-11
 const of = (...items) => {
   const len = items.length;
-  const newObj = new FastBuffer(len); // In heap for small sizes
+  const newObj = makeFastBuffer(len); // In heap for small sizes
   for (let k = 0; k < len; k++)
     newObj[k] = items[k];
   return newObj;
@@ -426,7 +445,7 @@ Buffer.alloc = function alloc(size, fill, encoding) {
     const buf = createUnsafeBuffer(size);
     return _fill(buf, fill, 0, buf.length, encoding);
   }
-  return new FastBuffer(size);
+  return makeFastBuffer(size);
 };
 
 /**
@@ -434,10 +453,11 @@ Buffer.alloc = function alloc(size, fill, encoding) {
  * instance. If `--zero-fill-buffers` is set, will zero-fill the buffer.
  * @returns {FastBuffer}
  */
-Buffer.allocUnsafe = function allocUnsafe(size) {
+function allocUnsafe(size) {
   validateNumber(size, 'size', 0, kMaxLength);
   return allocate(size);
-};
+}
+Buffer.allocUnsafe = nativeNamed(73, allocUnsafe, 1, allocate, 'allocUnsafe');
 
 /**
  * Equivalent to SlowBuffer(num), by default creates a non-zero-filled
@@ -461,20 +481,6 @@ function SlowBuffer(size) {
 ObjectSetPrototypeOf(SlowBuffer.prototype, Uint8ArrayPrototype);
 ObjectSetPrototypeOf(SlowBuffer, Uint8Array);
 
-function allocate(size) {
-  if (size <= 0) {
-    return new FastBuffer();
-  }
-  if (size < (Buffer.poolSize >>> 1)) {
-    if (size > (poolSize - poolOffset))
-      createPool();
-    const b = new FastBuffer(allocPool, poolOffset, size);
-    poolOffset += size;
-    alignPool();
-    return b;
-  }
-  return createUnsafeBuffer(size);
-}
 
 function fromStringFast(string, ops) {
   const maxLength = Buffer.poolSize >>> 1;
@@ -492,21 +498,16 @@ function fromStringFast(string, ops) {
   if (length >= maxLength)
     return createFromString(string, ops, length);
 
-  if (length > (poolSize - poolOffset))
-    createPool();
-
-  const actual = ops.write(allocBuffer, string, poolOffset, length);
-  const b = new FastBuffer(allocPool, poolOffset, actual);
-
-  poolOffset += actual;
-  alignPool();
-  return b;
+  // The pool's next length bytes; the bytes not written go back to it.
+  const b = allocate(length);
+  const actual = ops.write(b, string, 0, length);
+  return actual < length ? poolTrim(b, actual) : b;
 }
 
 function createFromString(string, ops, length = ops.byteLength(string)) {
   const buf = Buffer.allocUnsafeSlow(length);
   const actual = ops.write(buf, string, 0, length);
-  return actual < length ? new FastBuffer(buf.buffer, 0, actual) : buf;
+  return actual < length ? makeFastBuffer(buf.buffer, 0, actual) : buf;
 }
 
 function fromString(string, encoding) {
@@ -519,7 +520,7 @@ function fromString(string, encoding) {
       throw new ERR_UNKNOWN_ENCODING(encoding);
   }
 
-  return string.length === 0 ? new FastBuffer() : fromStringFast(string, ops);
+  return string.length === 0 ? makeFastBuffer() : fromStringFast(string, ops);
 }
 
 function fromArrayBuffer(obj, byteOffset, length) {
@@ -548,29 +549,25 @@ function fromArrayBuffer(obj, byteOffset, length) {
     }
   }
 
-  return new FastBuffer(obj, byteOffset, length);
+  return makeFastBuffer(obj, byteOffset, length);
 }
 
 function fromArrayLike(obj) {
   const { length } = obj;
   if (length <= 0)
-    return new FastBuffer();
+    return makeFastBuffer();
   if (length < (Buffer.poolSize >>> 1)) {
-    if (length > (poolSize - poolOffset))
-      createPool();
-    const b = new FastBuffer(allocPool, poolOffset, length);
+    const b = allocate(length);
     TypedArrayPrototypeSet(b, obj, 0);
-    poolOffset += length;
-    alignPool();
     return b;
   }
-  return new FastBuffer(obj);
+  return makeFastBuffer(obj);
 }
 
 function fromObject(obj) {
   if (obj.length !== undefined || isAnyArrayBuffer(obj.buffer)) {
     if (typeof obj.length !== 'number') {
-      return new FastBuffer();
+      return makeFastBuffer();
     }
     return fromArrayLike(obj);
   }
@@ -607,11 +604,11 @@ Buffer.isEncoding = function isEncoding(encoding) {
          normalizeEncoding(encoding) !== undefined;
 };
 
-Buffer.concat = function concat(list, length) {
+function concat(list, length) {
   validateArray(list, 'list');
 
   if (list.length === 0)
-    return new FastBuffer();
+    return makeFastBuffer();
 
   if (length === undefined) {
     length = 0;
@@ -676,7 +673,8 @@ Buffer.concat = function concat(list, length) {
   }
 
   return buffer;
-};
+}
+Buffer.concat = nativeNamed(74, concat, 2, allocate, 'concat');
 
 function base64ByteLength(str, bytes) {
   // Handle padding
@@ -866,7 +864,7 @@ function byteLength(string, encoding) {
   return ops.byteLength(string);
 }
 
-Buffer.byteLength = byteLength;
+Buffer.byteLength = nativeNamed(75, byteLength, 2, allocate, 'byteLength');
 
 // For backwards compatibility.
 ObjectDefineProperty(Buffer.prototype, 'parent', {
@@ -897,7 +895,7 @@ Buffer.prototype.copy =
 // property of a typed array.
 // This behaves neither like String nor Uint8Array in that we set start/end
 // to their upper/lower bounds if the value passed is out of range.
-Buffer.prototype.toString = function toString(encoding, start, end) {
+function toString(encoding, start, end) {
   // utf8 with integer offsets (or none) decodes natively; the codec declines
   // with undefined anything the generic path below must handle.
   if (encoding === 'utf8' || encoding === undefined) {
@@ -933,7 +931,8 @@ Buffer.prototype.toString = function toString(encoding, start, end) {
     throw new ERR_UNKNOWN_ENCODING(encoding);
 
   return ops.slice(this, start, end);
-};
+}
+Buffer.prototype.toString = nativeNamed(76, toString, 3, allocate, 'toString');
 
 Buffer.prototype.equals = function equals(otherBuffer) {
   if (!isUint8Array(otherBuffer)) {
@@ -1199,7 +1198,7 @@ function _fill(buf, value, offset, end, encoding) {
   return buf;
 }
 
-Buffer.prototype.write = function write(string, offset, length, encoding) {
+function write(string, offset, length, encoding) {
   const bufferLength = TypedArrayPrototypeGetLength(this);
   // Buffer#write(string);
   if (offset === undefined) {
@@ -1238,7 +1237,8 @@ Buffer.prototype.write = function write(string, offset, length, encoding) {
   if (ops === undefined)
     throw new ERR_UNKNOWN_ENCODING(encoding);
   return ops.write(this, string, offset, length);
-};
+}
+Buffer.prototype.write = nativeNamed(77, write, 4, allocate, 'write');
 
 Buffer.prototype.toJSON = function toJSON() {
   const bufferLength = TypedArrayPrototypeGetLength(this);
@@ -1268,7 +1268,7 @@ function adjustOffset(offset, length) {
   return NumberIsNaN(offset) ? 0 : length;
 }
 
-Buffer.prototype.subarray = function subarray(start, end) {
+function subarray(start, end) {
   // Integer offsets on a Uint8Array take the native view (bufferCodec 9).
   const view = bufferCodec(9, this, start, end, FastBuffer);
   if (view !== undefined) return view;
@@ -1276,8 +1276,9 @@ Buffer.prototype.subarray = function subarray(start, end) {
   start = adjustOffset(start, srcLength);
   end = end !== undefined ? adjustOffset(end, srcLength) : srcLength;
   const newLength = end > start ? end - start : 0;
-  return new FastBuffer(this.buffer, this.byteOffset + start, newLength);
-};
+  return makeFastBuffer(this.buffer, this.byteOffset + start, newLength);
+}
+Buffer.prototype.subarray = nativeNamed(78, subarray, 2, allocate, 'subarray');
 
 Buffer.prototype.slice = function slice(start, end) {
   return this.subarray(start, end);
@@ -1359,7 +1360,7 @@ function transcode(source, fromEncoding, toEncoding) {
     throw new ERR_INVALID_ARG_TYPE('source',
                                    ['Buffer', 'Uint8Array'], source);
   }
-  if (source.length === 0) return new FastBuffer();
+  if (source.length === 0) return makeFastBuffer();
 
   fromEncoding = normalizeEncoding(fromEncoding) || fromEncoding;
   toEncoding = normalizeEncoding(toEncoding) || toEncoding;
