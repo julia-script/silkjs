@@ -82,4 +82,10 @@ function stripTypeScriptModuleTypes(source, filename, mode = 'strip-only', sourc
   return processTypeScriptCode(source, { mode, sourceMap, filename: sourceURL });
 }
 
-module.exports = { stripTypeScriptTypes, stripTypeScriptModuleTypes };
+// The test runner's coverage maps a TypeScript file's lines through its stripped code.
+function stripTypeScriptTypesForCoverage(code) {
+  validateString(code, 'code');
+  return processTypeScriptCode(code, { mode: 'strip-only' });
+}
+
+module.exports = { stripTypeScriptTypes, stripTypeScriptModuleTypes, stripTypeScriptTypesForCoverage };
