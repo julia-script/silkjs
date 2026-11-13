@@ -153,6 +153,13 @@ function normalizeSpawnArguments(file, args, options) {
     env = env || { ...process.env };
     copyPermissionModelFlagsToEnv(env, 'NODE_OPTIONS', args);
   }
+  // process.env.NODE_V8_COVERAGE always propagates, so programs that spawn with a
+  // white-listed environment are covered too (Node's copyProcessEnvToEnv).
+  // Like Node, this writes to options.env itself.
+  if (env && env !== process.env && process.env.NODE_V8_COVERAGE &&
+      !Object.prototype.hasOwnProperty.call(env, 'NODE_V8_COVERAGE')) {
+    env.NODE_V8_COVERAGE = process.env.NODE_V8_COVERAGE;
+  }
   const inherit = !env || env === process.env;
   if (!inherit) {
     envPairs = [];

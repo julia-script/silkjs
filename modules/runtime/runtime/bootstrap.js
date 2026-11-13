@@ -155,7 +155,7 @@ host.stripTypeScriptModuleTypes = (source, filename, sourceURL = filename) => {
   }
   // --experimental-transform-types implies --enable-source-maps unless it is turned off.
   const mode = transform ? 'transform' : 'strip-only', sourceMap = transform && host.enableSourceMaps !== false;
-  const strip = () => internalRequire('internal/typescript').stripTypeScriptModuleTypes(source, filename, mode, sourceMap, sourceURL);
+  const strip = () => internalRequire('internal/modules/typescript').stripTypeScriptModuleTypes(source, filename, mode, sourceMap, sourceURL);
   return moduleHas('internal/compile_cache') ? internalRequire('internal/compile_cache').transpile(source, filename, mode, sourceMap, strip) : strip();
 };
 // These ephemeron registries share brands without rooting other realms. Only
@@ -1995,6 +1995,11 @@ globalThis.__silkRuntime = {
   asyncDestroy: asyncHooks._nativeDestroy,
   drainDestroy: asyncHooks._drainDestroy,
   workerError: workerThreads._reportError,
+  // A worker that terminate() stopped still ends its profilers (Node's EndStartedProfilers).
+  stopped() {
+    if (moduleHas('internal/heap_prof')) internalRequire('internal/heap_prof').finish();
+    if (moduleHas('internal/profiler_binding')) internalRequire('internal/profiler_binding').finish();
+  },
   run: () => invoke(run, undefined, []), loop, onRejection,
   // The loop for an embedder (src/runtime/embed.silk).
   loopStart, loopTimeout, loopEnd,
