@@ -17,7 +17,7 @@ import js_string_types { AtomRegistry, AtomSlot }
 import runtime_memory { AllocationObserver }
 import js_heap { HeapCell, HeapHeader, HeapKind, CellRef }
 import silk.core.ownership { Copy }
-import js_core_types { ObjectData, ObjectPayload, ObjectPayloadFamily, ShapeData, JS_PROP_TMASK, JS_PROP_GETSET,
+import js_core_types { ObjectData, ObjectPayload, ObjectPayloadFamily, ShapeData,
   PropertyEnum, RuntimeState, NativeErrorKind, JS_PROP_ENUMERABLE, OwnedAtom }
 import js_value { ValueBits }
 import js_intl_realm as ops
@@ -27,6 +27,7 @@ import js_object_ref { ObjectRef }
 import js_atoms { ATOM_INTEGER_TAG }
 import js_gc { HeapHooks, Tracer }
 import js_gc as gc
+import js_shapes as shapes
 import js_runtime as runtime
 import js_class_data as classes
 import js_object_allocate as objects
@@ -246,43 +247,40 @@ unsafe fn quietChain(prototype: ?*mut HeapHeader) -> bool {
   }
   return true
 }
-/// The receiver's own enumerable string keys in for-in order, read from its
-/// shape, when they are all that for-in visits: object is ordinary with every
-/// property in its shape, none integer-like (those come first), and its
-/// prototype chain is quiet. Sets version to its shape's. None when it does not apply.
-unsafe effect fn ownTable<'a, 'o>(realm: Realm<'a>, object: ValueRef<'o>, version: &mut u64) -> Option<List<PropertyEnum>> ! OutOfMemoryError ? &mut Allocator {
-  if !object.view().isObject() { return Option<List<PropertyEnum>>.none() }
+/// Fills table with the receiver's own enumerable string keys in for-in order,
+/// from its shape's enumeration cache (js_shapes.enumKeys), when they are all
+/// that for-in visits: object is ordinary with every property in its shape, none
+/// integer-like (those come first), and its prototype chain is quiet (checked
+/// once per RuntimeState.shapeEpoch). Sets version to its shape's. False, with
+/// table untouched, when it does not apply.
+unsafe effect fn ownTable<'a, 'o>(realm: Realm<'a>, object: ValueRef<'o>, table: &mut List<PropertyEnum>, version: &mut u64) -> bool ! OutOfMemoryError ? &mut Allocator {
+  if !object.view().isObject() { return false }
   let anchor = () let data = ObjectRef.of(object).data(&anchor)
-  if data.isExotic() || data.fastArray() { return Option<List<PropertyEnum>>.none() }
-  let shape = unsafe HeapCell.payload<ShapeData, ()>(&anchor, data.shape)
-  let count = shape.properties.length()
-  if data.slotCount() != count || !unsafe quietChain(shape.prototype) { return Option<List<PropertyEnum>>.none() }
-  let state = realm.runtimeState(&anchor)
-  let mut listed: usize = 0
-  let mut i: usize = 0
-  while i < count {
-    let property = unsafe shape.properties.getUnchecked(i)
-    i = i + 1
-    if property.atom == 0 { continue }
-    if (property.atom & ATOM_INTEGER_TAG) != 0 { return Option<List<PropertyEnum>>.none() }
-    let flags = u8.toU32(property.flags)
-    if (flags & JS_PROP_ENUMERABLE) == 0 { continue }
-    let kind = flags & JS_PROP_TMASK
-    if kind != 0 && kind != JS_PROP_GETSET { return Option<List<PropertyEnum>>.none() }
-    if state.atoms.borrowedString(property.atom).isString() { listed = listed + 1 }
+  if data.isExotic() || data.fastArray() { return false }
+  let shapeNode = data.shape
+  if data.slotCount() != (unsafe HeapCell.payload<ShapeData, ()>(&anchor, shapeNode)).properties.length() { return false }
+  drop data
+  let runtime = realm.runtime()
+  let kind = run unsafe shapes.enumKeys(runtime, shapeNode)
+  if kind == shapes.ENUM_UNSUPPORTED { return false }
+  let epoch = realm.runtimeState(&anchor).shapeEpoch
+  let mut shapeAnchor = ()
+  let shape = unsafe HeapCell.payloadMut<ShapeData, ()>(&mut shapeAnchor, shapeNode)
+  if shape.quietEpoch != epoch {
+    if !unsafe quietChain(shape.prototype) { return false }
+    shape.quietEpoch = epoch
   }
-  let mut table = List<PropertyEnum>.make()
+  let listed = shape.enumKeys.length()
   run table.reserveExact(listed)
-  i = 0
-  while i < count {
-    let property = unsafe shape.properties.getUnchecked(i)
+  let state = realm.runtimeState(&anchor)
+  let mut i: usize = 0
+  while i < listed {
+    let atom = state.atoms.atomOfString(shape.enumKeys.get(i))
+    run table.append(PropertyEnum { atom: state.atoms.duplicate(atom), isEnumerable: true })
     i = i + 1
-    if property.atom == 0 || (u8.toU32(property.flags) & JS_PROP_ENUMERABLE) == 0 { continue }
-    if !state.atoms.borrowedString(property.atom).isString() { continue }
-    run table.append(PropertyEnum { atom: state.atoms.duplicate(property.atom), isEnumerable: true })
   }
   version.* = shape.version
-  return Option<List<PropertyEnum>>.some(move table)
+  return true
 }
 /// Whether object still has a shape of version, so every key ownTable listed
 /// for it is still an own enumerable property.
@@ -310,21 +308,44 @@ effect fn initialize<'a, 'b, H: HeapHooks + OwnKeysHooks + OwnPropertyHooks + Co
     }
     Option<usize>.None => {
       let mut version: u64 = 0
-      let quick = run Effect.result(unsafe ownTable(realm, object, &mut version))
+      let mut anchor = () let state = snapshot.getMut(&mut anchor)
+      let quick = run Effect.result(unsafe ownTable(realm, object, &mut state.atoms, &mut version))
       match move quick {
-        Result<Option<List<PropertyEnum>>, OutOfMemoryError>.Success { value: Option<List<PropertyEnum>>.Some { value: table } } => {
-          installTable(realm, snapshot, move table, false)
-          let mut anchor = () let state = snapshot.getMut(&mut anchor)
-          state.ownOnly = true state.version = version
-          return ()
+        Result<bool, OutOfMemoryError>.Success { value: listed } => {
+          if listed {
+            state.count = state.atoms.length() state.isArray = false
+            state.ownOnly = true state.version = version
+            return ()
+          }
         }
-        Result<Option<List<PropertyEnum>>, OutOfMemoryError>.Success { .. } => ()
-        Result<Option<List<PropertyEnum>>, OutOfMemoryError>.Failure { error: _error } => { return run outOfMemory(&mut hooks, realm) }
+        Result<bool, OutOfMemoryError>.Failure { error: _error } => { drop state return run outOfMemory(&mut hooks, realm) }
       }
+      drop state
       let table = run ownNames(&mut hooks, realm, object, JS_GPN_STRING_MASK | JS_GPN_SET_ENUM)
       installTable(realm, snapshot, move table, false)
     }
   }
+}
+/// The parked for-in iterator (RuntimeState.parkedForIn) with one more count,
+/// when no loop holds it (the park's count is its only one); Undefined otherwise.
+unsafe fn takeParked<'a>(realm: Realm<'a>) -> ValueBits {
+  let anchor = ()
+  let parked = realm.runtimeState(&anchor).parkedForIn
+  let node = match parked { ValueBits.Object { reference } => reference _ => { return ValueBits.Undefined } }
+  let mut headerAnchor = ()
+  let header = unsafe Pointer.borrowMut<(), HeapHeader>(&mut headerAnchor, node)
+  if header.referenceCount != 1 { return ValueBits.Undefined }
+  header.referenceCount = 2
+  return parked
+}
+/// Parks a fresh iterator, with a count of its own, when none is parked.
+unsafe fn park<'a>(realm: Realm<'a>, iterator: ValueBits) -> () {
+  let mut anchor = ()
+  let state = realm.runtimeStateMut(&mut anchor)
+  if state.parkedForIn.tag() != 3 { return () }
+  let node = match iterator { ValueBits.Object { reference } => reference _ => { return () } }
+  unsafe HeapCell.retain(node)
+  state.parkedForIn = iterator
 }
 unsafe effect fn buildOwned<'a, H: HeapHooks + OwnKeysHooks + OwnPropertyHooks + CoercionHooks + PropertyWriteHooks>(hooks: &mut H,
   memory: &AllocationObserver, realm: Realm<'a>, input: ValueBits) -> ValueBits ! JsException ? &mut Allocator {
@@ -333,6 +354,25 @@ unsafe effect fn buildOwned<'a, H: HeapHooks + OwnKeysHooks + OwnPropertyHooks +
   if !object.isObject() && object.tag() != 2 && object.tag() != 3 {
     object = run boxing.toObjectFree(&mut hooks, memory, realm, unsafe Value.adoptBits(object))
     if object.isException() { fail JsException {} }
+  }
+  // The parked iterator, when no loop holds it: its State and table storage
+  // are reset and reused rather than made and freed per loop.
+  let parked = unsafe takeParked(realm)
+  if let ValueBits.Object { reference: parkedNode } = parked {
+    let cell = match Pointer.nonNullMut<HeapHeader>(unsafe storage(parkedNode)) { Option<*mut HeapHeader>.Some { value } => value Option<*mut HeapHeader>.None => invariant() }
+    let mut stateAnchor = () let state = unsafe HeapCell.payloadMut<State, ()>(&mut stateAnchor, cell)
+    let previous = Intrinsic.replace(state.object, unsafe Value.adoptBits(object))
+    let mut i: usize = 0
+    while i < state.atoms.length() { realm.releaseAtom(state.atoms.get(i).atom) i = i + 1 }
+    state.atoms.clear()
+    state.index = 0 state.count = 0 state.inPrototypeChain = false state.isArray = false state.ownOnly = false state.version = 0
+    drop state
+    realm.release(&mut hooks, move previous)
+    let reused = run Effect.result(initialize(&mut hooks, realm, unsafe lendBits(&parked, parked), unsafe lendBits(&object, object)))
+    return match move reused {
+      Result<(), JsException>.Success { .. } => parked
+      Result<(), JsException>.Failure { error } => { unsafe gc.release(&mut hooks, rt, parked) fail move error }
+    }
   }
   let allocated = run Effect.result(HeapCell.allocate(HeapKind.Auxiliary, State { object: Value.immediate(ValueBits.Undefined),
     index: 0, count: 0, inPrototypeChain: false, isArray: false, atoms: List<PropertyEnum>.make(), ownOnly: false, version: 0 }))
@@ -358,6 +398,7 @@ unsafe effect fn buildOwned<'a, H: HeapHooks + OwnKeysHooks + OwnPropertyHooks +
   state.object = unsafe Value.adoptBits(object) drop state
   let data = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut anchor, reference(iterator))
   data.payload = ObjectPayload.Opaque { family: ObjectPayloadFamily.ForInIterator, reference: node } drop data
+  unsafe park(realm, iterator)
   let initialized = run Effect.result(initialize(&mut hooks, realm, unsafe lendBits(&iterator, iterator), unsafe lendBits(&object, object)))
   return match move initialized {
     Result<(), JsException>.Success { .. } => iterator
@@ -512,7 +553,12 @@ pub unsafe fn quickNext(runtime: *mut HeapHeader, iterator: ValueBits) -> ValueB
   let index = state.index
   if state.ownOnly {
     // Done, or a listed key the object still holds under the same shape.
-    if index >= state.count { return ValueBits.Undefined }
+    if index >= state.count {
+      // Done: let go of the object now unless that would free it (which
+      // needs the collector's hooks); a later reuse or collection does then.
+      if unsafe gc.releaseIfShared(state.object.view()) { let _released = state.object.take().intoBits() }
+      return ValueBits.Undefined
+    }
     if !sameShape(state.object.borrow(), state.version) { return ValueBits.Uninitialized }
     let atom = state.atoms.get(index).atom
     state.index = index + 1
