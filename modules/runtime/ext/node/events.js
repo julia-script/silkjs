@@ -1092,7 +1092,7 @@ function on(emitter, event, options = kEmptyObject) {
   validateInteger(lowWatermark, 'options.lowWaterMark', 1);
 
   // Preparing controlling queues and variables
-  FixedQueue ??= require('internal/path_events/fixed_queue');
+  FixedQueue ??= require('internal/fixed_queue');
   const unconsumedEvents = new FixedQueue();
   const unconsumedPromises = new FixedQueue();
   let paused = false;

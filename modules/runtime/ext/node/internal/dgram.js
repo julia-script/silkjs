@@ -64,7 +64,13 @@ class UDP {
   }
   // A handle without a family has no socket yet: libuv answers EBADF for it.
   call(operation, ...args) { return this.id === null ? UV_EBADF : host.net(operation, [this.id, ...args]); }
-  get fd() { const fd = this.closed ? -1 : this.call('fileno'); return fd >= 0 ? fd : -1; }
+  // HandleWrap's fd accessor throws for a receiver that is no handle.
+  #handle = true;
+  get fd() {
+    if (!(#handle in this)) throw new TypeError('Illegal invocation');
+    const fd = this.closed ? -1 : this.call('fileno');
+    return fd >= 0 ? fd : -1;
+  }
   // Node's handle.lookup: an IP literal of the socket's family resolves to itself.
   lookup(address, callback) {
     address ||= this.family === 4 ? '127.0.0.1' : '::1';
@@ -94,6 +100,9 @@ class UDP {
     }
     return status;
   }
+  // UDPWrap's send6 and connect6: the handle's family already decides how ip parses.
+  send6(request, list, port, ip) { return this.send(request, list, port, ip); }
+  connect6(ip, port) { return this.connect(ip, port); }
   address(peer) { return this.call('address', peer); }
   // UDPWrap's getsockname/getpeername fill `out` and return a status.
   getsockname(out) { const result = this.address(false); if (typeof result === 'number') return result; Object.assign(out, result); return 0; }
@@ -109,11 +118,13 @@ class UDP {
   getSendQueueSize() { return this.queueSize; }
   getSendQueueCount() { return this.requests.size; }
   // Like a closed UDPWrap, pending sends never call back.
-  close() {
+  // HandleWrap::Close: the callback runs once the handle is closed.
+  close(callback) {
     if (this.closed) return;
     this.closed = true;
     this.requests.clear();
     this.queueSize = 0;
+    if (typeof callback === 'function') process.nextTick(() => Reflect.apply(callback, this, []));
     if (this.id === null) { this.resource.emitDestroy(); return; }
     host.net('close', [this.id]);
   }

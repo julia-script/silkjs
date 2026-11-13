@@ -136,6 +136,32 @@ function maybeClose(subprocess) {
     subprocess._resource.emitDestroy();
   }
 }
+// process_wrap.cc's Process over the native child watcher: a HandleWrap that keeps the loop
+// alive while referenced, until it is closed. A closed handle's exit is never reported.
+class Process {
+  #id; #referenced = true; #closed = false;
+  constructor(id) { this.#id = id; }
+  kill(signal) { return native('kill', [this.#id, signal]); }
+  ref() {
+    if (this.#closed) return;
+    this.#referenced = true;
+    native('ref', [this.#id]);
+  }
+  unref() {
+    if (this.#closed) return;
+    this.#referenced = false;
+    native('unref', [this.#id]);
+  }
+  hasRef() { return this.#referenced && !this.#closed; }
+  close(callback) {
+    if (this.#closed) return;
+    this.#closed = true;
+    native('unref', [this.#id]);
+    if (typeof callback === 'function') process.nextTick(() => Reflect.apply(callback, this, []));
+  }
+  get closed() { return this.#closed; }
+}
+
 class ChildProcess extends EventEmitter {
   constructor() {
     super();
@@ -154,6 +180,7 @@ class ChildProcess extends EventEmitter {
     if (signal) this.signalCode = signalName(signal) ?? null;
     else this.exitCode = exitCode;
     this.stdin?.destroy();
+    this._handle?.close();
     this._handle = null;
     if (exitCode < 0) {
       const syscall = this.spawnfile ? 'spawn ' + this.spawnfile : 'spawn';
@@ -194,10 +221,11 @@ class ChildProcess extends EventEmitter {
     tracing?.start.publish({ process: this, options });
     const result = native('spawn', [options.file, argv.map(String).join('\0') + '\0', nativeEnvironment(options),
       nativeCwd(options.cwd), stdio.map(nativeFd), flags, options.uid >>> 0, options.gid >>> 0, (code, signal) => {
+        if (handle?.closed) return;
         host.invokeResource(this._resource, this._onexit, this, [code, signal], false);
         host.checkpoint();
       }]);
-    let err = 0;
+    let err = 0, handle;
     if (typeof result === 'number') {
       err = result;
       const code = native('errorName', [err]);
@@ -211,7 +239,7 @@ class ChildProcess extends EventEmitter {
       if (code === 'EMFILE' || code === 'ENFILE') return err;
       this.pid = undefined;
     } else {
-      this._handle = result[0];
+      this._handle = handle = new Process(result[0]);
       this.pid = result[1];
       tracing?.end.publish({ process: this });
       process.nextTick(() => this.emit('spawn'));
@@ -253,7 +281,7 @@ class ChildProcess extends EventEmitter {
   kill(sig) {
     const signal = sig === 0 ? sig : convertToValidSignal(sig === undefined ? 'SIGTERM' : sig);
     if (this._handle) {
-      const err = native('kill', [this._handle, signal]);
+      const err = this._handle.kill(signal);
       if (err === 0) { this.killed = true; return true; }
       const code = native('errorName', [err]);
       if (code === 'ESRCH') { /* Already dead. */ }
@@ -262,8 +290,8 @@ class ChildProcess extends EventEmitter {
     }
     return false;
   }
-  ref() { if (this._handle) native('ref', [this._handle]); }
-  unref() { if (this._handle) native('unref', [this._handle]); }
+  ref() { this._handle?.ref(); }
+  unref() { this._handle?.unref(); }
   [Symbol.dispose]() { if (!this.killed) this.kill(); }
 }
 

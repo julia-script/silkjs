@@ -19,7 +19,7 @@ function scalarString(value) {
 }
 function optionsObject(options) {
   if (options == null) return {};
-  if (typeof options !== 'object' && typeof options !== 'function') throw new TypeError('Options must be an object');
+  require('internal/validators').validateDictionary(options, 'options');
   return options;
 }
 function normalizeType(value = '') {
@@ -28,7 +28,7 @@ function normalizeType(value = '') {
 }
 function state(blob) {
   const value = blobs.get(blob);
-  if (!value) throw new TypeError('Value of this must be of type Blob');
+  if (!value) throw new (require('internal/errors').codes.ERR_INVALID_THIS)('Blob');
   return value;
 }
 function integer(value) {
@@ -117,7 +117,7 @@ class Blob {
     const values = blobPartsConverter(blobParts);
     options = optionsObject(options);
     const endings = options.endings === undefined ? 'transparent' : string(options.endings);
-    if (endings !== 'transparent' && endings !== 'native') throw new TypeError('Invalid endings value');
+    if (endings !== 'transparent' && endings !== 'native') throw new (require('internal/errors').codes.ERR_INVALID_ARG_VALUE)('options.endings', endings);
     const type = normalizeType(options.type);
     const parts = [];
     let size = 0;
@@ -145,8 +145,10 @@ class Blob {
   get type() { return state(this).type; }
   // Node's lib/internal/blob.js [kInspect].
   [kInspect](depth, options) {
+    // Node returns the Blob, which util.inspect shows as [Blob] past the depth:
+    // its internal slots are symbol keys there, held in a WeakMap here.
     if (depth < 0)
-      return this;
+      return options.stylize('[Blob]', 'special');
 
     const opts = {
       ...options,
@@ -244,7 +246,7 @@ class File extends Blob {
   // Node's lib/internal/file.js [kInspect].
   [kInspect](depth, options) {
     if (depth < 0) {
-      return this;
+      return options.stylize('[File]', 'special');
     }
 
     const opts = {

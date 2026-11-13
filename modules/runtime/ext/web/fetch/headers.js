@@ -19,11 +19,12 @@ function byteString(value) {
 }
 // A token is ASCII, so a name that passes the token test is a ByteString too; the
 // ByteString check only decides which error a bad name throws.
-function nameOf(name) {
+function checkedName(name) {
   name = string(name);
   if (!token.test(name)) { byteString(name); throw new TypeError('Invalid header name: ' + name); }
-  return name.toLowerCase();
+  return name;
 }
+function nameOf(name) { return checkedName(name).toLowerCase(); }
 // Bytes a value can hold untouched: no NUL, CR, LF or tab, nothing above 0xff.
 const plain = /[^\x20-\x7e\x80-\xff]/;
 function valueOf(value) {
@@ -36,7 +37,8 @@ function valueOf(value) {
 }
 function state(value) {
   const result = states.get(value);
-  if (!result) throw new TypeError('Illegal Headers invocation');
+  // undici's webidl.brandCheck.
+  if (!result) throw Object.assign(new TypeError('Illegal invocation'), { code: 'ERR_INVALID_THIS' });
   return result;
 }
 function mutable(value) {
@@ -54,7 +56,7 @@ function sorted(value) {
 }
 class Headers {
   constructor(init = undefined) {
-    states.set(this, { list: new Map(), immutable: false });
+    states.set(this, { list: new Map(), names: new Map(), immutable: false });
     if (init == null) return;
     if (typeof init !== 'object' && typeof init !== 'function') throw new TypeError('Headers init must be an object');
     if (init[Symbol.iterator] !== undefined) {
@@ -68,14 +70,18 @@ class Headers {
   }
   append(name, value) {
     if (arguments.length < 2) throw new TypeError('Headers.append requires two arguments');
-    name = nameOf(name); value = valueOf(value);
-    const list = mutable(this).list;
+    const given = checkedName(name); value = valueOf(value);
+    name = given.toLowerCase();
+    const current = mutable(this), list = current.list;
     const values = list.get(name);
-    if (values) values.push(value); else list.set(name, [value]);
+    // undici's HeadersList keeps the name a header was first given with, for inspection.
+    if (values) values.push(value); else { list.set(name, [value]); current.names?.set(name, given); }
   }
   delete(name) {
     if (!arguments.length) throw new TypeError('Headers.delete requires an argument');
-    name = nameOf(name); mutable(this).list.delete(name);
+    name = nameOf(name);
+    const current = mutable(this);
+    current.list.delete(name); current.names?.delete(name);
   }
   get(name) {
     if (!arguments.length) throw new TypeError('Headers.get requires an argument');
@@ -90,7 +96,10 @@ class Headers {
   }
   set(name, value) {
     if (arguments.length < 2) throw new TypeError('Headers.set requires two arguments');
-    name = nameOf(name); value = valueOf(value); mutable(this).list.set(name, [value]);
+    const given = checkedName(name); value = valueOf(value);
+    name = given.toLowerCase();
+    const current = mutable(this);
+    current.list.set(name, [value]); current.names?.set(name, given);
   }
   *entries() { state(this); for (let index = 0; ; index++) { const entry = sorted(this)[index]; if (!entry) return; yield entry; } }
   *keys() { for (const [key] of this.entries()) yield key; }
@@ -100,8 +109,16 @@ class Headers {
     if (typeof callback !== 'function') throw new TypeError('Callback must be a function');
     for (const [key, value] of this.entries()) callback.call(thisArg, value, key, this);
   }
-  [Symbol.iterator]() { return this.entries(); }
+  // undici's Headers: the header list's entries under the names they were given.
+  [Symbol.for('nodejs.util.inspect.custom')](depth, options) {
+    const current = state(this), entries = {};
+    for (const [name, values] of current.list) entries[current.names?.get(name) ?? name] = values.join(name === 'cookie' ? '; ' : ', ');
+    options.depth ??= depth;
+    return `Headers ${require('internal/util/inspect').formatWithOptions(options, entries)}`;
+  }
 }
+// WebIDL pair iterators: @@iterator is the entries method itself.
+Object.defineProperty(Headers.prototype, Symbol.iterator, { __proto__: null, value: Headers.prototype.entries, writable: true, configurable: true });
 function immutable(headers) { state(headers).immutable = true; return headers; }
 function rawHeaders(headers) {
   const result = Object.create(null);

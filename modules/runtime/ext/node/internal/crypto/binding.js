@@ -939,4 +939,6 @@ module.exports = {
   handleSecret,
   isKeyObjectHandle,
   noteFipsChange,
+  // node_crypto.cc's SecureContext: the native TLS context class tls builds on.
+  get SecureContext() { return require('internal/tls/context').NativeSecureContext; },
 };

@@ -35,9 +35,9 @@ function output(fd) {
       const status = stream._handle.setBlocking(true);
       if (status < 0) { stream.destroy(); throw nativeError(status, 'setBlocking'); }
     }
-  } else {
+  } else if (kind === 6) {
     // Regular files (and character devices such as /dev/null) use synchronous
-    // writes on all platforms. Invalid descriptors report their real write error.
+    // writes on all platforms.
     const { writeAll } = require('internal/tty/write');
     stream = new (require('internal/streams/writable'))({
       autoDestroy: false,
@@ -51,6 +51,10 @@ function output(fd) {
     // As Node's SyncWriteStream, which marks itself not readable.
     stream.readable = false;
     stream._type = 'fs';
+  } else {
+    // createWritableStdioStream's dummy black-hole output for a descriptor that is
+    // none of these (closed, or a UDP socket).
+    stream = new (require('internal/streams/writable'))({ write(buf, enc, cb) { cb(); } });
   }
   stream.fd = fd;
   stream._isStdio = true;
@@ -75,12 +79,16 @@ function input() {
     stream._type = 'tty';
   } else if (kind === 1 || kind === 2) {
     stream = socket(0, true);
-  } else {
+  } else if (kind === 6) {
     stream = require('fs').createReadStream(undefined, { fd: 0, autoClose: false });
     stream._type = 'fs';
     // Even an explicit close() must not transfer ownership of process fd 0.
     const destroy = stream._destroy;
     stream._destroy = function(error, callback) { this.autoClose = false; destroy.call(this, error, callback); };
+  } else {
+    // getStdin's dummy contentless input.
+    stream = new (require('internal/streams/readable'))({ read() {} });
+    stream.push(null);
   }
   stream.fd = 0;
   stream._isStdio = true;
@@ -176,4 +184,7 @@ function install(process) {
   process.on('exit', () => native('ttyResetMode', []));
 }
 
-module.exports = { install, direct: (fd, text) => direct !== undefined && direct(fd, text) };
+// node.cc ResetStdio: the terminals stdio found at startup get their modes back.
+function resetStdio() { native('ttyResetMode', []); }
+
+module.exports = { install, resetStdio, direct: (fd, text) => direct !== undefined && direct(fd, text) };

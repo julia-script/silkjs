@@ -21,4 +21,4 @@ for (const [name, letter] of [
 // The extensionless entry formats of the module loader, in Node's enum order.
 const internal = { __proto__: null, EXTENSIONLESS_FORMAT_JAVASCRIPT: 0, EXTENSIONLESS_FORMAT_WASM: 1 };
 
-module.exports = { os, fs, crypto, zlib, trace, internal };
+module.exports = { __proto__: null, os, fs, crypto, zlib, trace, internal };

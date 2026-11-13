@@ -33,7 +33,32 @@ function getHeapSnapshot(options) {
   // Capture synchronously, before returning a stream. silk fields retain exact
   // native edge strengths and projection limitations alongside DevTools data.
   const snapshot = require('internal/inspector_profiles').heapSnapshot();
-  return Readable.from([Buffer.from(snapshot)], { objectMode: false });
+  return new HeapSnapshotStream(Buffer.from(snapshot));
+}
+// internal/heap_utils HeapSnapshotStream: reads hand out the snapshot in V8's 64 KiB
+// OutputStream chunks, with no promise of its own (an async hook may take a snapshot).
+class HeapSnapshotStream extends Readable {
+  #data;
+  #offset = 0;
+  constructor(data) {
+    super({ autoDestroy: true });
+    this.#data = data;
+  }
+  _read() {
+    const data = this.#data;
+    if (data === undefined) return;
+    while (this.#offset < data.length) {
+      const chunk = data.subarray(this.#offset, this.#offset + 65536);
+      this.#offset += chunk.length;
+      if (!this.push(chunk)) return;
+    }
+    this.#data = undefined;
+    this.push(null);
+  }
+  _destroy(error, callback) {
+    this.#data = undefined;
+    callback(error);
+  }
 }
 function writeHeapSnapshot(filename, options) {
   if (filename !== undefined) {

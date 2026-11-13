@@ -181,6 +181,6 @@ function makeContextifyScript(code, filename, lineOffset, columnOffset, cachedDa
 }
 
 module.exports = {
-  contexts, error, invalid, contextData, isContext, syntaxDiagnostic, terminationErrors, terminationError, run, runBegin, runEnd, runFailure, rethrow,
+  decorateErrorStack, contexts, error, invalid, contextData, isContext, syntaxDiagnostic, terminationErrors, terminationError, run, runBegin, runEnd, runFailure, rethrow,
   kInternalImportModuleDynamically, makeContextifyScript, writeCache, readCache,
 };

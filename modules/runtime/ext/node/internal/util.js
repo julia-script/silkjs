@@ -694,7 +694,17 @@ function getCIDR(address, netmask, family) {
   return `${address}/${ones}`;
 }
 
+// util.cc ConstructSharedArrayBuffer: a SharedArrayBuffer even when the global is left
+// out (--enable-sharedarraybuffer-per-context). IntegerValue clamps the length.
+function constructSharedArrayBuffer(length) {
+  let size = Math.trunc(Number(length));
+  if (Number.isNaN(size)) size = 0;
+  if (size < 0 || size > require('buffer').kMaxLength) throw new RangeError('Invalid array buffer length');
+  return new (require('internal/host').SharedArrayBuffer)(size);
+}
+
 module.exports = {
+  constructSharedArrayBuffer,
   getCIDR,
   WeakReference,
   assertCrypto,

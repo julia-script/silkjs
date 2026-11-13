@@ -1,6 +1,6 @@
 'use strict';
 
-const { codes: { ERR_INVALID_ARG_TYPE }, validateInteger } = require('internal/path_events/support');
+const { validateInteger } = require('internal/path_events/support');
 // Event, CustomEvent and EventTarget are Node's (internal/event_target); this module adds
 // the runtime's AbortSignal, AbortController and DOMException on top of them.
 const {
@@ -169,6 +169,7 @@ function abortSignal(signal, reason) {
     item.dispatchEvent(new Event('abort', { [kTrustEvent]: true }));
   }
 }
+let sequenceOfSignals;
 class AbortSignal extends EventTarget {
   constructor(token) {
     if (token !== signalToken) {
@@ -228,13 +229,10 @@ class AbortSignal extends EventTarget {
     return signal;
   }
   static any(signals) {
-    if (signals === null || signals === undefined || typeof signals[Symbol.iterator] !== 'function') {
-      throw new ERR_INVALID_ARG_TYPE('signals', 'Iterable', signals);
-    }
-    const sources = Array.from(signals);
-    for (let i = 0; i < sources.length; i++) {
-      if (!signalBrands.has(sources[i])) throw new ERR_INVALID_ARG_TYPE(`signals[${i}]`, 'AbortSignal', sources[i]);
-    }
+    // Node's converters['sequence<AbortSignal>'] (lib/internal/abort_controller.js).
+    const { converters, createSequenceConverter } = require('internal/webidl');
+    sequenceOfSignals ??= createSequenceConverter(converters.AbortSignal);
+    const sources = sequenceOfSignals(signals, { __proto__: null, context: 'signals' });
     const signal = new AbortSignal(signalToken);
     for (const source of sources) {
       // The internal state, not the getters: a source may have its own aborted or reason.

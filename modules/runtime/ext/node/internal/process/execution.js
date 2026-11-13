@@ -9,7 +9,15 @@ const host = require('internal/host');
 // module globals under the cwd and handled ESM input.
 function evalScript(name, body, print) {
   host.clearRegExpStatics();
-  const result = host.compileFunction(body, name, undefined, undefined, undefined, true);
+  let result;
+  try {
+    result = host.compileFunction(body, name, undefined, undefined, undefined, true);
+  } catch (error) {
+    // runScriptInThisContext(script, true): an error leaving the script carries
+    // the arrow of where it was thrown in its stack (DecorateErrorStack).
+    require('internal/vm').decorateErrorStack(error, { filename: name, line: 0, column: 0, source: body });
+    throw error;
+  }
   // As Node, --print logs the result on exit, after the loop has run (a promise
   // settled in a later tick prints settled).
   if (print) {

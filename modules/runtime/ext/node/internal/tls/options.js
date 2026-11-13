@@ -8,6 +8,10 @@ const booleans = [
 // --force-fips=<policy> arrives as [force_fips_crypto_policy]=<policy> and --force-fips.
 const values = ['--tls-cipher-list', '--tls-keylog', '--openssl-config', '--secure-heap', '--secure-heap-min', '[force_fips_crypto_policy]'];
 const state = new Map();
+// getOptionValue reads its tables without user-mutable methods (a replaced
+// Map.prototype.get must not run), as Node's binding does.
+const mapGet = Function.prototype.call.bind(Map.prototype.get);
+const mapHas = Function.prototype.call.bind(Map.prototype.has);
 
 function applyOption(arg) {
   const separator = arg.indexOf('=');
@@ -74,12 +78,12 @@ function processFipsOptions(host) {
 }
 const DEFAULT_CIPHER_LIST = 'TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256:TLS_AES_128_GCM_SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-AES256-GCM-SHA384:DHE-RSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-SHA256:DHE-RSA-AES128-SHA256:ECDHE-RSA-AES256-SHA384:DHE-RSA-AES256-SHA384:ECDHE-RSA-AES256-SHA256:DHE-RSA-AES256-SHA256:HIGH:!aNULL:!eNULL:!EXPORT:!DES:!RC4:!MD5:!PSK:!SRP:!CAMELLIA';
 function getOptionValue(name) {
-  if (name === '--tls-cipher-list') return state.get(name) ?? DEFAULT_CIPHER_LIST;
-  if (name === '--use-openssl-ca') return !!state.get('[openssl-store]');
-  if (name === '--secure-heap' || name === '--secure-heap-min') return state.has(name) ? Number(state.get(name)) : (name === '--secure-heap' ? 0 : 2);
-  if (values.includes(name)) return state.get(name) ?? '';
-  if (name === '--use-system-ca' && !state.has(name)) return process.env.NODE_USE_SYSTEM_CA === '1';
-  if (booleans.includes(name)) return !!state.get(name);
+  if (name === '--tls-cipher-list') return mapGet(state, name) ?? DEFAULT_CIPHER_LIST;
+  if (name === '--use-openssl-ca') return !!mapGet(state, '[openssl-store]');
+  if (name === '--secure-heap' || name === '--secure-heap-min') return mapHas(state, name) ? Number(mapGet(state, name)) : (name === '--secure-heap' ? 0 : 2);
+  if (values.includes(name)) return mapGet(state, name) ?? '';
+  if (name === '--use-system-ca' && !mapHas(state, name)) return process.env.NODE_USE_SYSTEM_CA === '1';
+  if (booleans.includes(name)) return !!mapGet(state, name);
   return undefined;
 }
 // Whether the command line or NODE_OPTIONS gave any TLS or OpenSSL option.

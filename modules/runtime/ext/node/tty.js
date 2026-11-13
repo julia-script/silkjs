@@ -28,13 +28,15 @@ const {
 } = require('internal/per_context/primordials');
 
 const net = require('net');
+// The binding object itself: this module is in the startup image, so a TTY that
+// internalBinding('tty_wrap') is given later must still be the one constructed.
+const ttyWrap = require('internal/net/binding').tty_wrap;
 const {
-  TTY,
   UV_TTY_MODE_IO,
   UV_TTY_MODE_NORMAL,
   UV_TTY_MODE_RAW_VT,
   isTTY,
-} = require('internal/net/binding').tty_wrap;
+} = ttyWrap;
 const {
   ErrnoException,
   codes: {
@@ -63,7 +65,7 @@ function ReadStream(fd, options) {
     throw new ERR_INVALID_FD(fd);
 
   const ctx = {};
-  const tty = new TTY(fd, ctx);
+  const tty = new ttyWrap.TTY(fd, ctx);
   if (ctx.code !== undefined) {
     throw new ERR_TTY_INIT_FAILED(ctx);
   }
@@ -116,7 +118,7 @@ function WriteStream(fd) {
     throw new ERR_INVALID_FD(fd);
 
   const ctx = {};
-  const tty = new TTY(fd, ctx);
+  const tty = new ttyWrap.TTY(fd, ctx);
   if (ctx.code !== undefined) {
     throw new ERR_TTY_INIT_FAILED(ctx);
   }
