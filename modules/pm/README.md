@@ -33,6 +33,11 @@ asks the registry nothing when it still matches `package.json`. The graph holds 
 every platform, so the file is the same on every machine; the install skips what the host cannot
 run.
 
+The metadata the registry sends is kept in the `metadata` directory of the store. A resolution
+within five minutes of the last one, such as an `add` after an install, asks the registry
+nothing. After that the registry is asked whether each document changed, and sends only the ones
+that did.
+
 A package gets its peer dependencies from what is above it: the nearest package, up to the
 project, that depends on something under that name. When the same version of a package is used
 with different peers, each use is a node of its own in the graph, with its own entry in the
@@ -144,7 +149,8 @@ list under `packages`. The packages are installed together:
 ## Layout
 
 - `src/pkg` knows nothing about npm: versions and ranges, the content-addressable store,
-  integrity checks, name interning, file linking, the ref list of a git server, a one-pass JSON
+  integrity checks, name interning, file linking, the ref list of a git server, kept HTTP
+  documents with their validators, a one-pass JSON
   walker and an editor for JSON text. A package manager for another ecosystem can use it
   as is.
 - `src/npm` is what is specific to the npm ecosystem: manifests, registry metadata, the registry

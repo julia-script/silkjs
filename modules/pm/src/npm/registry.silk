@@ -4,6 +4,11 @@
 //! it over HTTP: requests of one call run at the same time, metadata is asked for compressed and
 //! in the abbreviated install format, which leaves out everything an install does not need, and
 //! credentials come from the [`Npmrc`] and go only to URLs below the path they were set for.
+//!
+//! Metadata is kept between runs, in [`Documents`]. A document that was fetched in the last
+//! five minutes is used without asking; an older one is sent back to the registry by the name
+//! the registry gave it, and the registry answers with the new document or, in a few bytes,
+//! that the old one still holds.
 
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.collections.bytes { Bytes }
@@ -17,6 +22,7 @@ import silk.http.client { Http, HttpError, Request, Response }
 import silk.http.client_native { NativeHttp }
 import silk.text.string { String }
 import npm.npmrc { Npmrc }
+import pkg.documents { Documents, Kept }
 import pkg.names { Names }
 import pkg.store { StoreError, gunzip }
 
@@ -49,6 +55,9 @@ impl Copy for RegistryError {}
 const METADATA_LIMIT: usize = 268435456
 /// The largest tarball that is accepted.
 const TARBALL_LIMIT: usize = 2147483648
+/// For how many seconds a metadata document is used without asking the registry again. It is
+/// what the npm registry tells caches to do, and what npm and Bun do.
+const FRESH: u64 = 300
 
 /// The metadata URL of the package `name` on `registry`. The `/` of a scoped name is encoded, as
 /// registries expect.
@@ -97,6 +106,18 @@ pub service Registry {
 pub struct NetworkRegistry<'c> {
   config: Npmrc,
   http: NativeHttp<'c>,
+  kept: Documents,
+  // The time of this run, in seconds since 1970.
+  now: u64,
+}
+
+// What a request brought back.
+struct Answer {
+  body: Bytes,
+  // The name the server gave this version of the document, or nothing.
+  validator: Bytes,
+  // The server said that the version it was asked about still holds, and sent no body.
+  unchanged: bool,
 }
 
 const METADATA_ACCEPT: string<'static> = "application/vnd.npm.install-v1+json; q=1.0, application/json; q=0.8"
@@ -105,28 +126,34 @@ fn failure(kind: RegistryErrorKind, message: string<'static>) -> RegistryError {
   return RegistryError { kind: kind, status: 0, message: message }
 }
 
-// Turns one HTTP result into the body or a registry error.
-fn settle(result: Result<Response, HttpError>) -> Result<Bytes, RegistryError> {
+// Turns one HTTP result into the answer or a registry error.
+effect fn settle(result: Result<Response, HttpError>) -> Result<Answer, RegistryError> ! OutOfMemoryError ? &mut Allocator {
   return match move result {
-    Result.Failure { error } => Result<Bytes, RegistryError>.failResult(failure(RegistryErrorKind.Transport, error.message))
+    Result.Failure { error } => Result<Answer, RegistryError>.failResult(failure(RegistryErrorKind.Transport, error.message))
     Result.Success { value: response } => {
       let status = Response.status(&response)
-      if status >= 200 && status <= 299 {
-        Result<Bytes, RegistryError>.succeed(Response.intoBody(move response))
+      if (status >= 200 && status <= 299) || status == 304 {
+        let validator = match Response.header(&response, "etag") {
+          Option.Some { value } => run Bytes.copy(value)
+          Option.None => Bytes.make()
+        }
+        Result<Answer, RegistryError>.succeed(Answer { body: Response.intoBody(move response), validator: move validator, unchanged: status == 304 })
       } else if status == 404 {
-        Result<Bytes, RegistryError>.failResult(RegistryError { kind: RegistryErrorKind.NotFound, status: status, message: "the registry has no such package" })
+        Result<Answer, RegistryError>.failResult(RegistryError { kind: RegistryErrorKind.NotFound, status: status, message: "the registry has no such package" })
       } else if status == 401 || status == 403 {
-        Result<Bytes, RegistryError>.failResult(RegistryError { kind: RegistryErrorKind.Unauthorized, status: status, message: "the registry refused the credentials" })
+        Result<Answer, RegistryError>.failResult(RegistryError { kind: RegistryErrorKind.Unauthorized, status: status, message: "the registry refused the credentials" })
       } else {
-        Result<Bytes, RegistryError>.failResult(RegistryError { kind: RegistryErrorKind.Status, status: status, message: "the registry answered with an error status" })
+        Result<Answer, RegistryError>.failResult(RegistryError { kind: RegistryErrorKind.Status, status: status, message: "the registry answered with an error status" })
       }
     }
   }
 }
 
 // Sends one GET per URL at the same time. `metadata` says, per URL, whether it is a metadata
-// document or a tarball. A URL that is not valid text fails alone.
-effect fn getOnce(config: &Npmrc, urls: &[Bytes], metadata: &[bool]) -> List<Result<Bytes, RegistryError>>
+// document or a tarball, and `validators` the name of the version that is at hand, or nothing:
+// the registry then answers that this version still holds in place of sending it again. A URL
+// that is not valid text fails alone.
+effect fn getOnce(config: &Npmrc, urls: &[Bytes], metadata: &[bool], validators: &[Bytes]) -> List<Result<Answer, RegistryError>>
   ! OutOfMemoryError ? &mut Http | &mut Allocator {
   let mut credentials = List<Bytes>.make()
   let mut index: usize = 0
@@ -159,6 +186,12 @@ effect fn getOnce(config: &Npmrc, urls: &[Bytes], metadata: &[bool]) -> List<Res
         } else {
           run request.header("accept", "*/*")
         }
+        if Bytes.length(&validators[index]) > 0 {
+          match String.fromUtf8(Bytes.asSlice(&validators[index])) {
+            Result.Failure {..} => {}
+            Result.Success { value: version } => { run request.header("if-none-match", version) }
+          }
+        }
         if Bytes.length(&headers[index]) > 0 {
           match String.fromUtf8(Bytes.asSlice(&headers[index])) {
             Result.Failure {..} => {}
@@ -173,7 +206,7 @@ effect fn getOnce(config: &Npmrc, urls: &[Bytes], metadata: &[bool]) -> List<Res
   }
   let mut answers = run Http.sendAll(move requests)
   // Results come back in request order; put them back in URL order, from the end.
-  let mut reversed = List<Result<Bytes, RegistryError>>.make()
+  let mut reversed = List<Result<Answer, RegistryError>>.make()
   index = urls.length
   while index > 0 {
     index = index - 1
@@ -181,23 +214,23 @@ effect fn getOnce(config: &Npmrc, urls: &[Bytes], metadata: &[bool]) -> List<Res
     if last > 0 && List<usize>.get(&sent, last - 1) == index {
       drop List<usize>.pop(&mut sent)
       match move List<Result<Response, HttpError>>.pop(&mut answers) {
-        Option.Some { value } => { run reversed.append(settle(move value)) }
-        Option.None => { run reversed.append(Result<Bytes, RegistryError>.failResult(failure(RegistryErrorKind.Transport, "the request was not sent"))) }
+        Option.Some { value } => { run reversed.append(run settle(move value)) }
+        Option.None => { run reversed.append(Result<Answer, RegistryError>.failResult(failure(RegistryErrorKind.Transport, "the request was not sent"))) }
       }
     } else {
-      run reversed.append(Result<Bytes, RegistryError>.failResult(failure(RegistryErrorKind.Url, "the URL is not valid text")))
+      run reversed.append(Result<Answer, RegistryError>.failResult(failure(RegistryErrorKind.Url, "the URL is not valid text")))
     }
   }
-  return run turned(move reversed)
+  return run turned<Answer>(move reversed)
 }
 
 // The same results in the opposite order.
-effect fn turned(list: List<Result<Bytes, RegistryError>>) -> List<Result<Bytes, RegistryError>>
+effect fn turned<T>(list: List<Result<T, RegistryError>>) -> List<Result<T, RegistryError>>
   ! OutOfMemoryError ? &mut Allocator {
   let mut from = move list
-  let mut ordered = List<Result<Bytes, RegistryError>>.make()
+  let mut ordered = List<Result<T, RegistryError>>.make()
   while true {
-    match move List<Result<Bytes, RegistryError>>.pop(&mut from) {
+    match move List<Result<T, RegistryError>>.pop(&mut from) {
       Option.None => { break }
       Option.Some { value } => { run ordered.append(move value) }
     }
@@ -216,16 +249,17 @@ fn transient(error: &RegistryError) -> bool {
 
 // Sends one GET per URL at the same time, and asks again, up to three more times, for the ones
 // that failed in a way that can pass.
-effect fn getAll(config: &Npmrc, urls: &[Bytes], metadata: &[bool]) -> List<Result<Bytes, RegistryError>>
+effect fn getAll(config: &Npmrc, urls: &[Bytes], metadata: &[bool], validators: &[Bytes]) -> List<Result<Answer, RegistryError>>
   ! OutOfMemoryError ? &mut Http | &mut Allocator {
-  let mut results = run getOnce(config, urls, metadata)
+  let mut results = run getOnce(config, urls, metadata, validators)
   let mut attempt: u8 = 0
   while attempt < 3 {
     attempt = attempt + 1
     let mut again = List<Bytes>.make()
     let mut kinds = List<bool>.make()
+    let mut versions = List<Bytes>.make()
     let mut which = List<usize>.make()
-    let current = List<Result<Bytes, RegistryError>>.asSlice(&results)
+    let current = List<Result<Answer, RegistryError>>.asSlice(&results)
     let mut index: usize = 0
     while index < current.length {
       match &current[index] {
@@ -234,6 +268,7 @@ effect fn getAll(config: &Npmrc, urls: &[Bytes], metadata: &[bool]) -> List<Resu
           if transient(&error) {
             run again.append(run Bytes.copy(Bytes.asSlice(&urls[index])))
             run kinds.append(metadata[index])
+            run versions.append(run Bytes.copy(Bytes.asSlice(&validators[index])))
             run which.append(index)
           }
         }
@@ -243,13 +278,13 @@ effect fn getAll(config: &Npmrc, urls: &[Bytes], metadata: &[bool]) -> List<Resu
     if List<usize>.length(&which) == 0 {
       break
     }
-    let mut answers = run getOnce(config, List<Bytes>.asSlice(&again), List<bool>.asSlice(&kinds))
+    let mut answers = run getOnce(config, List<Bytes>.asSlice(&again), List<bool>.asSlice(&kinds), List<Bytes>.asSlice(&versions))
     index = List<usize>.length(&which)
     while index > 0 {
       index = index - 1
-      match move List<Result<Bytes, RegistryError>>.pop(&mut answers) {
+      match move List<Result<Answer, RegistryError>>.pop(&mut answers) {
         Option.None => {}
-        Option.Some { value } => { List<Result<Bytes, RegistryError>>.set(&mut results, List<usize>.get(&which, index), move value) }
+        Option.Some { value } => { List<Result<Answer, RegistryError>>.set(&mut results, List<usize>.get(&which, index), move value) }
       }
     }
   }
@@ -257,11 +292,7 @@ effect fn getAll(config: &Npmrc, urls: &[Bytes], metadata: &[bool]) -> List<Resu
 }
 
 // A metadata body as JSON: decompressed when the registry sent it as gzip.
-effect fn plain(answer: Result<Bytes, RegistryError>) -> Result<Bytes, RegistryError> ! OutOfMemoryError ? &mut Allocator {
-  let body = match move answer {
-    Result.Success { value } => move value
-    Result.Failure { error } => { return Result<Bytes, RegistryError>.failResult(error) }
-  }
+effect fn plain(body: Bytes) -> Result<Bytes, RegistryError> ! OutOfMemoryError ? &mut Allocator {
   let bytes = Bytes.asSlice(&body)
   if bytes.length < 2 || bytes[0] != 31 || bytes[1] != 139 {
     return Result<Bytes, RegistryError>.succeed(move body)
@@ -276,46 +307,102 @@ effect fn plain(answer: Result<Bytes, RegistryError>) -> Result<Bytes, RegistryE
 }
 
 impl<'c> NetworkRegistry<'c> {
-  /// A registry client with these settings, sending through `http`.
-  pub fn make(config: Npmrc, http: NativeHttp<'c>) -> NetworkRegistry<'c> {
-    return NetworkRegistry<'c> { config: move config, http: move http }
+  /// A registry client with these settings, sending through `http`. Metadata is kept in `kept`
+  /// between runs; `now` is the time, in seconds since 1970.
+  pub fn make(config: Npmrc, http: NativeHttp<'c>, kept: Documents, now: u64) -> NetworkRegistry<'c> {
+    return NetworkRegistry<'c> { config: move config, http: move http, kept: move kept, now: now }
+  }
+
+  // The document of one answer to a metadata request for `url`, for which `old` was at hand,
+  // or an empty body when nothing was. What the registry sent or confirmed is kept.
+  effect fn document(kept: &Documents, now: u64, url: &[u8], answer: Result<Answer, RegistryError>, old: Kept) -> Result<Bytes, RegistryError>
+    ! OutOfMemoryError ? &mut Allocator {
+    let got = match move answer {
+      Result.Success { value } => move value
+      Result.Failure { error } => { return Result<Bytes, RegistryError>.failResult(error) }
+    }
+    if got.unchanged {
+      if Bytes.length(&old.body) == 0 {
+        return Result<Bytes, RegistryError>.failResult(failure(RegistryErrorKind.Transport, "the registry answered without the metadata"))
+      }
+      run Documents.confirm(kept, url, &old, now)
+      return Result<Bytes, RegistryError>.succeed(move old.body)
+    }
+    let body = match move run plain(move got.body) {
+      Result.Success { value } => move value
+      Result.Failure { error } => { return Result<Bytes, RegistryError>.failResult(error) }
+    }
+    run Documents.write(kept, url, Bytes.asSlice(&got.validator), now, Bytes.asSlice(&body))
+    return Result<Bytes, RegistryError>.succeed(move body)
   }
 
   effect fn fetch(self: &mut Self, names: &Names, ids: &[usize], tarballs: &[Bytes]) -> Fetched
     ! OutOfMemoryError ? &mut Allocator {
     let mut urls = List<Bytes>.make()
     let mut metadata = List<bool>.make()
+    let mut validators = List<Bytes>.make()
+    // The documents, with a stand-in where the registry is asked, and the place of each.
+    let mut documents = List<Result<Bytes, RegistryError>>.make()
+    let mut asked = List<usize>.make()
+    // What was at hand for each one that is asked for.
+    let mut old = List<Kept>.make()
     let mut index: usize = 0
     while index < ids.length {
       let name = Names.bytes(names, ids[index])
-      run urls.append(run packumentUrl(Npmrc.registryFor(&self.config, name), name))
-      run metadata.append(true)
+      let url = run packumentUrl(Npmrc.registryFor(&self.config, name), name)
+      let found = match move run Documents.read(&self.kept, Bytes.asSlice(&url)) {
+        Option.Some { value } => move value
+        Option.None => Kept { body: Bytes.make(), validator: Bytes.make(), stored: 0 }
+      }
+      // A time in the future is a clock that was set back; it does not make a document young.
+      if Bytes.length(&found.body) > 0 && found.stored <= self.now && self.now - found.stored < FRESH {
+        run documents.append(Result<Bytes, RegistryError>.succeed(move found.body))
+      } else {
+        run documents.append(Result<Bytes, RegistryError>.failResult(failure(RegistryErrorKind.Transport, "the request was not sent")))
+        run asked.append(index)
+        run validators.append(run Bytes.copy(Bytes.asSlice(&found.validator)))
+        run old.append(move found)
+        run urls.append(move url)
+        run metadata.append(true)
+      }
       index = index + 1
     }
     index = 0
     while index < tarballs.length {
       run urls.append(run Bytes.copy(Bytes.asSlice(&tarballs[index])))
       run metadata.append(false)
+      run validators.append(Bytes.make())
       index = index + 1
     }
-    let mut answers = run getAll(&self.config, List<Bytes>.asSlice(&urls), List<bool>.asSlice(&metadata))
+    if List<Bytes>.length(&urls) == 0 {
+      return Fetched { documents: move documents, tarballs: List<Result<Bytes, RegistryError>>.make() }
+    }
+    let mut answers = run getAll(&self.config, List<Bytes>.asSlice(&urls), List<bool>.asSlice(&metadata), List<Bytes>.asSlice(&validators))
       |> Effect.provideMut<Http>(&mut self.http)
-    // The tarballs are the tail; take both parts from the end and turn them back.
+    // The tarballs are the tail; take both parts from the end.
     let mut tail = List<Result<Bytes, RegistryError>>.make()
-    let mut head = List<Result<Bytes, RegistryError>>.make()
     while true {
-      match move List<Result<Bytes, RegistryError>>.pop(&mut answers) {
+      match move List<Result<Answer, RegistryError>>.pop(&mut answers) {
         Option.None => { break }
         Option.Some { value } => {
           if List<Result<Bytes, RegistryError>>.length(&tail) < tarballs.length {
-            run tail.append(move value)
+            run tail.append(match move value {
+              Result.Success { value: answer } => Result<Bytes, RegistryError>.succeed(move answer.body)
+              Result.Failure { error } => Result<Bytes, RegistryError>.failResult(error)
+            })
           } else {
-            run head.append(run plain(move value))
+            let at = List<Result<Answer, RegistryError>>.length(&answers)
+            let before = match move List<Kept>.pop(&mut old) {
+              Option.Some { value: kept } => move kept
+              Option.None => Kept { body: Bytes.make(), validator: Bytes.make(), stored: 0 }
+            }
+            let document = run NetworkRegistry.document(&self.kept, self.now, Bytes.asSlice(&List<Bytes>.asSlice(&urls)[at]), move value, move before)
+            List<Result<Bytes, RegistryError>>.set(&mut documents, List<usize>.get(&asked, at), move document)
           }
         }
       }
     }
-    return Fetched { documents: run turned(move head), tarballs: run turned(move tail) }
+    return Fetched { documents: move documents, tarballs: run turned<Bytes>(move tail) }
   }
 }
 
