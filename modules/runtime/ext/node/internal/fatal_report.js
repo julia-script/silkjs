@@ -102,9 +102,23 @@ function inspected(error) {
     return originalStack;
   }
 }
+// An error's message takes the stack the error captured when it was made, as V8's
+// CreateMessage does, in PrintStackTrace's lines.
+function errorTrace(error) {
+  const frames = require('internal/error_stack').framesOf(error);
+  if (!Array.isArray(frames)) return host.captureCallSites(-7, error);
+  let text = '';
+  for (const frame of frames) {
+    const where = frame.scriptName + ':' + frame.lineNumber + ':' + frame.columnNumber;
+    text += '    at ' + (frame.functionName ? frame.functionName + ' (' + where + ')' : where) + '\n';
+  }
+  return text;
+}
 function format(error, fromPromise) {
   const object = error !== null && (typeof error === 'object' || typeof error === 'function');
   const nativeError = object && require('util/types').isNativeError(error);
+  // --trace-uncaught: read the throw-site stack before any getter below throws over it.
+  const thrownAt = host.traceUncaught && !nativeError ? host.captureCallSites(-7, error) : undefined;
   let source;
   try {
     // GetErrorSource prints an arrow the error was given (setArrowMessage) first.
@@ -131,8 +145,15 @@ function format(error, fromPromise) {
     }
     if (message === undefined || name === undefined) text += stringOf(error) + '\n';
     else text += (source === undefined ? '' : source + '\n') + stringOf(name) + ': ' + stringOf(message) + '\n';
-    const program = require('path').basename(process.argv0 || 'node', '.exe') || 'node';
-    text += '(Use `' + program + ' --trace-uncaught ...` to show where the exception was thrown)\n';
+    if (!host.traceUncaught) {
+      const program = require('path').basename(process.argv0 || 'node', '.exe') || 'node';
+      text += '(Use `' + program + ' --trace-uncaught ...` to show where the exception was thrown)\n';
+    }
+  }
+  // --trace-uncaught: the stack the value was thrown with, as PrintStackTrace writes it.
+  if (host.traceUncaught) {
+    const thrown = nativeError ? errorTrace(error) : thrownAt;
+    if (typeof thrown === 'string') text += 'Thrown at:\n' + thrown + '\n';
   }
   // --no-extra-info-on-fatal-exception leaves out the version line.
   if (host.extraInfoOnFatalException === false) return text;

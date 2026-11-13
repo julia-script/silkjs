@@ -53,7 +53,7 @@ const SEND_BUFFER = false;
 
 const isIP = input => typeof input === 'string' ? native('isIP', [input]) : 0;
 const isInt32 = value => value === (value | 0);
-const isBlockList = value => require('internal/blocklist').isBlockList(value);
+const isBlockList = value => require('internal/blocklist').BlockList.isBlockList(value);
 
 function Socket(type, listener) {
   EventEmitter.call(this);

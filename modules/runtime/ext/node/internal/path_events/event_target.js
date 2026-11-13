@@ -191,6 +191,7 @@ const exceptionConstants = [
   'VALIDATION_ERR', 'TYPE_MISMATCH_ERR', 'SECURITY_ERR', 'NETWORK_ERR', 'ABORT_ERR',
   'URL_MISMATCH_ERR', 'QUOTA_EXCEEDED_ERR', 'TIMEOUT_ERR', 'INVALID_NODE_TYPE_ERR', 'DATA_CLONE_ERR',
 ];
+const { kDeserialize } = require('internal/worker/js_transferable');
 const exceptionState = new WeakMap();
 class DOMException extends Error {
   constructor(message = '', options = 'Error') {
@@ -210,6 +211,12 @@ class DOMException extends Error {
   get name() { return exceptionData(this).name; }
   get message() { return exceptionData(this).message; }
   get code() { return exceptionNames.indexOf(exceptionData(this).name) + 1; }
+  // Node's per-context DOMException: a cloned one (internal/worker/clone_dom_exception)
+  // gets its name, message and stack back here.
+  [kDeserialize](data) {
+    exceptionState.set(this, { message: data.message, name: data.name });
+    this.stack = data.stack;
+  }
 }
 function exceptionData(value) {
   const data = exceptionState.get(value);

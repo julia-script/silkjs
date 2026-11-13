@@ -12,6 +12,7 @@ const booleanOptions = new Map([
   // allocations already meet --zero-fill-buffers.
   ['--zero-fill-buffers', 'zeroFillBuffers'],
   ['--abort-on-uncaught-exception', 'abortOnUncaughtException'], ['--trace-exit', 'traceExit'],
+  ['--trace-uncaught', 'traceUncaught'],
   ['--network-family-autoselection', 'networkFamilyAutoselection'],
 ]);
 const valueOptions = new Set(['--disable-warning', '--redirect-warnings', '--unhandled-rejections', '--stack-trace-limit',
@@ -68,6 +69,8 @@ function initialize() {
   // uncaught exception goes to its parent (test-worker-abort-on-uncaught-exception).
   if (state.abortOnUncaughtException && !require('worker_threads').isMainThread) state.abortOnUncaughtException = false;
   if (state.abortOnUncaughtException) host.abortOnUncaughtException = abortOnUncaughtException;
+  // --trace-uncaught: every throw records its stack, which the fatal report prints.
+  if (state.traceUncaught) { host.traceUncaught = true; host.captureCallSites(-6, true); }
   if (host.startupSnapshot.isBuildingSnapshotBuffer[0])
     require('internal/v8/startup_snapshot').namespace.addSerializeCallback(resetForSerialization);
 }

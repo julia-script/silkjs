@@ -1,194 +1,90 @@
 'use strict';
 
-// Pure-JS net.BlockList. The handle (this[kHandle]) is a plain record of rule
-// lists, each newest first: { addresses: [addr], subnets: [{ network, prefix }],
-// ranges: [{ start, end }] }, where every address is a SocketAddress handle.
+// Node.js v24.22.1 lib/internal/blocklist.js, over internal/block_list_binding (src/node_sockaddr.cc).
+// Copyright Node.js contributors. MIT license (see vendor/node-api/LICENSE).
 
-const { inspect } = require('util');
+const {
+  ArrayIsArray,
+  Boolean,
+  JSONParse,
+  NumberIsNaN,
+  NumberParseInt,
+  ObjectFreeze,
+  ObjectSetPrototypeOf,
+  StringPrototypeIncludes,
+  StringPrototypeLastIndexOf,
+  StringPrototypeSlice,
+  StringPrototypeToLowerCase,
+  Symbol,
+} = require('internal/per_context/primordials');
+const { internalBinding } = require('internal/bindings');
+
+const {
+  BlockList: BlockListHandle,
+  AF_INET,
+  AF_INET6,
+} = internalBinding('block_list');
+
+const {
+  customInspectSymbol: kInspect,
+} = require('internal/util');
+
 const {
   SocketAddress,
-  InternalSocketAddress,
   kHandle: kSocketAddressHandle,
+} = require('internal/socketaddress');
+
+const {
+  markTransferMode,
   kClone,
   kDeserialize,
-  parseAddress,
-  formatAddress,
-} = require('internal/socketaddress');
-const { codes: { ERR_INVALID_ARG_TYPE, ERR_INVALID_ARG_VALUE }, validateArray, validateInteger, validateString } = require('internal/validators');
+} = require('internal/worker/js_transferable');
+
+const { inspect } = require('internal/util/inspect');
 
 const kHandle = Symbol('kHandle');
+const { owner_symbol } = internalBinding('symbols');
 
-// --- Address arithmetic (IPv4-mapped IPv6 addresses match IPv4 both ways) ----
+const {
+  ERR_INVALID_ARG_VALUE,
+  ERR_INVALID_ARG_TYPE,
+} = require('internal/errors').codes;
 
-const kMappedPrefix = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff];
-
-// The IPv4 bytes of an IPv4 or IPv4-mapped IPv6 address, else null.
-function ipv4Bytes({ family, bytes }) {
-  if (family === 4) return bytes;
-  return kMappedPrefix.every((b, i) => bytes[i] === b) ? bytes.subarray(12) : null;
-}
-
-// -1, 0 or 1; NaN when an IPv4 address meets an IPv6 address that is not mapped.
-function compare(a, b) {
-  const [x, y] = a.family === b.family ? [a.bytes, b.bytes] : [ipv4Bytes(a), ipv4Bytes(b)];
-  if (x === null || y === null) return NaN;
-  for (let i = 0; i < x.length; i++) {
-    if (x[i] !== y[i]) return x[i] < y[i] ? -1 : 1;
-  }
-  return 0;
-}
-
-function identical(a, b) {
-  return a.family === b.family && a.bytes.every((byte, i) => byte === b.bytes[i]);
-}
-
-function inSubnet(address, network, prefix) {
-  let x = address.bytes;
-  if (address.family !== network.family) {
-    x = network.family === 6 ? Uint8Array.of(...kMappedPrefix, ...x) : ipv4Bytes(address);
-    if (x === null) return false;
-  }
-  const y = network.bytes;
-  const whole = prefix >> 3;
-  for (let i = 0; i < whole; i++) {
-    if (x[i] !== y[i]) return false;
-  }
-  const mask = (0xff00 >> (prefix & 7)) & 0xff;
-  return mask === 0 || (x[whole] & mask) === (y[whole] & mask);
-}
-
-function matches(list, address) {
-  return list.addresses.some((a) => compare(a, address) === 0) ||
-    list.subnets.some(({ network, prefix }) => inSubnet(address, network, prefix)) ||
-    list.ranges.some(({ start, end }) => compare(address, start) >= 0 && compare(address, end) <= 0);
-}
-
-function familyName(address) {
-  return address.family === 4 ? 'IPv4' : 'IPv6';
-}
-
-function rulesOf(list) {
-  return [
-    ...list.addresses.map((a) => `Address: ${familyName(a)} ${formatAddress(a)}`),
-    ...list.subnets.map(({ network, prefix }) => `Subnet: ${familyName(network)} ${formatAddress(network)}/${prefix}`),
-    ...list.ranges.map(({ start, end }) => `Range: ${familyName(start)} ${formatAddress(start)}-${formatAddress(end)}`),
-  ];
-}
-
-// Re-adding an equal address replaces that rule in place.
-function addAddressHandle({ addresses }, handle) {
-  const index = addresses.findIndex((a) => compare(a, handle) === 0);
-  if (index === -1) addresses.unshift(handle);
-  else addresses[index] = handle;
-}
-
-function removeFirst(rules, predicate) {
-  const index = rules.findIndex(predicate);
-  if (index !== -1) rules.splice(index, 1);
-}
-
-// --- Argument handling -----------------------------------------------------
-
-function toHandle(value, name, family) {
-  if (!SocketAddress.isSocketAddress(value)) {
-    validateString(value, name);
-    validateString(family, 'family');
-    value = new SocketAddress({ address: value, family });
-  }
-  return value[kSocketAddressHandle];
-}
-
-function toSubnet(network, prefix, family) {
-  network = toHandle(network, 'network', family);
-  validateInteger(prefix, 'prefix', 0, network.family === 4 ? 32 : 128);
-  return { network, prefix: prefix + 0 }; // Coerce -0 to +0.
-}
+const { validateArray, validateInt32, validateString } = require('internal/validators');
 
 function parseCIDR(cidr) {
   validateString(cidr, 'cidr');
-  const slash = cidr.lastIndexOf('/');
+  const slash = StringPrototypeLastIndexOf(cidr, '/');
   if (slash === -1) {
     throw new ERR_INVALID_ARG_VALUE('cidr', cidr, 'must contain a prefix length (e.g. "10.0.0.0/8")');
   }
-  const address = cidr.slice(0, slash);
-  const prefixStr = cidr.slice(slash + 1);
-  const prefix = parseInt(prefixStr, 10);
-  if (Number.isNaN(prefix) || `${prefix}` !== prefixStr) {
+  const address = StringPrototypeSlice(cidr, 0, slash);
+  const prefixStr = StringPrototypeSlice(cidr, slash + 1);
+  const prefix = NumberParseInt(prefixStr, 10);
+  if (NumberIsNaN(prefix) || `${prefix}` !== prefixStr) {
     throw new ERR_INVALID_ARG_VALUE('cidr', cidr, 'prefix length must be a valid integer');
   }
-  return { address, prefix, family: address.includes(':') ? 'ipv6' : 'ipv4' };
+  const family = StringPrototypeIncludes(address, ':') ? 'ipv6' : 'ipv4';
+  return { address, prefix, family };
 }
-
-function validateRuleData(data) {
-  if (!Array.isArray(data) || !data.every((n) => typeof n === 'string')) {
-    throw new ERR_INVALID_ARG_TYPE('data', ['string', 'string[]'], data);
-  }
-}
-
-// Accepts the rule strings produced by `rules`, e.g. 'Address: IPv4 10.0.0.5',
-// 'Range: IPv4 10.0.0.1-10.0.0.10' or 'Subnet: IPv6 2001:db8:1234::/48'.
-// Unrecognised entries are ignored.
-function parseRules(blockList, data) {
-  const v4 = '(\\d{1,3}(?:\\.\\d{1,3}){3})';
-  const v6 = '([0-9a-fA-F:.]{1,45})';
-  for (const item of data) {
-    let match;
-    if (item.includes('IPv4')) {
-      if ((match = item.match(new RegExp(`Subnet: IPv4 ${v4}/(\\d{1,2})`)))) {
-        blockList.addSubnet(match[1], parseInt(match[2]));
-        continue;
-      }
-      if ((match = item.match(new RegExp(`Address: IPv4 ${v4}`)))) {
-        blockList.addAddress(match[1]);
-        continue;
-      }
-      if ((match = item.match(new RegExp(`Range: IPv4 ${v4}-${v4}`)))) {
-        blockList.addRange(match[1], match[2]);
-        continue;
-      }
-    }
-    if (item.includes('IPv6')) {
-      if ((match = item.match(new RegExp(`Subnet: IPv6 ${v6}/([0-9]{1,3})`, 'i')))) {
-        blockList.addSubnet(match[1], parseInt(match[2]), 'ipv6');
-      } else if ((match = item.match(new RegExp(`Address: IPv6 ${v6}`, 'i')))) {
-        blockList.addAddress(match[1], 'ipv6');
-      } else if ((match = item.match(new RegExp(`Range: IPv6 ${v6}-${v6}`, 'i')))) {
-        blockList.addRange(match[1], match[2], 'ipv6');
-      }
-    }
-  }
-}
-
-// --- Shared handles for structured clone -------------------------------------
-// Clones in the same realm share one handle (as Node shares the native handle);
-// a clone that lands in another realm gets its own copy of the rules.
-
-const realmId = Math.random().toString(36).slice(2);
-let nextId = 0;
-const sharedHandles = new Map();
-const handleCleanup = new FinalizationRegistry((id) => sharedHandles.delete(id));
-
-function shareHandle(handle) {
-  if (sharedHandles.get(handle.id)?.deref() !== handle) {
-    handle.id = `${realmId}:${nextId++}`;
-    sharedHandles.set(handle.id, new WeakRef(handle));
-    handleCleanup.register(handle, handle.id);
-  }
-  return handle;
-}
-
-// --- BlockList -------------------------------------------------------------
 
 class BlockList {
   constructor() {
-    this[kHandle] = { addresses: [], subnets: [], ranges: [] };
+    markTransferMode(this, true, false);
+    this[kHandle] = new BlockListHandle();
+    this[kHandle][owner_symbol] = this;
   }
 
+  /**
+   * Returns true if the value is a BlockList
+   * @param {any} value
+   * @returns {boolean}
+   */
   static isBlockList(value) {
     return value?.[kHandle] !== undefined;
   }
 
-  static PRIVATE_RANGES = Object.freeze([
+  static PRIVATE_RANGES = ObjectFreeze([
     // RFC 1918 - Private IPv4
     '10.0.0.0/8',
     '172.16.0.0/12',
@@ -203,128 +99,397 @@ class BlockList {
     'fc00::/7',
   ]);
 
-  [inspect.custom](depth, options) {
-    if (depth < 0) return this;
-    const opts = { ...options, depth: options.depth == null ? null : options.depth - 1 };
-    return `BlockList ${inspect({ rules: this.rules }, opts)}`;
+  [kInspect](depth, options) {
+    if (depth < 0)
+      return this;
+
+    const opts = {
+      ...options,
+      depth: options.depth == null ? null : options.depth - 1,
+    };
+
+    return `BlockList ${inspect({
+      rules: this.rules,
+    }, opts)}`;
   }
 
+  /**
+   * @param {string|SocketAddress} address
+   * @param {string} [family]
+   */
   addAddress(address, family = 'ipv4') {
-    addAddressHandle(this[kHandle], toHandle(address, 'address', family));
+    if (!SocketAddress.isSocketAddress(address)) {
+      validateString(address, 'address');
+      validateString(family, 'family');
+      address = new SocketAddress({
+        address,
+        family,
+      });
+    }
+    this[kHandle].addAddress(address[kSocketAddressHandle]);
   }
 
+  /**
+   *
+   * @param {(string|SocketAddress)[]} addresses
+   * @param {string} [family]
+   */
   addAddresses(addresses, family = 'ipv4') {
     validateArray(addresses, 'addresses');
     validateString(family, 'family');
-    addresses.map((address, i) => toHandle(address, `addresses[${i}]`, family))
-      .forEach((handle) => addAddressHandle(this[kHandle], handle));
-  }
-
-  addRange(start, end, family = 'ipv4') {
-    const startHandle = toHandle(start, 'start', family);
-    const endHandle = toHandle(end, 'end', family);
-    if (compare(startHandle, endHandle) > 0) {
-      throw new ERR_INVALID_ARG_VALUE('start', new InternalSocketAddress(startHandle), 'must come before end');
+    const handles = [];
+    for (let i = 0; i < addresses.length; i++) {
+      let address = addresses[i];
+      if (!SocketAddress.isSocketAddress(address)) {
+        validateString(address, `addresses[${i}]`);
+        address = new SocketAddress({ address, family });
+      }
+      handles.push(address[kSocketAddressHandle]);
     }
-    this[kHandle].ranges.unshift({ start: startHandle, end: endHandle });
+    this[kHandle].addAddresses(handles);
   }
 
+  /**
+   * @param {string|SocketAddress} start
+   * @param {string|SocketAddress} end
+   * @param {string} [family]
+   */
+  addRange(start, end, family = 'ipv4') {
+    if (!SocketAddress.isSocketAddress(start)) {
+      validateString(start, 'start');
+      validateString(family, 'family');
+      start = new SocketAddress({
+        address: start,
+        family,
+      });
+    }
+    if (!SocketAddress.isSocketAddress(end)) {
+      validateString(end, 'end');
+      validateString(family, 'family');
+      end = new SocketAddress({
+        address: end,
+        family,
+      });
+    }
+    const ret = this[kHandle].addRange(
+      start[kSocketAddressHandle],
+      end[kSocketAddressHandle]);
+    if (ret === false)
+      throw new ERR_INVALID_ARG_VALUE('start', start, 'must come before end');
+  }
+
+  /**
+   * @param {string|SocketAddress} network
+   * @param {number} prefix
+   * @param {string} [family]
+   */
   addSubnet(network, prefix, family = 'ipv4') {
-    this[kHandle].subnets.unshift(toSubnet(network, prefix, family));
+    if (!SocketAddress.isSocketAddress(network)) {
+      validateString(network, 'network');
+      validateString(family, 'family');
+      network = new SocketAddress({
+        address: network,
+        family,
+      });
+    }
+    switch (network.family) {
+      case 'ipv4':
+        validateInt32(prefix, 'prefix', 0, 32);
+        break;
+      case 'ipv6':
+        validateInt32(prefix, 'prefix', 0, 128);
+        break;
+    }
+    // Coerce -0 to +0.
+    prefix += 0;
+    this[kHandle].addSubnet(network[kSocketAddressHandle], prefix);
   }
 
+  /**
+   * @param {string} cidr
+   */
   addCIDR(cidr) {
     const { address, prefix, family } = parseCIDR(cidr);
     this.addSubnet(address, prefix, family);
   }
 
+  /**
+   * @param {string[]} cidrs
+   */
   addCIDRs(cidrs) {
     validateArray(cidrs, 'cidrs');
-    // Parse every entry first so that a bad one leaves the list unchanged.
-    const parsed = cidrs.map((cidr, i) => {
-      validateString(cidr, `cidrs[${i}]`);
-      return parseCIDR(cidr);
-    });
-    for (const { address, prefix, family } of parsed) this.addSubnet(address, prefix, family);
+    // Validate and parse all entries first so that an exception mid-array
+    // does not leave the blocklist half-modified.
+    const parsed = [];
+    for (let i = 0; i < cidrs.length; i++) {
+      validateString(cidrs[i], `cidrs[${i}]`);
+      parsed.push(parseCIDR(cidrs[i]));
+    }
+    for (let i = 0; i < parsed.length; i++) {
+      const { address, prefix, family } = parsed[i];
+      this.addSubnet(address, prefix, family);
+    }
   }
 
+  /**
+   * @param {string|SocketAddress} address
+   * @param {string} [family]
+   */
   removeAddress(address, family = 'ipv4') {
-    const handle = toHandle(address, 'address', family);
-    removeFirst(this[kHandle].addresses, (a) => compare(a, handle) === 0);
+    if (!SocketAddress.isSocketAddress(address)) {
+      validateString(address, 'address');
+      validateString(family, 'family');
+      address = new SocketAddress({
+        address,
+        family,
+      });
+    }
+    this[kHandle].removeAddress(address[kSocketAddressHandle]);
   }
 
+  /**
+   * @param {string|SocketAddress} start
+   * @param {string|SocketAddress} end
+   * @param {string} [family]
+   */
   removeRange(start, end, family = 'ipv4') {
-    const startHandle = toHandle(start, 'start', family);
-    const endHandle = toHandle(end, 'end', family);
-    removeFirst(this[kHandle].ranges, (r) => identical(r.start, startHandle) && identical(r.end, endHandle));
+    if (!SocketAddress.isSocketAddress(start)) {
+      validateString(start, 'start');
+      validateString(family, 'family');
+      start = new SocketAddress({
+        address: start,
+        family,
+      });
+    }
+    if (!SocketAddress.isSocketAddress(end)) {
+      validateString(end, 'end');
+      validateString(family, 'family');
+      end = new SocketAddress({
+        address: end,
+        family,
+      });
+    }
+    this[kHandle].removeRange(
+      start[kSocketAddressHandle],
+      end[kSocketAddressHandle]);
   }
 
+  /**
+   * @param {string|SocketAddress} network
+   * @param {number} prefix
+   * @param {string} [family]
+   */
   removeSubnet(network, prefix, family = 'ipv4') {
-    const subnet = toSubnet(network, prefix, family);
-    removeFirst(this[kHandle].subnets, (s) => s.prefix === subnet.prefix && identical(s.network, subnet.network));
+    if (!SocketAddress.isSocketAddress(network)) {
+      validateString(network, 'network');
+      validateString(family, 'family');
+      network = new SocketAddress({
+        address: network,
+        family,
+      });
+    }
+    switch (network.family) {
+      case 'ipv4':
+        validateInt32(prefix, 'prefix', 0, 32);
+        break;
+      case 'ipv6':
+        validateInt32(prefix, 'prefix', 0, 128);
+        break;
+    }
+    prefix += 0;
+    this[kHandle].removeSubnet(network[kSocketAddressHandle], prefix);
   }
 
+  /**
+   * @param {string} cidr
+   */
   removeCIDR(cidr) {
     const { address, prefix, family } = parseCIDR(cidr);
     this.removeSubnet(address, prefix, family);
   }
 
+  /**
+   * @param {string|SocketAddress} address
+   * @param {string} [family]
+   * @returns {boolean}
+   */
   check(address, family = 'ipv4') {
     if (!SocketAddress.isSocketAddress(address)) {
       validateString(address, 'address');
       validateString(family, 'family');
-      const af = family.toLowerCase() === 'ipv4' ? 4 : 6;
-      const bytes = parseAddress(address, af);
-      return bytes !== null && matches(this[kHandle], { family: af, bytes });
+      // Fast path: pass the string directly to C++ which does
+      // inet_pton + Apply() without allocating a JS SocketAddress wrapper.
+      const af = StringPrototypeToLowerCase(family) === 'ipv4' ?
+        AF_INET : AF_INET6;
+      return this[kHandle].checkString(address, af);
     }
-    return matches(this[kHandle], address[kSocketAddressHandle]);
+    return Boolean(this[kHandle].check(address[kSocketAddressHandle]));
   }
 
+  /**
+   * Removes all rules from the block list.
+   */
   clear() {
-    const handle = this[kHandle];
-    handle.addresses.length = handle.subnets.length = handle.ranges.length = 0;
+    this[kHandle].clear();
   }
+
+  /*
+  * @param {string[]} data
+  * @example
+  * const data = [
+  *   // IPv4 examples
+  *   'Subnet: IPv4 192.168.1.0/24',
+  *   'Address: IPv4 10.0.0.5',
+  *   'Range: IPv4 192.168.2.1-192.168.2.10',
+  *   'Range: IPv4 10.0.0.1-10.0.0.10',
+  *
+  *   // IPv6 examples
+  *   'Subnet: IPv6 2001:0db8:85a3:0000:0000:8a2e:0370:7334/64',
+  *   'Address: IPv6 2001:0db8:85a3:0000:0000:8a2e:0370:7334',
+  *   'Range: IPv6 2001:0db8:85a3:0000:0000:8a2e:0370:7334-2001:0db8:85a3:0000:0000:8a2e:0370:7335',
+  *   'Subnet: IPv6 2001:db8:1234::/48',
+  *   'Address: IPv6 2001:db8:1234::1',
+  *   'Range: IPv6 2001:db8:1234::1-2001:db8:1234::10'
+  * ];
+  */
+  #parseIPInfo(data) {
+    for (const item of data) {
+      if (item.includes('IPv4')) {
+        const subnetMatch = item.match(
+          /Subnet: IPv4 (\d{1,3}(?:\.\d{1,3}){3})\/(\d{1,2})/,
+        );
+        if (subnetMatch) {
+          const { 1: network, 2: prefix } = subnetMatch;
+          this.addSubnet(network, NumberParseInt(prefix));
+          continue;
+        }
+        const addressMatch = item.match(/Address: IPv4 (\d{1,3}(?:\.\d{1,3}){3})/);
+        if (addressMatch) {
+          const { 1: address } = addressMatch;
+          this.addAddress(address);
+          continue;
+        }
+
+        const rangeMatch = item.match(
+          /Range: IPv4 (\d{1,3}(?:\.\d{1,3}){3})-(\d{1,3}(?:\.\d{1,3}){3})/,
+        );
+        if (rangeMatch) {
+          const { 1: start, 2: end } = rangeMatch;
+          this.addRange(start, end);
+          continue;
+        }
+      }
+      // IPv6 parsing with support for compressed addresses
+      if (item.includes('IPv6')) {
+        // IPv6 subnet pattern: supports both full and compressed formats
+        // Examples:
+        // - 2001:0db8:85a3:0000:0000:8a2e:0370:7334/64 (full)
+        // - 2001:db8:85a3::8a2e:370:7334/64 (compressed)
+        // - 2001:db8:85a3::192.0.2.128/64 (mixed)
+        const ipv6SubnetMatch = item.match(
+          /Subnet: IPv6 ([0-9a-fA-F:.]{1,45})\/([0-9]{1,3})/i,
+        );
+        if (ipv6SubnetMatch) {
+          const { 1: network, 2: prefix } = ipv6SubnetMatch;
+          this.addSubnet(network, NumberParseInt(prefix), 'ipv6');
+          continue;
+        }
+
+        // IPv6 address pattern: supports both full and compressed formats
+        // Examples:
+        // - 2001:0db8:85a3:0000:0000:8a2e:0370:7334 (full)
+        // - 2001:db8:85a3::8a2e:370:7334 (compressed)
+        // - 2001:db8:85a3::192.0.2.128 (mixed)
+        const ipv6AddressMatch = item.match(/Address: IPv6 ([0-9a-fA-F:.]{1,45})/i);
+        if (ipv6AddressMatch) {
+          const { 1: address } = ipv6AddressMatch;
+          this.addAddress(address, 'ipv6');
+          continue;
+        }
+
+        // IPv6 range pattern: supports both full and compressed formats
+        // Examples:
+        // - 2001:0db8:85a3:0000:0000:8a2e:0370:7334-2001:0db8:85a3:0000:0000:8a2e:0370:7335 (full)
+        // - 2001:db8:85a3::8a2e:370:7334-2001:db8:85a3::8a2e:370:7335 (compressed)
+        // - 2001:db8:85a3::192.0.2.128-2001:db8:85a3::192.0.2.129 (mixed)
+        const ipv6RangeMatch = item.match(/Range: IPv6 ([0-9a-fA-F:.]{1,45})-([0-9a-fA-F:.]{1,45})/i);
+        if (ipv6RangeMatch) {
+          const { 1: start, 2: end } = ipv6RangeMatch;
+          this.addRange(start, end, 'ipv6');
+          continue;
+        }
+      }
+    }
+  }
+
 
   toJSON() {
     return this.rules;
   }
 
   fromJSON(data) {
-    if (typeof data === 'string') data = JSON.parse(data);
-    validateRuleData(data);
-    parseRules(this, data);
+    // The data argument must be a string, or an array of strings that
+    // is JSON parseable.
+    if (ArrayIsArray(data)) {
+      for (const n of data) {
+        if (typeof n !== 'string') {
+          throw new ERR_INVALID_ARG_TYPE('data', ['string', 'string[]'], data);
+        }
+      }
+    } else if (typeof data !== 'string') {
+      throw new ERR_INVALID_ARG_TYPE('data', ['string', 'string[]'], data);
+    } else {
+      data = JSONParse(data);
+      if (!ArrayIsArray(data)) {
+        throw new ERR_INVALID_ARG_TYPE('data', ['string', 'string[]'], data);
+      }
+      for (const n of data) {
+        if (typeof n !== 'string') {
+          throw new ERR_INVALID_ARG_TYPE('data', ['string', 'string[]'], data);
+        }
+      }
+    }
+
+    this.#parseIPInfo(data);
   }
 
+
   get rules() {
-    return rulesOf(this[kHandle]);
+    return this[kHandle].getRules();
   }
 
   get size() {
-    const { addresses, subnets, ranges } = this[kHandle];
-    return addresses.length + subnets.length + ranges.length;
+    return this[kHandle].getSize();
   }
 
   [kClone]() {
-    return { data: { handle: shareHandle(this[kHandle]) }, deserializeInfo: 'internal/blocklist:InternalBlockList' };
+    const handle = this[kHandle];
+    return {
+      data: { handle },
+      deserializeInfo: 'internal/blocklist:InternalBlockList',
+    };
   }
 
   [kDeserialize]({ handle }) {
-    this[kHandle] = sharedHandles.get(handle.id)?.deref() ?? shareHandle(handle);
+    this[kHandle] = handle;
+    this[kHandle][owner_symbol] = this;
   }
 }
 
 class InternalBlockList {
   constructor(handle) {
+    markTransferMode(this, true, false);
     this[kHandle] = handle;
+    if (handle !== undefined)
+      handle[owner_symbol] = this;
   }
 }
 
-InternalBlockList.prototype.constructor = BlockList;
-Object.setPrototypeOf(InternalBlockList.prototype, BlockList.prototype);
+InternalBlockList.prototype.constructor = BlockList.prototype.constructor;
+ObjectSetPrototypeOf(InternalBlockList.prototype, BlockList.prototype);
 
 module.exports = {
   BlockList,
   InternalBlockList,
   kHandle,
-  isBlockList: BlockList.isBlockList,
 };
