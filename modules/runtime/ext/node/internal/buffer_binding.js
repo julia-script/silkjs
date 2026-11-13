@@ -125,37 +125,17 @@ const utf8Slice = (view, start, end) => codecSlice(3, view, start, end);
 const ucs2Slice = (view, start, end) => codecSlice(4, view, start, end);
 const latin1Slice = (view, start, end) => codecSlice(6, view, start, end);
 const asciiSlice = (view, start, end) => codecSlice(7, view, start, end);
-const hexDigits = '0123456789abcdef';
-const hexTable = [];
-for (let i = 0; i < 256; i++) hexTable.push(hexDigits[i >>> 4] + hexDigits[i & 15]);
 function hexSlice(view, start, end) {
   const source = viewBytes(view);
   const range = sliceRange(source, start, end), s = range[0], e = range[1];
   if ((e - s) * 2 > kStringMaxLength) throw new ERR_STRING_TOO_LONG();
-  let result = '';
-  for (let i = s; i < e; i++) result += hexTable[source[i]];
-  return result;
-}
-const base64Alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
-const base64urlAlphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_';
-function base64Encode(source, s, e, url) {
-  const chars = url ? base64urlAlphabet : base64Alphabet;
-  let result = '';
-  for (let i = s; i < e; i += 3) {
-    const a = source[i], b = i + 1 < e ? source[i + 1] : 0, c = i + 2 < e ? source[i + 2] : 0;
-    result += chars[a >>> 2] + chars[((a & 3) << 4) | (b >>> 4)];
-    if (i + 1 < e) result += chars[((b & 15) << 2) | (c >>> 6)];
-    else if (!url) result += '=';
-    if (i + 2 < e) result += chars[c & 63];
-    else if (!url) result += '=';
-  }
-  return result;
+  return s === e ? '' : bufferCodec(12, source, s, e);
 }
 function base64SliceWith(view, start, end, url) {
   const source = viewBytes(view);
   const range = sliceRange(source, start, end), s = range[0], e = range[1];
   if (Math.ceil((e - s) / 3) * 4 > kStringMaxLength) throw new ERR_STRING_TOO_LONG();
-  return base64Encode(source, s, e, url);
+  return s === e ? '' : bufferCodec(url ? 11 : 10, source, s, e);
 }
 const base64Slice = (view, start, end) => base64SliceWith(view, start, end, false);
 const base64urlSlice = (view, start, end) => base64SliceWith(view, start, end, true);
@@ -467,7 +447,7 @@ function btoa(input) {
   for (let i = 0; i < input.length; i++) if (input.charCodeAt(i) > 255) return -1;
   const source = new Uint8Array(input.length);
   if (source.length) bufferCodec(5, input, source, 0, source.length);
-  return base64Encode(source, 0, source.length, false);
+  return source.length ? bufferCodec(10, source, 0, source.length) : '';
 }
 function atob(input) {
   let string = input.replace(/[\t\n\f\r ]/g, '');

@@ -234,12 +234,20 @@ const kState = Symbol('kState'), kFinalized = Symbol('kFinalized');
 const { emitWarning } = process;
 let shakeWarned = false;
 function warnShake(algorithm) {
-  if (shakeWarned || !require('internal/options').getOptionValue('--pending-deprecation')) return;
-  const normalized = algorithm.toLowerCase().replace('-', '');
-  if (normalized !== 'shake128' && normalized !== 'shake256') return;
+  // The name test first: it is cheaper than the option lookup, and most digests are not SHAKE.
+  if (shakeWarned || !/^shake-?(?:128|256)$/i.test(algorithm)) return;
+  if (!require('internal/options').getOptionValue('--pending-deprecation')) return;
   shakeWarned = true; emitWarning('Creating SHAKE128/256 digests without an explicit options.outputLength is deprecated.', 'DeprecationWarning', 'DEP0198');
 }
-function digestSize(algorithm) { try { return call('hashSize', [algorithm]); } catch { return undefined; } }
+// Digest sizes never change for a name, so a known size is looked up once.
+const digestSizes = new Map();
+function digestSize(algorithm) {
+  let size = digestSizes.get(algorithm);
+  if (size !== undefined) return size;
+  try { size = call('hashSize', [algorithm]); } catch { return undefined; }
+  if (size !== undefined && typeof algorithm === 'string') digestSizes.set(algorithm, size);
+  return size;
+}
 // The native digest has no output length: XOF lengths are applied when the digest is read.
 function hashState(algorithm, xofLen, existing) {
   const size = digestSize(algorithm), xof = /^shake-?(?:128|256)$/i.test(algorithm);
@@ -249,16 +257,47 @@ function hashState(algorithm, xofLen, existing) {
 // The native half of Node's Hash (crypto::Hash): update() reports an OpenSSL
 // failure as false, and digest() keeps the first digest so _flush() can read it
 // without finalizing.
+//
+// For the common fixed-size digests the native context waits for a second update
+// (or a copy): a single update then digest, as ETag and checksum code does, is one
+// native one-shot digest of a private copy of the bytes.
+const oneShotDigests = new Set(['md5', 'sha1', 'sha256', 'sha384', 'sha512']);
 class HashHandle {
   constructor(algorithm, length, source) {
     this.algorithm = algorithm; this.length = length;
-    attach(this, source === undefined ? call('hashCreate', [algorithm]) : call('hashCopy', [handle(source)]));
+    this.deferred = source === undefined && length === -1 && oneShotDigests.has(algorithm);
+    this.pending = undefined;
+    if (!this.deferred) attach(this, source === undefined ? call('hashCreate', [algorithm]) : call('hashCopy', [handle(source.native())]));
+  }
+  // The native context, created (and fed the pending bytes) on first need.
+  native() {
+    if (this.deferred) {
+      this.deferred = false;
+      attach(this, call('hashCreate', [this.algorithm]));
+      const pending = this.pending; this.pending = undefined;
+      if (pending !== undefined) call('hashUpdate', [handle(this), pending]);
+    }
+    return this;
   }
   update(data, encoding) {
-    try { call('hashUpdate', [handle(this), packed(typeof data === 'string' ? Buffer.from(data, encoding) : data)]); } catch { return false; }
+    try {
+      const bytes = typeof data === 'string' ? Buffer.from(data, encoding) : data;
+      if (this.deferred && this.pending === undefined) {
+        this.pending = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
+        return true;
+      }
+      call('hashUpdate', [handle(this.native()), packed(bytes)]);
+    } catch { return false; }
     return true;
   }
-  digest(outputEncoding) { return hashDigest(this, 'hashFinal', () => [handle(this), this.length], outputEncoding); }
+  digest(outputEncoding) {
+    if (this.deferred && this[kDigest] === undefined) {
+      this.deferred = false;
+      const pending = this.pending ?? new ArrayBuffer(0); this.pending = undefined;
+      this[kDigest] = Buffer.from(call('digest', [this.algorithm, pending]));
+    }
+    return hashDigest(this, 'hashFinal', () => [handle(this), this.length], outputEncoding);
+  }
 }
 function Hash(algorithm, options) {
   if (!new.target) return new Hash(algorithm, options);
