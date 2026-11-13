@@ -14,7 +14,8 @@ const promiseEventIndex = { init: 0, before: 1, after: 2, settled: 3 };
 const nativeResources = new Map();
 const rootResource = {};
 const resourceOwnerToken = Symbol('resourceOwner');
-let nextId = 2;
+// The async id counter, an object so that the native setImmediate takes ids from it too.
+const asyncIds = { next: 2 };
 let emitting = false;
 let pendingDestroy = [];
 // Node's async_hook_fields counters: enabled hooks per callback kind (kInit..kPromiseResolve)
@@ -238,7 +239,7 @@ class AsyncResource {
     const trigger = typeof options === 'number' ? options : options.triggerAsyncId ?? executionAsyncId();
     if (!Number.isSafeInteger(trigger) || trigger < -1) throw error('ERR_INVALID_ASYNC_ID', `Invalid triggerAsyncId value: ${trigger}`, RangeError);
     this.#stores = captureContext()?.stores;
-    this.#id = token === resourceOwnerToken && typeof explicitId === 'number' && explicitId !== -1 ? explicitId : nextId++;
+    this.#id = token === resourceOwnerToken && typeof explicitId === 'number' && explicitId !== -1 ? explicitId : asyncIds.next++;
     this.#trigger = trigger;
     this.#destroy = { id: this.#id, destroyed: false, promise: false };
     this.#owner = token === resourceOwnerToken ? owner : undefined;
@@ -285,7 +286,7 @@ class InternalResource {
     const context = host.getAsyncContext();
     // Only the stores: the whole context would keep the resource that was current alive.
     this.stores = context?.stores;
-    this.id = typeof explicitId === 'number' && explicitId !== -1 ? explicitId : nextId++;
+    this.id = typeof explicitId === 'number' && explicitId !== -1 ? explicitId : asyncIds.next++;
     this.trigger = context?.id ?? 1;
     this.owner = owner;
     this.destroyed = false;
@@ -436,7 +437,7 @@ function nativeEvent(event, token, parent, resource, parentResource) {
       nativeResources.set(token, hiddenPromise);
       return;
     }
-    const state = { id: nextId++, trigger: nativeResources.get(parent)?.id ?? executionAsyncId(),
+    const state = { id: asyncIds.next++, trigger: nativeResources.get(parent)?.id ?? executionAsyncId(),
       resource: new WeakRef(resource), destroyed: false, promise: true };
     nativeResources.set(token, state);
     trackPromise(resource, state);
@@ -456,7 +457,7 @@ function nativeEvent(event, token, parent, resource, parentResource) {
     // id on its first event, without an init.
     state = latePromises.get(resource);
     if (state === undefined) {
-      state = { id: nextId++, trigger: executionAsyncId(), resource: new WeakRef(resource), destroyed: true, promise: true };
+      state = { id: asyncIds.next++, trigger: executionAsyncId(), resource: new WeakRef(resource), destroyed: true, promise: true };
       latePromises.set(resource, state);
       trackPromise(resource, state);
     }
@@ -540,8 +541,9 @@ Object.defineProperties(module.exports, {
   _setPromiseObserver: { value: setPromiseObserver },
   _drainDestroy: { value: drainDestroy },
   // Node's newAsyncId: the next id from the same counter every resource takes its id from.
-  _newAsyncId: { value: () => nextId++ },
+  _newAsyncId: { value: () => asyncIds.next++ },
   _hookFields: { value: hookFields },
+  _asyncIds: { value: asyncIds },
   _getPromiseHooks: { value: getPromiseHooks },
   // Node's async_wrap.queueDestroyAsyncId: a destroy event for an id with no resource.
   _queueDestroyId: { value: id => { if (hookCount !== 0) pendingDestroy.push({ id, destroyed: true }); } },

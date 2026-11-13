@@ -8,7 +8,7 @@ function unpackError(value) {
   if (value.properties) Object.assign(error, value.properties);
   return error;
 }
-function create(threads, status, execArgv) {
+function create(threads, status, execArgv, drainWorker) {
   const { Worker, MessageChannel, receiveMessageOnPort } = threads;
   const { port1, port2 } = new MessageChannel();
   const signal = new Int32Array(new SharedArrayBuffer(4));
@@ -31,6 +31,10 @@ function create(threads, status, execArgv) {
       const epoch = Atomics.load(signal, 0);
       const envelope = receiveMessageOnPort(port1);
       if (envelope) {
+        // The worker posted its output before this reply (Node's hooks thread writes it from
+        // the ticks that run before the reply). Take it now: in Node the requesting thread's
+        // event loop receives it before the process can exit, and this wait never yields to it.
+        drainWorker(worker);
         const message = envelope.message;
         if (message.id !== id) throw new Error('Loader hook response sequence mismatch');
         if (message.failed) throw unpackError(message.error);
