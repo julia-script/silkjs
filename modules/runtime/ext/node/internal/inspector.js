@@ -406,6 +406,10 @@ function broadcast(method, params) {
     if (method === 'Network.requestWillBeSent') {
       params = { ...params, request: { ...params.request, hasPostData: params.request.hasPostData === true } };
       if (params.initiator === undefined) params.initiator = { type: 'script', stack: callerStack(broadcast) };
+    } else if (method === 'Network.webSocketCreated' && params.initiator === undefined) {
+      // NetworkAgent::webSocketCreated: V8's whole current stack, built-in frames
+      // included, since the open is published from the WebSocket's own code.
+      params = { ...params, initiator: { type: 'script', stack: stackTrace(host.captureCallSites(200, broadcast)) } };
     }
     for (const session of sessions.values()) if (session.networkEnabled) {
       const event = network.observe(session, method, params);
