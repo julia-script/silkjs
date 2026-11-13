@@ -109,18 +109,21 @@ class Transport {
     if (status >= 0) this.reading = false;
     return status;
   }
-  write(chunk, callback) {
+  // Starts a write: 0 when the kernel took every byte now, a status below 0 when it failed
+  // at once, else the request's token, whose completion expect() must register before the
+  // turn ends (completions are only dispatched from the event loop).
+  writeNow(chunk) {
     const token = ++this.sequence;
-    this.requests.set(token, { callback, chunk });
-    const status = this.call('write', chunk.buffer, chunk.byteOffset, chunk.byteLength, token);
-    // 1: the kernel took every byte now. Node completes such a write synchronously too.
-    if (status === 1) {
-      this.requests.delete(token);
-      callback(null);
-    } else if (status < 0) {
-      this.requests.delete(token);
-      callback(error(status, 'write'));
-    }
+    const status = host.net('write', [this.id, chunk.buffer, chunk.byteOffset, chunk.byteLength, token]);
+    return status === 1 ? 0 : status < 0 ? status : token;
+  }
+  expect(token, callback, chunk) { this.requests.set(token, { callback, chunk }); }
+  write(chunk, callback) {
+    const result = this.writeNow(chunk);
+    // The kernel took every byte now: Node completes such a write synchronously too.
+    if (result === 0) callback(null);
+    else if (result < 0) callback(error(result, 'write'));
+    else this.expect(result, callback, chunk);
   }
   writev(chunks, callback) {
     let pending = chunks.length;
