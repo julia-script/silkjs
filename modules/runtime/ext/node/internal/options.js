@@ -281,6 +281,9 @@ function loaderWorkerArguments(args) {
   return result;
 }
 
+// getOptionValue reads its tables without user-mutable methods (a replaced
+// Map.prototype.get must not run), as Node's binding does.
+const mapGet = Function.prototype.call.bind(Map.prototype.get);
 // Node's per-option defaults (src/node_options.h) where they differ from the type's.
 // Boolean options that default to true are marked in the table instead.
 const kOptionDefaults = {
@@ -300,7 +303,7 @@ const kOptionDefaults = {
 // The value of a table option nothing above answers for, as node_options.cc keeps it:
 // the CLI and NODE_OPTIONS entries the bootstrap parsed, NODE_OPTIONS first.
 function parsedOptionValue(name) {
-  const info = table.options.get(name);
+  const info = mapGet(table.options, name);
   if (info === undefined) return undefined;
   const type = info[0];
   let value = name in kOptionDefaults ? kOptionDefaults[name] :

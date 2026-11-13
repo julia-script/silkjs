@@ -72,6 +72,7 @@ const {
 
 const {
   AbortError,
+  ErrnoException,
   codes: {
     ERR_INVALID_ARG_TYPE,
     ERR_INVALID_ARG_VALUE,
@@ -996,9 +997,165 @@ function newStreamDuplexFromReadableWritablePair(pair = kEmptyObject, options = 
   return duplex;
 }
 
-// newWritableStreamFromStreamBase() and newReadableStreamFromStreamBase() are
-// not ported: they drive a libuv StreamBase handle through the stream_wrap
-// binding, which the runtime does not have.
+// The stream_wrap and uv bindings are read on first use: most users of this module
+// never adapt a StreamBase.
+const internalBinding = name => require('internal/bindings').internalBinding(name);
+
+/**
+ * @typedef {import('./queuingstrategies').QueuingStrategy} QueuingStrategy
+ * @param {object} streamBase
+ * @param {QueuingStrategy} strategy
+ * @returns {WritableStream}
+ */
+function newWritableStreamFromStreamBase(streamBase, strategy) {
+  validateObject(streamBase, 'streamBase');
+  const { WriteWrap, ShutdownWrap, kLastWriteWasAsync, streamBaseState } = internalBinding('stream_wrap');
+
+  let current;
+
+  function createWriteWrap(controller, promise) {
+    const req = new WriteWrap();
+    req.handle = streamBase;
+    req.oncomplete = onWriteComplete;
+    req.async = false;
+    req.bytes = 0;
+    req.buffer = null;
+    req.controller = controller;
+    req.promise = promise;
+    return req;
+  }
+
+  function onWriteComplete(status) {
+    if (status < 0) {
+      const error = new ErrnoException(status, 'write', this.error);
+      this.promise.reject(error);
+      this.controller.error(error);
+      return;
+    }
+    this.promise.resolve();
+  }
+
+  function doWrite(chunk, controller) {
+    const promise = PromiseWithResolvers();
+    let ret;
+    let req;
+    try {
+      req = createWriteWrap(controller, promise);
+      ret = streamBase.writeBuffer(req, chunk);
+      if (streamBaseState[kLastWriteWasAsync])
+        req.buffer = chunk;
+      req.async = !!streamBaseState[kLastWriteWasAsync];
+    } catch (error) {
+      promise.reject(error);
+    }
+
+    if (ret !== 0)
+      promise.reject(new ErrnoException(ret, 'write', req));
+    else if (!req.async)
+      promise.resolve();
+
+    return promise.promise;
+  }
+
+  return new WritableStream({
+    write(chunk, controller) {
+      current = current !== undefined ?
+        PromisePrototypeThen(
+          current,
+          () => doWrite(chunk, controller),
+          (error) => controller.error(error)) :
+        doWrite(chunk, controller);
+      return current;
+    },
+
+    close() {
+      const promise = PromiseWithResolvers();
+      const req = new ShutdownWrap();
+      req.oncomplete = () => promise.resolve();
+      const err = streamBase.shutdown(req);
+      if (err === 1)
+        promise.resolve();
+      return promise.promise;
+    },
+  }, strategy);
+}
+
+/**
+ * @param {StreamBase} streamBase
+ * @param {QueuingStrategy} strategy
+ * @returns {ReadableStream}
+ */
+function newReadableStreamFromStreamBase(streamBase, strategy, options = kEmptyObject) {
+  validateObject(streamBase, 'streamBase');
+  validateObject(options, 'options');
+
+  const {
+    ondone = () => {},
+  } = options;
+
+  if (typeof streamBase.onread === 'function')
+    throw new ERR_INVALID_STATE('StreamBase already has a consumer');
+
+  validateFunction(ondone, 'options.ondone');
+
+  const { ShutdownWrap, kArrayBufferOffset, kReadBytesOrError, streamBaseState } = internalBinding('stream_wrap');
+  const { UV_EOF } = internalBinding('uv');
+
+  let controller;
+
+  streamBase.onread = (arrayBuffer) => {
+    const nread = streamBaseState[kReadBytesOrError];
+
+    if (nread === 0)
+      return;
+
+    try {
+      if (nread === UV_EOF) {
+        controller.close();
+        streamBase.readStop();
+        try {
+          ondone();
+        } catch (error) {
+          controller.error(error);
+        }
+        return;
+      }
+
+      const offset = streamBaseState[kArrayBufferOffset];
+      controller.enqueue(new Uint8Array(arrayBuffer, offset, nread));
+
+      if (controller.desiredSize <= 0)
+        streamBase.readStop();
+    } catch (error) {
+      controller.error(error);
+      streamBase.readStop();
+    }
+  };
+
+  return new ReadableStream({
+    start(c) { controller = c; },
+
+    pull() {
+      streamBase.readStart();
+    },
+
+    cancel() {
+      const promise = PromiseWithResolvers();
+      try {
+        ondone();
+      } catch (error) {
+        promise.reject(error);
+        return promise.promise;
+      }
+      const req = new ShutdownWrap();
+      req.oncomplete = () => promise.resolve();
+      const err = streamBase.shutdown(req);
+      if (err === 1)
+        promise.resolve();
+      return promise.promise;
+    },
+  }, strategy);
+}
 
 module.exports = {
   newWritableStreamFromStreamWritable,
@@ -1007,6 +1164,8 @@ module.exports = {
   newStreamReadableFromReadableStream,
   newReadableWritablePairFromDuplex,
   newStreamDuplexFromReadableWritablePair,
+  newWritableStreamFromStreamBase,
+  newReadableStreamFromStreamBase,
   kValidateChunk,
   kDestroyOnSyncError,
 };

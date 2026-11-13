@@ -162,11 +162,16 @@ class StreamHandle {
     this.#owner = owner;
     if (this._transport) this._transport.owner = owner;
   }
+  // Like StreamBase's accessors, these throw for a receiver that is no handle.
   get fd() {
+    if (!(#onread in this)) throw new TypeError('Illegal invocation');
     const fd = this._transport?.call?.('fileno');
     return typeof fd === 'number' && fd >= 0 ? fd : -1;
   }
-  get _externalStream() { return this._transport; }
+  get _externalStream() {
+    if (!(#onread in this)) throw new TypeError('Illegal invocation');
+    return this._transport;
+  }
   getAsyncId() { return this._transport?.resource?.asyncId() ?? -1; }
   getProviderType() { return this._transport?.getProviderType?.() ?? 0; }
   // AsyncWrap::AsyncReset: the handle's callbacks run in a new async resource, reported to
@@ -694,6 +699,8 @@ class JSStream extends StreamHandle {
   // A MakeCallback: an exception is reported as uncaught, and the call fails with
   // UV_EPROTO (JSStream's DoWrite, DoShutdown, ReadStart and ReadStop).
   _callback(fn, args, receiver = this) {
+    // AsyncWrap::MakeCallback calls nothing when the property is not a function.
+    if (typeof fn !== 'function') return uv.UV_EPROTO;
     let result;
     const threw = host.invokeTimer(this._resource, function callback() {
       result = Reflect.apply(fn, receiver, args);
@@ -721,7 +728,12 @@ class JSStream extends StreamHandle {
     streamBaseState[kLastWriteErr] = 0;
     this._countWritten(bytes);
     const status = this._callback(this.onwrite, [wrap, buffers]) ?? 0;
-    return req ? status : wrap;
+    // StreamBase::Write: a failed write is not async, and its error is the result.
+    if (status !== 0) {
+      streamBaseState[kLastWriteWasAsync] = 0;
+      return status;
+    }
+    return req ? 0 : wrap;
   }
   finishWrite(req, status) {
     if (typeof req.oncomplete === 'function') this._callback(req.oncomplete, [status], req);

@@ -89,7 +89,27 @@ function createLoader(host, builtins) {
   // A package's directory as Node's package errors name it.
   const packagePath = pkg => pkg.directory.endsWith(path.sep) ? pkg.directory : pkg.directory + path.sep;
 
-  const text = host.readText;
+  // fs.readFileSync or fs.realpathSync as user code replaced it, which Node's loader
+  // calls for module sources and real paths; null while it is fs's own, whose native
+  // reads are taken then.
+  let fsOriginals = null;
+  function patchedFs(name) {
+    const fs = builtins.get('fs');
+    fsOriginals ??= { readFileSync: fs.readFileSync, realpathSync: fs.realpathSync };
+    return fs[name] === fsOriginals[name] ? null : fs;
+  }
+  // A module's source. Node reads package.json files natively, so they never come here.
+  function text(filename) {
+    const fs = patchedFs('readFileSync');
+    return fs === null ? host.readText(filename) : `${fs.readFileSync(filename, 'utf8')}`;
+  }
+  // Module._stat as user code replaced it (Node's experimental hook for a virtual file
+  // system), which the CommonJS file lookups ask instead of the filesystem; null while
+  // it is Node's own.
+  let statHook = null;
+  function legacyDirectory(filename) {
+    return statHook === null ? isDirectory(filename) : statHook(filename) === 1;
+  }
 
   function probedText(filename) {
     if (probed === null || probed.filename !== filename) return text(filename);
@@ -181,7 +201,7 @@ function createLoader(host, builtins) {
     if (known !== undefined) return known;
     if (!isFile(filename)) { packages.set(directory, null); return null; }
     let data;
-    try { data = JSON.parse(text(filename).replace(/^\uFEFF/, '')); }
+    try { data = JSON.parse(host.readText(filename).replace(/^\uFEFF/, '')); }
     catch (cause) {
       if (!(cause instanceof SyntaxError)) throw cause;
       throw Object.assign(error('ERR_INVALID_PACKAGE_CONFIG', filename, importing, cause.message), { cause });
@@ -202,6 +222,8 @@ function createLoader(host, builtins) {
   // The real path of an absolute filename: its directory's, found once, joined to its own
   // name unless it is itself a symlink. One lstat for a file whose directory is known.
   function realPath(filename) {
+    const fs = patchedFs('realpathSync');
+    if (fs !== null) return fs.realpathSync(filename);
     let real = realPaths.get(filename);
     if (real !== undefined) return real;
     const directory = path.dirname(filename);
@@ -381,6 +403,7 @@ function createLoader(host, builtins) {
   }
 
   function tryFile(filename) {
+    if (statHook !== null) return statHook(filename) === 0 ? filename : null;
     // An lstat answers for a regular file, and its realPath needs no other.
     const type = typeOf(filename, false);
     if (type === 0o100000) { regularFile = filename; return filename; }
@@ -400,7 +423,7 @@ function createLoader(host, builtins) {
   // index file stands in for a "main" that names nothing.
   function legacyFile(filename, directoryAllowed, directoryOnly, warnMain = true) {
     const exact = directoryOnly ? null : tryFile(filename) || tryExtensions(filename);
-    if (exact || !directoryAllowed || !isDirectory(filename)) return exact;
+    if (exact || !directoryAllowed || !legacyDirectory(filename)) return exact;
     const pkg = readPackage(filename);
     if (pkg && typeof pkg.data.main === 'string' && pkg.data.main) {
       const target = path.resolve(filename, pkg.data.main);
@@ -1215,10 +1238,20 @@ function createLoader(host, builtins) {
   });
   Module._nodeModulePaths = directory => modulePaths(path.resolve(directory));
   // Node's internalModuleStat: 0 for a file, 1 for a directory, negative otherwise.
-  Module._stat = filename => {
+  const nodeStat = filename => {
     const type = typeOf(path.toNamespacedPath(String(filename)), true);
     return type === 0o100000 ? 0 : type === 0o040000 ? 1 : -2;
   };
+  Object.defineProperty(Module, '_stat', {
+    __proto__: null,
+    get() { return statHook ?? nodeStat; },
+    set(stat) {
+      require('internal/util').emitExperimentalWarning('Module._stat');
+      statHook = stat;
+      return true;
+    },
+    configurable: true,
+  });
   Module._resolveLookupPaths = (request, parent) => {
     if (builtinName(request) !== null) return null;
     if (request[0] !== '.' || (request.length > 1 && request[1] !== '.' && request[1] !== '/' && (path.sep !== '\\' || request[1] !== '\\'))) {
@@ -1235,7 +1268,7 @@ function createLoader(host, builtins) {
     const trailingSlash = /[\\/]$/.test(request) || /(?:^|[\\/])\.?\.$/.test(request);
     for (let index = 0; index < paths.length; index++) {
       const base = paths[index];
-      if (!absolute && typeOf(base, true) !== 0o040000) continue;
+      if (!absolute && !legacyDirectory(base)) continue;
       const found = legacyFile(path.resolve(base, request), true, trailingSlash);
       if (found) return isMain ? (host.preserveSymlinksMain ? path.resolve(found) : realPath(found)) : (host.preserveSymlinks ? path.resolve(found) : realPath(found));
     }

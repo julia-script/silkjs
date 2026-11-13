@@ -36,7 +36,9 @@ function javascriptStack(error) {
   }
   return {
     message: lines.length ? lines[0] : 'No stack.',
-    stack: lines.length ? lines.slice(1).filter(line => /^\s*at /.test(line)).map(line => line.trim()) : ['Unavailable.'],
+    // node_report.cc PrintJavaScriptErrorStack: every line after the first, without its
+    // leading white space (a decorated stack keeps its source line and arrow).
+    stack: lines.length ? lines.slice(1).map(line => line.trimStart()) : ['Unavailable.'],
     errorProperties: properties,
   };
 }

@@ -1,6 +1,7 @@
 'use strict';
 // Node 24 public codec constants (Z_MAX_CHUNK is intentionally unbounded).
 module.exports = Object.freeze({
+  __proto__: null,
   "Z_NO_FLUSH": 0,
   "Z_PARTIAL_FLUSH": 1,
   "Z_SYNC_FLUSH": 2,

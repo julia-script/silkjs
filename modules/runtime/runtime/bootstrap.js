@@ -792,6 +792,7 @@ const processMethods = host.processMethods = {
     // Node reports the directory it was in as the path and the target as dest.
     if (code < 0) throw systemError(code, 'chdir', host.cwd(), directory);
   },
+  resetStdioForTesting() { internalRequire('internal/stdio').resetStdio(); },
 };
 Object.assign(process, {
   argv: native.argv.slice(), argv0: native.argv[0], execArgv: [], execPath: native.osNative('execPath', []),
@@ -1716,9 +1717,24 @@ function run(restored = false) {
       case '--interactive': interactive = value; continue;
       case '--check': check = value; continue;
       case '--test': testMode = value; continue;
+      // node.cc ProcessGlobalArgs: Revert() for each, and Node 24 has no revertible CVE
+      // (node_revert.h SECURITY_REVERSIONS is empty).
+      case '--security-revert':
+        host.writeStartupDiagnostic(`${process.execPath}: Error: Attempt to revert an unknown CVE [${value}]\n`);
+        return process.exit(12);
       case '--version': host.stdout.write('silkjsruntime 0.1.0 (QuickJS; Node 24 target)\n'); return;
       // node.cc: --help runs internal/main/print_help from Node's option table.
       case '--help': internalRequire('internal/main/print_help').print(process.stdout); return;
+      // node_options.cc GetBashCompletion: every option and alias the parser knows.
+      case '--completion-bash': {
+        const { options, aliases } = internalRequire('internal/options_table');
+        const names = [...options.keys(), ...aliases.keys()].filter(item => item[0] !== '[');
+        host.stdout.write(`_node_complete() {\n  local cur_word options\n  cur_word="\${COMP_WORDS[COMP_CWORD]}"\n` +
+          `  if [[ "\${cur_word}" == -* ]] ; then\n    COMPREPLY=( $(compgen -W '${names.join(' ')}' -- "\${cur_word}") )\n` +
+          `    return 0\n  else\n    COMPREPLY=( $(compgen -f "\${cur_word}") )\n    return 0\n  fi\n}\n` +
+          'complete -o filenames -o nospace -o bashdefault -F _node_complete node node_g\n');
+        return;
+      }
     }
     // The test runner and the watch supervisor read their options with getOptionValue, as Node's do.
     if (name.startsWith('--test-') || name.startsWith('--experimental-test-') || name.startsWith('--watch-')) continue;

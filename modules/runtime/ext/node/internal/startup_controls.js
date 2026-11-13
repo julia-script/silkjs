@@ -1,6 +1,9 @@
 'use strict';
 
 const host = require('internal/host');
+// getOptionValue reads its tables without user-mutable methods (a replaced
+// Map.prototype.get must not run), as Node's binding does.
+const mapGet = Function.prototype.call.bind(Map.prototype.get);
 const booleanOptions = new Map([
   ['--warnings', 'warnings'], ['--deprecation', 'deprecation'],
   ['--trace-warnings', 'traceProcessWarnings'], ['--trace-deprecation', 'traceDeprecation'],
@@ -291,7 +294,7 @@ module.exports = { applyV8Flag,
     if (name === '--disable-warning') return [...disabledWarnings];
     if (name === '--redirect-warnings') return state.redirectWarnings || '';
     if (name === '--network-family-autoselection-attempt-timeout') return state.networkFamilyAutoselectionAttemptTimeout;
-    const key = booleanOptions.get(name);
+    const key = mapGet(booleanOptions, name);
     return key ? state[key] : undefined;
   },
 };

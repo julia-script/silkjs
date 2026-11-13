@@ -37,8 +37,29 @@ function builtins() {
     natives[host.builtinName(index)] = source;
   }
   natives.config = JSON.stringify(process.config);
-  return { natives, builtinIds: Object.keys(natives), configs: JSON.stringify(process.config) };
+  const builtinIds = Object.keys(natives);
+  // BuiltinLoader::GetBuiltinCategories: what a require() of the id may load. The
+  // runtime's own entry points, contexts and bundled deps cannot, nor can the modules
+  // Node leaves out of the list for needing a flag or warning on load.
+  const cannotBeRequired = new Set(), canBeRequired = new Set();
+  for (const id of builtinIds) {
+    if (id === 'config') continue;
+    const internal = /^internal\/(?:bootstrap|main|per_context|deps)\//.test(id) || id === 'internal/test/binding' || id === 'internal/v8_prof_polyfill';
+    (internal || kNotRequirable.has(id) ? cannotBeRequired : canBeRequired).add(id);
+  }
+  return {
+    natives, builtinIds, configs: JSON.stringify(process.config),
+    builtinCategories: { cannotBeRequired, canBeRequired },
+    // BuiltinLoader::GetCacheUsage. No built-in runs from a code cache: each was compiled
+    // from its source, into the startup image or when first required.
+    getCacheUsage() {
+      const compiledWithoutCache = new Set();
+      for (const entry of process.moduleLoadList) if (entry.startsWith('NativeModule ')) compiledWithoutCache.add(entry.slice(13));
+      return { compiledWithCache: new Set(), compiledWithoutCache, compiledInSnapshot: [] };
+    },
+  };
 }
+const kNotRequirable = new Set(['quic', 'sqlite', 'stream/iter', 'sys', 'wasi', 'zlib/iter']);
 
 const net = () => require('internal/net/binding');
 const kBindings = {
@@ -72,6 +93,12 @@ const kBindings = {
   },
   // node_process_methods.cc: process.chdir and process.cwd call through these.
   process_methods: () => require('internal/host').processMethods,
+  // node_credentials.cc: SafeGetenv reads the process environment, which process.env
+  // reads and writes through.
+  credentials: () => ({
+    safeGetenv: key => process.env[key],
+    implementsPosixCredentials: typeof process.getuid === 'function',
+  }),
   // node_worker.cc: this thread's identity and its control port.
   worker: () => {
     const { isMainThread, isInternalThread, threadId, getEnvMessagePort } = require('internal/worker');

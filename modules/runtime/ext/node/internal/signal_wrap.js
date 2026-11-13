@@ -27,6 +27,12 @@ class Signal {
     const state = handle(this);
     if (state.closed) return 0;
     signum |= 0;
+    // SignalWrap::Start: the inspector's profiler owns SIGPROF while it listens.
+    if (signum === require('os').constants.signals.SIGPROF && process.platform !== 'win32' &&
+        process.features.inspector && require('internal/inspector').url() !== undefined) {
+      process.emitWarning('process.on(SIGPROF) is reserved while debugging');
+      return undefined;
+    }
     stopWatching(state);
     const self = this;
     const id = host.processNative('signalStart', [signum, function onSignal() {
