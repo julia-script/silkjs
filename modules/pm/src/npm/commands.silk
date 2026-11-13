@@ -23,22 +23,22 @@ import silk.concurrency.thread_pool { Pool }
 import silk.core.effect { Effect }
 import silk.core.option { Option }
 import silk.core.result { Result }
-import silk.platform.native.file { NativeFileError }
+import silk.platform.native.file { NativeFile, NativeFileError }
 import silk.system.child_process { ChildProcess }
-import npm.git { Repository }
-import npm.install { Downloader, InstallError, Summary, install }
+import npm.git { Repository, isArchive }
+import npm.install { Downloader, InstallError, Summary, identity, install, reachedNodes }
 import npm.lock { LOCKFILE, Lock, write }
 import npm.manifest { DEVELOPMENT, Manifest, OPTIONAL }
 import npm.registry { Registry }
 import npm.resolve { Graph, Host, ResolveError, Tarballs, directoryDigest, isTarball, resolve }
 import npm.scripts { Runner, Script, ScriptError, commandOf, scriptsOf }
 import npm.workspace { Located, MANIFEST, Workspace, WorkspaceError }
-import pkg.files { makeDirectories, readOptional, removeTree, writeFile }
+import pkg.files { copyFile, makeDirectories, readOptional, removeTree, writeFile }
 import pkg.semver { Version }
 import pkg.json_edit { removeMember, setMember }
 import pkg.names { Names }
-import pkg.store { Store }
-import pkg.text { same, startsWith }
+import pkg.store { PackageFiles, Store, StoreError, directoryFiles }
+import pkg.text { endsWith, same, startsWith }
 
 /// Why a command stopped, apart from a failed resolution or install.
 pub struct CommandError {
@@ -223,10 +223,10 @@ effect fn plan(workspace: &Workspace, pins: Pins, fresh: &[Bytes]) -> Plan
 // The scripts of a package of the project that an install runs, in their order.
 const LIFECYCLE: [&'static [u8]; 4] = [b"preinstall", b"install", b"postinstall", b"prepare"]
 
-// Runs the install scripts of the packages of the workspace themselves, each package after
+// Runs the install scripts of the `chosen` packages of the workspace themselves, each package after
 // the packages of the workspace it depends on and the root project last, with the input and
 // the output of this process. They are the project's own commands, so nothing has to allow them.
-effect fn lifecycle(workspace: &Workspace, store: &Store, host: Host) -> ()
+effect fn lifecycle(workspace: &Workspace, store: &Store, host: Host, chosen: &[bool]) -> ()
   ! InstallError | OutOfMemoryError ? &mut Allocator {
   let members = Workspace.all(workspace)
   let mut seen = List<bool>.make()
@@ -243,6 +243,9 @@ effect fn lifecycle(workspace: &Workspace, store: &Store, host: Host) -> ()
   while turn < List<usize>.length(&order) {
     member = List<usize>.get(&order, turn)
     turn = turn + 1
+    if chosen[member] == false {
+      continue
+    }
     let directory = run Workspace.directory(workspace, member)
     let path = run inProject(Bytes.asSlice(&directory), MANIFEST)
     let scripts = match move run readOptional(Bytes.asSlice(&path)) {
@@ -294,10 +297,193 @@ effect fn lifecycle(workspace: &Workspace, store: &Store, host: Host) -> ()
   }
 }
 
-// Writes the lockfile of a resolved plan when it differs from the one on disk, installs, and
-// runs the install scripts of the project.
-effect fn finish(workspace: &Workspace, settled: Plan, downloader: Downloader<'_>, changes: Bytes, store: &Store, host: Host) -> Outcome
-  ! CommandError | InstallError | OutOfMemoryError ? &mut Registry | &mut ChildProcess | &mut Allocator {
+// Every package of `workspace` as chosen.
+effect fn everyone(workspace: &Workspace) -> List<bool> ! OutOfMemoryError ? &mut Allocator {
+  let mut chosen = List<bool>.make()
+  run chosen.appendRepeated(true, Workspace.all(workspace).length)
+  return move chosen
+}
+
+// Marks package `member` of the workspace in `chosen`, and the packages of the workspace it
+// depends on.
+effect fn reach(workspace: &Workspace, member: usize, chosen: &mut [bool]) -> () ! OutOfMemoryError ? &mut Allocator {
+  if chosen[member] {
+    return ()
+  }
+  chosen[member] = true
+  let manifest = &Workspace.all(workspace)[member].manifest
+  let needs = Manifest.allDependencies(manifest)
+  let mut index: usize = 0
+  while index < needs.length {
+    match Workspace.named(workspace, Manifest.text(manifest, needs[index].name)) {
+      Option.Some { value: other } => { run reach(workspace, other, &mut chosen) }
+      Option.None => {}
+    }
+    index = index + 1
+  }
+}
+
+// The packages of `workspace` that `filters` choose: each one is the name of a package, or the
+// name and `...` for the package and the packages of the workspace it depends on. No filter
+// chooses every package.
+effect fn selected(workspace: &Workspace, filters: &[Bytes]) -> List<bool> ! CommandError | OutOfMemoryError ? &mut Allocator {
+  if filters.length == 0 {
+    return run everyone(workspace)
+  }
+  let mut chosen = List<bool>.make()
+  run chosen.appendRepeated(false, Workspace.all(workspace).length)
+  let mut index: usize = 0
+  while index < filters.length {
+    let filter = Bytes.asSlice(&filters[index])
+    index = index + 1
+    let deep = endsWith(filter, b"...")
+    let name = if deep { Slice.view<u8>(filter, 0, filter.length - 3) } else { filter }
+    let member = match Workspace.named(workspace, name) {
+      Option.Some { value } => value
+      Option.None => { run stop("no package of the workspace has the name", name) }
+    }
+    if deep {
+      run reach(workspace, member, List<bool>.asMutSlice(&mut chosen))
+    } else {
+      List<bool>.set(&mut chosen, member, true)
+    }
+  }
+  return move chosen
+}
+
+// What the built form of a package is recorded under in the store, after its own identity.
+const PREPARED: &'static [u8] = b"#prepared"
+
+// The label of package `package` of `graph`, for a message.
+effect fn labelOf(graph: &Graph, package: usize) -> Bytes ! OutOfMemoryError ? &mut Allocator {
+  let mut label = run Bytes.copy(Graph.name(graph, package))
+  run label.append(b"@")
+  run label.append(Graph.version(graph, package))
+  return move label
+}
+
+// Builds a package that is the snapshot of a repository: puts `files`, the snapshot, in a
+// directory of its own in the store, installs there as in a project, which brings its
+// development dependencies and runs its install scripts and `prepare`, and returns the files
+// that are there then. It is what the author does before publishing to a registry.
+effect fn build(graph: &Graph, package: usize, files: &PackageFiles, store: &Store, pool: &Pool, host: Host) -> PackageFiles
+  ! CommandError | ResolveError | InstallError | OutOfMemoryError ? &mut Registry | &mut ChildProcess | &mut Allocator {
+  let mut template = run Bytes.copy(Store.directory(store))
+  run template.append(b"/staging/XXXXXX")
+  let mut stage = run Bytes.copy(Bytes.asSlice(&template))
+  match run Effect.result(NativeFile.makeTemporaryDirectory(Bytes.asSlice(&template), Bytes.asMutSlice(&mut stage))) {
+    Result.Success {..} => {}
+    Result.Failure {..} => { fail InstallError { message: "the store has no room to build", subject: run labelOf(graph, package) } }
+  }
+  let here = Bytes.asSlice(&stage)
+  let entries = PackageFiles.all(files)
+  let mut whole = true
+  // Whether the repository has a lockfile of its own, which is then one of its files.
+  let mut locked = false
+  let mut index: usize = 0
+  while index < entries.length {
+    let name = PackageFiles.name(files, &entries[index])
+    if same(name, LOCKFILE) {
+      locked = true
+    }
+    let source = run Store.filePath(store, &entries[index].key, entries[index].executable)
+    let target = run inProject(here, name)
+    match run Effect.result(copyFile(Bytes.asSlice(&source), Bytes.asSlice(&target))) {
+      Result.Success {..} => {}
+      Result.Failure {..} => { whole = false }
+    }
+    index = index + 1
+  }
+  if whole == false {
+    drop run Effect.result(removeTree(here))
+    fail InstallError { message: "the store has no room to build", subject: run labelOf(graph, package) }
+  }
+  let installed = run Effect.result(installProject(here, store, pool, host, false, &[]))
+  match move installed {
+    Result.Success {..} => {}
+    Result.Failure { error } => {
+      drop run Effect.result(removeTree(here))
+      fail move error
+    }
+  }
+  if locked == false {
+    let lockfile = run inProject(here, LOCKFILE)
+    drop run Effect.result(NativeFile.remove(Bytes.asSlice(&lockfile)))
+  }
+  let gathered = run Effect.result(directoryFiles(here, Option<&Store>.some(store)))
+  drop run Effect.result(removeTree(here))
+  return match move gathered {
+    Result.Success { value: found } => match move found {
+      Option.Some { value } => move value
+      Option.None => { fail InstallError { message: "the build left files that cannot be read for", subject: run labelOf(graph, package) } }
+    }
+    Result.Failure { error } => match move error {
+      StoreError _ => { fail InstallError { message: "the store could not take the files of", subject: run labelOf(graph, package) } }
+      OutOfMemoryError exhausted => { fail move exhausted }
+    }
+  }
+}
+
+// Builds the packages that the `chosen` packages of the workspace use, that are snapshots of
+// repositories, and that have a `prepare` script: a repository holds sources, and `prepare` is
+// what makes of them the files a registry would have. Like install scripts, it runs only for a
+// package that `allowBuilds` of the root project allows; the others are installed as they are,
+// and the ones `allowBuilds` does not name are added to `blocked`. A build is kept in the store,
+// so it happens once.
+effect fn prepare(workspace: &Workspace, graph: &Graph, downloader: &mut Downloader<'_>, store: &Store, pool: &Pool, host: Host, chosen: &[bool], blocked: &mut Bytes) -> ()
+  ! CommandError | ResolveError | InstallError | OutOfMemoryError ? &mut Registry | &mut ChildProcess | &mut Allocator {
+  let rules = &Workspace.all(workspace)[0].manifest
+  let reached = run reachedNodes(workspace, graph, chosen)
+  let mut seen = List<bool>.make()
+  run seen.appendRepeated(false, Graph.count(graph))
+  let mut node: usize = 0
+  while node < Graph.nodeCount(graph) {
+    let package = Graph.nodePackage(graph, node)
+    let wanted = List<bool>.get(&reached, node) && List<bool>.get(&seen, package) == false
+    node = node + 1
+    if wanted == false {
+      continue
+    }
+    List<bool>.set(&mut seen, package, true)
+    let manifest = &Graph.package(graph, package).manifest
+    if manifest.hasPrepare == false || isArchive(Graph.tarball(graph, package)) == false || Graph.supports(graph, package, host) == false {
+      continue
+    }
+    match Manifest.buildRule(rules, Graph.name(graph, package), Graph.version(graph, package)) {
+      Option.Some { value: allowed } => {
+        if allowed == false {
+          continue
+        }
+      }
+      Option.None => {
+        run blocked.append(Graph.name(graph, package))
+        run blocked.append(b"@")
+        run blocked.append(Graph.version(graph, package))
+        run blocked.append(b"\n")
+        continue
+      }
+    }
+    let mut id = run identity(graph, package)
+    run id.append(PREPARED)
+    let built = match move run Store.recorded(store, Bytes.asSlice(&id)) {
+      Option.Some { value } => move value
+      Option.None => {
+        let made = match run Downloader.fetch(&mut downloader, graph, package) {
+          Option.Some { value: snapshot } => run build(graph, package, snapshot, store, pool, host)
+          Option.None => { continue }
+        }
+        drop run Effect.result(Store.record(store, Bytes.asSlice(&id), &made))
+        move made
+      }
+    }
+    run Downloader.provide(&mut downloader, graph, package, move built)
+  }
+}
+
+// Writes the lockfile of a resolved plan when it differs from the one on disk, builds what has
+// to be built, installs the `chosen` packages of the workspace, and runs their install scripts.
+effect fn finish(workspace: &Workspace, settled: Plan, downloader: Downloader<'_>, changes: Bytes, store: &Store, pool: &Pool, host: Host, chosen: &[bool]) -> Outcome
+  ! CommandError | ResolveError | InstallError | OutOfMemoryError ? &mut Registry | &mut ChildProcess | &mut Allocator {
   let Plan { graph, resolved } = move settled
   let mut written = false
   if resolved {
@@ -312,8 +498,12 @@ effect fn finish(workspace: &Workspace, settled: Plan, downloader: Downloader<'_
       written = true
     }
   }
-  let summary = run install(workspace, &graph, move downloader)
-  run lifecycle(workspace, store, host)
+  let mut fetcher = move downloader
+  let mut blocked = Bytes.make()
+  run prepare(workspace, &graph, &mut fetcher, store, pool, host, chosen, &mut blocked)
+  let mut summary = run install(workspace, &graph, move fetcher, chosen)
+  run summary.blocked.append(Bytes.asSlice(&blocked))
+  run lifecycle(workspace, store, host, chosen)
   return Outcome { summary: move summary, lockfile: written, changes: move changes }
 }
 
@@ -323,18 +513,26 @@ effect fn finish(workspace: &Workspace, settled: Plan, downloader: Downloader<'_
 /// ranges allow, and the lockfile is written. With `frozen`, a lockfile that is missing or does
 /// not match is an error, which is what a build server wants.
 ///
+/// `filters` narrow the install to some packages of the workspace: each is the name of a
+/// package, or the name and `...` for that package and the packages of the workspace it depends
+/// on. The lockfile still covers the whole workspace; only the `node_modules` of the named
+/// packages are made, and only what they use is fetched. With no filter every package is
+/// installed.
+///
 /// # Errors
 ///
 /// - [`CommandError`] when a `package.json` or the lockfile is not as needed.
 /// - [`ResolveError`] and [`InstallError`] from the resolution and the install.
-pub effect fn installProject(project: &[u8], store: &Store, pool: &Pool, host: Host, frozen: bool) -> Outcome
+pub effect fn installProject(project: &[u8], store: &Store, pool: &Pool, host: Host, frozen: bool, filters: &[Bytes]) -> Outcome
   ! CommandError | ResolveError | InstallError | OutOfMemoryError ? &mut Registry | &mut ChildProcess | &mut Allocator {
   let Located { workspace, .. } = run located(project)
-  // The downloads of a resolution start while it still asks for metadata.
-  let mut downloader = Downloader.make(store, pool, host, run Bytes.copy(Workspace.root(&workspace)))
+  let chosen = run selected(&workspace, filters)
+  // The downloads of a resolution start while it still asks for metadata, when all of it is
+  // going to be installed.
+  let mut downloader = Downloader.make(store, pool, host, run Bytes.copy(Workspace.root(&workspace)), filters.length == 0)
   let pins = if frozen { Pins.Frozen } else { Pins.Kept }
   let settled = run plan(&workspace, pins, &[]) |> Effect.provideMut<Tarballs>(&mut downloader)
-  return run finish(&workspace, move settled, move downloader, Bytes.make(), store, host)
+  return run finish(&workspace, move settled, move downloader, Bytes.make(), store, pool, host, List<bool>.asSlice(&chosen))
 }
 
 /// Moves packages to the newest versions the ranges of the workspace allow, writes the
@@ -347,10 +545,11 @@ pub effect fn installProject(project: &[u8], store: &Store, pool: &Pool, host: H
 pub effect fn updateProject(project: &[u8], store: &Store, pool: &Pool, host: Host, names: &[Bytes]) -> Outcome
   ! CommandError | ResolveError | InstallError | OutOfMemoryError ? &mut Registry | &mut ChildProcess | &mut Allocator {
   let Located { workspace, .. } = run located(project)
-  let mut downloader = Downloader.make(store, pool, host, run Bytes.copy(Workspace.root(&workspace)))
+  let mut downloader = Downloader.make(store, pool, host, run Bytes.copy(Workspace.root(&workspace)), true)
   let pins = if names.length == 0 { Pins.Dropped } else { Pins.Kept }
   let settled = run plan(&workspace, pins, names) |> Effect.provideMut<Tarballs>(&mut downloader)
-  return run finish(&workspace, move settled, move downloader, Bytes.make(), store, host)
+  let chosen = run everyone(&workspace)
+  return run finish(&workspace, move settled, move downloader, Bytes.make(), store, pool, host, List<bool>.asSlice(&chosen))
 }
 
 // Where the name ends in `name@spec`: the first `@` that is not the one of a scope, or the
@@ -482,7 +681,7 @@ pub effect fn addDependencies(project: &[u8], store: &Store, pool: &Pool, host: 
     index = index + 1
   }
   Workspace.replace(&mut workspace, member, run parsed(Bytes.asSlice(&text)))
-  let mut downloader = Downloader.make(store, pool, host, run Bytes.copy(Workspace.root(&workspace)))
+  let mut downloader = Downloader.make(store, pool, host, run Bytes.copy(Workspace.root(&workspace)), true)
   let mut settled = run plan(&workspace, Pins.Kept, List<Bytes>.asSlice(&names)) |> Effect.provideMut<Tarballs>(&mut downloader)
 
   // Then with each tag replaced by the range for the version it gave, and what had no name
@@ -549,7 +748,8 @@ pub effect fn addDependencies(project: &[u8], store: &Store, pool: &Pool, host: 
   }
   let Plan { graph, .. } = move settled
   // The lockfile records the ranges of package.json, which are the final ones only now.
-  return run finish(&workspace, Plan { graph: move graph, resolved: true }, move downloader, move changes, store, host)
+  let chosen = run everyone(&workspace)
+  return run finish(&workspace, Plan { graph: move graph, resolved: true }, move downloader, move changes, store, pool, host, List<bool>.asSlice(&chosen))
 }
 
 /// Takes dependencies out of the `package.json` in `project`, whatever table they are in, and installs, which
@@ -587,9 +787,10 @@ pub effect fn removeDependencies(project: &[u8], store: &Store, pool: &Pool, hos
   Workspace.replace(&mut workspace, member, run parsed(Bytes.asSlice(&text)))
   let path = run inProject(project, MANIFEST)
   run save(Bytes.asSlice(&path), Bytes.asSlice(&text))
-  let mut downloader = Downloader.make(store, pool, host, run Bytes.copy(Workspace.root(&workspace)))
+  let mut downloader = Downloader.make(store, pool, host, run Bytes.copy(Workspace.root(&workspace)), true)
   let settled = run plan(&workspace, Pins.Kept, &[]) |> Effect.provideMut<Tarballs>(&mut downloader)
-  return run finish(&workspace, move settled, move downloader, move changes, store, host)
+  let chosen = run everyone(&workspace)
+  return run finish(&workspace, move settled, move downloader, move changes, store, pool, host, List<bool>.asSlice(&chosen))
 }
 
 effect fn ran(outcome: Result<i32, ScriptError | OutOfMemoryError>) -> i32 ! CommandError | OutOfMemoryError {
@@ -814,7 +1015,7 @@ pub effect fn runPackage(store: &Store, pool: &Pool, host: Host, origin: &[u8], 
   run save(Bytes.asSlice(&manifest), Bytes.asSlice(&text))
   // One version stays what it is; anything else may have moved since the last time.
   let installed = if Option.isSome(&Version.parse(spec)) {
-    run Effect.result(installProject(here, store, pool, host, false))
+    run Effect.result(installProject(here, store, pool, host, false, &[]))
   } else {
     run Effect.result(updateProject(here, store, pool, host, &[]))
   }

@@ -35,10 +35,14 @@ import silk.core.result { Result }
 import silk.http.client { HttpError }
 import silk.http.client_native { NativeHttp }
 import silk.io.writer { Writer, WriterError }
+import silk.num.i32
+import silk.num.i64
 import silk.io.writer_native { StderrWriter, StdoutWriter }
 import silk.system.child_process { ChildProcess }
 import silk.system.child_process_native { OsChildProcess }
 import silk.system.host_input { HostInput, HostInputError }
+import silk.system.system_clock { SystemClock }
+import silk.system.system_clock_native { OsSystemClock }
 import silk.system.system_info { SystemInfo }
 import silk.system.system_info_native { OsSystemInfo }
 import silk.text.format { Format }
@@ -49,6 +53,7 @@ import npm.manifest { DEVELOPMENT, OPTIONAL, PRODUCTION }
 import npm.npmrc { Npmrc }
 import npm.registry { NetworkRegistry, Registry }
 import npm.resolve { Host, ResolveError }
+import pkg.documents { Documents }
 import pkg.files { linkTo, readOptional }
 import pkg.store { Store, StoreError }
 import pkg.text { same }
@@ -92,13 +97,19 @@ effect fn settings() -> Npmrc ! HostInputError | OutOfMemoryError ? &mut HostInp
   return move config
 }
 
-// Opens the store named by `SILKJS_STORE`, or the one in the home directory.
-effect fn openStore() -> Store ! CommandError | HostInputError | OutOfMemoryError ? &mut HostInput | &mut Allocator {
+// The directory of the store: the one `SILKJS_STORE` names, or the one in the home directory.
+effect fn storeRoot() -> Bytes ! HostInputError | OutOfMemoryError ? &mut HostInput | &mut Allocator {
   let mut root = run variable(b"SILKJS_STORE")
   if Bytes.length(&root) == 0 {
     root = run variable(b"HOME")
     run root.append(b"/.silkjs/store")
   }
+  return move root
+}
+
+// Opens the store.
+effect fn openStore() -> Store ! CommandError | HostInputError | OutOfMemoryError ? &mut HostInput | &mut Allocator {
+  let root = run storeRoot()
   return match move run Effect.result(Store.open(Bytes.asSlice(&root))) {
     Result.Success { value } => move value
     Result.Failure { error } => match move error {
@@ -108,7 +119,7 @@ effect fn openStore() -> Store ! CommandError | HostInputError | OutOfMemoryErro
   }
 }
 
-const USAGE: string<'static> = "commands: install [--frozen-lockfile] | ci | add <package>... [-D] [-O] [-E] | remove <package>... | update [package]... | run [-r] [script] [argument]... | exec <command> [argument]... | dlx <package> [argument]...; in a workspace, --filter <name> or -w choose the package that add, remove, run and exec work in"
+const USAGE: string<'static> = "commands: install [--frozen-lockfile] [--filter <name>[...]]... | ci | add <package>... [-D] [-O] [-E] | remove <package>... | update [package]... | run [-r] [script] [argument]... | exec <command> [argument]... | dlx <package> [argument]...; in a workspace, --filter <name> or -w choose the package that add, remove, run and exec work in, and --filter narrows an install to the packages it names, with ... after a name for the packages of the workspace it depends on too"
 
 effect fn usage() -> never ! CommandError {
   fail CommandError { message: USAGE, subject: Bytes.make() }
@@ -259,7 +270,7 @@ effect fn command(pool: &Pool, executable: &[u8]) -> i32
   let mut exact = false
   let mut kind = PRODUCTION
   let mut atRoot = false
-  let mut filter = Bytes.make()
+  let mut filters = List<Bytes>.make()
   let mut position: usize = 2
   while true {
     let word = match move run HostInput.argument(position) {
@@ -283,9 +294,9 @@ effect fn command(pool: &Pool, executable: &[u8]) -> i32
     } else if isOneOf(text, b"-w", b"--workspace-root") {
       atRoot = true
     } else if isOneOf(text, b"-F", b"--filter") {
-      filter = match move run HostInput.argument(position) {
+      match move run HostInput.argument(position) {
         Option.None => { run usage() }
-        Option.Some { value } => move value
+        Option.Some { value } => { run filters.append(move value) }
       }
       position = position + 1
     } else {
@@ -300,18 +311,22 @@ effect fn command(pool: &Pool, executable: &[u8]) -> i32
   }
   let host = Host.current()
   let here = run HostInput.workingDirectory()
+  let narrowed = List<Bytes>.asSlice(&filters)
+  // An install takes any number of filters; the other commands work in one package.
+  let installs = (isOneOf(word, b"install", b"i") || same(word, b"ci")) && wanted.length == 0
+  if installs == false && narrowed.length > 1 {
+    fail CommandError { message: "this command works in one package, and --filter was given more than once", subject: Bytes.make() }
+  }
   let chosen = if atRoot {
     run rootDirectory(Bytes.asSlice(&here))
-  } else if Bytes.length(&filter) > 0 {
-    run packageDirectory(Bytes.asSlice(&here), Bytes.asSlice(&filter))
+  } else if installs == false && narrowed.length == 1 {
+    run packageDirectory(Bytes.asSlice(&here), Bytes.asSlice(&narrowed[0]))
   } else {
     move here
   }
   let project = Bytes.asSlice(&chosen)
-  let outcome = if isOneOf(word, b"install", b"i") && wanted.length == 0 {
-    run installProject(project, &store, pool, host, frozen)
-  } else if same(word, b"ci") && wanted.length == 0 {
-    run installProject(project, &store, pool, host, true)
+  let outcome = if installs {
+    run installProject(project, &store, pool, host, frozen || same(word, b"ci"), narrowed)
   } else if same(word, b"add") && wanted.length > 0 {
     run addDependencies(project, &store, pool, host, wanted, kind, exact)
   } else if (isOneOf(word, b"remove", b"rm") || isOneOf(word, b"uninstall", b"un")) && wanted.length > 0 {
@@ -364,9 +379,20 @@ effect fn program(name: string<'static>, node: bool) -> i32 ! HttpError | SpawnE
   let mut writer = StdoutWriter.make()
   let config = run settings()
   let http = (run NativeHttp.fromEnvironment()).withConcurrency(64)
-  let mut registry = NetworkRegistry.make(move config, move http)
-  // One worker per processor for unpacking; the calling thread does the network.
   let mut system = OsSystemInfo.make()
+  // Metadata is kept beside the store, under the name of this process while it is written.
+  let mut metadata = run storeRoot()
+  run metadata.append(b"/metadata")
+  let process = match run Effect.result(SystemInfo.processId()) |> Effect.provideMut<SystemInfo>(&mut system) {
+    Result.Success { value } => i32.toU64(value)
+    Result.Failure {..} => 0
+  }
+  let mut clock = OsSystemClock.make()
+  let instant = run SystemClock.now() |> Effect.provideMut<SystemClock>(&mut clock)
+  let seconds = SystemClock.seconds(&instant)
+  let now: u64 = if seconds > 0 { i64.toU64(seconds) } else { 0 }
+  let mut registry = NetworkRegistry.make(move config, move http, Documents.at(move metadata, process), now)
+  // One worker per processor for unpacking; the calling thread does the network.
   let processors = match run Effect.result(SystemInfo.availableParallelism()) |> Effect.provideMut<SystemInfo>(&mut system) {
     Result.Success { value } => value
     Result.Failure {..} => 4

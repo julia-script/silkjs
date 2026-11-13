@@ -69,6 +69,8 @@ function bytes(view) {
   return length === 0 ? empty : new Uint8Array(view.buffer, view.byteOffset, length);
 }
 function viewBytes(view) {
+  // A Uint8Array (every Buffer) is its own bytes: one test instead of two.
+  if (types.isUint8Array(view)) return view;
   if (!ArrayBuffer.isView(view)) throw bufferError();
   return bytes(view);
 }
