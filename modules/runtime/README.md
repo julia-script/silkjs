@@ -49,10 +49,13 @@ The package manager of [`modules/pm`](../pm) is in the executable. Its commands 
 ./build/silkjsruntime update
 ./build/silkjsruntime ci                 # install, and fail when the lockfile is out of date
 ./build/silkjsruntime run build          # a script of package.json; arguments follow the name
+./build/silkjsruntime run -r build       # in every package of the workspace that has the script
 ./build/silkjsruntime exec tsc --noEmit  # a command of the dependencies
 ```
 
 In a workspace, a `package.json` with `workspaces`, the commands install for every package from any of their directories, and `add --filter <name>` or `add -w` choose the package to change.
+
+A script that calls `node` on a machine without Node.js gets this executable, which by that name runs a file and has no package manager commands.
 
 The install scripts of a dependency run only when `allowBuilds` in the `package.json` of the project names it: `"allowBuilds": { "esbuild": true }`.
 

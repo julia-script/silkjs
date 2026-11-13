@@ -15,6 +15,8 @@
 //!
 //! `run <script>` runs a script of `package.json` and `exec <command>` a command of the
 //! dependencies, with the words after it as arguments. Both end with the exit code of what ran.
+//! `run -r <script>` runs the script in every package of the workspace that has it, a package
+//! after the ones it depends on, and stops at the first that fails.
 //!
 //! In a workspace every command installs for the whole workspace, from any of its packages.
 //! `add` and `remove` change the package in the working directory, the package that
@@ -40,13 +42,13 @@ import silk.system.system_info { SystemInfo }
 import silk.system.system_info_native { OsSystemInfo }
 import silk.text.format { Format }
 import silk.text.string { String }
-import npm.commands { CommandError, addDependencies, executeCommand, installProject, packageDirectory, removeDependencies, rootDirectory, runScript, scriptList, updateProject }
+import npm.commands { CommandError, addDependencies, executeCommand, installProject, packageDirectory, removeDependencies, rootDirectory, runScript, scriptList, scriptedPackages, updateProject }
 import npm.install { InstallError }
 import npm.manifest { DEVELOPMENT, OPTIONAL, PRODUCTION }
 import npm.npmrc { Npmrc }
 import npm.registry { NetworkRegistry, Registry }
 import npm.resolve { Host, ResolveError }
-import pkg.files { readOptional }
+import pkg.files { linkTo, readOptional }
 import pkg.store { Store, StoreError }
 import pkg.text { same }
 
@@ -105,7 +107,7 @@ effect fn openStore() -> Store ! CommandError | HostInputError | OutOfMemoryErro
   }
 }
 
-const USAGE: string<'static> = "commands: install [--frozen-lockfile] | ci | add <package>... [-D] [-O] [-E] | remove <package>... | update [package]... | run [script] [argument]... | exec <command> [argument]...; in a workspace, --filter <name> or -w choose the package that add, remove, run and exec work in"
+const USAGE: string<'static> = "commands: install [--frozen-lockfile] | ci | add <package>... [-D] [-O] [-E] | remove <package>... | update [package]... | run [-r] [script] [argument]... | exec <command> [argument]...; in a workspace, --filter <name> or -w choose the package that add, remove, run and exec work in"
 
 effect fn usage() -> never ! CommandError {
   fail CommandError { message: USAGE, subject: Bytes.make() }
@@ -125,11 +127,12 @@ fn isOneOf(word: &[u8], first: &[u8], second: &[u8]) -> bool {
 }
 
 // `run` and `exec`: the words after the flags of the package manager belong to what runs.
-effect fn passOn(verb: &[u8]) -> i32
+effect fn passOn(verb: &[u8], store: &Store) -> i32
   ! CommandError | HostInputError | WriterError | OutOfMemoryError ? &mut HostInput | &mut Writer | &mut Allocator {
   let here = run HostInput.workingDirectory()
   let mut chosen = run Bytes.copy(Bytes.asSlice(&here))
   let mut words = List<Bytes>.make()
+  let mut everywhere = false
   let mut position: usize = 2
   while true {
     let word = match move run HostInput.argument(position) {
@@ -142,6 +145,8 @@ effect fn passOn(verb: &[u8]) -> i32
       run words.append(move word)
     } else if isOneOf(text, b"-w", b"--workspace-root") {
       chosen = run rootDirectory(Bytes.asSlice(&here))
+    } else if isOneOf(text, b"-r", b"--recursive") {
+      everywhere = true
     } else if isOneOf(text, b"-F", b"--filter") {
       let name = match move run HostInput.argument(position) {
         Option.None => { run usage() }
@@ -162,7 +167,7 @@ effect fn passOn(verb: &[u8]) -> i32
     if all.length == 0 {
       run usage()
     }
-    return run executeCommand(project, Bytes.asSlice(&here), host, all)
+    return run executeCommand(project, store, Bytes.asSlice(&here), host, all)
   }
   if all.length == 0 {
     let scripts = run scriptList(project)
@@ -178,10 +183,41 @@ effect fn passOn(verb: &[u8]) -> i32
   if given.length > 0 && same(Bytes.asSlice(&given[0]), b"--") {
     given = Slice.view<Bytes>(given, 1, given.length - 1)
   }
-  return run runScript(project, Bytes.asSlice(&here), host, Bytes.asSlice(&all[0]), given)
+  if everywhere == false {
+    return run runScript(project, store, Bytes.asSlice(&here), host, Bytes.asSlice(&all[0]), given)
+  }
+  // In every package of the workspace that has the script, until one fails.
+  let packages = run scriptedPackages(project, Bytes.asSlice(&all[0]))
+  let places = List<Bytes>.asSlice(&packages)
+  if places.length == 0 {
+    fail CommandError { message: "no package of the workspace has a script named", subject: run Bytes.copy(Bytes.asSlice(&all[0])) }
+  }
+  let mut index: usize = 0
+  while index < places.length {
+    let place: string = match move String.fromUtf8(Bytes.asSlice(&places[index])) {
+      Result.Success { value } => move value
+      Result.Failure {..} => ""
+    }
+    run Format.format("in {place}\n", &.{ place: place })
+    let code = run runScript(Bytes.asSlice(&places[index]), store, Bytes.asSlice(&here), host, Bytes.asSlice(&all[0]), given)
+    if code != 0 {
+      return code
+    }
+    index = index + 1
+  }
+  return 0
 }
 
-effect fn command(pool: &Pool) -> i32
+// Puts the program file `executable` among the fallback commands of the store under the name
+// `node`, for the scripts of packages on a machine that has no Node.js.
+effect fn standIn(store: &Store, executable: &[u8]) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut link = run Store.commands(store)
+  run link.append(b"/node")
+  // Without the link a script that asks for `node` fails as it would have.
+  drop run Effect.result(linkTo(executable, Bytes.asSlice(&link)))
+}
+
+effect fn command(pool: &Pool, executable: &[u8]) -> i32
   ! CommandError | ResolveError | InstallError | HostInputError | WriterError | OutOfMemoryError
   ? &mut Registry | &mut ChildProcess | &mut HostInput | &mut Writer | &mut Allocator {
   let verb = match move run HostInput.argument(1) {
@@ -189,7 +225,11 @@ effect fn command(pool: &Pool) -> i32
     Option.Some { value } => move value
   }
   if isOneOf(Bytes.asSlice(&verb), b"run", b"run-script") || same(Bytes.asSlice(&verb), b"exec") {
-    return run passOn(Bytes.asSlice(&verb))
+    let store = run openStore()
+    if executable.length > 0 {
+      run standIn(&store, executable)
+    }
+    return run passOn(Bytes.asSlice(&verb), &store)
   }
   // The words after the verb: package names, and flags that start with a dash.
   let mut names = List<Bytes>.make()
@@ -233,6 +273,9 @@ effect fn command(pool: &Pool) -> i32
   let wanted = List<Bytes>.asSlice(&names)
   let word = Bytes.asSlice(&verb)
   let store = run openStore()
+  if executable.length > 0 {
+    run standIn(&store, executable)
+  }
   let host = Host.current()
   let here = run HostInput.workingDirectory()
   let chosen = if atRoot {
@@ -295,7 +338,7 @@ effect fn report(program: string<'static>, message: string<'static>, subject: &[
   }
 }
 
-effect fn program(name: string<'static>) -> i32 ! HttpError | SpawnError | HostInputError | WriterError | OutOfMemoryError ? &mut HostInput | &mut Allocator {
+effect fn program(name: string<'static>, node: bool) -> i32 ! HttpError | SpawnError | HostInputError | WriterError | OutOfMemoryError ? &mut HostInput | &mut Allocator {
   let mut writer = StdoutWriter.make()
   let config = run settings()
   let http = (run NativeHttp.fromEnvironment()).withConcurrency(64)
@@ -306,10 +349,18 @@ effect fn program(name: string<'static>) -> i32 ! HttpError | SpawnError | HostI
     Result.Success { value } => value
     Result.Failure {..} => 4
   }
+  let executable = if node {
+    match move run Effect.result(SystemInfo.executablePath()) |> Effect.provideMut<SystemInfo>(&mut system) {
+      Result.Success { value } => move value
+      Result.Failure {..} => Bytes.make()
+    }
+  } else {
+    Bytes.make()
+  }
   let threads = run ThreadPool.make(processors)
   let pool = threads.pool()
   let mut processes = OsChildProcess.make()
-  let outcome = run Effect.result(command(&pool))
+  let outcome = run Effect.result(command(&pool, Bytes.asSlice(&executable)))
     |> Effect.provideMut<Registry>(&mut registry)
     |> Effect.provideMut<ChildProcess>(&mut processes)
     |> Effect.provideMut<Writer>(&mut writer)
@@ -329,7 +380,9 @@ effect fn program(name: string<'static>) -> i32 ! HttpError | SpawnError | HostI
 }
 
 /// Runs the command that the arguments of the process name, the first argument being the
-/// command. `name` is what the executable is called in messages. Returns the exit code: 0 when
+/// command. `name` is what the executable is called in messages. `node` says that the executable
+/// runs JavaScript as `node` does when it is called by that name; it is then what a script gets
+/// for `node` on a machine that has none. Returns the exit code: 0 when
 /// the command did its work, 1 when it could not, and for `run` and `exec` the exit code of what
 /// ran.
 ///
@@ -337,9 +390,9 @@ effect fn program(name: string<'static>) -> i32 ! HttpError | SpawnError | HostI
 ///
 /// - `HostInputError` when the arguments or the environment cannot be read.
 /// - `OutOfMemoryError` if the `Allocator` fails.
-pub effect fn execute(name: string<'static>) -> i32 ! HostInputError | OutOfMemoryError ? &mut HostInput | &mut Allocator {
+pub effect fn execute(name: string<'static>, node: bool) -> i32 ! HostInputError | OutOfMemoryError ? &mut HostInput | &mut Allocator {
   let mut errors = StderrWriter.make()
-  let problem: string<'static> = match move run Effect.result(program(name)) {
+  let problem: string<'static> = match move run Effect.result(program(name, node)) {
     Result.Success { value } => { return value }
     Result.Failure { error } => match move error {
       HttpError failed => failed.message
