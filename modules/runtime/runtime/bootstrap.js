@@ -443,11 +443,33 @@ host.hasURLScheme = value => {
   return false;
 };
 // The carets under a SyntaxError's site, from column (0-based) of text: V8 underlines
-// the token a message names ("Unexpected identifier 'line'"), else one character.
-const namedToken = /^Unexpected (?:identifier|token|reserved word|strict mode reserved word) '(.+)'$/;
+// the token a message names ("Unexpected identifier 'line'", a repeated label), a
+// repeated parameter, or a redeclared class's whole declaration; else one character.
+const namedToken = /^(?:Unexpected (?:identifier|token|reserved word|strict mode reserved word) '(.+)'|Label '(.+)' has already been declared)$/;
+const redeclared = /^Identifier '.+' has already been declared$/;
+const identifierCode = code => (code >= 0x61 && code <= 0x7a) || (code >= 0x41 && code <= 0x5a) || (code >= 0x30 && code <= 0x39) || code === 0x5f || code === 0x24 || code > 0x7f;
+function classWidth(text, column) {
+  let depth = 0;
+  for (let index = column; index < text.length; index++) {
+    const code = text.charCodeAt(index);
+    if (code === 0x7b) depth++;
+    else if (code === 0x7d && --depth === 0) return index + 1 - column;
+  }
+  return 1;
+}
 host.syntaxUnderline = (message, text, column) => {
-  const token = Reflect.apply(regExpExec, namedToken, [String(message)])?.[1];
-  const width = token !== undefined && stringStartsWith(text, token, column) ? token.length : 1;
+  message = String(message);
+  const named = Reflect.apply(regExpExec, namedToken, [message]);
+  const token = named?.[1] ?? named?.[2];
+  let width = token !== undefined && stringStartsWith(text, token, column) ? token.length : 1;
+  if (message === 'Duplicate parameter name not allowed in this context') {
+    let end = column;
+    while (end < text.length && identifierCode(text.charCodeAt(end))) end++;
+    if (end > column) width = end - column;
+  } else if (stringStartsWith(text, 'class', column) && !identifierCode(text.charCodeAt(column + 5)) &&
+             Reflect.apply(regExpExec, redeclared, [message]) !== null) {
+    width = classWidth(text, column);
+  }
   let underline = '';
   for (let index = 0; index < width; index++) underline += '^';
   return underline;

@@ -11,8 +11,8 @@ import silk.num.u32
 import silk.num.u16
 import silk.num.usize
 import js_heap { HeapCell }
-import js_core_types { FunctionKind, RuntimeState, JS_MODE_STRICT, SourceText, OwnedAtom }
-import js_compiler_types { LazyBody, LazyName, FunctionId, ParseFunctionKind, ParseExportKind, VariableDefinition, CompilerError, ARGUMENT_VAR_OFFSET }
+import js_core_types { FunctionKind, RuntimeState, JS_MODE_STRICT, SourceText, OwnedAtom, VariableKind }
+import js_compiler_types { LazyBody, LazyName, FunctionId, ParseFunctionKind, ParseExportKind, VariableDefinition, CompilerError, CompilerErrorKind, ARGUMENT_VAR_OFFSET }
 import js_compiler_state as state
 import js_parser_core { Parser, ParserStackOverflow, PF_IN_ACCEPTED }
 import js_parser_diagnostics { SyntaxError }
@@ -112,6 +112,11 @@ fn strictFutureKeyword(name: u32) -> bool {
 fn invalidStrictName(name: u32) -> bool {
   return name == atoms.JS_ATOM_eval || name == atoms.JS_ATOM_arguments || strictFutureKeyword(name)
 }
+effect fn duplicateParameter(s: &mut Parser<'_>, at: &Option<usize>) -> ()
+  ! OutOfMemoryError | StringLengthError | SyntaxError ? &mut Allocator {
+  let text = b"Duplicate parameter name not allowed in this context"
+  return match &at.* { Option<usize>.Some { value } => run s.syntaxAt<()>(value, text)  Option<usize>.None => run s.syntax<()>(text) }
+}
 effect fn checkNames(s: &mut Parser<'_>, name: u32) -> ()
   ! OutOfMemoryError | StringLengthError | SyntaxError ? &mut Allocator {
   let fd = s.functionView()
@@ -142,8 +147,9 @@ effect fn checkNames(s: &mut Parser<'_>, name: u32) -> ()
         let mut previous: usize = 0
         while previous < index {
           if fd.args.get(previous).name == argument {
+            let at = fd.duplicateParameterStart
             drop fd
-            return run s.syntax<()>(b"Duplicate parameter name not allowed in this context")
+            return run duplicateParameter(&mut s, &at)
           }
           previous = previous + 1
         }
@@ -151,8 +157,9 @@ effect fn checkNames(s: &mut Parser<'_>, name: u32) -> ()
         while previous < fd.vars.length() {
           let variable = fd.vars.get(previous)
           if variable.name == argument && variable.scopeLevel == 0 {
+            let at = fd.duplicateParameterStart
             drop fd
-            return run s.syntax<()>(b"Duplicate parameter name not allowed in this context")
+            return run duplicateParameter(&mut s, &at)
           }
           previous = previous + 1
         }
@@ -197,8 +204,26 @@ fn incrementLength(s: &mut Parser<'_>) -> () {
   let fd = s.function()
   fd.definedArgCount = fd.definedArgCount + 1
 }
+/// Notes where the first parameter that repeats an earlier one starts.
+fn noteDuplicateParameter(s: &mut Parser<'_>, name: u32) -> () {
+  let start = s.token.start
+  let fd = s.function()
+  if fd.duplicateParameterStart.isSome() { return () }
+  let mut index: usize = 0
+  while index < fd.args.length() {
+    if fd.args.get(index).name == name { fd.duplicateParameterStart = Option<usize>.some(start) return () }
+    index = index + 1
+  }
+  index = 0
+  while index < fd.vars.length() {
+    let variable = fd.vars.get(index)
+    if variable.name == name && variable.scopeLevel == 0 { fd.duplicateParameterStart = Option<usize>.some(start) return () }
+    index = index + 1
+  }
+}
 effect fn addArgument(s: &mut Parser<'_>, name: u32) -> i32
   ! OutOfMemoryError | StringLengthError | CompilerError ? &mut Allocator {
+  if name != 0 { noteDuplicateParameter(&mut s, name) }
   let cells = s.cells() let fd = move cells.function
   let rt = move cells.runtime
   return run state.addArg(&mut fd, &mut rt.atoms, name)
@@ -393,6 +418,14 @@ effect fn parseParameters<H: HeapHooks + ModuleAttributeHooks>(s: &mut Parser<'_
   run s.advance()
 }
 
+/// V8's error for a function declaration whose name is taken, at its keyword.
+effect fn redeclaredFunction(s: &mut Parser<'_>, name: u32, sourceStart: &Option<usize>) -> FunctionId
+  ! OutOfMemoryError | StringLengthError | SyntaxError ? &mut Allocator {
+  return match &sourceStart.* {
+    Option<usize>.Some { value } => run s.syntaxAtomAt<FunctionId>(b"Identifier '", name, b"' has already been declared", value)
+    Option<usize>.None => run s.syntaxPreviousAtom<FunctionId>(b"Identifier '", name, b"' has already been declared")
+  }
+}
 effect fn parseFunctionInner<H: HeapHooks + ModuleAttributeHooks>(s: &mut Parser<'_>, hooks: &mut H,
     memory: &AllocationObserver, functionType: ParseFunctionKind, initialKind: FunctionKind,
     borrowedName: u32, sourceStart: Option<usize>, exportKind: ParseExportKind, mayEager: bool) -> FunctionId
@@ -442,12 +475,30 @@ effect fn parseFunctionInner<H: HeapHooks + ModuleAttributeHooks>(s: &mut Parser
   let mut createFunctionVar = false
   let mut lexicalFunctionIndex: i32 = -1
   let parent = s.functionAt(parentCell)
-  if parent.isEval && parent.evalType == 1
+  // A script's (evalType 0) top-level function may not redeclare its let, const
+  // or class; an eval's (1) may not redeclare any of its own top-level names.
+  if parent.isEval && (parent.evalType == 0 || parent.evalType == 1)
     && (functionType == ParseFunctionKind.Statement || functionType == ParseFunctionKind.Var) {
     let previous = state.findGlobalVar(&parent.*, name.get())
-    if previous >= 0 && parent.globalVars.get(i32.toUsize(previous)).scopeLevel == parent.scopeLevel {
+    if previous >= 0 && parent.globalVars.get(i32.toUsize(previous)).scopeLevel == parent.scopeLevel
+      && (parent.evalType == 1 || parent.globalVars.get(i32.toUsize(previous)).isLexical) {
       drop parent
-      return run s.syntaxAtom<FunctionId>(b"Identifier '", name.get(), b"' has already been declared")
+      return run redeclaredFunction(&mut s, name.get(), &sourceStart)
+    }
+  }
+  // An eval's top-level let, const or class lives in its own scope, not in
+  // globalVars: a function declaration there may not redeclare it either.
+  if parent.isEval && parent.scopeLevel == parent.bodyScope
+    && (functionType == ParseFunctionKind.Statement || functionType == ParseFunctionKind.Var) {
+    let mut index = parent.scopeFirst
+    while index >= 0 {
+      let v = parent.vars.get(i32.toUsize(index))
+      if v.name == name.get() && v.isLexical && v.scopeLevel == parent.scopeLevel
+        && v.kind != VariableKind.FunctionDeclaration && v.kind != VariableKind.NewFunctionDeclaration {
+        drop parent
+        return run redeclaredFunction(&mut s, name.get(), &sourceStart)
+      }
+      index = v.scopeNext
     }
   }
   let mut defineLexical = false
@@ -463,7 +514,7 @@ effect fn parseFunctionInner<H: HeapHooks + ModuleAttributeHooks>(s: &mut Parser
       let previous = state.findGlobalVar(&parent.*, name.get())
       if previous >= 0 && parent.globalVars.get(i32.toUsize(previous)).scopeLevel == parent.scopeLevel {
         drop parent
-        return run s.syntaxAtom<FunctionId>(b"Identifier '", name.get(), b"' has already been declared")
+        return run redeclaredFunction(&mut s, name.get(), &sourceStart)
       }
     } else { defineLexical = true }
   }
@@ -471,7 +522,24 @@ effect fn parseFunctionInner<H: HeapHooks + ModuleAttributeHooks>(s: &mut Parser
   if defineLexical {
     let mut definition = VariableDefinition.FunctionDeclaration
     if kind != FunctionKind.Normal { definition = VariableDefinition.NewFunctionDeclaration }
-    lexicalFunctionIndex = run defineBinding(&mut s, name.get(), definition)
+    // V8 reports a redeclared function at its `function` keyword.
+    let defined = run Effect.result(defineBinding(&mut s, name.get(), definition))
+    lexicalFunctionIndex = match move defined {
+      Result<i32, OutOfMemoryError | StringLengthError | CompilerError>.Success { value } => value
+      Result<i32, OutOfMemoryError | StringLengthError | CompilerError>.Failure { error } => {
+        match move error {
+          CompilerError compiler => {
+            if compiler.kind == CompilerErrorKind.LexicalRedefinition && sourceStart.isSome() {
+              let at = match &sourceStart { Option<usize>.Some { value } => value Option<usize>.None => 0 }
+              return run s.syntaxAtomAt<FunctionId>(b"Identifier '", name.get(), b"' has already been declared", at)
+            }
+            fail move compiler
+          }
+          OutOfMemoryError allocation => { fail move allocation }
+          StringLengthError length => { fail move length }
+        }
+      }
+    }
   }
   let outer = s.functionAt(parentCell)
   let filename = outer.filename let cache = outer.sourceCache

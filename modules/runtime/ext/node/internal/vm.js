@@ -33,7 +33,7 @@ function syntaxDiagnostic(cause, source, filename, line, column, prefix = 0) {
   cause[origin.file] = filename;
   const frames = typeof cause.stack === 'string' ? cause.stack.split('\n').slice(1).join('\n') : '';
   const caret = text.slice(0, Math.max(0, sourceColumn - 1)).replace(/[^\t]/g, ' ') +
-    (cause[origin.column] === 0 ? '' : host.syntaxUnderline(cause.message, text, Math.max(0, sourceColumn - 1)));
+    (cause[origin.column] === 0 || sourceColumn - 1 >= text.length ? '' : host.syntaxUnderline(cause.message, text, Math.max(0, sourceColumn - 1)));
   cause.stack = `${filename}:${cause[origin.line]}\n${text}\n${caret}\n\n${cause.name}: ${cause.message}\n${frames}`;
   // decorateErrorStack: the stack holds the arrow, so the fatal report adds none.
   host.decoratedErrors.add(cause);
