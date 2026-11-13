@@ -95,7 +95,12 @@ function install(global, isolated = false) {
     return filename;
   }
   // V8's SerializeJSStackFrame: an async stack trace frame is "async " then the frame.
-  function stringify(frame) { return frame.isAsync ? 'async ' + stringifyFrame(frame) : stringifyFrame(frame); }
+  // A combinator waiting in the async stack trace, as V8 writes it.
+  const combinatorNames = ['all', 'allSettled', 'any'];
+  function stringify(frame) {
+    if (frame.promiseCombinator >= 0) return 'async Promise.' + combinatorNames[frame.promiseCombinator] + ' (index ' + frame.promiseIndex + ')';
+    return frame.isAsync ? 'async ' + stringifyFrame(frame) : stringifyFrame(frame);
+  }
   function stringifyFrame(frame) {
     const name = frame.functionName;
     const place = location(frame);
@@ -143,7 +148,7 @@ function install(global, isolated = false) {
     getMethodName() { return methodName(record(this)); },
     getPosition() { return position(record(this)); },
     // Promise.all continuations are not walked: no frame is one.
-    getPromiseIndex() { record(this); return null; },
+    getPromiseIndex() { const frame = record(this); return frame.promiseCombinator >= 0 ? frame.promiseIndex : null; },
     getScriptNameOrSourceURL() { const frame = record(this); return frame.scriptName || (frame.isEval ? undefined : null); },
     getScriptHash() {
       const frame = record(this);
@@ -157,7 +162,7 @@ function install(global, isolated = false) {
     isConstructor() { return record(this).isConstructor; },
     isEval() { return record(this).isEval; },
     isNative() { return record(this).isNative; },
-    isPromiseAll() { record(this); return false; },
+    isPromiseAll() { return record(this).promiseCombinator === 0; },
     isToplevel() { return record(this).isToplevel; },
     toString() { return stringify(record(this)); },
   };
@@ -193,6 +198,7 @@ function install(global, isolated = false) {
       typeName: raw[13], methodName: currentMethod(raw[14], raw[22], raw[21]), isToplevel: raw[15],
       scriptMetadata: raw[16],
       sourceLineNumber: raw[18], sourceColumnNumber: raw[19], isAsync: raw[20] === true,
+      promiseCombinator: raw[23], promiseIndex: raw[24],
     };
   }
   function defaultFormat(error, frames, sites) {
