@@ -35,7 +35,10 @@ const stringIndexOf = Function.prototype.call.bind(String.prototype.indexOf);
 const stringLastIndexOf = Function.prototype.call.bind(String.prototype.lastIndexOf);
 const define = (name, factory) => {
   factories.set(name, factory);
-  if (name === 'internal/error_stack' ||
+  // Node runs lib/internal/per_context/* in every context; a realm compiles its own
+  // copy of these the first time it needs them.
+  if (name === 'internal/error_stack' || name === 'internal/per_context/primordials' ||
+      name === 'internal/per_context/domexception' ||
       name === 'internal/web/wasm' || name.startsWith('internal/web/wasm/'))
     realmSources.set(name, factory);
 };
@@ -218,6 +221,7 @@ host.initializeRealmBuiltins = (handle, global, wasmCodeGeneration, isolated = f
   if (!host.jitless) Object.defineProperty(global, 'WebAssembly', {
     value: load('internal/web/wasm').WebAssembly, writable: true, configurable: true,
   });
+  return load;
 };
 const errnoNames = new Map(), errnoMessages = new Map();
 {

@@ -252,7 +252,7 @@ if (Symbol.dispose) MessagePort.prototype[Symbol.dispose] = MessagePort.prototyp
 function wrap(endpoint, realm) {
   if (!realm) return initialize(Object.create(InternalMessagePort.prototype), endpoint, null, true);
   return initialize(realm.makePort({
-    post(port, value, list) { const data = state(port); if (data.id !== null) clone.post(data.id, value, list); },
+    post(port, value, list) { const data = state(port); if (data.id !== null) clone.post(data.id, value, list, realm.DOMException); },
     start, close, ref, retain,
     hasRef,
   }), endpoint, realm);
@@ -338,6 +338,10 @@ function moveMessagePortToContext(port, context) {
       }
     };
   })()`, context);
+  // Errors for the moved port come from the context's own DOMException (Node's
+  // per-context exports), which the context compiles the first time one is thrown.
+  const { realmRequire } = require('internal/vm').contextData(context);
+  realm.DOMException = () => realmRequire('internal/per_context/domexception').DOMException;
   // Creating a wrapper can throw; retain the old endpoint until it succeeds.
   const moved = wrap(endpoint, realm);
   dispose(port, false);

@@ -124,6 +124,13 @@ const kBindings = {
     return { types: optionTypes, envSettings: envVarSettings, getCLIOptionsInfo };
   },
   signal_wrap: () => ({ Signal: require('internal/signal_wrap').Signal }),
+  // node_sockaddr.cc: SocketAddress and BlockList handles.
+  block_list: () => {
+    const { AF_INET, AF_INET6, BlockList, SocketAddress } = require('internal/block_list_binding');
+    return { AF_INET, AF_INET6, BlockList, SocketAddress };
+  },
+  // env_properties.h: the per-isolate symbols.
+  symbols: () => require('internal/async_hooks').symbols,
   udp_wrap: () => {
     const { UDP, UV_UDP_IPV6ONLY, UV_UDP_REUSEADDR, UV_UDP_REUSEPORT } = require('internal/dgram');
     return { UDP, constants: { UV_UDP_IPV6ONLY, UV_UDP_REUSEADDR, UV_UDP_REUSEPORT } };

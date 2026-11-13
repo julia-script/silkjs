@@ -53,7 +53,7 @@ function createContext(sandbox = {}, value) {
   if (sandbox !== DONT_CONTEXTIFY && contexts.has(sandbox)) return sandbox;
   const handle = host.vmCreateContext(config.afterEvaluate);
   const global = host.vmGlobal(handle);
-  host.initializeRealmBuiltins(handle, global, config.wasm);
+  const realmRequire = host.initializeRealmBuiltins(handle, global, config.wasm);
   let result = global;
   if (sandbox !== DONT_CONTEXTIFY) {
     // The sandbox mirror and the realm's binding record have distinct property
@@ -117,7 +117,7 @@ function createContext(sandbox = {}, value) {
     result = sandbox;
   }
   host.vmSetCodeGeneration(handle, config.strings);
-  contexts.set(result, { handle, afterEvaluate: config.afterEvaluate });
+  contexts.set(result, { handle, afterEvaluate: config.afterEvaluate, realmRequire });
   // Node registers the context's importModuleDynamically for an import() with no
   // referrer script; without one, such an import() reports the missing callback.
   host.vmSetImportModuleDynamically(handle, importCallback(config.importModuleDynamically, result,
