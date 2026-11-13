@@ -308,6 +308,10 @@ const hydrations = [];
 host.onHydrate = refresh => { hydrations.push(refresh); };
 const asyncHooks = internalRequire('async_hooks');
 function resource(type, owner) { return asyncHooks._createResource(type, owner); }
+const newAsyncId = asyncHooks._newAsyncId, queueDestroyId = asyncHooks._queueDestroyId;
+const InternalResourceClass = asyncHooks._InternalResource;
+const asyncHookFields = asyncHooks._hookFields;
+const invokeIdFrom = asyncHooks._invokeIdFrom;
 const invokeScoped = asyncHooks._invoke;
 const hidePromises = asyncHooks._hidePromises;
 function invokeResource(scope, callback, receiver, args, destroy = true) {
@@ -348,10 +352,28 @@ host.diagnostics = {
   watch(name, callback) { this.watchers.set(name, callback); },
   status(name, active) { const callback = this.watchers.get(name); if (callback !== undefined) callback(active); },
 };
-host.nextTick = function nextTick(callback, ...args) {
+host.nextTick = function nextTick(callback) {
   if (typeof callback !== 'function') throw new (internalRequire('internal/errors').codes.ERR_INVALID_ARG_TYPE)('callback', 'function', callback);
-  ticks.push(callback, args, resource('TickObject'));
+  // As Node's nextTick: an arguments array only when there are arguments.
+  const count = arguments.length;
+  let args;
+  if (count > 1) {
+    args = [];
+    for (let index = 1; index < count; index++) args.push(arguments[index]);
+  }
+  ticks.push(callback, args, tickScope());
 };
+// A tick's async scope. With no hooks it is the callback context itself, the TickObject
+// resource: no InternalResource to build and destroy. The run emits before, after and
+// destroy for it once hooks exist by then, as Node's processTicksAndRejections does.
+function tickScope() {
+  if (asyncHookFields[5] !== 0) return resource('TickObject');
+  const context = host.getAsyncContext();
+  const scope = { stores: context?.stores, id: newAsyncId(), trigger: context?.id ?? 1, resource: undefined };
+  scope.resource = scope;
+  return scope;
+}
+const noTickArguments = [];
 host.queueMicrotask = function queueMicrotask(callback) {
   checkCallback(callback);
   const scope = resource('Microtask');
@@ -389,20 +411,55 @@ host.privateSymbols = {
   arrow_message_private_symbol: native.privateSymbol('node:arrowMessage'),
   decorated_private_symbol: native.privateSymbol('node:decorated'),
 };
+// Where the engine puts a SyntaxError's origin. V8 keeps it in the message, so the
+// error itself has only its stack and message as own properties.
+const syntaxOrigin = host.syntaxOrigin = {
+  __proto__: null,
+  file: native.privateSymbol('node:syntaxFile'),
+  line: native.privateSymbol('node:syntaxLine'),
+  column: native.privateSymbol('node:syntaxColumn'),
+};
+native.workerNative('syntaxOriginKeys', [syntaxOrigin.file, syntaxOrigin.line, syntaxOrigin.column]);
+// V8 starts a context with empty RegExp statics (RegExp.$1, lastMatch...), and
+// Node's startup leaves them so. The runtime's own startup runs regexps in the
+// user's realm, so the user's code starts from the empty match V8 starts from.
+const regExpExec = RegExp.prototype.exec;
+const emptyPattern = /(?:)/;
+host.clearRegExpStatics = () => { Reflect.apply(regExpExec, emptyPattern, ['']); };
+// Whether value starts with a URL scheme ("file:", "node:"). A scan, not a RegExp:
+// the loader runs it in the user's realm, where a RegExp would set RegExp.input.
+host.hasURLScheme = value => {
+  if (typeof value !== 'string') value = String(value);
+  const first = value.charCodeAt(0) | 0x20;
+  if (first < 0x61 || first > 0x7a) return false;
+  for (let index = 1; index < value.length; index++) {
+    const code = value.charCodeAt(index);
+    if (code === 0x3a) return true;
+    const lower = code | 0x20;
+    if (!((lower >= 0x61 && lower <= 0x7a) || (code >= 0x30 && code <= 0x39) || code === 0x2b || code === 0x2e || code === 0x2d)) return false;
+  }
+  return false;
+};
+// The carets under a SyntaxError's site, from column (0-based) of text: V8 underlines
+// the token a message names ("Unexpected identifier 'line'"), else one character.
+const namedToken = /^Unexpected (?:identifier|token|reserved word|strict mode reserved word) '(.+)'$/;
+host.syntaxUnderline = (message, text, column) => {
+  const token = Reflect.apply(regExpExec, namedToken, [String(message)])?.[1];
+  const width = token !== undefined && stringStartsWith(text, token, column) ? token.length : 1;
+  let underline = '';
+  for (let index = 0; index < width; index++) underline += '^';
+  return underline;
+};
 host.attachArrow = (error, scriptName, source, prefix) => {
-  if (!(error instanceof SyntaxError) || host.errorArrows.has(error) || !Number.isInteger(error.lineNumber)) return;
-  const line = error.lineNumber;
+  if (!(error instanceof SyntaxError) || host.errorArrows.has(error) || !Number.isInteger(error[syntaxOrigin.line])) return;
+  const line = error[syntaxOrigin.line];
   const text = String(source).split(/\r\n|[\n\r\u2028\u2029]/)[line - 1];
   if (text === undefined) return;
-  const column = error.columnNumber - 1 - (line === 1 ? prefix : 0);
+  const column = error[syntaxOrigin.column] - 1 - (line === 1 ? prefix : 0);
   let caret = '';
   if (column >= 0 && column < text.length) {
     for (let index = 0; index < column; index++) caret += text[index] === '\t' ? '\t' : ' ';
-    // V8 underlines the token a message names ("Unexpected identifier 'line'").
-    const token = /^Unexpected (?:identifier|token|reserved word|strict mode reserved word) '(.+)'$/.exec(error.message)?.[1];
-    const width = token !== undefined && stringStartsWith(text, token, column) ? token.length : 1;
-    for (let index = 0; index < width; index++) caret += '^';
-    caret += '\n';
+    caret += host.syntaxUnderline(error.message, text, column) + '\n';
   }
   const arrow = scriptName + ':' + line + '\n' + text + '\n' + caret;
   host.errorArrows.set(error, arrow);
@@ -433,6 +490,9 @@ function exceptionInFatalHandler(error) {
   rawStd.exit(7);
 }
 const rejections = new Map();
+// Set when a rejection is queued, cleared once a checkpoint finds none: checkpoint's
+// fast path tests it rather than rejections.size (a Map getter call).
+let rejectionsQueued = false;
 const reportedRejections = new WeakMap();
 let nextRejectionId = 0;
 function onRejection(promise, reason, handled) {
@@ -448,6 +508,7 @@ function onRejection(promise, reason, handled) {
     }
   } else {
     rejections.set(promise, { reason, id: ++nextRejectionId, domain: process.domain, context: asyncHooks._captureContext() });
+    rejectionsQueued = true;
   }
 }
 // Node evaluates an ES main module inside a microtask checkpoint (its loader awaits
@@ -455,7 +516,47 @@ function onRejection(promise, reason, handled) {
 // settle before the next ticks it queued run (test-esm-dynamic-import-commonjs).
 let mainJobsFirst = false;
 host.mainModuleEvaluated = () => { mainJobsFirst = true; };
+// Node's tick queue drain (lib/internal/process/task_queues.js), called with process as
+// its receiver: a tick's callback runs straight from it, so its stack shows
+// process.processTicksAndRejections below the callback, as Node's does.
+function processTicksAndRejections() {
+  while (tickHead !== ticks.length) {
+    const at = tickHead;
+    const callback = ticks[at], args = ticks[at + 1], scope = ticks[at + 2];
+    ticks[at] = ticks[at + 1] = ticks[at + 2] = undefined;
+    tickHead = at + 3;
+    // A tick queued with no hook enabled has a plain scope (tickScope): switch to it, and
+    // emit before, after and destroy only for hooks enabled since.
+    if (!(scope instanceof InternalResourceClass)) {
+      const previous = host.getAsyncContext();
+      if (asyncHookFields[5] !== 0) {
+        try { invokeIdFrom(previous, scope, scope.id, invokeReporting, callback, undefined, args ?? noTickArguments); }
+        finally { queueDestroyId(scope.id); }
+        continue;
+      }
+      host.setAsyncContext(scope);
+      try { if (args === undefined) callback(); else Reflect.apply(callback, undefined, args); }
+      catch (error) { reportUncaught(error); }
+      finally { host.setAsyncContext(previous); }
+      continue;
+    }
+    asyncHooks._enterResource(scope);
+    try { Reflect.apply(callback, undefined, args ?? noTickArguments); }
+    catch (error) { reportUncaught(error); }
+    finally {
+      try { asyncHooks._leaveResource(scope); }
+      finally { scope.emitDestroy(); }
+    }
+  }
+}
+// Node's async_hook_fields: index 5 counts the callbacks of every enabled hook.
 function checkpoint() {
+  // The usual case, nothing queued but promise jobs: drain them once, and leave when they
+  // queued nothing either. With no hook callbacks a queued destroy has no effect.
+  if (!mainJobsFirst && tickHead === ticks.length && completionHead === completions.length && !rejectionsQueued) {
+    native.drainJobs(true);
+    if (tickHead === ticks.length && completionHead === completions.length && !rejectionsQueued && asyncHookFields[5] === 0) return;
+  }
   if (mainJobsFirst) {
     mainJobsFirst = false;
     native.drainJobs(true);
@@ -465,13 +566,7 @@ function checkpoint() {
       // Jobs after nextTick callbacks run inside Node's processTicksAndRejections;
       // otherwise they are V8's own checkpoint, below which no stack shows.
       const alone = tickHead === ticks.length;
-      while (tickHead !== ticks.length) {
-        const at = tickHead;
-        const callback = ticks[at], args = ticks[at + 1], scope = ticks[at + 2];
-        ticks[at] = ticks[at + 1] = ticks[at + 2] = undefined;
-        tickHead = at + 3;
-        invokeResource(scope, callback, undefined, args);
-      }
+      if (!alone) native.runTicks(processTicksAndRejections, process);
       ticks.length = tickHead = 0;
       native.drainJobs(alone);
       if (ticksPending()) continue;
@@ -501,6 +596,7 @@ function checkpoint() {
     // These must settle before testing loop liveness or emitting beforeExit.
     if (!ticksPending()) native.drainJobs();
   } while (ticksPending() || rejections.size || completionsPending());
+  rejectionsQueued = false;
 }
 host.checkpoint = checkpoint;
 // Node's lib/timers.js and lib/internal/timers.js run the timers; the loop
@@ -508,12 +604,18 @@ host.checkpoint = checkpoint;
 // Named, as Node's timer frames are: the REPL trims an error's frames below the
 // last one without a function name.
 host.invokeTimer = function invokeTimer(scope, callback, receiver, args) { return invokeScoped(scope, invokeReporting, callback, receiver, args); };
+// An Immediate's callback, in its context (scope) with hooks for its async id, from the
+// immediate queue's context (previous).
+host.invokeImmediate = function invokeTimer(previous, scope, id, callback, receiver, args) { return invokeIdFrom(previous, scope, id, invokeReporting, callback, receiver, args); };
 const timerAPI = internalRequire('timers');
 {
   const { processImmediate, processTimers } = internalRequire('internal/timers').getTimerCallbacks(checkpoint);
   internalRequire('internal/timers_binding').setupTimers(processImmediate, processTimers);
 }
 const timerLoop = host.timerLoop;
+const timerState = timerLoop.state;
+const nativeImmediates = timerLoop.nativeImmediates;
+const immediateInfo = timerLoop.immediateInfo;
 for (const name of ['setTimeout', 'clearTimeout', 'setImmediate', 'clearImmediate', 'setInterval', 'clearInterval']) globalThis[name] = timerAPI[name];
 const Buffer = internalRequire('buffer').Buffer;
 host.Buffer = Buffer;
@@ -607,6 +709,8 @@ const performanceMilestones = {
 host.markBootstrapComplete = () => { performanceMilestones.bootstrapComplete = native.now() - startTime; };
 let initialNativeIdleTime = 0;
 const loopListeners = new Set();
+// loopListeners.size, for the loop turn to test without a Set getter call.
+let loopListenerCount = 0;
 host.performanceStartTime = startTime;
 host.performanceTimeOrigin = Date.now() - (native.now() - startTime);
 // A worker takes the process's clock, as Node: performance.timeOrigin, performance.now(),
@@ -637,7 +741,8 @@ host.performanceUvMetrics = () => [native.loopMetrics(0), native.loopMetrics(1),
 host.performanceNodeTiming = () => ({ ...performanceMilestones, idleTime: host.performanceLoopStats().idle });
 host.performanceAddLoopListener = callback => {
   loopListeners.add(callback);
-  return () => loopListeners.delete(callback);
+  loopListenerCount = loopListeners.size;
+  return () => { const removed = loopListeners.delete(callback); loopListenerCount = loopListeners.size; return removed; };
 };
 // The Node release whose API this runtime implements.
 const nodeVersion = '24.22.1';
@@ -1018,6 +1123,7 @@ function evaluateMain(source, name) {
   // Node's ModuleJob.run hint for a CommonJS global (an --eval module has no load step
   // that would add it).
   let result;
+  host.clearRegExpStatics();
   try { result = native.evaluateModule(source, name, true); }
   catch (cause) { throw loader.decorateModuleError(cause, name); }
   host.entryModule = { name, source, promise: result };
@@ -1271,6 +1377,10 @@ function runtimeFlag(arg) {
       arg === '--require-module' || arg === '--no-require-module') {
     host.requireModuleDisabled = arg.startsWith('--no-'); return true;
   }
+  // --no-experimental-detect-module: an ambiguous .js file is CommonJS (get_format.js detectModuleFormat).
+  if (arg === '--experimental-detect-module' || arg === '--no-experimental-detect-module') {
+    host.detectModuleDisabled = arg === '--no-experimental-detect-module'; return true;
+  }
   if (arg === '--experimental-import-meta-resolve') { host.importMetaResolveParent = true; return true; }
   if (arg === '--experimental-print-required-tla') { host.printRequiredTLA = true; return true; }
   if (arg === '--experimental-import-text') { host.importText = true; return true; }
@@ -1449,9 +1559,11 @@ function runWorker() {
 }
 function startRepl() {
   console.log('Welcome to SilkJS Runtime.\nType ".help" for more information.');
-  return internalRequire('internal/repl').createInternalRepl(process.env, {
+  const repl = internalRequire('internal/repl').createInternalRepl(process.env, {
     input: process.stdin, output: process.stdout, terminal: !!process.stdout.isTTY, preview: !!process.stdout.isTTY,
   }, error => { if (error) console.error('REPL history:', error.message); });
+  host.clearRegExpStatics();
+  return repl;
 }
 function installCommonJSInputGlobals(filename, id) {
   // Node's createModule (lib/internal/process/execution.js): lookup paths from the cwd.
@@ -1766,7 +1878,7 @@ function run(restored = false) {
     return afterMain(loader.Module.runMain(path));
   }
   // Only a preload can register a hook or a mock that resolves it differently.
-  const resolved = early !== undefined && !requirePreloads.length && !importPreloads.length ? early : loader.resolveMain(path);
+  const resolved = early !== undefined && !requirePreloads.length && !importPreloads.length && !loaderPreloads.length ? early : loader.resolveMain(path);
   mainModuleName = resolved.filename;
   armInspectorEntry();
   return afterMain(loader.runMain(path, inputTypeSet, resolved));
@@ -1781,9 +1893,12 @@ function wasmEntry(path) {
   catch { return false; }
 }
 function referencedWork() {
-  return native.hasPendingIO() || timerLoop.hasRef();
+  return timerState.immediateRefed || (timerState.timerRefed && timerState.timerDue !== -1) || timerState.nativeRefs !== 0 || native.hasPendingIO();
 }
 function pollWorkers() {
+  // Worker events need a worker, port, channel, lock or route of this thread: the main
+  // thread polls only once it made one (host.workerActivity).
+  if (host.workerActivity !== true && workerThreads.isMainThread) return;
   // Replenished queues must yield to timers and native I/O. Rearm the wake
   // even for an already-queued burst, since uv_async coalesces notifications.
   for (let count = 0; count < 1000; count++) {
@@ -1797,9 +1912,11 @@ function pollWorkers() {
 function pollTimeout(pendingPromise) {
   if (ticksPending()) return 0;
   if (pendingPromise !== undefined && native.promiseState(pendingPromise) !== 0) return 0;
+  const delay = timerLoop.pollDelay();
+  // Ready immediates: every case below answers 0 then too.
+  if (delay === 0) return 0;
   const referenced = referencedWork();
   if (!referenced && pendingPromise === undefined) return 0;
-  const delay = timerLoop.pollDelay();
   // A hook may await an unreferenced timer or an externally settled promise.
   // Keep nested waits interruptible without emitting main-loop lifecycle events.
   if (!referenced && delay === -1) return 1;
@@ -1813,15 +1930,23 @@ function pollTimeout(pendingPromise) {
 // With keepAlive and nothing referenced the wait is the embedder's: up to the next timer
 // (referenced or not) or `limit`, whichever comes first.
 function loopTurn(pendingPromise, limit, keepAlive) {
-  if (timerLoop.runTimers()) checkpoint();
-  let timeout = keepAlive && !ticksPending() && !referencedWork() ? timerLoop.pollDelay() : pollTimeout(pendingPromise);
+  if (timerState.timerDue !== -1 && timerLoop.runTimers()) checkpoint();
+  // Referenced immediates wait (pollDelay 0): every case of pollTimeout answers 0 then.
+  let timeout = !keepAlive && pendingPromise === undefined && timerState.immediateRefed ? 0
+    : keepAlive && !ticksPending() && !referencedWork() ? timerLoop.pollDelay() : pollTimeout(pendingPromise);
   if (limit !== undefined && limit >= 0 && (timeout === -1 || timeout > limit)) timeout = limit;
   native.pollIO(timeout);
   pollWorkers();
   checkpoint();
-  if (loopListeners.size !== 0) for (const listener of loopListeners) listener();
-  if (timerLoop.checkImmediate()) checkpoint();
+  if (loopListenerCount !== 0) {
+    for (const listener of loopListeners) listener();
+    checkpoint();
+  }
+  if ((immediateInfo[0] !== 0 || nativeImmediates.length !== 0 || host.traceEnvironment) && timerLoop.checkImmediate()) checkpoint();
+  // Every phase ended in a checkpoint: nothing is queued for the next step's.
+  loopSettled = true;
 }
+let loopSettled = false;
 // An exception in a 'beforeExit' or 'exit' listener is uncaught like any other.
 function emitProcessEvent(name) { process.emit(name, Number(process.exitCode) || 0); }
 // Node's EmitProcessExitInternal: with no exit code set, an entry module whose
@@ -1846,7 +1971,7 @@ function checkUnsettledTopLevelAwait() {
       const sourceLine = sources.get(name)[line - 1] ?? '';
       let caret = '';
       for (let at = 0; at < column - 1 && at < sourceLine.length; at++) caret += sourceLine[at] === '\t' ? '\t' : ' ';
-      const location = /^[A-Za-z][A-Za-z\d+.-]*:/.test(name) ? name : url.pathToFileURL(name).href;
+      const location = host.hasURLScheme(name) ? name : url.pathToFileURL(name).href;
       host.writeText(2, `Warning: Detected unsettled top-level await at ${location}:${line}\n${sourceLine}\n${caret}^\n\n\n\n`);
     }
   }
@@ -1864,9 +1989,11 @@ function loopStart() {
 // own work keeps the process alive, such as open windows) no work left is not an end:
 // the pass polls once and 'beforeExit' waits for loopEnd.
 function loopStep(limit, keepAlive) {
-  checkpoint();
+  // An embedder's own code may have run since the last turn; the executable's has not.
+  if (!loopSettled || limit !== undefined || keepAlive) checkpoint();
+  loopSettled = false;
   pollWorkers();
-  if (workerThreads._exitRequested) return false;
+  if (host.workerExitRequested === true) return false;
   if (!keepAlive && !referencedWork()) {
     const beforeExit = host.traceEnvironment ? internalRequire('internal/trace_events').now() : undefined;
     invoke(emitProcessEvent, undefined, ['beforeExit']);
@@ -1932,7 +2059,7 @@ globalThis.__silkRuntime = {
   importTrace(specifier, referrer, promise) {
     const channels = host.diagnostics.tracing('module.import');
     if (channels === undefined) return promise;
-    const parentURL = typeof referrer === 'string' ? (/^[A-Za-z][A-Za-z\d+.-]*:/.test(referrer) ? referrer : fileHref(referrer)) : undefined;
+    const parentURL = typeof referrer === 'string' ? (host.hasURLScheme(referrer) ? referrer : fileHref(referrer)) : undefined;
     const context = { __proto__: null, parentURL, url: specifier };
     const { end, asyncStart, asyncEnd, error } = channels;
     const resolve = result => {
@@ -1956,11 +2083,11 @@ globalThis.__silkRuntime = {
   registerSource(filename, source, metadata) {
     host.registerSource(filename, source, { ...metadata, owner: metadata });
     if (!metadata.generated && typeof filename === 'string') {
-      return /^[A-Za-z][A-Za-z\d+.-]*:/.test(filename) ? filename : fileHref(filename);
+      return host.hasURLScheme(filename) ? filename : fileHref(filename);
     }
   },
   importMeta(name) {
-    const asURL = value => /^[A-Za-z][A-Za-z\d+.-]*:/.test(value) ? value : fileHref(value);
+    const asURL = value => host.hasURLScheme(value) ? value : fileHref(value);
     const url = asURL(name);
     // As in Node: a null prototype, keys in this order, filename and dirname for file: only.
     const meta = { __proto__: null };

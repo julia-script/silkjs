@@ -729,6 +729,10 @@ function encodeRealpathResult(result, options) {
   const asBuffer = Buffer.from(result);
   return options.encoding === 'buffer' ? asBuffer : asBuffer.toString(options.encoding);
 }
+// The realpath walk's stats, without the permission checks fs.lstatSync and fs.statSync make.
+function walkStat(stat) {
+  return c.host.builtinLoaded('internal/permission') ? require('internal/permission').walk(stat) : stat();
+}
 fs.realpathSync = function realpathSync(path, options) {
   options = c.options(options);
   path = c.toPathIfFileURL(path);
@@ -760,12 +764,12 @@ fs.realpathSync = function realpathSync(path, options) {
     const maybeCached = cache?.get(base);
     if (maybeCached) resolvedLink = maybeCached;
     else {
-      const info = fs.lstatSync(base, { bigint: true });
+      const info = walkStat(() => fs.lstatSync(base, { bigint: true }));
       if (!info.isSymbolicLink()) { knownHard.add(base); cache?.set(base, base); continue; }
       const id = `${info.dev.toString(32)}:${info.ino.toString(32)}`;
       let linkTarget = seenLinks.has(id) ? seenLinks.get(id) : null;
       if (linkTarget === null) {
-        const target = fs.statSync(base);
+        const target = walkStat(() => fs.statSync(base));
         reachedPipeOrSocket = target.isFIFO() || target.isSocket();
         linkTarget = c.pair(os.readlink(base), 'readlink', base);
       }

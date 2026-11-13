@@ -50,6 +50,27 @@ const packages = {
       'index.js': 'module.exports = "world";\n',
     },
   },
+  sayer: {
+    version: '3.0.0',
+    dependencies: { worder: '^2.0.0' },
+    bin: 'cli.js',
+    files: {
+      'package.json': '{"name":"sayer","version":"3.0.0","bin":"cli.js","dependencies":{"worder":"^2.0.0"}}',
+      'cli.js': '#!/usr/bin/env node\nconsole.log(require("worder"), process.argv.slice(2).join("|"));\n',
+    },
+  },
+  builder: {
+    version: '1.0.0',
+    dependencies: {},
+    hasInstallScript: true,
+    files: {
+      'package.json': JSON.stringify({
+        name: 'builder',
+        version: '1.0.0',
+        scripts: { postinstall: 'printf \'%s %s\' "$npm_lifecycle_event" "$npm_package_name" > made.txt' },
+      }),
+    },
+  },
 };
 
 const requests = [];
@@ -75,6 +96,8 @@ const server = http.createServer((request, response) => {
         name,
         version: found.version,
         dependencies: found.dependencies,
+        hasInstallScript: found.hasInstallScript,
+        bin: found.bin,
         dist: {
           tarball: `${base}/${name}/-/${name}-${found.version}.tgz`,
           integrity: 'sha512-' + crypto.createHash('sha512').update(archive).digest('base64'),
@@ -85,9 +108,9 @@ const server = http.createServer((request, response) => {
   response.writeHead(200, { 'content-type': 'application/json', 'content-length': Buffer.byteLength(body) }).end(body);
 });
 
-function run(directory, args) {
+function run(directory, args, home = directory, search = process.env.PATH) {
   return new Promise((resolve, reject) => {
-    const environment = { PATH: process.env.PATH, HOME: directory, SILKJS_STORE: path.join(directory, 'store') };
+    const environment = { PATH: search, HOME: home, SILKJS_STORE: path.join(home, 'store') };
     const child = spawn(process.execPath, args, { cwd: directory, env: environment });
     let stdout = '';
     let stderr = '';
@@ -139,6 +162,73 @@ server.listen(0, '127.0.0.1', async () => {
     assert.strictEqual(missing.status, 1);
     assert.match(missing.stderr, /^silkjsruntime: /);
     assert.strictEqual(fs.readFileSync(manifest, 'utf8'), '{\n  "name": "app",\n  "private": true\n}\n');
+
+    // The install scripts of a package run only when allowBuilds of the project names it.
+    const made = path.join(directory, 'node_modules/builder/made.txt');
+    const unbuilt = await run(directory, ['add', 'builder']);
+    assert.strictEqual(unbuilt.status, 0, unbuilt.stderr);
+    assert.match(unbuilt.stdout, /allowBuilds in package\.json does not name the package:\nbuilder@1\.0\.0\n/);
+    assert.ok(!fs.existsSync(made));
+    const allowing = JSON.parse(fs.readFileSync(manifest, 'utf8'));
+    allowing.allowBuilds = { builder: true };
+    fs.writeFileSync(manifest, JSON.stringify(allowing, null, 2) + '\n');
+    const built = await run(directory, ['install']);
+    assert.strictEqual(built.status, 0, built.stderr);
+    assert.match(built.stdout, /1 packages: 0 downloaded, 1 linked, 1 built\n/);
+    assert.strictEqual(fs.readFileSync(made, 'utf8'), 'postinstall builder');
+    const settled = await run(directory, ['install']);
+    assert.match(settled.stdout, /1 packages: 0 downloaded, 0 linked\n/);
+
+    // run and exec: a script of package.json, and a command, with the exit code of what ran.
+    allowing.scripts = { hello: 'echo hi from $npm_lifecycle_event', prestop: 'echo first', stop: 'exit 4' };
+    fs.writeFileSync(manifest, JSON.stringify(allowing, null, 2) + '\n');
+    const hello = await run(directory, ['run', 'hello', '--', 'two words', '--flag']);
+    assert.strictEqual(hello.status, 0, hello.stderr);
+    assert.strictEqual(hello.stdout, 'hi from hello two words --flag\n');
+    const stopped = await run(directory, ['run', 'stop']);
+    assert.strictEqual(stopped.status, 4);
+    assert.strictEqual(stopped.stdout, 'first\n');
+    const listed = await run(directory, ['run']);
+    assert.match(listed.stdout, /^hello: echo hi from \$npm_lifecycle_event\n/);
+    const executed = await run(directory, ['exec', 'sh', '-c', 'echo "$npm_package_name in $PWD"']);
+    assert.strictEqual(executed.stdout, `app in ${fs.realpathSync(directory)}\n`);
+    // On a machine without Node.js the executable is what a script gets for `node`, and by
+    // that name it runs a file even when the file is named like a command.
+    fs.writeFileSync(path.join(directory, 'install'), 'console.log("ran as", require("node:path").basename(process.argv0));\n');
+    const alone = await run(directory, ['exec', '/bin/sh', '-c', 'node install'], directory, '/nowhere');
+    assert.strictEqual(alone.status, 0, alone.stderr);
+    assert.strictEqual(alone.stdout, 'ran as node\n');
+    // dlx runs the command of a package the project does not have, here without a Node.js.
+    const said = await run(directory, ['dlx', 'sayer', 'two words', '--flag'], directory, '/usr/bin:/bin');
+    assert.strictEqual(said.status, 0, said.stderr);
+    assert.strictEqual(said.stdout, 'world two words|--flag\n');
+    assert.ok(!fs.existsSync(path.join(directory, 'node_modules/sayer')));
+
+    // A workspace: one lockfile and one hidden directory at the root, and a package that depends
+    // on another gets a link to its directory.
+    const repo = path.join(directory, 'repo');
+    fs.mkdirSync(path.join(repo, 'packages/app'), { recursive: true });
+    fs.mkdirSync(path.join(repo, 'packages/lib'), { recursive: true });
+    fs.writeFileSync(path.join(repo, '.npmrc'), `registry=http://127.0.0.1:${server.address().port}/\n`);
+    fs.writeFileSync(path.join(repo, 'package.json'), '{"name":"repo","private":true,"workspaces":["packages/*"]}\n');
+    fs.writeFileSync(path.join(repo, 'packages/lib/package.json'), '{"name":"@repo/lib","version":"1.0.0","main":"index.js","dependencies":{"worder":"^2.0.0"}}\n');
+    fs.writeFileSync(path.join(repo, 'packages/lib/index.js'), 'module.exports = () => "lib says " + require("worder");\n');
+    fs.writeFileSync(path.join(repo, 'packages/app/package.json'), '{"name":"app","dependencies":{"@repo/lib":"workspace:*"}}\n');
+    fs.writeFileSync(path.join(repo, 'packages/app/main.js'), 'console.log(require("@repo/lib")(), require("greeter")());\n');
+    const app = path.join(repo, 'packages/app');
+    const shared = await run(app, ['install'], directory);
+    assert.strictEqual(shared.status, 0, shared.stderr);
+    assert.match(shared.stdout, /1 packages: 0 downloaded, 1 linked\n/);
+    assert.ok(fs.existsSync(path.join(repo, 'sjs.lock')));
+    assert.ok(!fs.existsSync(path.join(app, 'sjs.lock')));
+    assert.strictEqual(fs.readlinkSync(path.join(app, 'node_modules/@repo/lib')), '../../../../packages/lib');
+    assert.ok(fs.existsSync(path.join(repo, 'node_modules/.sjs/worder@2.1.0')));
+    const filtered = await run(path.join(repo, 'packages/lib'), ['add', '--filter', 'app', 'greeter'], directory);
+    assert.strictEqual(filtered.status, 0, filtered.stderr);
+    assert.match(fs.readFileSync(path.join(app, 'package.json'), 'utf8'), /"greeter":\s*"\^1\.0\.0"/);
+    const together = await run(app, ['main.js'], directory);
+    assert.strictEqual(together.status, 0, together.stderr);
+    assert.strictEqual(together.stdout, 'lib says world hello world\n');
     console.log('ok');
   } finally {
     fs.rmSync(directory, { recursive: true, force: true });

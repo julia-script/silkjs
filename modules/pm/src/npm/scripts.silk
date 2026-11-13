@@ -1,0 +1,393 @@
+//! Runs the scripts of a `package.json`: the install scripts of a package that is in place,
+//! `preinstall`, `install` and `postinstall` in that order, and the scripts and commands a
+//! person asks for.
+//!
+//! A script is a shell command line. It runs in the directory of the package, with the
+//! environment of this process and, as npm gives it, the commands of the package's dependencies
+//! and of the project first on `PATH`, and `npm_lifecycle_event`, `npm_package_name`,
+//! `npm_package_version`, `npm_package_json`, `npm_config_user_agent` and `INIT_CWD`.
+//!
+//! The last place on `PATH` is a directory of the store, where a runtime that can stand in for
+//! `node` puts itself under that name, so the scripts of packages work on a machine that has the
+//! runtime alone.
+//!
+//! An install script runs with its output kept, which is shown when it fails. What a person
+//! asks for has the input and the output of this process.
+//!
+//! A package with a `binding.gyp` and neither an `install` nor a `preinstall` script gets
+//! `node-gyp rebuild` as its `install` script, which is what the registry says of it.
+
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.collections.bytes { Bytes }
+import silk.collections.list { List }
+import silk.collections.slice { Slice }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.platform.native.file { NativeFile }
+import silk.system.child_process { ChildProcess, ProcessError, ProcessRequest }
+import silk.system.filesystem { FileError, Path }
+import silk.system.subprocess { ExitStatus, ExitWatch, SpawnOptions, Stdio, Subprocess, SubprocessError }
+import npm.resolve { Host }
+import pkg.files { readOptional }
+import pkg.json_walk { Text, Walker }
+import pkg.text { same, startsWith }
+
+/// A script that did not do its work.
+pub struct ScriptError {
+  /// A short description for people.
+  pub message: string<'static>,
+  /// The package as `name@version`, the script, and the end of what it wrote.
+  pub subject: Bytes,
+}
+
+/// How much of what a failed script wrote is kept for the message.
+const TAIL: usize = 2000
+
+/// What every script of one install runs with.
+pub struct Runner {
+  // The environment of this process, each entry `name=value` and a NUL after it.
+  inherited: Bytes,
+  // The value of `PATH` in it.
+  search: Bytes,
+  // The directory of the root project.
+  root: Bytes,
+  // The directory the person is in.
+  origin: Bytes,
+  // A directory of commands that is looked in last, or empty.
+  fallback: Bytes,
+  agent: Bytes,
+}
+
+/// One script of a `package.json`.
+pub struct Script {
+  pub name: Bytes,
+  /// The command line.
+  pub command: Bytes,
+}
+
+effect fn textOf(value: &Text<'_>) -> Bytes ! OutOfMemoryError ? &mut Allocator {
+  if value.escaped {
+    return run Text.decode(value)
+  }
+  return run Bytes.copy(Text.bytes(value))
+}
+
+/// The scripts of the `package.json` whose text is `document`, in the order they are written.
+pub effect fn scriptsOf(document: &[u8]) -> List<Script> ! OutOfMemoryError ? &mut Allocator {
+  let mut scripts = List<Script>.make()
+  let mut walker = Walker.make(document)
+  if Walker.enterObject(&mut walker) == false {
+    return move scripts
+  }
+  while true {
+    let field = match move Walker.key(&mut walker) {
+      Option.None => { break }
+      Option.Some { value } => move value
+    }
+    if same(Text.bytes(&field), b"scripts") == false {
+      Walker.skip(&mut walker)
+      continue
+    }
+    if Walker.enterObject(&mut walker) == false {
+      continue
+    }
+    while true {
+      let event = match move Walker.key(&mut walker) {
+        Option.None => { break }
+        Option.Some { value } => move value
+      }
+      let command = Walker.string(&mut walker)
+      if Text.present(&command) {
+        run scripts.append(Script { name: run textOf(&event), command: run textOf(&command) })
+      }
+    }
+  }
+  return move scripts
+}
+
+/// The command line of the script `name` among `scripts`; empty when there is none.
+pub fn commandOf<'s>(scripts: &'s [Script], name: &[u8]) -> &'s [u8] {
+  let mut index: usize = 0
+  while index < scripts.length {
+    if same(Bytes.asSlice(&scripts[index].name), name) {
+      return Bytes.asSlice(&scripts[index].command)
+    }
+    index = index + 1
+  }
+  return b""
+}
+
+effect fn join(directory: &[u8], rest: &[u8]) -> Bytes ! OutOfMemoryError ? &mut Allocator {
+  let mut path = run Bytes.copy(directory)
+  run path.append(rest)
+  return move path
+}
+
+effect fn pathOf(bytes: &[u8]) -> Path ! ScriptError | OutOfMemoryError ? &mut Allocator {
+  return match move run Effect.result(Path.fromBytes(bytes)) {
+    Result.Success { value } => move value
+    Result.Failure { error } => match move error {
+      FileError _ => { fail ScriptError { message: "an install script cannot run in", subject: run Bytes.copy(bytes) } }
+      OutOfMemoryError exhausted => { fail move exhausted }
+    }
+  }
+}
+
+// Waits for the child `pid` to end.
+effect fn ended(pid: i32) -> ExitStatus ! SubprocessError {
+  let watch = run ExitWatch.open(pid)
+  return run watch.collect()
+}
+
+// The name of an environment entry `name=value`.
+fn nameOf(entry: &[u8]) -> &[u8] {
+  let mut end: usize = 0
+  while end < entry.length && entry[end] != 61 {
+    end = end + 1
+  }
+  return Slice.view<u8>(entry, 0, end)
+}
+
+// Whether a script is given its own value for the variable `name`.
+fn isSet(name: &[u8]) -> bool {
+  return same(name, b"PATH") || same(name, b"INIT_CWD") || same(name, b"npm_lifecycle_event")
+    || same(name, b"npm_lifecycle_script") || same(name, b"npm_package_name") || same(name, b"npm_package_version")
+    || same(name, b"npm_package_json") || same(name, b"npm_config_user_agent")
+}
+
+impl Runner {
+  /// A runner for the packages of the project in the directory `root`, on `host`, for a person
+  /// who works in the directory `origin`. `fallback` is a directory of commands for what `PATH`
+  /// does not have, such as a `node` on a machine with this runtime alone; empty for none.
+  pub effect fn make(root: &[u8], origin: &[u8], host: Host, fallback: &[u8]) -> Runner ! OutOfMemoryError ? &mut Allocator {
+    // A request is what the standard library reads the environment into.
+    let nowhere = run Path.root()
+    let mut scratch = run ChildProcess.request(&nowhere)
+    run Subprocess.inheritEnvironment(&mut scratch)
+    let inherited = run Bytes.copy(ChildProcess.environment(&scratch))
+    let mut search = Bytes.make()
+    let entries = Bytes.asSlice(&inherited)
+    let mut start: usize = 0
+    let mut index: usize = 0
+    while index < entries.length {
+      if entries[index] == 0 {
+        let entry = Slice.view<u8>(entries, start, index - start)
+        if startsWith(entry, b"PATH=") {
+          search = run Bytes.copy(Slice.view<u8>(entry, 5, entry.length - 5))
+        }
+        start = index + 1
+      }
+      index = index + 1
+    }
+    let mut agent = run Bytes.copy(b"silkjs/0.1.0 npm/? node/? ")
+    run agent.append(host.os)
+    run agent.append(b" ")
+    run agent.append(host.cpu)
+    return Runner { inherited: move inherited, search: move search, root: run Bytes.copy(root), origin: run Bytes.copy(origin), fallback: run Bytes.copy(fallback), agent: move agent }
+  }
+
+  // What runs the command line `command` as the script `event` of a package.
+  effect fn request(self: &Self, name: &[u8], version: &[u8], directory: &[u8], commands: &[u8], event: &[u8], command: &[u8]) -> ProcessRequest
+    ! ScriptError | OutOfMemoryError ? &mut Allocator {
+    let shell = run pathOf(b"/bin/sh")
+    let place = run pathOf(directory)
+    let mut request: ProcessRequest = run ChildProcess.requestWithin(&shell, &place)
+    run ChildProcess.addArgumentBytes(&mut request, b"-c")
+    run ChildProcess.addArgumentBytes(&mut request, command)
+
+    let entries = Bytes.asSlice(&self.inherited)
+    let mut start: usize = 0
+    let mut index: usize = 0
+    while index < entries.length {
+      if entries[index] == 0 {
+        let entry = Slice.view<u8>(entries, start, index - start)
+        let variable = nameOf(entry)
+        if variable.length < entry.length && isSet(variable) == false {
+          run ChildProcess.setVariableBytes(&mut request, variable, Slice.view<u8>(entry, variable.length + 1, entry.length - variable.length - 1))
+        }
+        start = index + 1
+      }
+      index = index + 1
+    }
+    // The commands of the package's dependencies, then the ones of the project.
+    let mut search = run Bytes.copy(commands)
+    let mut shared = run Bytes.copy(Bytes.asSlice(&self.root))
+    run shared.append(b"/node_modules/.bin")
+    if same(Bytes.asSlice(&shared), commands) == false {
+      run search.append(b":")
+      run search.append(Bytes.asSlice(&shared))
+    }
+    if Bytes.length(&self.search) > 0 {
+      run search.append(b":")
+      run search.append(Bytes.asSlice(&self.search))
+    }
+    if Bytes.length(&self.fallback) > 0 {
+      run search.append(b":")
+      run search.append(Bytes.asSlice(&self.fallback))
+    }
+    let manifest = run join(directory, b"/package.json")
+    run ChildProcess.setVariableBytes(&mut request, b"PATH", Bytes.asSlice(&search))
+    run ChildProcess.setVariableBytes(&mut request, b"INIT_CWD", Bytes.asSlice(&self.origin))
+    run ChildProcess.setVariableBytes(&mut request, b"npm_lifecycle_event", event)
+    run ChildProcess.setVariableBytes(&mut request, b"npm_lifecycle_script", command)
+    run ChildProcess.setVariableBytes(&mut request, b"npm_package_name", name)
+    run ChildProcess.setVariableBytes(&mut request, b"npm_package_version", version)
+    run ChildProcess.setVariableBytes(&mut request, b"npm_package_json", Bytes.asSlice(&manifest))
+    run ChildProcess.setVariableBytes(&mut request, b"npm_config_user_agent", Bytes.asSlice(&self.agent))
+    return move request
+  }
+
+  // Runs one install script of a package and keeps what it writes.
+  effect fn script(self: &Self, name: &[u8], version: &[u8], directory: &[u8], commands: &[u8], event: &[u8], command: &[u8]) -> ()
+    ! ScriptError | OutOfMemoryError ? &mut ChildProcess | &mut Allocator {
+    let request = run Runner.request(self, name, version, directory, commands, event, command)
+    let mut subject = run Bytes.copy(name)
+    run subject.append(b"@")
+    run subject.append(version)
+    run subject.append(b" (")
+    run subject.append(event)
+    run subject.append(b")")
+    let outcome = match move run Effect.result(ChildProcess.submit(&request)) {
+      Result.Success { value } => move value
+      Result.Failure { error } => match move error {
+        ProcessError _ => { fail ScriptError { message: "the shell could not be started for the install script of", subject: move subject } }
+        OutOfMemoryError exhausted => { fail move exhausted }
+      }
+    }
+    match ChildProcess.exitCode(&outcome) {
+      Option.Some { value: code } => {
+        if code == 0 {
+          return ()
+        }
+      }
+      Option.None => {}
+    }
+    // The end of what the script wrote says what went wrong.
+    let mut written = ChildProcess.errorBytes(&outcome)
+    if written.length == 0 {
+      written = ChildProcess.outputBytes(&outcome)
+    }
+    if written.length > TAIL {
+      written = Slice.view<u8>(written, written.length - TAIL, TAIL)
+    }
+    while written.length > 0 && (written[written.length - 1] == 10 || written[written.length - 1] == 13) {
+      written = Slice.view<u8>(written, 0, written.length - 1)
+    }
+    if written.length > 0 {
+      run subject.append(b"\n")
+      run subject.append(written)
+    }
+    fail ScriptError { message: "an install script failed:", subject: move subject }
+  }
+
+  // Starts `request` with the input and the output of this process and waits for it. Returns
+  // its exit code, or 128 and the signal that ended it.
+  effect fn attached(request: &ProcessRequest, subject: &[u8]) -> i32 ! ScriptError | OutOfMemoryError ? &mut Allocator {
+    let mut options = SpawnOptions.make()
+    run options.setStdio(0, Stdio.inherit(0))
+    run options.setStdio(1, Stdio.inherit(1))
+    run options.setStdio(2, Stdio.inherit(2))
+    let child = match move run Effect.result(Subprocess.spawn(request, &options)) {
+      Result.Success { value } => move value
+      Result.Failure { error } => match move error {
+        SubprocessError _ => { fail ScriptError { message: "the shell could not be started for", subject: run Bytes.copy(subject) } }
+        OutOfMemoryError exhausted => { fail move exhausted }
+      }
+    }
+    return match run Effect.result(ended(child.pid())) {
+      Result.Success { value } => if value.signaled { 128 + value.signal } else { value.code }
+      Result.Failure {..} => { fail ScriptError { message: "the end of the command could not be seen for", subject: run Bytes.copy(subject) } }
+    }
+  }
+
+  /// Runs the command line `command` as the script `event` of version `version` of the package
+  /// `name` in `directory`, with the input and the output of this process. `commands` is the
+  /// directory with the commands of the package. Each of `arguments` is added to the command
+  /// line as one word. Returns the exit code.
+  ///
+  /// # Errors
+  ///
+  /// - [`ScriptError`] when the shell cannot be started.
+  pub effect fn start(self: &Self, name: &[u8], version: &[u8], directory: &[u8], commands: &[u8], event: &[u8], command: &[u8], arguments: &[Bytes]) -> i32
+    ! ScriptError | OutOfMemoryError ? &mut Allocator {
+    let mut line = run Bytes.copy(command)
+    let mut index: usize = 0
+    while index < arguments.length {
+      // In single quotes nothing is special to the shell but the quote itself.
+      let word = Bytes.asSlice(&arguments[index])
+      run line.append(b" '")
+      let mut at: usize = 0
+      while at < word.length {
+        if word[at] == 39 {
+          run line.append(b"'\\''")
+        } else {
+          run line.append(Slice.view<u8>(word, at, 1))
+        }
+        at = at + 1
+      }
+      run line.append(b"'")
+      index = index + 1
+    }
+    let request = run Runner.request(self, name, version, directory, commands, event, Bytes.asSlice(&line))
+    return run Runner.attached(&request, event)
+  }
+
+  /// Runs the command `words[0]` with the other words as its arguments, in `directory`, with
+  /// what a script of the package gets. The command is looked for on `PATH`, the commands of the
+  /// package first. Returns the exit code, which is 127 when there is no such command.
+  ///
+  /// # Errors
+  ///
+  /// - [`ScriptError`] when the shell cannot be started.
+  pub effect fn execute(self: &Self, name: &[u8], version: &[u8], directory: &[u8], commands: &[u8], words: &[Bytes]) -> i32
+    ! ScriptError | OutOfMemoryError ? &mut Allocator {
+    // The shell finds the command and becomes it; the words reach it as they are.
+    let mut request = run Runner.request(self, name, version, directory, commands, b"exec", b"exec \"$0\" \"$@\"")
+    let mut index: usize = 0
+    while index < words.length {
+      run ChildProcess.addArgumentBytes(&mut request, Bytes.asSlice(&words[index]))
+      index = index + 1
+    }
+    return run Runner.attached(&request, if words.length > 0 { Bytes.asSlice(&words[0]) } else { b"" })
+  }
+
+  /// Runs the install scripts of version `version` of the package `name`, whose files are in
+  /// `directory`. `commands` is the directory with the commands of its dependencies. Returns how
+  /// many scripts ran.
+  ///
+  /// # Errors
+  ///
+  /// - [`ScriptError`] when a script cannot be started, or ends with another exit code than 0.
+  pub effect fn build(self: &Self, name: &[u8], version: &[u8], directory: &[u8], commands: &[u8]) -> usize
+    ! ScriptError | OutOfMemoryError ? &mut ChildProcess | &mut Allocator {
+    let manifest = run join(directory, b"/package.json")
+    let scripts = match move run readOptional(Bytes.asSlice(&manifest)) {
+      Option.Some { value: text } => run scriptsOf(Bytes.asSlice(&text))
+      Option.None => List<Script>.make()
+    }
+    let all = List<Script>.asSlice(&scripts)
+    let mut install = commandOf(all, b"install")
+    if install.length == 0 && commandOf(all, b"preinstall").length == 0 {
+      let gyp = run join(directory, b"/binding.gyp")
+      match run Effect.result(NativeFile.status(Bytes.asSlice(&gyp), true)) {
+        Result.Success {..} => { install = b"node-gyp rebuild" }
+        Result.Failure {..} => {}
+      }
+    }
+    let mut ran: usize = 0
+    if commandOf(all, b"preinstall").length > 0 {
+      run Runner.script(self, name, version, directory, commands, b"preinstall", commandOf(all, b"preinstall"))
+      ran = ran + 1
+    }
+    if install.length > 0 {
+      run Runner.script(self, name, version, directory, commands, b"install", install)
+      ran = ran + 1
+    }
+    if commandOf(all, b"postinstall").length > 0 {
+      run Runner.script(self, name, version, directory, commands, b"postinstall", commandOf(all, b"postinstall"))
+      ran = ran + 1
+    }
+    return ran
+  }
+}

@@ -205,9 +205,17 @@ function dropScope(scope, reference) {
     if (scope === 'fs.read') readGrants = keep; else writeGrants = keep;
   } else if (own(names, scope)) state[scope] = false;
 }
+// realpathSync's walk stats each ancestor of a path it already checked through the
+// unchecked binding.lstat and binding.stat, as lib/fs.js does; walk() runs it so.
+let walking = 0;
+function walk(fn) {
+  walking++;
+  try { return fn(); } finally { walking--; }
+}
 function checkFile(op, args) {
   // Every case below checks only with the Permission Model or its audit on.
   if (!initialized || (!state.enforce && !state.audit)) return;
+  if (walking !== 0 && (op === 'lstat' || op === 'stat')) return;
   const path = args[0];
   switch (op) {
     case 'close': case 'read': case 'pread': case 'readv': case 'write': case 'pwrite': case 'writev': case 'fstat': case 'ftruncate': return;
@@ -366,5 +374,5 @@ function accessDenied(message, scope, resource) {
   error.permission = names[scope]; error.resource = resource;
   return error;
 }
-module.exports = { applyOption, initialize, check, allows, canRead, checkFile, checkCallbackFile, checkNative, has, accessDenied,
+module.exports = { applyOption, initialize, check, allows, canRead, checkFile, walk, checkCallbackFile, checkNative, has, accessDenied,
   enabled: () => initialized && (state.enforce || state.audit) };

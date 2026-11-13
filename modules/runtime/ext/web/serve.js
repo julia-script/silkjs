@@ -7,7 +7,7 @@
 
 const host = require('internal/host');
 const { AsyncResource } = require('async_hooks');
-const { Response, readResponse, takeResponseText, responseState, serverRequest } = require('internal/web/fetch/message');
+const { Request, Response, internal, readResponse, takeResponseText, responseState, serverRequest } = require('internal/web/fetch/message');
 const { headerList } = require('internal/web/fetch/headers');
 const { URL } = require('internal/url');
 const { _memoryBytes: memoryBytes } = require('internal/web/blob');
@@ -95,7 +95,9 @@ function connectionEvent(type, status, payload, extra) {
 
 function request(connection, flags, payload, bytes) {
   const server = connection.server;
-  const req = serverRequest(payload, server._authority, (flags & HAS_BODY) !== 0 ? bytes : undefined);
+  // A bodyless request with a host field keeps just its field list (serverRequest's common case).
+  const req = (flags & HAS_BODY) === 0 && payload[2] !== '' ? new Request(internal, payload)
+    : serverRequest(payload, server._authority, (flags & HAS_BODY) !== 0 ? bytes : undefined);
   const head = payload[0] === 'HEAD';
   server._pending++;
   let result;

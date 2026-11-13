@@ -1,8 +1,9 @@
 'use strict';
 
-const { ArrayPrototypeConcat } = require('internal/per_context/primordials');
 const host = require('internal/host');
-const { AsyncResource, asyncWrapProviders } = require('async_hooks');
+const { _createResource: createResource, _invokeDispatch: invokeDispatch, asyncWrapProviders } = require('async_hooks');
+// The handle's async resource is the runtime's own (no FinalizationRegistry entry and no
+// private state): close and asyncReset destroy it, as Node's HandleWrap does.
 const { Buffer } = require('buffer');
 
 function error(status, syscall, address, port) {
@@ -35,9 +36,9 @@ class Transport {
     this.requests = new Map();
     this.sequence = 0;
     this.provider = kind === 5 ? 'TTYWRAP' : kind === 2 ? 'PIPEWRAP' : 'TCPWRAP';
-    this.resource = new AsyncResource(this.provider);
+    this.resource = createResource(this.provider);
     const callback = (type, status, payload, extra) => {
-      host.invokeResource(this.resource, this.dispatch, this, [type, status, payload, extra], false);
+      invokeDispatch(this.resource, this, type, status, payload, extra);
       host.checkpoint();
     };
     this.id = id === undefined ? host.net('create', [kind, callback, fd]) : id;
@@ -55,8 +56,13 @@ class Transport {
     }
     live.add(this);
   }
-  // concat, not spread: user code may have replaced Array.prototype[Symbol.iterator].
-  call(operation, ...args) { return host.net(operation, ArrayPrototypeConcat([this.id], args)); }
+  // The handle id, then the arguments, in a fresh array built by index: no rest array, and
+  // no spread (user code may have replaced Array.prototype[Symbol.iterator]).
+  call(operation) {
+    const args = [this.id];
+    for (let index = 1; index < arguments.length; index++) args.push(arguments[index]);
+    return host.net(operation, args);
+  }
   // A stream handle that an HTTP parser can consume directly (Node's StreamBase).
   get isStreamBase() { return true; }
   getAsyncId() { return this.resource.asyncId(); }
@@ -65,7 +71,7 @@ class Transport {
   // and the handle continues under a new one.
   asyncReset() {
     this.resource.emitDestroy();
-    this.resource = new AsyncResource(this.provider);
+    this.resource = createResource(this.provider);
   }
   dispatch(type, status, payload, extra) {
     if (type === 4 || type === 5) {

@@ -9,6 +9,7 @@ import platform
 import shutil
 import struct
 import subprocess
+import sys
 import tempfile
 import tomllib
 from embed import ROOT, generate
@@ -113,9 +114,13 @@ def embed_heap_image(output):
     runtime still works: each start runs the bootstrap. That is what an executable that
     cannot run here gets. Stripping the executable afterwards removes the image.
 
+    An executable that runs but fails to write its image, or a layout start that fails,
+    is a bug in the runtime (a bootstrap that reads the environment while the image
+    warms, a start that throws): the build fails, rather than ship an executable whose
+    every start runs the bootstrap.
+
     A start copies each image page it writes, so the image is laid out by the pages
-    starts write (lay_out_heap_image); an image that cannot be laid out is used as the
-    bootstrap left it.
+    starts write (lay_out_heap_image).
     """
     if platform.system() != 'Linux':
         return
@@ -127,12 +132,16 @@ def embed_heap_image(output):
         finally:
             shutil.rmtree(work, ignore_errors=True)
         write_heap_image(output, image, layout)
-    except (OSError, subprocess.CalledProcessError) as error:
-        print(f'Heap image not embedded ({error}); every start will run the bootstrap')
+    except subprocess.CalledProcessError as error:
+        sys.exit(f'Heap image not built ({error}); see the error above')
+    except OSError as error:
+        print(f'Heap image not embedded: the executable cannot run here ({error}); every start will run the bootstrap')
         return
     data = image.read_bytes()
     append_heap_image(output, data)
-    print(f'Embedded a heap image of {len(data)} bytes')
+    ranges = written_page_ranges(output)
+    append_heap_image_ranges(output, ranges)
+    print(f'Embedded a heap image of {len(data)} bytes; a start copies in {sum(n for _, n in ranges)} of its pages at once')
 
 
 def write_heap_image(executable, image, layout=None):
@@ -157,14 +166,67 @@ def append_heap_image(executable, data):
         handle.write(struct.pack('<QQQQ', offset, len(data), 0, HEAP_IMAGE_MAGIC))
 
 
+# heap_image.silk: a range word is its first page above RANGE_PAGE_BITS and its page
+# count below; the loader reads at most MAX_RANGES of them.
+RANGE_PAGE_BITS = 24
+MAX_RANGES = 1024
+
+
+def written_page_ranges(executable):
+    """The image pages every start in tools/heap-image-starts writes, as (first page,
+    count) runs. A start from the image has the kernel copy these in at once
+    (heap_image.load), which costs less than the read fault and then the
+    copy-on-write fault each would take; only pages every start writes are listed,
+    so no start copies a page it would have left alone."""
+    common = None
+    with tempfile.TemporaryDirectory(dir=ROOT / 'build') as directory:
+        profile = Path(directory) / 'pages'
+        for start in sorted(HEAP_IMAGE_STARTS.iterdir()):
+            if start.suffix not in ('.js', '.cjs', '.mjs'):
+                continue
+            for output_to in (subprocess.DEVNULL, subprocess.PIPE):
+                subprocess.run([str(executable), start.name], cwd=HEAP_IMAGE_STARTS, check=True,
+                               env={'SILKJS_HEAP_IMAGE_PAGES': str(profile)},
+                               stdin=subprocess.DEVNULL, stdout=output_to, stderr=subprocess.DEVNULL)
+                data = profile.read_bytes()
+                pages = set(struct.unpack(f'<{len(data) // 8}Q', data))
+                common = pages if common is None else common & pages
+    ranges = []
+    for page in sorted(common or ()):
+        if ranges and ranges[-1][0] + ranges[-1][1] == page:
+            ranges[-1][1] += 1
+        else:
+            ranges.append([page, 1])
+    # Past the loader's limit, join the runs closest together.
+    while len(ranges) > MAX_RANGES:
+        gaps = [ranges[i + 1][0] - ranges[i][0] - ranges[i][1] for i in range(len(ranges) - 1)]
+        i = gaps.index(min(gaps))
+        ranges[i][1] = ranges[i + 1][0] + ranges[i + 1][1] - ranges[i][0]
+        del ranges[i + 1]
+    return [(first, count) for first, count in ranges]
+
+
+def append_heap_image_ranges(executable, ranges):
+    """Puts ranges between the executable's image and its trailer."""
+    with open(executable, 'r+b') as handle:
+        handle.seek(-32, 2)
+        offset, length, _, magic = struct.unpack('<QQQQ', handle.read(32))
+        handle.seek(-32, 2)
+        handle.truncate()
+        handle.write(b''.join(struct.pack('<Q', (first << RANGE_PAGE_BITS) | count) for first, count in ranges))
+        handle.write(struct.pack('<QQQQ', offset, length, len(ranges), magic))
+
+
 def lay_out_heap_image(output, work):
     """The layout for output's heap image: the small blocks that the starts in
     tools/heap-image-starts write go to arenas of their own, packed into as few pages
-    as their bytes need. Every block is named by its allocation id, which each build
-    of the image hands out the same. A first image keeps every block where the
+    as their bytes need. Every block is named by its placed allocation id: its
+    requested size and how many blocks of that size came before it, which each build
+    of the image hands out the same even where a cache or a collection makes a build
+    allocate a little more or less elsewhere. A first image keeps every block where the
     bootstrap puts it, and the pages its starts write name the candidates; a second
     puts each candidate alone on its pages, and the pages written then name the
-    blocks. None when the starts cannot be profiled here."""
+    blocks."""
     def written(layout, name):
         image = work / (name + '.bin')
         write_heap_image(output, image, layout)
@@ -179,18 +241,17 @@ def lay_out_heap_image(output, work):
             # Output to a file and to a pipe take different paths.
             for output_to in (subprocess.DEVNULL, subprocess.PIPE):
                 profile = work / (name + '.ids')
-                subprocess.run([str(executable), start.name], cwd=HEAP_IMAGE_STARTS, check=True,
-                               env={'SILKJS_HEAP_IMAGE_PROFILE': str(profile)},
-                               stdin=subprocess.DEVNULL, stdout=output_to, stderr=subprocess.DEVNULL)
+                result = subprocess.run([str(executable), start.name], cwd=HEAP_IMAGE_STARTS,
+                                        env={'SILKJS_HEAP_IMAGE_PROFILE': str(profile)},
+                                        stdin=subprocess.DEVNULL, stdout=output_to, stderr=subprocess.PIPE)
+                if result.returncode != 0:
+                    sys.stderr.buffer.write(result.stderr)
+                    raise subprocess.CalledProcessError(result.returncode, result.args)
                 data = profile.read_bytes()
                 ids.update(struct.unpack(f'<{len(data) // 8}Q', data))
         return ids
-    try:
-        candidates = written((set(), 'pack'), 'plain')
-        written_ids = written((candidates, 'probe'), 'probe') & candidates
-    except (OSError, subprocess.CalledProcessError) as error:
-        print(f'Heap image not laid out ({error})')
-        return None
+    candidates = written((set(), 'pack'), 'plain')
+    written_ids = written((candidates, 'probe'), 'probe') & candidates
     print(f'Heap image: {len(written_ids)} of {len(candidates)} candidate blocks written by a start')
     return written_ids, 'pack'
 

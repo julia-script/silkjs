@@ -91,9 +91,11 @@ async function performFetch(original) {
   const signal = abortSource(record);
   const timing = { startTime: performance.now() };
   let redirects = 0;
+  // fetch() made `original` for this call alone, so the URL its constructor parsed is ours.
+  let next = original.parsedURL ?? null;
   for (;;) {
     if (signal?.aborted) throw signal.reason;
-    const url = new URL(record.url);
+    const url = next ?? new URL(record.url); next = null;
     if (url.protocol === 'data:' || url.protocol === 'blob:') {
       const response = url.protocol === 'data:' ? dataResponse(url) : blobResponse(record, url);
       const state = responseState(response); url.hash = ''; state.url = url.href; state.type = 'basic'; state.immutable = true; immutable(state.headers);
@@ -141,7 +143,7 @@ async function performFetch(original) {
     if (!redirects) timing.redirectStartTime = timing.startTime;
     timing.redirectEndTime = performance.now();
     timing.firstInterimNetworkResponseStartTime = undefined;
-    record.url = target.href; redirects++;
+    record.url = target.href; next = target; redirects++;
   }
 }
 for (const Constructor of [Headers, FormData, Request, Response]) {
