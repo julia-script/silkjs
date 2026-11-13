@@ -29,6 +29,12 @@ function closePayload(code, reason) {
   payload.set(reason, 2);
   return payload;
 }
+// Undici's WebSocket channels, which the inspector's network agent and user code read.
+let channels;
+function channel(name) {
+  channels ??= { __proto__: null };
+  return channels[name] ??= require('diagnostics_channel').channel('undici:websocket:' + name);
+}
 function finish(record) {
   if (record.readyState === 3) return;
   record.readyState = 3;
@@ -38,11 +44,11 @@ function finish(record) {
   const clean = record.receivedClose && record.closeWritten && !record.failure;
   if (!clean && !record.failure) record.failure = new Error('WebSocket connection closed abnormally');
   if (record.failure) record.target.dispatchEvent(new ErrorEvent('error', { error: record.failure, message: record.failure.message }));
-  record.target.dispatchEvent(new CloseEvent('close', {
-    wasClean: clean,
-    code: record.receivedClose && !record.failure ? record.closeCode : 1006,
-    reason: record.receivedClose && !record.failure ? record.closeReason : '',
-  }));
+  const code = record.receivedClose && !record.failure ? record.closeCode : 1006;
+  const reason = record.receivedClose && !record.failure ? record.closeReason : '';
+  record.target.dispatchEvent(new CloseEvent('close', { wasClean: clean, code, reason }));
+  // As Undici: only a connection that opened publishes its close, after the event.
+  if (record.opened) { const close = channel('close'); if (close.hasSubscribers) close.publish({ websocket: record.target, code, reason }); }
 }
 function peerEnded(record) {
   record.ended = true;
@@ -240,7 +246,19 @@ function establish(record, protocols, init) {
       socket.allowHalfOpen = true;
       socket.setNoDelay(true);
       record.readyState = 1;
+      record.opened = true;
       record.target.dispatchEvent(new Event('open'));
+      const open = channel('open');
+      if (open.hasSubscribers) {
+        // Undici's HeadersList.entries: lowercase names, repeated fields joined.
+        const headers = {};
+        for (const [name, values] of fields) headers[name] = values.join(', ');
+        open.publish({
+          address: typeof socket.address === 'function' ? socket.address() : null,
+          protocol: record.protocol, extensions: record.extensions, websocket: record.target,
+          handshakeResponse: { status: response.statusCode, statusText: response.statusMessage ?? '', headers },
+        });
+      }
       if (head.length) receiver.feed(head);
       if (!receiver.paused && !receiver.stopped) socket.resume();
     };
