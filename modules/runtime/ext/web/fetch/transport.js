@@ -259,7 +259,7 @@ function exchange(record, timing, url, headers, source) {
   return new Promise((resolve, reject) => {
     const signal = source ?? noAbort;
     if (signal.aborted) { reject(signal.reason); return; }
-    let transfer = null, controller = null, settled = false, streamDone = false, cancelled = false;
+    let transfer = null, body = null, settled = false, streamDone = false, cancelled = false;
     let encoded = 0, decoded = 0, raw = null, reader = null, completed;
     const codecs = [];
     const completion = new Promise(done => { completed = done; });
@@ -291,7 +291,7 @@ function exchange(record, timing, url, headers, source) {
       if (cancelled) return;
       cancelled = true;
       if (!settled) { settled = true; reject(reason); }
-      if (controller && !streamDone) { streamDone = true; controller.error(reason); }
+      if (body && !streamDone) { streamDone = true; body.fail(reason); }
       completed(false);
       removeAbort(); stop(reason);
     };
@@ -302,11 +302,7 @@ function exchange(record, timing, url, headers, source) {
       if (streamDone || cancelled) return;
       streamDone = true;
       timing.endTime = performance.now(); timing.encodedBodySize = encoded; timing.decodedBodySize = decoded;
-      if (controller) {
-        const pending = controller.byobRequest;
-        controller.close();
-        if (pending) pending.respond(0);
-      }
+      if (body) body.end();
       removeAbort();
       completed(true);
     };
@@ -355,8 +351,7 @@ function exchange(record, timing, url, headers, source) {
     };
     const deliver = bytes => {
       decoded += bytes.length;
-      controller.enqueue(bytes);
-      return controller.desiredSize > 0;
+      return body.push(bytes);
     };
     const handler = {
       information() { if (timing.firstInterimNetworkResponseStartTime === undefined) timing.firstInterimNetworkResponseStartTime = performance.now(); },
@@ -365,7 +360,7 @@ function exchange(record, timing, url, headers, source) {
         timing.finalNetworkResponseStartTime = performance.now();
         const responseFields = responseHeaders(list);
         const noBody = method === 'HEAD' || nullBodyStatus.has(status);
-        let stream = null;
+        let incoming = null;
         if (!noBody) {
           const chain = decoders(responseFields.get('content-encoding') || '');
           let source = null;
@@ -384,22 +379,20 @@ function exchange(record, timing, url, headers, source) {
             });
             source.once('end', finishBody);
           }
-          stream = new ReadableStream({
-            type: 'bytes',
-            start(value) { controller = value; },
-            pull() { if (cancelled || streamDone) return; if (source !== null) source.resume(); else transfer.resume(); },
-            cancel(reason) { cancelled = true; streamDone = true; completed(false); removeAbort(); stop(reason); },
-          // undici's fetch reads ahead into a 64 KiB Readable: a body that fits completes
-          // (and reports its end) before anything reads it.
-          }, { highWaterMark: 65536 });
+          // The body takes the bytes as they come, and makes a ReadableStream only for a
+          // reader of response.body (body.js IncomingBody).
+          incoming = require('internal/web/fetch/body').incomingBody(
+            () => { if (cancelled || streamDone) return; if (source !== null) source.resume(); else transfer.resume(); },
+            reason => { cancelled = true; streamDone = true; completed(false); removeAbort(); stop(reason); });
+          body = incoming.source;
         }
         const fragment = record.url.indexOf('#');
-        const result = makeResponse({ status, statusText: text, headers: immutable(responseFields), body: stream ? require('internal/web/fetch/body').streamBody(stream) : null, type: 'basic', url: fragment === -1 ? record.url : record.url.slice(0, fragment), redirected: false, immutable: true });
+        const result = makeResponse({ status, statusText: text, headers: immutable(responseFields), body: incoming, type: 'basic', url: fragment === -1 ? record.url : record.url.slice(0, fragment), redirected: false, immutable: true });
         settled = true;
         resolve({ response: result, completion, cancel: reason => { if (!streamDone) { cancelled = true; streamDone = true; completed(false); } removeAbort(); stop(reason); } });
       },
       body(bytes) {
-        if (cancelled || streamDone || (controller === null && raw === null)) return;
+        if (cancelled || streamDone || (body === null && raw === null)) return;
         encoded += bytes.length;
         if (raw !== null) { if (!raw.write(bytes)) transfer.pause(); return; }
         if (!deliver(bytes)) transfer.pause();

@@ -50,6 +50,18 @@ const packages = {
       'index.js': 'module.exports = "world";\n',
     },
   },
+  builder: {
+    version: '1.0.0',
+    dependencies: {},
+    hasInstallScript: true,
+    files: {
+      'package.json': JSON.stringify({
+        name: 'builder',
+        version: '1.0.0',
+        scripts: { postinstall: 'printf \'%s %s\' "$npm_lifecycle_event" "$npm_package_name" > made.txt' },
+      }),
+    },
+  },
 };
 
 const requests = [];
@@ -75,6 +87,7 @@ const server = http.createServer((request, response) => {
         name,
         version: found.version,
         dependencies: found.dependencies,
+        hasInstallScript: found.hasInstallScript,
         dist: {
           tarball: `${base}/${name}/-/${name}-${found.version}.tgz`,
           integrity: 'sha512-' + crypto.createHash('sha512').update(archive).digest('base64'),
@@ -139,6 +152,37 @@ server.listen(0, '127.0.0.1', async () => {
     assert.strictEqual(missing.status, 1);
     assert.match(missing.stderr, /^silkjsruntime: /);
     assert.strictEqual(fs.readFileSync(manifest, 'utf8'), '{\n  "name": "app",\n  "private": true\n}\n');
+
+    // The install scripts of a package run only when allowBuilds of the project names it.
+    const made = path.join(directory, 'node_modules/builder/made.txt');
+    const unbuilt = await run(directory, ['add', 'builder']);
+    assert.strictEqual(unbuilt.status, 0, unbuilt.stderr);
+    assert.match(unbuilt.stdout, /allowBuilds in package\.json does not name the package:\nbuilder@1\.0\.0\n/);
+    assert.ok(!fs.existsSync(made));
+    const allowing = JSON.parse(fs.readFileSync(manifest, 'utf8'));
+    allowing.allowBuilds = { builder: true };
+    fs.writeFileSync(manifest, JSON.stringify(allowing, null, 2) + '\n');
+    const built = await run(directory, ['install']);
+    assert.strictEqual(built.status, 0, built.stderr);
+    assert.match(built.stdout, /1 packages: 0 downloaded, 1 linked, 1 built\n/);
+    assert.strictEqual(fs.readFileSync(made, 'utf8'), 'postinstall builder');
+    const settled = await run(directory, ['install']);
+    assert.match(settled.stdout, /1 packages: 0 downloaded, 0 linked\n/);
+
+    // run and exec: a script of package.json, and a command, with the exit code of what ran.
+    allowing.scripts = { hello: 'echo hi from $npm_lifecycle_event', prestop: 'echo first', stop: 'exit 4' };
+    fs.writeFileSync(manifest, JSON.stringify(allowing, null, 2) + '\n');
+    const hello = await run(directory, ['run', 'hello', '--', 'two words', '--flag']);
+    assert.strictEqual(hello.status, 0, hello.stderr);
+    assert.strictEqual(hello.stdout, 'hi from hello two words --flag\n');
+    const stopped = await run(directory, ['run', 'stop']);
+    assert.strictEqual(stopped.status, 4);
+    assert.strictEqual(stopped.stdout, 'first\n');
+    const listed = await run(directory, ['run']);
+    assert.match(listed.stdout, /^hello: echo hi from \$npm_lifecycle_event\n/);
+    const executed = await run(directory, ['exec', 'sh', '-c', 'echo "$npm_package_name in $PWD"']);
+    assert.strictEqual(executed.stdout, `app in ${fs.realpathSync(directory)}\n`);
+
     // A workspace: one lockfile and one hidden directory at the root, and a package that depends
     // on another gets a link to its directory.
     const repo = path.join(directory, 'repo');
