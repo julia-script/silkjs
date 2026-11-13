@@ -118,6 +118,23 @@ function createLoader(host, builtins) {
     return source;
   }
 
+  // postgres.js (porsager/postgres) connection.js: runs of DataRow messages go to
+  // internal/postgres_rows, which decodes them natively. A source that does not
+  // read as expected loads unchanged.
+  const postgresConnection = /[\\/]node_modules[\\/]postgres[\\/](?:cjs[\\/])?src[\\/]connection\.js$/;
+  const postgresLoop = '    while (incoming.length > 4) {\n      length = incoming.readUInt32BE(1)\n';
+  // On the loop's own line, so the lines after it keep their numbers.
+  const postgresFast = '    while (incoming.length > 4) { if (incoming[0] === 68 && query) { const used = __silkPostgresRows(incoming, query, result, rows, transform); if (used > 0) { rows = result.length; incoming = incoming.subarray(used); continue } }\n      length = incoming.readUInt32BE(1)\n';
+  function patchPackageSource(filename, source, esm) {
+    if (!postgresConnection.test(filename)) return source;
+    const at = source.indexOf(postgresLoop);
+    if (at < 0 || source.indexOf(postgresLoop, at + 1) >= 0 || !source.includes('function DataRow(x)')) return source;
+    // Kept on the first line, so line numbers match the file.
+    const binding = esm ? 'const __silkPostgresRows = import.meta.silkPostgresRows;' : 'const __silkPostgresRows = module.silkPostgresRows;';
+    return binding + source.slice(0, at) + postgresFast + source.slice(at + postgresLoop.length);
+  }
+  function isPatchedPackage(filename) { return postgresConnection.test(filename); }
+
   function cleanSource(source) {
     if (source.charCodeAt(0) === 0xFEFF) source = source.slice(1);
     if (source.startsWith('#!')) {
@@ -1151,7 +1168,11 @@ function createLoader(host, builtins) {
     }
     require(specifier) { return makeRequire(this.filename || path.join(host.tryGetCwd(), '__entry__.js'), this, moduleAsyncModes.get(this) === true)(specifier); }
     _compile(source, filename) {
-      const compiledSource = cleanSource(source);
+      let compiledSource = cleanSource(source);
+      if (isPatchedPackage(String(filename))) {
+        compiledSource = patchPackageSource(String(filename), compiledSource, false);
+        Object.defineProperty(this, 'silkPostgresRows', { value: builtins.get('internal/postgres_rows') });
+      }
       const detecting = detectingFormat;
       detectingFormat = false;
       let wrapper;
@@ -2117,7 +2138,7 @@ function createLoader(host, builtins) {
       resolutions.set(resolved.filename, { filename: resolved.filename, format: 'commonjs' });
       source = bridgeSource(resolved.filename, Object.keys(substitute), true);
     }
-    else if (resolved.format === 'module') source = cleanSource(loaded.source);
+    else if (resolved.format === 'module') source = patchPackageSource(filesystemName(resolved.filename), cleanSource(loaded.source), true);
     else if (resolved.format === 'builtin') {
       pendingLoads.set(resolved.filename, loaded);
       source = bridgeSource(resolved.filename, Object.keys(loadBuiltin(resolved.filename)), false);

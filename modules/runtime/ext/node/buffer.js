@@ -1269,6 +1269,9 @@ function adjustOffset(offset, length) {
 }
 
 Buffer.prototype.subarray = function subarray(start, end) {
+  // Integer offsets on a Uint8Array take the native view (bufferCodec 9).
+  const view = bufferCodec(9, this, start, end, FastBuffer);
+  if (view !== undefined) return view;
   const srcLength = TypedArrayPrototypeGetLength(this);
   start = adjustOffset(start, srcLength);
   end = end !== undefined ? adjustOffset(end, srcLength) : srcLength;

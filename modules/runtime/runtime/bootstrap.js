@@ -2125,6 +2125,9 @@ globalThis.__silkRuntime = {
       meta.filename = filename;
     }
     meta.main = mainModuleName !== undefined && url === asURL(mainModuleName);
+    // The loader's patched postgres.js connection.js reads its row decoder here.
+    if (meta.filename !== undefined && /[\\/]node_modules[\\/]postgres[\\/]src[\\/]connection\.js$/.test(meta.filename))
+      Object.defineProperty(meta, 'silkPostgresRows', { value: internalRequire('internal/postgres_rows') });
     meta.resolve = function resolve(specifier, parent) {
       // Only --experimental-import-meta-resolve gives the second argument meaning.
       let from = name;
