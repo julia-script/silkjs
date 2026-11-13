@@ -20,12 +20,13 @@ function bytes(value, name = 'value') {
   if (value instanceof ArrayBuffer) return Buffer.from(value);
   throw invalidArgType(name, ['string', 'Buffer', 'TypedArray', 'DataView'], value);
 }
-function native(op, ...args) {
-  args = args.map(value => {
-    if (typeof value === 'boolean') return Number(value);
-    if (!ArrayBuffer.isView(value)) return value;
-    return value.byteOffset === 0 && value.byteLength === value.buffer.byteLength ? value.buffer : value.buffer.slice(value.byteOffset, value.byteOffset + value.byteLength);
-  });
+// Views pass as they are: the binding copies their bytes from the backing.
+function native(op) {
+  const args = [];
+  for (let index = 1; index < arguments.length; index++) {
+    const value = arguments[index];
+    args.push(typeof value === 'boolean' ? Number(value) : value);
+  }
   try { return host.tls(op, args); }
   catch (err) { throw decorate(err); }
 }

@@ -200,9 +200,31 @@ Timeout.prototype[Symbol.toPrimitive] = function() {
  * @param {...any} [args]
  * @returns {Immediate}
  */
-function setImmediate(callback, ...args) {
+function setImmediate(callback, arg1, arg2, arg3) {
   validateFunction(callback, 'callback');
-  return new Immediate(callback, args.length ? args : undefined);
+
+  // Node's argument copy: no rest array for the usual call without arguments.
+  let i, args;
+  switch (arguments.length) {
+    // fast cases
+    case 1:
+      break;
+    case 2:
+      args = [arg1];
+      break;
+    case 3:
+      args = [arg1, arg2];
+      break;
+    default:
+      args = [arg1, arg2, arg3];
+      for (i = 4; i < arguments.length; i++) {
+        // Extend array dynamically, makes .apply run much faster in v6.0.0
+        args[i - 1] = arguments[i];
+      }
+      break;
+  }
+
+  return new Immediate(callback, args);
 }
 
 Object.defineProperty(setImmediate, customPromisify, {

@@ -303,10 +303,11 @@ function prepareError(err, parser, rawPacket) {
 }
 
 let warnedLenient = false;
+let insecureHTTPParser;
 
 function isLenient() {
-  // Read on each use: http is in the heap image, built without this process's flags.
-  const insecureHTTPParser = getOptionValue('--insecure-http-parser');
+  // Read on first use, not at load: http is in the heap image, built without this process's flags.
+  insecureHTTPParser ??= getOptionValue('--insecure-http-parser');
   if (insecureHTTPParser && !warnedLenient) {
     warnedLenient = true;
     process.emitWarning('Using insecure HTTP parsing');
