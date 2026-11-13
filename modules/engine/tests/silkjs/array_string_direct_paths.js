@@ -26,6 +26,10 @@ out.push('a'.concat(1, 2, 3, 4, 5, 6, 7, 8, 9));
 out.push('text/html'.replace('html', 'json'), 'aaa'.replace('a', '$&$&'), 'abc'.replace('z', 'y'), 'abc'.replaceAll('b', '中'), 'abc'.replace('', '-'), 'a-b'.replace('-', () => '+'));
 out.push(parseInt('1234'), parseInt('-7', 10), parseInt('12px'), parseInt('0x1f'), parseInt('0x1f', 10), Object.is(parseInt('-0'), -0), parseInt(' 5'), parseInt('1234567890123'), parseInt('9', 8), parseInt('123456789'), parseInt('1234567890'));
 out.push(parseFloat('12'), parseFloat('12.5'), parseFloat('3e2'), parseFloat('-4x'), Object.is(parseFloat('-0'), -0));
+out.push(show(new Array(4).fill(0)), show([1, 2, 3].fill('z', 1)), show([1, 2, 3].fill(9, -1)), show(new Array(3).fill({}).map((o) => typeof o)), show(Array(2).fill()), show([].fill(1)));
+var frozen = Object.freeze([1, 2]); try { frozen.fill(0); } catch (e) { out.push(e.constructor.name); }
+var sealed = Object.seal([1, 2]); sealed.fill(5); out.push(show(sealed));
+out.push(show('a,b,a,b'.split(',')), show('é,中,x'.split(',')), show('ab'.split('')));
 // Observable hooks turn the shortcuts off.
 Object.defineProperty(Array.prototype, Symbol.isConcatSpreadable, { get() { return false; }, configurable: true });
 out.push([1].concat([2]).length);
@@ -33,5 +37,5 @@ delete Array.prototype[Symbol.isConcatSpreadable];
 Array.prototype[Symbol.iterator] = function* () { yield 42; };
 out.push(show([...a]), show(Array.from(a)));
 var __result = out.join(' ');
-var __expected = "[1,\"x\",null] [0,1,\"x\",null,1,\"x\",null,9] [1,\"x\",null] [1,\"y\"] [\"p\",undefined] [\"a\",\"b\"] [1,undefined,3] [1,undefined,3] true 3 false [1,2,3] [2,3] [\"x\"] 4 0 [1,2] RangeError true true 2 [\"a\",\"b\",\"\",\"c\"] [\"a\",\"b\",\"c\"] [\"a\"] [] [\"x\"] [2,3] [] [4,5] [\"changed\",7] [1,2,3,4,\"x\",[5]] [] [1,null,undefined] 2 [1,[9]] [1,\"l\",\"m\"] a-b-3---é x 123 中üa 1,2;3 -2147483648,5  6 aQb7cnulldundefined a12é 中xQ  T TypeError a123456789 text/json aaaa abc a中c -abc a+b 1234 -7 12 31 0 true 5 1234567890123 NaN 123456789 1234567890 12 12.5 300 -4 true 2 [42] [42]";
+var __expected = "[1,\"x\",null] [0,1,\"x\",null,1,\"x\",null,9] [1,\"x\",null] [1,\"y\"] [\"p\",undefined] [\"a\",\"b\"] [1,undefined,3] [1,undefined,3] true 3 false [1,2,3] [2,3] [\"x\"] 4 0 [1,2] RangeError true true 2 [\"a\",\"b\",\"\",\"c\"] [\"a\",\"b\",\"c\"] [\"a\"] [] [\"x\"] [2,3] [] [4,5] [\"changed\",7] [1,2,3,4,\"x\",[5]] [] [1,null,undefined] 2 [1,[9]] [1,\"l\",\"m\"] a-b-3---é x 123 中üa 1,2;3 -2147483648,5  6 aQb7cnulldundefined a12é 中xQ  T TypeError a123456789 text/json aaaa abc a中c -abc a+b 1234 -7 12 31 0 true 5 1234567890123 NaN 123456789 1234567890 12 12.5 300 -4 true [0,0,0,0] [1,\"z\",\"z\"] [1,2,9] [\"object\",\"object\",\"object\"] [undefined,undefined] [] TypeError [5,5] [\"a\",\"b\",\"a\",\"b\"] [\"é\",\"中\",\"x\"] [\"a\",\"b\"] 2 [42] [42]";
 if (__result !== __expected) throw new Error("expected " + __expected + ", got " + __result);
