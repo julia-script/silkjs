@@ -71,7 +71,7 @@ function getErrorSourceLocation(error) {
     originalColumn,
     originalSource,
   } = sm.findEntry(lineNumber - 1, startColumn);
-  const originalSourceLine = getSourceLine(sm, originalSource, originalLine);
+  const originalSourceLine = maps.getSourceLine(sm, originalSource, originalLine);
 
   if (!originalSourceLine) {
     return;
@@ -81,16 +81,6 @@ function getErrorSourceLocation(error) {
     sourceLine: originalSourceLine,
     startColumn: originalColumn,
   };
-}
-
-// The text of line `line` (0-based) of a source map's original source: its
-// sourcesContent, as Node's source_map_cache getSourceLine reads it.
-function getSourceLine(sm, originalSource, line) {
-  const { sources, sourcesContent } = sm.payload;
-  const index = sources === undefined ? -1 : sources.indexOf(originalSource);
-  const content = index === -1 || sourcesContent === undefined ? undefined : sourcesContent[index];
-  if (typeof content !== 'string') return;
-  return content.split(/\r?\n/)[line];
 }
 
 const memberAccessTokens = [ '.', '?.', '[', ']' ];

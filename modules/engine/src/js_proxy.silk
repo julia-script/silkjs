@@ -51,6 +51,7 @@ import js_string_types { StringLengthError }
 import js_bigint { BigIntError }
 import js_exceptions { JsException }
 import js_invariant { invariant }
+import js_parser_diagnostics { DiagnosticMessage }
 
 effect fn prototype<'a, 'b, H: CoercionHooks + PrototypeHooks>(hooks: &mut H, realm: Realm<'a>,
   target: ValueRef<'b>) -> Value ! JsException ? &mut Allocator {
@@ -69,13 +70,15 @@ pub effect fn getPrototype<'a, 'b, H: CoercionHooks + CallHooks + PrototypeHooks
   }
   let arguments = [target.view()]
   let result = run core.invoke(&mut hooks, realm, move method, core.handlerOf(object), &arguments)
-  if !run checkPrototype(&mut hooks, realm, target, result.borrow(), true) {
-    return run ops.error(&mut hooks,realm, b"proxy: inconsistent prototype")
+  if !result.view().isObject() && !match result.view() { ValueBits.Null => true _ => false } {
+    return run core.trapError(&mut hooks, realm, b"getPrototypeOf", b"trap returned neither object nor null")
+  }
+  if !run checkPrototype(&mut hooks, realm, target, result.borrow()) {
+    return run core.trapError(&mut hooks, realm, b"getPrototypeOf", b"proxy target is non-extensible but the trap did not return its actual prototype")
   }
   return result.intoBits()
 }
-effect fn checkPrototype<'a, 'b, H: CoercionHooks + PrototypeHooks>(hooks: &mut H,realm: Realm<'a>, target: ValueRef<'b>, result: ValueRef<'b>, checkType: bool) -> bool ! JsException ? &mut Allocator {
-  if checkType && !result.view().isObject() && !match result.view() { ValueBits.Null => true _ => false } { return false }
+effect fn checkPrototype<'a, 'b, H: CoercionHooks + PrototypeHooks>(hooks: &mut H,realm: Realm<'a>, target: ValueRef<'b>, result: ValueRef<'b>) -> bool ! JsException ? &mut Allocator {
   if !run core.extensible(&mut hooks, realm, target) {
     let actual = run prototype(&mut hooks, realm, target)
     if !core.same(actual.borrow(), result) { return false }
@@ -99,8 +102,8 @@ pub effect fn setPrototype<'a, 'b, H: HeapHooks + CoercionHooks + CallHooks + Pr
   let arguments = [target.view(), desired.view()]
   let result = run core.invoke(&mut hooks, realm, move method, core.handlerOf(object), &arguments)
   if !core.truthy(move result) { return false }
-  if !run checkPrototype(&mut hooks, realm, target, desired, false) {
-    return run ops.error(&mut hooks,realm, b"proxy: inconsistent prototype")
+  if !run checkPrototype(&mut hooks, realm, target, desired) {
+    return run core.trapError(&mut hooks, realm, b"setPrototypeOf", b"trap returned truish for setting a new prototype on the non-extensible proxy target")
   }
   return true
 }
@@ -111,8 +114,11 @@ pub effect fn isExtensible<'a, 'b, H: HeapHooks + CoercionHooks + CallHooks + Pr
   let arguments = [target.view()]
   let result = run core.invoke(&mut hooks, realm, move method, core.handlerOf(object), &arguments)
   let accepted = core.truthy(move result)
-  if accepted != run core.extensible(&mut hooks, realm, target) {
-    return run ops.error(&mut hooks,realm, b"proxy: inconsistent isExtensible")
+  let actual = run core.extensible(&mut hooks, realm, target)
+  if accepted != actual {
+    let text: &[u8] = if actual { b"trap result does not reflect extensibility of proxy target (which is 'true')" }
+      else { b"trap result does not reflect extensibility of proxy target (which is 'false')" }
+    return run core.trapError(&mut hooks, realm, b"isExtensible", text)
   }
   return accepted
 }
@@ -130,7 +136,7 @@ pub effect fn preventExtensions<'a, 'b, H: HeapHooks + CoercionHooks + CallHooks
   let result = run core.invoke(&mut hooks, realm, move method, core.handlerOf(object), &arguments)
   let accepted = core.truthy(move result)
   if accepted && run core.extensible(&mut hooks, realm, target) {
-    return run ops.error(&mut hooks,realm, b"proxy: inconsistent preventExtensions")
+    return run core.trapError(&mut hooks, realm, b"preventExtensions", b"trap returned truish but the proxy target is extensible")
   }
   return accepted
 }
@@ -158,29 +164,49 @@ pub effect fn has<'a, 'b, H: HeapHooks + OwnPropertyHooks + HasPropertyHooks + C
       Option<PropertyDescriptor>.Some { value } => {
         let fixed = (value.flags & JS_PROP_CONFIGURABLE) == 0
         drop value
-        if fixed || !core.storedExtensible(target) { return run ops.error(&mut hooks,realm, b"proxy: inconsistent has") }
+        if fixed { return run core.keyError(&mut hooks, realm, b"has", b"trap returned falsish for property ", atom, b" which exists in the proxy target as non-configurable") }
+        if !core.storedExtensible(target) { return run core.keyError(&mut hooks, realm, b"has", b"trap returned falsish for property ", atom, b" but the proxy target is not extensible") }
       }
       Option<PropertyDescriptor>.None => ()
     }
   }
   return accepted
 }
-effect fn checkGet<'a, 'b, H: HeapHooks + OwnPropertyHooks + CoercionHooks>(hooks: &mut H,realm: Realm<'a>, target: ValueRef<'b>, atom: u32, result: ValueRef<'b>) -> bool ! JsException ? &mut Allocator {
+effect fn checkGet<'a, 'b, H: HeapHooks + OwnPropertyHooks + CoercionHooks>(hooks: &mut H,realm: Realm<'a>, target: ValueRef<'b>, atom: u32, result: ValueRef<'b>) -> () ! JsException ? &mut Allocator {
   let ownDescriptorResult = run core.ownProperty(&mut hooks, realm, target, atom)
   match move ownDescriptorResult {
     Option<PropertyDescriptor>.Some { value } => {
-      let mut bad = false
       if (value.flags & (JS_PROP_GETSET | JS_PROP_CONFIGURABLE | JS_PROP_WRITABLE)) == 0 {
-        bad = !core.same(value.value.borrow(), result)
+        if !core.same(value.value.borrow(), result) {
+          let caught = run Effect.result(getDataError(&mut hooks, realm, atom, value.value.view(), result.view()))
+          drop value
+          match move caught { Result<(), JsException>.Success { .. } => () Result<(), JsException>.Failure { error } => { fail move error } }
+        }
       } else if (value.flags & (JS_PROP_GETSET | JS_PROP_CONFIGURABLE)) == JS_PROP_GETSET {
-        bad = core.undefined(value.getter.view()) && !core.undefined(result.view())
+        let bad = core.undefined(value.getter.view()) && !core.undefined(result.view())
+        drop value
+        if bad {
+          let mut message = DiagnosticMessage.make()
+          message.append(b" is a non-configurable accessor property on the proxy target and does not have a getter function, but the trap did not return 'undefined' (got '")
+          unsafe describe.appendPlain(&mut hooks, realm, &mut message, result.view())
+          message.append(b"')")
+          return run core.keyError(&mut hooks, realm, b"get", b"property ", atom, message.bytes())
+        }
       }
-      drop value
-      return !bad
     }
     Option<PropertyDescriptor>.None => ()
   }
-  return true
+}
+@cold
+effect fn getDataError<'a, H: CoercionHooks>(hooks: &mut H, realm: Realm<'a>, atom: u32,
+  expected: ValueBits, actual: ValueBits) -> () ! JsException ? &mut Allocator {
+  let mut message = DiagnosticMessage.make()
+  message.append(b" is a read-only and non-configurable data property on the proxy target but the proxy did not return its actual value (expected '")
+  unsafe describe.appendPlain(&mut hooks, realm, &mut message, expected)
+  message.append(b"' but got '")
+  unsafe describe.appendPlain(&mut hooks, realm, &mut message, actual)
+  message.append(b"')")
+  return run core.keyError(&mut hooks, realm, b"get", b"property ", atom, message.bytes())
 }
 pub effect fn get<'a, 'b, H: HeapHooks + OwnPropertyHooks + GetPropertyHooks + CoercionHooks + CallHooks>(hooks: &mut H,realm: Realm<'a>, object: ValueRef<'b>, atom: u32, receiver: ValueRef<'b>) -> ValueBits ! JsException ? &mut Allocator {
   let method = run core.trap(&mut hooks, realm, object, atoms.JS_ATOM_get)
@@ -196,9 +222,7 @@ pub effect fn get<'a, 'b, H: HeapHooks + OwnPropertyHooks + GetPropertyHooks + C
   let arguments = [target.view(), key.view(), receiver.view()]
   let result = run core.invoke(&mut hooks, realm, move method, core.handlerOf(object), &arguments)
   drop key
-  if !run checkGet(&mut hooks, realm, target, atom, result.borrow()) {
-    return run ops.error(&mut hooks,realm, b"proxy: inconsistent get")
-  }
+  run checkGet(&mut hooks, realm, target, atom, result.borrow())
   return result.intoBits()
 }
 pub effect fn set<'a, 'b, H: HeapHooks + OwnPropertyHooks + PropertyWriteHooks + CoercionHooks + CallHooks>(hooks: &mut H,realm: Realm<'a>, object: ValueRef<'b>, atom: u32, value: ValueRef<'b>, receiver: ValueRef<'b>, flags: u32) -> bool ! JsException ? &mut Allocator {
@@ -220,19 +244,20 @@ pub effect fn set<'a, 'b, H: HeapHooks + OwnPropertyHooks + PropertyWriteHooks +
     let ownDescriptorResult = run core.ownProperty(&mut hooks, realm, target, atom)
     match move ownDescriptorResult {
       Option<PropertyDescriptor>.Some { value: descriptor } => {
-        let mut bad = false
+        let mut changedData = false let mut missingSetter = false
         if (descriptor.flags & (JS_PROP_GETSET | JS_PROP_CONFIGURABLE | JS_PROP_WRITABLE)) == 0 {
-          bad = !core.same(descriptor.value.borrow(), value)
+          changedData = !core.same(descriptor.value.borrow(), value)
         } else if (descriptor.flags & (JS_PROP_GETSET | JS_PROP_CONFIGURABLE)) == JS_PROP_GETSET {
-          bad = core.undefined(descriptor.setter.view())
+          missingSetter = core.undefined(descriptor.setter.view())
         }
         drop descriptor
-        if bad { return run ops.error(&mut hooks,realm, b"proxy: inconsistent set") }
+        if changedData { return run core.keyError(&mut hooks, realm, b"set", b"trap returned truish for property ", atom, b" which exists in the proxy target as a non-configurable and non-writable data property with a different value") }
+        if missingSetter { return run core.keyError(&mut hooks, realm, b"set", b"trap returned truish for property ", atom, b" which exists in the proxy target as a non-configurable and non-writable accessor property without a setter") }
       }
       Option<PropertyDescriptor>.None => ()
     }
   } else if properties.shouldThrow(realm, flags) {
-    return run ops.error(&mut hooks,realm, b"proxy: cannot set property")
+    return run core.keyError(&mut hooks, realm, b"set", b"trap returned falsish for property ", atom, b"")
   }
   return accepted
 }
@@ -252,7 +277,7 @@ pub effect fn deleteProperty<'a, 'b, H: HeapHooks + OwnPropertyHooks + PropertyW
     let ownDescriptorResult = run core.ownProperty(&mut hooks, realm, target, atom)
     match move ownDescriptorResult {
       Option<PropertyDescriptor>.Some { value } => {
-        let checked = run Effect.result(checkDelete(&mut hooks, realm, target, value.flags))
+        let checked = run Effect.result(checkDelete(&mut hooks, realm, target, atom, value.flags))
         drop value
         match move checked { Result<(), JsException>.Success { .. } => () Result<(), JsException>.Failure { error } => { fail move error } }
       }
@@ -262,9 +287,12 @@ pub effect fn deleteProperty<'a, 'b, H: HeapHooks + OwnPropertyHooks + PropertyW
   return accepted
 }
 effect fn checkDelete<'a, 'b, H: CoercionHooks + PrototypeHooks>(hooks: &mut H, realm: Realm<'a>,
-  target: ValueRef<'b>, flags: u32) -> () ! JsException ? &mut Allocator {
-  if (flags & JS_PROP_CONFIGURABLE) == 0 || !run core.extensible(&mut hooks, realm, target) {
-    return run ops.error(&mut hooks,realm, b"proxy: inconsistent deleteProperty")
+  target: ValueRef<'b>, atom: u32, flags: u32) -> () ! JsException ? &mut Allocator {
+  if (flags & JS_PROP_CONFIGURABLE) == 0 {
+    return run core.keyError(&mut hooks, realm, b"deleteProperty", b"trap returned truish for property ", atom, b" which is non-configurable in the proxy target")
+  }
+  if !run core.extensible(&mut hooks, realm, target) {
+    return run core.keyError(&mut hooks, realm, b"deleteProperty", b"trap returned truish for property ", atom, b" but the proxy target is non-extensible")
   }
 }
 
@@ -313,7 +341,10 @@ pub effect fn appendKeys<'a, 'b, H: HeapHooks + OwnPropertyHooks + GetPropertyHo
     }
     let key = element.view()
     if !key.isString() && !match key { ValueBits.Symbol { .. } => true _ => false } {
-      return run ops.error(&mut hooks,realm, b"proxy: properties must be strings or symbols")
+      let mut message = DiagnosticMessage.make()
+      unsafe describe.appendPlain(&mut hooks, realm, &mut message, key)
+      message.append(b" is not a valid property name")
+      return run ops.error(&mut hooks,realm, message.bytes())
     }
     let interned = run Effect.result(coercions.valueToAtom(&mut hooks, realm, element.borrow()))
     let atom = match move interned {
@@ -338,7 +369,7 @@ effect fn checkKeys<'a, 'b, H: HeapHooks + OwnPropertyHooks + CoercionHooks>(hoo
   output: &mut List<PropertyEnum>, actual: &List<PropertyEnum>) -> () ! JsException ? &mut Allocator {
   let mut i: usize = 0
   while i < actual.length() {
-    if core.isRevoked(object) { return run ops.error(&mut hooks,realm, b"revoked proxy") }
+    if core.isRevoked(object) { return run core.revoked(&mut hooks, realm, b"ownKeys") }
     let ownDescriptorResult = run core.ownProperty(&mut hooks, realm, target, actual.get(i).atom)
     match move ownDescriptorResult {
       Option<PropertyDescriptor>.Some { value } => {
@@ -349,7 +380,7 @@ effect fn checkKeys<'a, 'b, H: HeapHooks + OwnPropertyHooks + CoercionHooks>(hoo
             Option<usize>.Some { value: at } => {
               if !extensible { let item = output.get(at) output.set(at, PropertyEnum { atom: item.atom, isEnumerable: true }) }
             }
-            Option<usize>.None => { return run ops.error(&mut hooks,realm, b"proxy: target property must be present in proxy ownKeys") }
+            Option<usize>.None => { return run core.keyError(&mut hooks, realm, b"ownKeys", b"trap result did not include ", actual.get(i).atom, b"") }
           }
         }
       }
@@ -361,24 +392,25 @@ effect fn checkKeys<'a, 'b, H: HeapHooks + OwnPropertyHooks + CoercionHooks>(hoo
     i = 0
     while i < output.length() {
       if !output.get(i).isEnumerable {
-        return run ops.error(&mut hooks,realm, b"proxy: property not present in target were returned by non extensible proxy")
+        return run core.trapError(&mut hooks, realm, b"ownKeys", b"trap returned extra keys but proxy target is non-extensible")
       }
       i = i + 1
     }
   }
 }
 effect fn ownKeysResult<'a, 'b, H: HeapHooks + OwnPropertyHooks + GetPropertyHooks + OwnKeysHooks + CoercionHooks + PrototypeHooks>(hooks: &mut H,realm: Realm<'a>, object: ValueRef<'b>, array: ValueRef<'b>, output: &mut List<PropertyEnum>) -> () ! JsException ? &mut Allocator {
+  if !array.view().isObject() { return run ops.error(&mut hooks,realm, b"CreateListFromArrayLike called on non-object") }
   run appendKeys(&mut hooks, realm, array, &mut output)
   let mut i: usize = 1
   while i < output.length() {
     if match findKey(&output, i, output.get(i).atom) { Option<usize>.Some { .. } => true _ => false } {
-      return run ops.error(&mut hooks,realm, b"proxy: duplicate property")
+      return run core.trapError(&mut hooks, realm, b"ownKeys", b"trap returned duplicate entries")
     }
     i = i + 1
   }
   let target = core.targetOf(object)
   let extensible = run core.extensible(&mut hooks, realm, target)
-  if core.isRevoked(object) { return run ops.error(&mut hooks,realm, b"revoked proxy") }
+  if core.isRevoked(object) { return run core.revoked(&mut hooks, realm, b"ownKeys") }
   let actual = run targetKeys(&mut hooks, realm, target)
   let result = run Effect.result(checkKeys(&mut hooks, realm, object, target, extensible, &mut output, &actual))
   realm.releaseNames(move actual)
@@ -473,7 +505,7 @@ pub unsafe effect fn call<'a, 'b, H: HeapHooks + CoercionHooks + CallHooks>(hook
   let slots = FrameSlots { data: data, count: 3 }
   let called = run unsafe invokeTarget(&mut hooks, realm, method.borrow(), core.handlerOf(object), &slots, false)
   let value = unsafe Value.adoptBits(called)
-  if construct && !value.view().isObject() { return run ops.error(&mut hooks,realm, b"not an object") }
+  if construct && !value.view().isObject() { return run core.valueError(&mut hooks, realm, b"construct", b"trap returned non-object (", value.view(), b")") }
   return value.intoBits()
 }
 pub effect fn resolve<'a, H: CoercionHooks>(hooks: &mut H, realm: Realm<'a>,
@@ -490,7 +522,7 @@ pub effect fn resolve<'a, H: CoercionHooks>(hooks: &mut H, realm: Realm<'a>,
     depth = depth + 1
     let record = Proxy.of(unsafe lendFor(value.*))
     if record.isRevoked() {
-      if throwException { return run ops.error(&mut hooks,realm, b"revoked proxy") }
+      if throwException { return run core.revoked(&mut hooks, realm, b"IsArray") }
       return false
     }
     value.* = record.target().view()

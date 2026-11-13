@@ -384,8 +384,15 @@ function sourceMapCacheToObject() {
 function originalSourceText(payload, originalSourcePath) {
   const index = payload.sources.indexOf(originalSourcePath);
   if (payload.sourcesContent?.[index]) return payload.sourcesContent[index];
-  if (!originalSourcePath.startsWith('file://')) return undefined;
+  if (typeof originalSourcePath !== 'string' || !originalSourcePath.startsWith('file://')) return undefined;
   try { return require('fs').readFileSync(require('url').fileURLToPath(originalSourcePath), 'utf8'); } catch { return undefined; }
+}
+
+// source_map_cache.js getSourceLine: line originalLine (0-based) of the original source.
+function getSourceLine(sourceMap, originalSourcePath, originalLine) {
+  const source = originalSourceText(sourceMap.payload, originalSourcePath);
+  if (typeof source !== 'string') return;
+  return source.split(/\r?\n/, originalLine + 1)[originalLine];
 }
 
 // prepare_stack_trace.js getSourceMapErrorSource and getErrorSource: the arrow of
@@ -412,6 +419,6 @@ function errorSource(fileName, lineNumber, columnNumber) {
 
 module.exports = {
   kMappings, sourceMapCacheToObject, errorSource,
-  SourceMap, findSourceMap, getSourceMapsSupport, setSourceMapsSupport,
+  SourceMap, findSourceMap, getSourceLine, getSourceMapsSupport, setSourceMapsSupport,
   registerSource, unregisterSource, mapPosition,
 };
