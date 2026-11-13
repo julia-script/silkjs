@@ -11,6 +11,13 @@ const finalizers = new FinalizationRegistry(id => native(1, id));
 const allMethods = native(8);
 const methods = allMethods.filter((name, index) => index < 34 || index === 46);
 
+// node_http_parser.cc: a parser given 0 takes the process's --max-http-header-size.
+// Read at each initialize: the heap image may hold this module from before the options are set.
+let options;
+function defaultMaxHeaderSize() {
+  options ??= require('internal/options');
+  return options.getOptionValue('--max-http-header-size');
+}
 function error(code, message) { return Object.assign(new TypeError(message), { code }); }
 function stateOf(parser) {
   const state = states.get(parser);
@@ -137,7 +144,7 @@ class HTTPParser {
     state.remainder = null;
     state.pauseRequested = false;
     resetMessage(state);
-    native(2, state.id, type, maxHeaderSize || 16384, lenientFlags >>> 0);
+    native(2, state.id, type, maxHeaderSize || defaultMaxHeaderSize(), lenientFlags >>> 0);
     state.provider = type === HTTPParser.REQUEST ? HTTPINCOMINGMESSAGE : HTTPCLIENTREQUEST;
     resetAsync(state, resource || this);
     if (connectionsList !== undefined) {

@@ -20,8 +20,12 @@ function fileHandles(load) {
   return host.builtinLoaded('internal/fs/promises') ? require('internal/fs/utils').fileHandles : null;
 }
 
+// node_messaging.cc ThrowDataCloneException: the DOMException of the context the
+// sending port belongs to. A port moved into a vm context names that context's class.
+let contextDOMException = null;
 function cloneError(message = 'The object could not be cloned.') {
-  return new DOMException(message, 'DataCloneError');
+  const Exception = contextDOMException === null ? DOMException : contextDOMException();
+  return new Exception(message, 'DataCloneError');
 }
 function codedError(code, message, Kind = TypeError) {
   return Object.assign(new Kind(message), { code });
@@ -465,8 +469,12 @@ function commit(prepared) {
   for (let at = 0; at < netHandles.length; at++) netHandles[at]._finishTransfer();
   prepared.signals?.forEach(record => abort.commitTransfer(record));
 }
-function post(id, value, list) {
-  const prepared = prepare(value, list, id);
+function post(id, value, list, contextException = null) {
+  const outer = contextDOMException;
+  contextDOMException = contextException;
+  let prepared;
+  try { prepared = prepare(value, list, id); }
+  finally { contextDOMException = outer; }
   let postedToItself;
   host.markWorkerActivity();
   try { postedToItself = host.workerNative('post', [id, prepared.bytes, prepared.buffers, prepared.shared, prepared.ports]); }

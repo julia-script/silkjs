@@ -3,7 +3,7 @@
 import js_realm { Realm }
 import js_object_ref { ObjectRef }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
-import silk.concurrency.atomic { Atomic, MemoryOrder }
+import silk.concurrency.atomic { Atomic, MemoryOrder, CompareExchange }
 import silk.core.effect { Effect }
 import silk.core.result { Result }
 import silk.core.option { Option }
@@ -66,6 +66,14 @@ union Backing {
 struct SharedBacking {
   references: usize,
   nativeReaders: usize,
+  /// A growable SharedArrayBuffer's byte length, which every wrapper of the backing
+  /// shares (all threads). Only grows; read and written atomically.
+  length: u64,
+  /// The bytes zeroed so far: a growable buffer zeroes its reserved capacity as it
+  /// grows into it, so pages it never uses are never touched.
+  zeroed: u64,
+  /// Held (1) while a grow zeroes and publishes a new length.
+  growing: u32,
   bytes: Intrinsic.RawBuffer<u8>,
   metadata: Option<Intrinsic.RawBuffer<u8>>
 }
@@ -189,7 +197,7 @@ pub unsafe fn reclaimPrivateBacking(object: *mut HeapHeader) -> () {
   let mut a = () let shared = unsafe Pointer.borrowMut<(), SharedBacking>(&mut a, owner)
   let refs = Pointer.fromMutRef<usize>(&mut shared.references) drop shared
   if unsafe Atomic.load<usize>(refs, MemoryOrder.Acquire) != 1 { return () }
-  let SharedBacking { references: _references, nativeReaders: _nativeReaders, bytes, metadata } = unsafe Pointer.take<SharedBacking>(owner)
+  let SharedBacking { references: _references, nativeReaders: _nativeReaders, length: _length, zeroed: _zeroed, growing: _growing, bytes, metadata } = unsafe Pointer.take<SharedBacking>(owner)
   let p = unsafe HeapCell.payloadMut<BufferData, ()>(&mut a, cell)
   p.backing = Backing.Owned { bytes: move bytes } p.state.physicalCapacity = 0 drop p
   drop metadata
@@ -833,8 +841,12 @@ unsafe fn zero(data: ?*mut u8, start: u64, end: u64) -> () {
 pub effect fn requireBuffer<'a, 'b, H: CoercionHooks>(hooks: &mut H, realm: Realm<'a>,
   value: ValueRef<'b>, shared: i32) -> BufferObject<'b> ! JsException ? &mut Allocator {
   let id = classOf(value)
-  if (shared != 1 && id == classes.JS_CLASS_ARRAY_BUFFER) ||
-    (shared != 0 && id == classes.JS_CLASS_SHARED_ARRAY_BUFFER) { return BufferObject<'b> { cell: core.reference(value.view()) } }
+  if shared != 1 && id == classes.JS_CLASS_ARRAY_BUFFER { return BufferObject<'b> { cell: core.reference(value.view()) } }
+  if shared != 0 && id == classes.JS_CLASS_SHARED_ARRAY_BUFFER {
+    // Another wrapper of a growable buffer may have grown it.
+    let _grown = unsafe syncShared(core.reference(value.view()))
+    return BufferObject<'b> { cell: core.reference(value.view()) }
+  }
   if shared == 1 { return run core.error(&mut hooks, realm, b"SharedArrayBuffer object expected") }
   return run core.error(&mut hooks, realm, b"ArrayBuffer object expected")
 }
@@ -861,7 +873,7 @@ effect fn allocateSharedBytes(length: u64, zeroed: bool) -> SharedAllocation ! O
   let base = unsafe pointer(&mut bytes)
   let data = unsafe Pointer.atMut<u8>(unsafe Pointer.assumeManyMut<u8>(base), offset)
   let owner = unsafe Intrinsic.pointerReinterpret<*mut u8, *mut SharedBacking>(base)
-  unsafe Pointer.put<SharedBacking>(owner, SharedBacking { references: 1, nativeReaders: 0, bytes: move bytes,
+  unsafe Pointer.put<SharedBacking>(owner, SharedBacking { references: 1, nativeReaders: 0, length: 0, zeroed: 0, growing: 0, bytes: move bytes,
     metadata: Option<Intrinsic.RawBuffer<u8>>.none() })
   return SharedAllocation { owner: owner, data: data }
 }
@@ -968,7 +980,7 @@ pub unsafe effect fn leaseBacking(object: *mut HeapHeader) -> BufferLease ! OutO
   }
   let data = unsafe pointer(&mut bytes)
   let capacity = usize.toU64(RawBuffer.count<u8>(&bytes))
-  unsafe Pointer.put<SharedBacking>(owner, SharedBacking { references: 2, nativeReaders: 0, bytes: move bytes,
+  unsafe Pointer.put<SharedBacking>(owner, SharedBacking { references: 2, nativeReaders: 0, length: state.byteLength, zeroed: 0, growing: 0, bytes: move bytes,
     metadata: Option<Intrinsic.RawBuffer<u8>>.some(move metadata) })
   let published = (unsafe bufferCell(object)).getMut(&mut mutable)
   published.backing = Backing.Shared { owner: owner }
@@ -1059,7 +1071,10 @@ unsafe effect fn initializeBacking<H: BufferHooks>(hooks: &mut H, rt: *mut HeapH
   if allocate {
     let mut capacity = state.byteLength
     if state.shared && state.maxByteLength >= 0 { capacity = i64.toU64(state.maxByteLength) }
-    let hasAllocator = match &allocCallback { Option<NativeFunctionId>.Some { .. } => true _ => false }
+    // A growable SharedArrayBuffer keeps its shared length in the engine's own
+    // backing record, so it never takes the host's allocator.
+    let mut hasAllocator = match &allocCallback { Option<NativeFunctionId>.Some { .. } => true _ => false }
+    if state.maxByteLength >= 0 { hasAllocator = false }
     if state.shared && hasAllocator {
       let callback = match move allocCallback { Option<NativeFunctionId>.Some { value } => value _ => invariant() }
       let mut size = u64.toUsize(capacity) if size == 0 { size = 1 }
@@ -1067,6 +1082,14 @@ unsafe effect fn initializeBacking<H: BufferHooks>(hooks: &mut H, rt: *mut HeapH
       if Pointer.isNull<u8>(data) { fail OutOfMemoryError {} }
       unsafe zero(data, 0, capacity)
       backing = Backing.HostShared { fallback: Option<NativeFunctionId>.none(), opaque: opaque, defaultFree: true }
+    } else if state.shared && state.maxByteLength >= 0 {
+      // Growable: only the initial length is zeroed now (growShared zeroes the rest).
+      let allocation = run allocateSharedBytes(capacity, false)
+      data = allocation.data
+      unsafe zero(data, 0, state.byteLength)
+      let mut a = () let record = unsafe Pointer.borrowMut<(), SharedBacking>(&mut a, allocation.owner)
+      record.length = state.byteLength record.zeroed = state.byteLength drop record
+      backing = Backing.Shared { owner: allocation.owner }
     } else if state.shared {
       let allocation = run allocateSharedBytes(capacity, true)
       data = allocation.data
@@ -1141,6 +1164,80 @@ pub unsafe effect fn initializeView<'a, H: HeapHooks + CoercionHooks>(hooks: &mu
     p.payload = ObjectPayload.TypedArray { array: TypedArrayCache { view: cell, cachedData: unsafe dataAt(state.data, offset),
       count: u64.shiftRight(byteLength, u32.toU64(shift)), requiresExtensible: tracking || (state.maxByteLength >= 0 && !state.shared), shared: state.physicalCapacity != 0 } }
   }
+}
+/// The shared length word of a growable SharedArrayBuffer's backing record.
+unsafe fn growableLength(object: *mut HeapHeader) -> Option<*mut u64> {
+  let owner = unsafe growableRecord(object)
+  if Pointer.isNull<SharedBacking>(owner) { return Option<*mut u64>.none() }
+  let mut a = () let record = unsafe Pointer.borrowMut<(), SharedBacking>(&mut a, present(owner))
+  return Option<*mut u64>.some(Pointer.fromMutRef<u64>(&mut record.length))
+}
+/// Brings a growable SharedArrayBuffer wrapper, and the views on it, up to the
+/// length its backing has now: another wrapper (in this or another thread) may
+/// have grown it. Other buffers are left as they are.
+/// True when it changed the length.
+pub unsafe fn syncShared(object: *mut HeapHeader) -> bool {
+  let cell = match unsafe growableLength(object) {
+    Option<*mut u64>.Some { value } => value
+    Option<*mut u64>.None => { return false }
+  }
+  let length = unsafe Atomic.load<u64>(cell, MemoryOrder.SequentiallyConsistent)
+  let mut a = () let buffer = (unsafe bufferCell(object)).getMut(&mut a)
+  if buffer.state.byteLength == length { return false }
+  buffer.state.byteLength = length drop buffer
+  unsafe refresh(object)
+  return true
+}
+/// The buffer under a typed array or DataView, brought up to its shared length.
+/// True when that changed the view's length.
+pub unsafe fn syncView(object: *mut HeapHeader) -> bool {
+  let anchor = () let p = unsafe HeapCell.payload<ObjectData, ()>(&anchor, object)
+  let shared = match &p.payload {
+    ObjectPayload.TypedArray { array } => array.shared
+    _ => p.classId() == classes.JS_CLASS_DATAVIEW
+  }
+  drop p
+  if shared { let state = unsafe view(object) let buffer = state.buffer return unsafe syncShared(buffer) }
+  return false
+}
+/// The backing record of a growable SharedArrayBuffer.
+unsafe fn growableRecord(object: *mut HeapHeader) -> ?*mut SharedBacking {
+  let anchor = () let buffer = (unsafe bufferCell(object)).get(&anchor)
+  if !buffer.state.shared || buffer.state.maxByteLength < 0 { return Pointer.null<SharedBacking>() }
+  return match &buffer.backing {
+    Backing.Shared { owner } => owner
+    _ => Pointer.null<SharedBacking>()
+  }
+}
+/// SharedArrayBuffer.prototype.grow on a buffer whose backing holds a shared
+/// length: false, with nothing changed, when that length is past `length` already.
+/// Grows are serialized by the record's lock, so the bytes a new length uncovers
+/// are zero before any thread can see that length.
+pub unsafe fn growShared(object: *mut HeapHeader, length: u64) -> bool {
+  let pointer = unsafe growableRecord(object)
+  if Pointer.isNull<SharedBacking>(pointer) { return true }
+  let owner = present(pointer)
+  let data = (unsafe snapshot(object)).data
+  let mut a = () let record = unsafe Pointer.borrowMut<(), SharedBacking>(&mut a, owner)
+  let lock = Pointer.fromMutRef<u32>(&mut record.growing)
+  let cell = Pointer.fromMutRef<u64>(&mut record.length)
+  let zeroed = Pointer.fromMutRef<u64>(&mut record.zeroed) drop record
+  let mut held = false
+  while !held {
+    held = match unsafe Atomic.compareExchange<u32>(lock, 0, 1, MemoryOrder.Acquire, MemoryOrder.Relaxed) {
+      CompareExchange<u32>.Exchanged => true
+      CompareExchange<u32>.Observed { .. } => false
+    }
+  }
+  let current = unsafe Atomic.load<u64>(cell, MemoryOrder.SequentiallyConsistent)
+  if current < length {
+    let done = unsafe Pointer.read<u64>(zeroed)
+    if done < length { unsafe zero(data, done, length) unsafe Pointer.write<u64>(zeroed, length) }
+    unsafe Atomic.store<u64>(cell, length, MemoryOrder.SequentiallyConsistent)
+  }
+  unsafe Atomic.store<u32>(lock, 0, MemoryOrder.Release)
+  if current > length { let _grown = unsafe syncShared(object) return false }
+  return true
 }
 pub unsafe fn refresh(object: *mut HeapHeader) -> () {
   let cell = unsafe payload(object) let anchor = ()
@@ -1270,7 +1367,7 @@ pub unsafe effect fn resize(object: *mut HeapHeader, length: u64) -> () ! OutOfM
     let mut a = () let shared = unsafe Pointer.borrowMut<(), SharedBacking>(&mut a, owner)
     let refs = Pointer.fromMutRef<usize>(&mut shared.references) drop shared
     if unsafe Atomic.load<usize>(refs, MemoryOrder.Acquire) == 1 {
-      let SharedBacking { references: _references, nativeReaders: _nativeReaders, bytes, metadata } = unsafe Pointer.take<SharedBacking>(owner)
+      let SharedBacking { references: _references, nativeReaders: _nativeReaders, length: _length, zeroed: _zeroed, growing: _growing, bytes, metadata } = unsafe Pointer.take<SharedBacking>(owner)
       let p = unsafe HeapCell.payloadMut<BufferData, ()>(&mut a, cell)
       p.backing = Backing.Owned { bytes: move bytes } p.state.physicalCapacity = 0 drop p
       drop metadata

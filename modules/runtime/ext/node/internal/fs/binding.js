@@ -6,9 +6,11 @@
 // an FSReqCallback gets oncomplete(err, result), and kUsePromises returns a
 // promise. Stat calls fill statValues or bigintStatValues and return it, in
 // node_file.cc's field order. Copyright Node.js contributors. MIT license (see
-// vendor/node-api/LICENSE).
+// vendor/node-api/LICENSE). V8 shows no frame for a binding call, so no stack
+// trace shows this script's frames (host.hideFrames).
 
 const c = require('internal/fs/utils');
+c.host.hideFrames();
 
 const kFsStatsFieldsNumber = 18;
 const statValues = new Float64Array(kFsStatsFieldsNumber * 2);

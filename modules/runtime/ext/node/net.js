@@ -71,7 +71,7 @@ const {
   UV_ETIMEDOUT,
 } = require('internal/uv_binding');
 // silkjs: cares_wrap's convertIpv6StringToBuffer, over the BlockList parser.
-const convertIpv6StringToBuffer = (ip) => require('internal/socketaddress').parseAddress(ip, 6);
+const convertIpv6StringToBuffer = (ip) => require('internal/block_list_binding').parseAddress(ip, 6);
 
 const { Buffer } = require('buffer');
 const { ShutdownWrap } = require('internal/net/binding').stream_wrap;

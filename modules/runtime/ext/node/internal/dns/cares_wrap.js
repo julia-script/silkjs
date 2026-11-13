@@ -102,9 +102,9 @@ function canonicalizeIP(ip) {
   const family = isIP(ip);
   if (family === 4) return ip.split('.').map(Number).join('.');
   if (family === 6) {
-    const { parseAddress, formatAddress } = require('internal/socketaddress');
+    const { parseAddress, formatAddress } = require('internal/block_list_binding');
     const bytes = parseAddress(ip, 6);
-    return bytes ? formatAddress({ family: 6, bytes }) : undefined;
+    return bytes ? formatAddress(6, bytes) : undefined;
   }
   return undefined;
 }

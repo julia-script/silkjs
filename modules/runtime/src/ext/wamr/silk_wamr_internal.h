@@ -52,6 +52,11 @@ struct SilkWasmHandle {
             uint8_t *compile_imports, *serialized;
             uint64_t serialized_length;
             SilkWasmTypeCache *type_cache;
+            /* Stack trace identity (silk_wamr_frames.c), made on first use. */
+            char *frame_url;
+            uint8_t *frame_module_name;
+            uint32_t frame_url_length, frame_module_name_length;
+            bool frame_described;
         } module;
         struct {
             WASMModuleInstance *instance;
@@ -84,6 +89,8 @@ struct SilkWasmStore {
     SilkWasmHandle *handles;
     SilkWasmHandle *last_exception;
     SilkWasmInvocation *invocations;
+    /* A start function's trap, kept until its RuntimeError has its stack. */
+    SilkWasmInvocation *start_trap;
     SilkWasmStore *next_thread_store;
     SilkWasmStore **previous_thread_store;
     SilkWasmMemoryObserver *memory_observers;
@@ -115,6 +122,9 @@ struct SilkWasmInvocation {
     uint32_t result_count;
     SilkWasmHandle *exception;
     void *host;
+    /* The engine StackFrame this invocation was entered from, while it runs
+       and after a trap until free; zero otherwise (silk_wasm_frame). */
+    uintptr_t frame;
     int status;
     int error_kind;
     char error[512];
@@ -128,6 +138,7 @@ bool silk_wasm_edge_handle(SilkWasmHandle *, SilkWasmHandle *);
 bool silk_wasm_edge_reference(SilkWasmHandle *, void *);
 void silk_wasm_clear_edges(SilkWasmHandle *);
 void silk_wasm_destroy_resource(SilkWasmHandle *);
+void silk_wasm_module_frames_destroy(SilkWasmHandle *);
 bool silk_wasm_compile_options_init(SilkWasmHandle *, const SilkWasmCompileOptions *);
 void silk_wasm_compile_options_destroy(SilkWasmHandle *);
 bool silk_wasm_type_info(const SilkWasmHandle *, uint8_t kind, uint32_t index,

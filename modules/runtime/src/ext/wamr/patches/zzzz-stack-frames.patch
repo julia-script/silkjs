@@ -1,0 +1,272 @@
+--- a/core/iwasm/interpreter/wasm.h
++++ b/core/iwasm/interpreter/wasm.h
+@@ -718,6 +718,8 @@
+     uint32 max_block_num;
+     uint32 code_size;
+     uint8 *code;
++    /* Silk: the body's start (its locals vector), for stack frame positions. */
++    const uint8 *silk_body;
+ #if WASM_ENABLE_FAST_INTERP != 0
+     uint32 code_compiled_size;
+     uint8 *code_compiled;
+--- a/core/iwasm/interpreter/wasm_continuation.h
++++ b/core/iwasm/interpreter/wasm_continuation.h
+@@ -54,6 +54,18 @@
+ void wasm_interp_invocation_visit_roots(WASMInterpInvocation *invocation,
+                                        WASMInterpRootVisitor visit,
+                                        void *context);
++/* A Wasm function frame: its function and the start of the instruction it is
++   in (the trapping instruction, or the call it waits in). */
++typedef struct WASMInterpInvocationFrame {
++    struct WASMFunctionInstance *function;
++    const uint8 *instruction;
++} WASMInterpInvocationFrame;
++/* The index-th Wasm function frame from the innermost one, skipping host and
++   import frames: of the live frame chain while the invocation runs (inside a
++   host call), else of the trap that ended its last run. False past the last. */
++bool wasm_interp_invocation_frame(const WASMInterpInvocation *invocation,
++                                  uint32 index,
++                                  WASMInterpInvocationFrame *frame);
+ /* Invalid on a RUNNING invocation. SUSPENDED invocations are cancelled. */
+ void wasm_interp_invocation_free(WASMInterpInvocation *invocation);
+ 
+--- a/core/iwasm/interpreter/wasm_continuation.inc
++++ b/core/iwasm/interpreter/wasm_continuation.inc
+@@ -140,6 +140,73 @@
+     }
+ }
+ 
++static bool
++silk_invocation_frame_at(WASMInterpFrame **cursor,
++                         WASMInterpInvocationFrame *out)
++{
++    WASMInterpFrame *frame = *cursor;
++    while (frame) {
++        WASMInterpFrame *next = frame->prev_frame;
++        if (frame->function && !frame->function->is_import_func && frame->ip) {
++            const uint8 *start = wasm_loader_instruction_start(
++                frame->function->u.func, frame->ip);
++            if (start) {
++                out->function = frame->function;
++                out->instruction = start;
++                *cursor = next;
++                return true;
++            }
++        }
++        frame = next;
++    }
++    *cursor = NULL;
++    return false;
++}
++
++static void
++silk_invocation_record_trap(WASMInterpInvocation *inv)
++{
++    WASMInterpFrame *cursor = wasm_exec_env_get_cur_frame(inv->env);
++    WASMInterpInvocationFrame frame;
++    uint32 count = 0, i = 0;
++    if (inv->trap_frames) {
++        wasm_runtime_free(inv->trap_frames);
++        inv->trap_frames = NULL;
++    }
++    inv->trap_frame_count = 0;
++    while (silk_invocation_frame_at(&cursor, &frame))
++        count++;
++    if (!count)
++        return;
++    inv->trap_frames = wasm_runtime_malloc(count * sizeof(frame));
++    if (!inv->trap_frames)
++        return;
++    cursor = wasm_exec_env_get_cur_frame(inv->env);
++    while (i < count && silk_invocation_frame_at(&cursor, &frame))
++        inv->trap_frames[i++] = frame;
++    inv->trap_frame_count = i;
++}
++
++bool
++wasm_interp_invocation_frame(const WASMInterpInvocation *inv, uint32 index,
++                             WASMInterpInvocationFrame *out)
++{
++    WASMInterpFrame *cursor;
++    if (inv->status != WASM_INVOCATION_RUNNING) {
++        if (inv->status != WASM_INVOCATION_THREW
++            || index >= inv->trap_frame_count)
++            return false;
++        *out = inv->trap_frames[index];
++        return true;
++    }
++    cursor = wasm_exec_env_get_cur_frame(inv->env);
++    do {
++        if (!silk_invocation_frame_at(&cursor, out))
++            return false;
++    } while (index--);
++    return true;
++}
++
+ static WASMInterpInvocationStatus
+ silk_invocation_run(WASMInterpInvocation *inv)
+ {
+@@ -160,6 +227,7 @@
+     if (wasm_copy_exception(module, inv->trap)) {
+         inv->status = WASM_INVOCATION_THREW;
+         wasm_set_exception(module, NULL);
++        silk_invocation_record_trap(inv);
+     }
+ #if WASM_ENABLE_EXCE_HANDLING != 0
+     else if (env->silk_exception) {
+@@ -453,5 +521,7 @@
+     inv->env->silk_invocation = NULL;
+     wasm_exec_env_destroy_internal(inv->env);
+     wasm_silk_instance_release(inv->module);
++    if (inv->trap_frames)
++        wasm_runtime_free(inv->trap_frames);
+     wasm_runtime_free(inv);
+ }
+--- a/core/iwasm/interpreter/wasm_continuation_internal.h
++++ b/core/iwasm/interpreter/wasm_continuation_internal.h
+@@ -20,6 +20,10 @@
+     bool boundary_allows_suspend;
+     bool resuming;
+     char trap[128];
++    /* The frames a trap unwound, innermost first, kept until free or the next
++       run: the frame chain itself is released when the run ends. */
++    WASMInterpInvocationFrame *trap_frames;
++    uint32 trap_frame_count;
+ };
+ 
+ static os_thread_local_attribute WASMInterpInvocation *silk_invocations;
+--- a/core/iwasm/interpreter/wasm_loader.c
++++ b/core/iwasm/interpreter/wasm_loader.c
+@@ -3840,7 +3840,7 @@
+                       uint32 error_buf_size)
+ {
+     const uint8 *p = buf, *p_end = buf_end;
+-    const uint8 *p_code = buf_code, *p_code_end, *p_code_save;
++    const uint8 *p_code = buf_code, *p_code_end, *p_code_save, *body_begin;
+     uint32 func_count;
+     uint64 total_size;
+     uint32 code_count = 0, code_size, type_index, i, j, k, local_type_index;
+@@ -3906,6 +3906,7 @@
+             /* Resolve local set count */
+             p_code_end = p_code + code_size;
+             local_count = 0;
++            body_begin = p_code;
+             read_leb_uint32(p_code, buf_code_end, local_set_count);
+             p_code_save = p_code;
+ 
+@@ -3991,6 +3992,7 @@
+              * func->code = code_body_cp;
+              */
+             func->code = (uint8 *)p_code;
++            func->silk_body = body_begin;
+ #if WASM_ENABLE_GC != 0
+             func->type_idx = type_index_org;
+ #endif
+@@ -7386,14 +7388,18 @@
+     wasm_runtime_free(module);
+ }
+ 
+-bool
+-wasm_loader_find_block_addr(WASMExecEnv *exec_env, BlockAddr *block_addr_cache,
+-                            uintptr_t cache_mask,
+-                            const uint8 *start_addr, const uint8 *code_end_addr,
+-                            uint8 label_type, uint8 **p_else_addr,
+-                            uint8 **p_end_addr)
++/* With a probe, walks a function body from start_addr instead of finding a
++   block: *p_end_addr is set to the start of the last instruction before the
++   probe (a frame's saved ip, just past its current instruction's opcode) and
++   no cache is read or written. */
++static bool
++find_block_addr(WASMExecEnv *exec_env, BlockAddr *block_addr_cache,
++                uintptr_t cache_mask, const uint8 *start_addr,
++                const uint8 *code_end_addr, uint8 label_type,
++                uint8 **p_else_addr, uint8 **p_end_addr, const uint8 *probe)
+ {
+     const uint8 *p = start_addr, *p_end = code_end_addr;
++    const uint8 *instruction = start_addr;
+     uint8 *else_addr = NULL;
+     char error_buf[128];
+     uint32 block_nested_depth = 1, count, i, j, t;
+@@ -7404,7 +7410,7 @@
+     i = ((uintptr_t)start_addr) & cache_mask;
+     block = block_addr_cache + BLOCK_ADDR_CONFLICT_SIZE * i;
+ 
+-    for (j = 0; j < BLOCK_ADDR_CONFLICT_SIZE; j++) {
++    for (j = 0; !probe && j < BLOCK_ADDR_CONFLICT_SIZE; j++) {
+         if (block[j].start_addr == start_addr) {
+             /* Cache hit */
+             *p_else_addr = block[j].else_addr;
+@@ -7417,6 +7423,13 @@
+     block_stack[0].start_addr = start_addr;
+ 
+     while (p < code_end_addr) {
++        if (probe) {
++            if (p >= probe) {
++                *p_end_addr = (uint8 *)instruction;
++                return true;
++            }
++            instruction = p;
++        }
+         opcode = *p++;
+ #if WASM_ENABLE_DEBUG_INTERP != 0
+     op_break_retry:
+@@ -7565,6 +7578,10 @@
+                 break;
+ 
+             case WASM_OP_END:
++                if (block_nested_depth == 1 && probe) {
++                    *p_end_addr = (uint8 *)instruction;
++                    return true;
++                }
+                 if (block_nested_depth == 1) {
+                     if (label_type == LABEL_TYPE_IF)
+                         *p_else_addr = else_addr;
+@@ -8267,6 +8284,33 @@
+     return false;
+ }
+ 
++bool
++wasm_loader_find_block_addr(WASMExecEnv *exec_env, BlockAddr *block_addr_cache,
++                            uintptr_t cache_mask,
++                            const uint8 *start_addr, const uint8 *code_end_addr,
++                            uint8 label_type, uint8 **p_else_addr,
++                            uint8 **p_end_addr)
++{
++    return find_block_addr(exec_env, block_addr_cache, cache_mask, start_addr,
++                           code_end_addr, label_type, p_else_addr, p_end_addr,
++                           NULL);
++}
++
++const uint8 *
++wasm_loader_instruction_start(const WASMFunction *function, const uint8 *ip)
++{
++    uint8 *else_addr = NULL, *start = NULL;
++    BlockAddr cache[BLOCK_ADDR_CONFLICT_SIZE] = { { 0 } };
++    if (!function || !ip || ip <= function->code
++        || ip > function->code + function->code_size)
++        return NULL;
++    if (!find_block_addr(NULL, cache, 0, function->code,
++                         function->code + function->code_size,
++                         LABEL_TYPE_FUNCTION, &else_addr, &start, ip))
++        return NULL;
++    return start;
++}
++
+ #if WASM_ENABLE_FAST_INTERP != 0
+ 
+ #if WASM_DEBUG_PREPROCESSOR != 0
+--- a/core/iwasm/interpreter/wasm_loader.h
++++ b/core/iwasm/interpreter/wasm_loader.h
+@@ -74,6 +74,12 @@
+                             uint8 block_type, uint8 **p_else_addr,
+                             uint8 **p_end_addr);
+ 
++/* The start of the instruction a frame's saved ip is in: the trapping
++   instruction, or the call a caller frame waits in. NULL when ip is not in
++   the function's code or the code cannot be decoded. */
++const uint8 *
++wasm_loader_instruction_start(const WASMFunction *function, const uint8 *ip);
++
+ #ifdef __cplusplus
+ }
+ #endif
