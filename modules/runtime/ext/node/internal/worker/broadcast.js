@@ -19,6 +19,7 @@ class BroadcastChannel extends EventTarget {
     if (arguments.length === 0) throw new ERR_MISSING_ARGS('name');
     if (typeof name === 'symbol') throw new TypeError('Cannot convert a Symbol value to a string');
     name = String(name);
+    host.workerActivity = true;
     const endpoint = host.workerNative('subscribe', [name]);
     const port = ports.wrap(endpoint);
     channels.set(this, { name, endpoint, port, closed: false, handlers: Object.create(null) });

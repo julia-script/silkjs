@@ -27,6 +27,8 @@ import silkjs.js_exceptions as exceptions
 import libs.core.owners as owners
 import libs.core.common as common
 import silkjs.js_buffer_storage as buffers
+import silkjs.js_class_data as classes
+import silkjs.js_proxy_core as core
 import libs.core.host as host
 import ext.openssl as crypto
 import ext.tls_abi as ssl
@@ -490,9 +492,17 @@ unsafe fn ticketFromJS(owner: *mut State, id: i32, name: ?*mut u8, iv: ?*mut u8,
   return result
 }
 unsafe fn reserve(c: &mut Call, n: usize) -> bool { c.output = unsafe crypto.calloc(1, n + 1) c.length = n return !Pointer.isNull<u8>(c.output) }
+/// reserve for output the call fills before it is read (SSL_read's 16 KiB), unzeroed.
+unsafe fn reserveRaw(c: &mut Call, n: usize) -> bool { c.output = unsafe malloc(n + 1) c.length = n return !Pointer.isNull<u8>(c.output) }
+unsafe extern "C" fn malloc(size: usize) -> ?*mut u8
+unsafe extern "C" fn memcpy(dest: *mut u8, source: *const u8, count: usize) -> *mut u8
+unsafe fn copyRaw(destination: ?*mut u8, source: ?*mut u8, n: usize) -> () {
+  if n == 0 { return () }
+  drop unsafe memcpy(unsafe buffers.dataAt(destination, 0), unsafe Intrinsic.pointerRequalify<*mut u8, *const u8>(unsafe buffers.dataAt(source, 0)), n)
+}
 unsafe fn bytes(c: &mut Call, p: ?*mut u8, n: usize) -> bool {
-  if !unsafe reserve(&mut c, n) { return false } let mut i: usize = 0
-  while i < n { unsafe Pointer.put<u8>(unsafe buffers.dataAt(c.output, usize.toU64(i)), unsafe Pointer.read<u8>(unsafe buffers.dataAt(p, usize.toU64(i)))) i = i + 1 } return true
+  if !unsafe reserve(&mut c, n) { return false }
+  unsafe copyRaw(c.output, p, n) return true
 }
 unsafe fn text(c: &mut Call, p: ?*mut u8) -> bool { c.kind = 2 return unsafe bytes(&mut c, p, unsafe textLength(p)) }
 unsafe fn certOutput(c: &mut Call, cert: ?*mut u8) -> bool {
@@ -569,6 +579,30 @@ unsafe fn execute(state: *mut State, name: &[u8], c: &mut Call) -> bool {
   let ptr = h.ptr let input = h.input let output = h.output let server = h.server let kind = h.kind drop h
   if Pointer.isNull<u8>(ptr) { return false }
   if equal(name, b"release") { unsafe release(state, hp) return true }
+  // The record pump's operations, several per request: tested before the rest.
+  if kind != 1 {
+    if equal(name, b"feed") { return unsafe ssl.BIO_write(input, c.data[1], usize.toI32(c.lengths[1])) == usize.toI32(c.lengths[1]) }
+    if equal(name, b"drain") {
+      c.kind = 0 let n = unsafe crypto.BIO_ctrl(output, 10, 0, nil()) if n < 0 || n > 2147483647 || !unsafe reserve(&mut c, i64.toUsize(n)) { return false }
+      if n != 0 { return unsafe crypto.BIO_read(output, c.output, i64.toI32(n)) == i64.toI32(n) } return true
+    }
+    if equal(name, b"read") {
+      c.kind = 0 if !unsafe reserveRaw(&mut c, 16384) { return false }
+      let n = unsafe ssl.SSL_read(ptr, c.output, 16384)
+      if n > 0 { c.length = i32.toUsize(n) return true }
+      c.length = 0 let error = unsafe ssl.SSL_get_error(ptr, n) return error == 2 || error == 3 || error == 6
+    }
+    if equal(name, b"write") {
+      let n = unsafe ssl.SSL_write(ptr, c.data[1], usize.toI32(c.lengths[1])) if n > 0 { c.number = i32.toI64(n) return true }
+      let error = unsafe ssl.SSL_get_error(ptr, n) c.number = 0 return error == 2 || error == 3
+    }
+    if equal(name, b"receivedShutdown") { c.number = i32.toI64(unsafe ssl.SSL_get_shutdown(ptr)) return true }
+    // Both handshake counters in one call: starts * 2^26 + completions.
+    if equal(name, b"handshakeCounts") {
+      let h2 = unsafe Pointer.borrow<(), Handle>(&anchor, hp)
+      c.number = h2.starts * 67108864 + h2.completions return true
+    }
+  }
   if kind == 1 {
     if equal(name, b"trustFlags") { return unsafe ssl.X509_STORE_set_flags(unsafe ssl.SSL_CTX_get_cert_store(ptr), i64.toU64(c.numbers[1])) == 1 }
     if equal(name, b"crl") {
@@ -834,29 +868,13 @@ unsafe fn execute(state: *mut State, name: &[u8], c: &mut Call) -> bool {
     let ok = unsafe bytes(&mut c, h2.keylogData, h2.keylogLength) unsafe crypto.free(h2.keylogData) h2.keylogData = nil() h2.keylogLength = 0 return ok
   }
   if equal(name, b"newSessionDone") { let h2 = unsafe Pointer.borrowMut<(), Handle>(&mut anchor, hp) h2.awaitingSession = false return true }
-  if equal(name, b"feed") { return unsafe ssl.BIO_write(input, c.data[1], usize.toI32(c.lengths[1])) == usize.toI32(c.lengths[1]) }
-  if equal(name, b"drain") {
-    c.kind = 0 let n = unsafe crypto.BIO_ctrl(output, 10, 0, nil()) if n < 0 || n > 2147483647 || !unsafe reserve(&mut c, i64.toUsize(n)) { return false }
-    if n != 0 { return unsafe crypto.BIO_read(output, c.output, i64.toI32(n)) == i64.toI32(n) } return true
-  }
   if equal(name, b"handshake") {
     let result = unsafe ssl.SSL_do_handshake(ptr) if result == 1 { c.number = 1 return true }
     let error = unsafe ssl.SSL_get_error(ptr, result) c.number = i32.toI64(error)
     // 4: the certificate callback waits for SNI; 11: the ClientHello waits for 'resumeSession'.
     if error == 2 || error == 3 { c.number = 0 return true } return error == 4 || error == 11
   }
-  if equal(name, b"read") {
-    c.kind = 0 if !unsafe reserve(&mut c, 16384) { return false }
-    let n = unsafe ssl.SSL_read(ptr, c.output, 16384)
-    if n > 0 { c.length = i32.toUsize(n) return true }
-    c.length = 0 let error = unsafe ssl.SSL_get_error(ptr, n) return error == 2 || error == 3 || error == 6
-  }
-  if equal(name, b"write") {
-    let n = unsafe ssl.SSL_write(ptr, c.data[1], usize.toI32(c.lengths[1])) if n > 0 { c.number = i32.toI64(n) return true }
-    let error = unsafe ssl.SSL_get_error(ptr, n) c.number = 0 return error == 2 || error == 3
-  }
   if equal(name, b"shutdown") { let n = unsafe ssl.SSL_shutdown(ptr) if n >= 0 { c.number = i32.toI64(n) return true } let e = unsafe ssl.SSL_get_error(ptr, n) return e == 2 || e == 3 }
-  if equal(name, b"receivedShutdown") { c.number = i32.toI64(unsafe ssl.SSL_get_shutdown(ptr)) return true }
   // ncrypto verifyPeerCertificate: the handshake's result; without a peer certificate,
   // success only for PSK suites or TLS 1.3 resumption, else UNABLE_TO_GET_ISSUER_CERT.
   if equal(name, b"verify") {
@@ -903,10 +921,36 @@ unsafe effect fn argument<'m, S: EngineServices>(engine: &mut Engine<'m, S>, con
     if Pointer.isNull<u8>(c.data[i]) { fail OutOfMemoryError {} } let mut n: usize = 0
     while n < c.lengths[i] { unsafe Pointer.put<u8>(unsafe buffers.dataAt(c.data[i], usize.toU64(n)), bytes.asSlice()[n]) n = n + 1 } return ()
   }
+  // A view's bytes (a Buffer write's subarray) copy straight from its backing.
+  let classId = unsafe buffers.classId(value)
+  if classId >= classes.JS_CLASS_UINT8C_ARRAY && classId <= classes.JS_CLASS_DATAVIEW {
+    let object = core.reference(value)
+    let view = unsafe buffers.view(object)
+    let mut offset: u64 = 0 let mut length: u64 = 0
+    if !unsafe buffers.isOutOfBounds(object) {
+      offset = view.offset length = view.byteLength
+      if view.tracking {
+        let tracked = unsafe buffers.snapshot(view.buffer)
+        length = tracked.byteLength - offset
+        if classId != classes.JS_CLASS_DATAVIEW {
+          let width = u64.shiftLeft(1, u32.toU64(buffers.sizeLog2(classId)))
+          length = length - length % width
+        }
+      }
+    }
+    let source = unsafe buffers.snapshot(view.buffer)
+    if length > usize.toU64(usize.MAX - 1) { fail OutOfMemoryError {} }
+    c.lengths[i] = u64.toUsize(length)
+    c.data[i] = unsafe crypto.calloc(1, c.lengths[i] + 1) if Pointer.isNull<u8>(c.data[i]) { fail OutOfMemoryError {} }
+    if source.physicalCapacity == 0 { if length != 0 { unsafe copyRaw(c.data[i], unsafe Intrinsic.pointerRequalify<*mut u8, ?*mut u8>(unsafe buffers.dataAt(source.data, offset)), c.lengths[i]) } return () }
+    let mut k: u64 = 0 while k < length { unsafe Pointer.put<u8>(unsafe buffers.dataAt(c.data[i], k), u64.toU8(unsafe buffers.loadScalar(source, offset + k, 0))) k = k + 1 }
+    return ()
+  }
   let backing = run buffers.getArrayBuffer(&mut engine, unsafe lendRealm(&context, context), unsafe lendFor(value))
   if backing.byteLength > usize.toU64(usize.MAX - 1) { fail OutOfMemoryError {} }
   c.lengths[i] = u64.toUsize(backing.byteLength)
   c.data[i] = unsafe crypto.calloc(1, c.lengths[i] + 1) if Pointer.isNull<u8>(c.data[i]) { fail OutOfMemoryError {} }
+  if backing.physicalCapacity == 0 { unsafe copyRaw(c.data[i], backing.data, c.lengths[i]) return () }
   let mut n: u64 = 0 while n < backing.byteLength { unsafe Pointer.put<u8>(unsafe buffers.dataAt(c.data[i], n), u64.toU8(unsafe buffers.loadScalar(backing, n, 0))) n = n + 1 }
 }
 unsafe effect fn dispatchCall<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, state: *mut State, argv: &FrameSlots, c: &mut Call) -> ValueBits ! OutOfMemoryError | JsException ? &mut Allocator {

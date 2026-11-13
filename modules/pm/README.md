@@ -17,6 +17,9 @@ silk run -- install                 # install the package.json of the working di
 | `pm add <name>[@range or tag]...` | Adds dependencies and installs them. `-D` for development, `-O` for optional, `-E` for an exact version. |
 | `pm remove <name>...` | Takes dependencies out and removes what nothing needs any more. |
 | `pm update [name]...` | Moves the named packages, or all, to the newest versions the ranges allow. |
+| `pm run <script> [argument]...` | Runs a script of `package.json`, between its `pre` and `post` scripts when it has them. Without a name it lists the scripts. `-r` runs it in every package of the workspace. |
+| `pm exec <command> [argument]...` | Runs a command of the dependencies. |
+| `pm dlx <name>[@range or tag] [argument]...` | Runs the command of a package the project does not have. |
 
 An install resolves the dependencies against the registry, downloads what the store at
 `$SILKJS_STORE` (or `~/.silkjs/store`) does not have, and links an isolated `node_modules`: each
@@ -37,6 +40,48 @@ lockfile and its own directory, named after the peers: `node_modules/.sjs/plugin
 A peer nothing above provides is installed for the package that asks, and an optional one is
 left out.
 
+## Scripts and commands
+
+`run` and `exec` work in the directory of the package, with `node_modules/.bin` of the package
+and of the root of the workspace first on `PATH`, the input and the output of the terminal, and
+the variables scripts read (`npm_lifecycle_event`, `npm_package_name`, `INIT_CWD` and the others
+named below). They end with the exit code of what ran. The words after the script name go to
+the script as they are, each as one argument; a `--` before them is left out. In a workspace,
+`--filter <name>` and `-w` before the script name choose the package, and `run -r <script>` runs
+the script in every package that has it, a package after the ones it depends on, until one fails.
+
+`dlx` installs the package in a project of its own in the store, `dlx/<name>@<range>`, and runs
+its command in the working directory: the one command it has, or the one named like the package.
+A range that is one version is installed once; anything else is resolved again each time, so
+`dlx create-thing` gets today's `latest`. Install scripts do not run for it.
+
+The last place on `PATH` is the `commands` directory of the store. The runtime puts itself there
+under the name `node`, so a script that calls `node` works on a machine that has the runtime
+alone, and a Node.js on `PATH` comes first where there is one. Called as `node`, the runtime has
+no package manager commands: `node install` runs the file `install`.
+
+## Install scripts
+
+A package can have `preinstall`, `install` and `postinstall` scripts, which build what it needs
+on the machine. They are commands the author of the package wrote, so none of them runs unless
+the root project names the package in `allowBuilds` of its `package.json`:
+
+```json
+{ "allowBuilds": { "esbuild": true, "sharp@0.33.5": true, "core-js": false } }
+```
+
+`true` runs the scripts, for every version or for the one after `@`. A package that has scripts
+and is not named is listed when it is installed; `false` leaves it out of that list.
+
+An allowed package is copied from the store and not linked, so its scripts change the copy of
+the project alone. The scripts run with `sh` in the directory of the package when everything is
+linked, a package after its dependencies, with the commands of its dependencies and of the
+project on `PATH` and the `npm_lifecycle_event`, `npm_package_name`, `npm_package_version`,
+`npm_package_json`, `npm_config_user_agent` and `INIT_CWD` variables. A package with a
+`binding.gyp` and no `install` script runs `node-gyp rebuild`, which has to be on `PATH`. A
+script that fails stops the install with the end of what it wrote, and the next install tries
+again. The scripts of the project's own packages do not run yet.
+
 `add` and `remove` edit `package.json` in its text: the formatting and the order of the keys
 stay as they are.
 
@@ -55,8 +100,8 @@ list under `packages`. The packages are installed together:
   or `workspaces.catalog`; `catalog:<name>` reads `catalogs.<name>`. The lockfile records the
   catalogs, so changing one resolves again.
 - Every command works from the directory of any package and installs for the whole workspace.
-  `add` and `remove` change the package they are run in; `--filter <name>` (`-F`) picks another
-  one by name, and `-w` the root project.
+  `add`, `remove`, `run` and `exec` work on the package they are run in; `--filter <name>`
+  (`-F`) picks another one by name, and `-w` the root project.
 - `.npmrc` is read from the home directory, then the root of the workspace, then the working
   directory.
 
@@ -67,5 +112,5 @@ list under `packages`. The packages are installed together:
   text. A package manager for another ecosystem can use it
   as is.
 - `src/npm` is what is specific to the npm ecosystem: manifests, registry metadata, the registry
-  client, `.npmrc`, workspaces, the resolver, the lockfile, the `node_modules` layout and the
-  commands.
+  client, `.npmrc`, workspaces, the resolver, the lockfile, the `node_modules` layout, install scripts and
+  the commands.

@@ -305,6 +305,7 @@ class Worker extends EventEmitter {
       controlChannel.port1.postMessage({ type: messageTypes.LOAD_SCRIPT, cwdCounter: cwdCounter || sharedCwdCounter, workerData: config.options.workerData,
         environmentData: Array.from(environmentData), parentPort: userChannel.port2,
         options: config.metadata }, [userChannel.port2, ...list]);
+      host.workerActivity = true;
       state.id = host.workerNative('startWorker', [JSON.stringify(config.metadata), ports().id(controlChannel.port2), Math.floor(config.metadata.resourceLimits.stackSizeMb * 1048576), config.metadata.name, limitBytes(config.metadata.resourceLimits.maxOldGenerationSizeMb), limitBytes(config.metadata.resourceLimits.maxYoungGenerationSizeMb)]);
       // Native ownership of this endpoint moved into the new isolate.
       clone().commit({ moved: [controlChannel.port2] });
@@ -575,6 +576,7 @@ function install(proc = process, metadata = bootstrap()) {
     proc.exitCode = code;
     if (!exitRequested) {
       exitRequested = true;
+      host.workerExitRequested = true;
       if (!proc._exiting) { proc._exiting = true; proc.emit('exit', code); }
     }
     if (host.builtinLoaded('internal/compile_cache')) require('internal/compile_cache').flushAtExit();
@@ -607,5 +609,5 @@ module.exports = { isMainThread: !!info.isMainThread, isInternalThread: false, t
 Object.defineProperties(module.exports, {
   _bootstrap: { value: bootstrap }, _install: { value: install }, _poll: { value: poll },
   _reportError: { value: reportError }, _exitRequested: { get: () => exitRequested },
-  _requestExit: { value: code => { exitRequested = true; host.workerNative('requestExit', [code]); } },
+  _requestExit: { value: code => { exitRequested = true; host.workerExitRequested = true; host.workerNative('requestExit', [code]); } },
 });

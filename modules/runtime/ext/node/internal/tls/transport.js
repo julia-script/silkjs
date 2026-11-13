@@ -8,8 +8,21 @@ const { codes } = require('internal/errors');
 class Failure { constructor(cause) { this.cause = cause; } }
 // TLSWrap cancels the writes it still holds when it closes (UV_ECANCELED).
 function canceled() { return Object.assign(new Error('write ECANCELED'), { errno: -125, code: 'ECANCELED', syscall: 'write' }); }
-function op(...args) {
-  try { return native(...args); } catch (cause) { throw new Failure(cause); }
+function op(name, a, b, c) {
+  try {
+    // Fixed arities without rest or spread arrays: the record pump calls this several times a request.
+    switch (arguments.length) {
+      case 1: return native(name);
+      case 2: return native(name, a);
+      case 3: return native(name, a, b);
+      case 4: return native(name, a, b, c);
+      default: {
+        const args = [];
+        for (let index = 0; index < arguments.length; index++) args.push(arguments[index]);
+        return Reflect.apply(native, undefined, args);
+      }
+    }
+  } catch (cause) { throw new Failure(cause); }
 }
 
 // The carrier is an ordinary net.Socket (or user Duplex). Only ciphertext crosses
@@ -244,14 +257,15 @@ class TLSTransport {
   }
   handshakeEvents() {
     if (!this.libraryEvents()) return false;
-    const starts = op('handshakeStarts', this.id);
+    const counts = op('handshakeCounts', this.id);
+    const starts = Math.floor(counts / 67108864);
     while (this.handshakeStarts < starts) {
       this.handshakeStarts++;
       if (this.options.isServer) this.socket._onHandshakeStart(Date.now());
       if (this.closing) return false;
     }
     if (!this.ready) return true;
-    const completions = op('handshakeCompletions', this.id);
+    const completions = counts % 67108864;
     while (this.handshakeCompletions < completions) {
       this.handshakeCompletions++;
       this.socket._onHandshakeDone();

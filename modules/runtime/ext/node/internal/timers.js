@@ -85,13 +85,23 @@
 // are the ones its async resource runs with; removeStoresFromResource lets go
 // of both.
 
+const ReflectApply = Reflect.apply;
 const binding = require('internal/timers_binding');
 const {
   immediateInfo,
   timeoutInfo,
 } = binding;
 const host = require('internal/host');
-const { _createResource: createResource } = require('async_hooks');
+const {
+  _createResource: createResource,
+  _newAsyncId: newAsyncId,
+  _emitInit: emitInit,
+  _queueDestroyId: queueDestroyId,
+  _hookFields: hookFields,
+} = require('async_hooks');
+// async_hook_fields indexes: init callbacks, and every callback of any kind.
+const kInitHooks = 0;
+const kTotalHooks = 5;
 const {
   symbols: {
     async_local_storage_context_symbol,
@@ -126,9 +136,11 @@ let debug = (...args) => {
 const AsyncContextFrame = require('internal/async_context_frame');
 
 const async_context_frame = Symbol('kAsyncContextFrame');
+// AsyncContextFrame.enabled (a getter) fixes its answer on first use; the hot paths keep it here.
+let framesEnabled;
 
 function removeStoresFromResource(resource) {
-  if (AsyncContextFrame.enabled) {
+  if (framesEnabled ??= AsyncContextFrame.enabled) {
     if (resource[async_context_frame] !== undefined) {
       resource[async_context_frame] = undefined;
     }
@@ -205,14 +217,17 @@ function initAsyncResource(resource, type) {
   resource[async_id_symbol] = asyncResource.id;
   resource[trigger_async_id_symbol] = asyncResource.trigger;
   resource[kAsyncResource] = asyncResource;
-  if (AsyncContextFrame.enabled)
+  if (framesEnabled ??= AsyncContextFrame.enabled)
     resource[async_context_frame] = asyncResource.stores;
   else if (asyncResource.stores !== undefined)
     resource[async_local_storage_context_symbol] = asyncResource.stores;
 }
 
 function emitDestroy(resource) {
-  resource[kAsyncResource].emitDestroy();
+  const asyncResource = resource[kAsyncResource];
+  // An Immediate keeps its id on itself, as Node's do (see Immediate).
+  if (asyncResource === undefined) queueDestroyId(resource[async_id_symbol]);
+  else asyncResource.emitDestroy();
 }
 
 let warnedNegativeNumber = false;
@@ -520,15 +535,13 @@ function setPosition(node, pos) {
   node.priorityQueuePosition = pos;
 }
 
-// Calls an immediate's callback as Node's processImmediate does. A throw clears
-// _onImmediate before the error reaches the uncaught handler, which formats its
-// stack: V8 looks method names up then, so the callback's frame reads
-// "Immediate.<anonymous>" rather than "Immediate._onImmediate".
+const noArguments = [];
+// An immediate's callback under async hooks, cleared on a throw as in the inline path.
 function runImmediate() {
   const argv = this._argv;
   try {
     if (argv === undefined) this._onImmediate();
-    else this._onImmediate(...argv);
+    else ReflectApply(this._onImmediate, this, argv);
   } catch (error) {
     this._onImmediate = undefined;
     this._argv = undefined;
@@ -536,6 +549,7 @@ function runImmediate() {
     host.rethrow(error);
   }
 }
+
 function getTimerCallbacks(runNextTicks) {
   // Set when a callback threw, until the next callback runs: Node unwinds to the
   // loop then and starts the queue again without draining nextTicks first.
@@ -549,6 +563,8 @@ function getTimerCallbacks(runNextTicks) {
     // calls occur while immediate callbacks are executed
     queue.head = queue.tail = null;
     immediateInfo[kHasOutstanding] = 1;
+    // Each callback, and the ticks between, restore the context they found: this one.
+    const context = host.getAsyncContext();
 
     let prevImmediate;
     let ranAtLeastOneImmediate = false;
@@ -578,8 +594,40 @@ function getTimerCallbacks(runNextTicks) {
 
       prevImmediate = immediate;
 
-      afterThrow = host.invokeTimer(immediate[kAsyncResource], runImmediate, immediate, []);
+      const argv = immediate._argv;
+      // The callback's async context, as an InternalResource would build it.
+      const scope = {
+        stores: framesEnabled ? immediate[async_context_frame] : immediate[async_local_storage_context_symbol],
+        id: immediate[async_id_symbol],
+        trigger: immediate[trigger_async_id_symbol],
+        resource: immediate,
+      };
+      if (hookFields[kTotalHooks] === 0) {
+        // No hook observes it: host.invokeImmediate's work, inline.
+        host.setAsyncContext(scope);
+        try {
+          try {
+            if (argv === undefined) immediate._onImmediate();
+            else ReflectApply(immediate._onImmediate, immediate, argv);
+            afterThrow = false;
+          } catch (error) {
+            // Node's processImmediate clears these before the error reaches the
+            // uncaught handler, which formats its stack: V8 looks method names up
+            // then, so the callback's frame reads "Immediate.<anonymous>".
+            immediate._onImmediate = undefined;
+            immediate._argv = undefined;
+            host.triggerUncaughtException(error);
+            afterThrow = true;
+          }
+        } finally {
+          host.setAsyncContext(context);
+        }
+      } else {
+        afterThrow = host.invokeImmediate(context, scope, scope.id, runImmediate, immediate, noArguments);
+      }
       if (afterThrow) {
+        immediate._onImmediate = undefined;
+        immediate._argv = undefined;
         enqueueRemoveStoresFromResource(immediate);
       } else {
         cleanImmediate(immediate);
@@ -669,7 +717,7 @@ function getTimerCallbacks(runNextTicks) {
 
       const args = timer._timerArgs;
       const threw = afterThrow = host.invokeTimer(timer[kAsyncResource], timer._onTimeout, timer,
-                                                  args === undefined ? [] : args);
+                                                  args === undefined ? noArguments : args);
       if (timer._repeat && timer._idleTimeout !== -1) {
         timer._idleTimeout = timer._repeat;
         insert(timer, timer._idleTimeout, start);
@@ -721,6 +769,9 @@ function getTimerCallbacks(runNextTicks) {
   };
 }
 
+// An Immediate is its own async resource, as in Node: its id, trigger and stores are its
+// own symbol properties (initAsyncResource keeps a Timeout's in a runtime resource), and
+// processImmediate builds the callback's context from them.
 class Immediate {
   constructor(callback, args) {
     this._idleNext = null;
@@ -728,13 +779,26 @@ class Immediate {
     this._onImmediate = callback;
     this._argv = args;
     this._destroyed = false;
-    this[kRefed] = false;
+    // this.ref(), inline.
+    this[kRefed] = true;
+    if (immediateInfo[kRefCount]++ === 0) {
+      binding.toggleImmediateRef(true);
+    }
 
-    initAsyncResource(this, 'Immediate');
+    const context = host.getAsyncContext();
+    const asyncId = newAsyncId();
+    const triggerId = context?.id ?? 1;
+    this[async_id_symbol] = asyncId;
+    this[trigger_async_id_symbol] = triggerId;
+    const stores = context?.stores;
+    if (framesEnabled ??= AsyncContextFrame.enabled)
+      this[async_context_frame] = stores;
+    else if (stores !== undefined)
+      this[async_local_storage_context_symbol] = stores;
+    if (hookFields[kInitHooks] !== 0)
+      emitInit(asyncId, 'Immediate', triggerId, this);
 
-    this.ref();
     immediateInfo[kCount]++;
-
     immediateQueue.append(this);
   }
 

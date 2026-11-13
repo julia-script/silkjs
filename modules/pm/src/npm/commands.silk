@@ -6,6 +6,12 @@
 //! what changed, and installs. `add` and `remove` edit the `package.json` of the package itself. A command line gives
 //! them a store, a thread pool and the host, and provides the [`Registry`].
 //!
+//! [`runScript`] and [`executeCommand`] run a script of a package, or a command, as the package
+//! sees it: in its directory, with the commands of its dependencies on `PATH`.
+//!
+//! [`runPackage`] runs the command of a package that the project does not depend on, from a
+//! project of its own in the store.
+//!
 //! `package.json` is edited in its text, so its formatting and the order of its keys stay as
 //! they are.
 
@@ -18,13 +24,16 @@ import silk.core.effect { Effect }
 import silk.core.option { Option }
 import silk.core.result { Result }
 import silk.platform.native.file { NativeFileError }
+import silk.system.child_process { ChildProcess }
 import npm.install { Downloader, InstallError, Summary, install }
 import npm.lock { LOCKFILE, Lock, write }
 import npm.manifest { DEVELOPMENT, Manifest, OPTIONAL }
 import npm.registry { Registry }
 import npm.resolve { Graph, Host, ResolveError, Tarballs, resolve }
+import npm.scripts { Runner, Script, ScriptError, commandOf, scriptsOf }
 import npm.workspace { Located, MANIFEST, Workspace, WorkspaceError }
-import pkg.files { readOptional, writeFile }
+import pkg.files { makeDirectories, readOptional, removeTree, writeFile }
+import pkg.semver { Version }
 import pkg.json_edit { removeMember, setMember }
 import pkg.names { Names }
 import pkg.store { Store }
@@ -185,7 +194,7 @@ effect fn plan(workspace: &Workspace, pins: Pins, fresh: &[Bytes]) -> Plan
 
 // Writes the lockfile of a resolved plan when it differs from the one on disk, and installs.
 effect fn finish(workspace: &Workspace, settled: Plan, downloader: Downloader<'_>, changes: Bytes) -> Outcome
-  ! CommandError | InstallError | OutOfMemoryError ? &mut Registry | &mut Allocator {
+  ! CommandError | InstallError | OutOfMemoryError ? &mut Registry | &mut ChildProcess | &mut Allocator {
   let Plan { graph, resolved } = move settled
   let mut written = false
   if resolved {
@@ -215,7 +224,7 @@ effect fn finish(workspace: &Workspace, settled: Plan, downloader: Downloader<'_
 /// - [`CommandError`] when a `package.json` or the lockfile is not as needed.
 /// - [`ResolveError`] and [`InstallError`] from the resolution and the install.
 pub effect fn installProject(project: &[u8], store: &Store, pool: &Pool, host: Host, frozen: bool) -> Outcome
-  ! CommandError | ResolveError | InstallError | OutOfMemoryError ? &mut Registry | &mut Allocator {
+  ! CommandError | ResolveError | InstallError | OutOfMemoryError ? &mut Registry | &mut ChildProcess | &mut Allocator {
   let Located { workspace, .. } = run located(project)
   // The downloads of a resolution start while it still asks for metadata.
   let mut downloader = Downloader.make(store, pool, host)
@@ -232,7 +241,7 @@ pub effect fn installProject(project: &[u8], store: &Store, pool: &Pool, host: H
 ///
 /// - [`CommandError`], [`ResolveError`] and [`InstallError`] as for [`installProject`].
 pub effect fn updateProject(project: &[u8], store: &Store, pool: &Pool, host: Host, names: &[Bytes]) -> Outcome
-  ! CommandError | ResolveError | InstallError | OutOfMemoryError ? &mut Registry | &mut Allocator {
+  ! CommandError | ResolveError | InstallError | OutOfMemoryError ? &mut Registry | &mut ChildProcess | &mut Allocator {
   let Located { workspace, .. } = run located(project)
   let mut downloader = Downloader.make(store, pool, host)
   let pins = if names.length == 0 { Pins.Dropped } else { Pins.Kept }
@@ -312,7 +321,7 @@ effect fn edited(result: Option<Bytes>) -> Bytes ! CommandError | OutOfMemoryErr
 /// - [`ResolveError`] when one of `wanted` cannot be resolved; `package.json` is then untouched.
 /// - [`InstallError`] from the install.
 pub effect fn addDependencies(project: &[u8], store: &Store, pool: &Pool, host: Host, wanted: &[Bytes], kind: u8, exact: bool) -> Outcome
-  ! CommandError | ResolveError | InstallError | OutOfMemoryError ? &mut Registry | &mut Allocator {
+  ! CommandError | ResolveError | InstallError | OutOfMemoryError ? &mut Registry | &mut ChildProcess | &mut Allocator {
   let table: &[u8] = if kind == DEVELOPMENT { TABLES[1] } else if kind == OPTIONAL { TABLES[2] } else { TABLES[0] }
   let Located { workspace: loaded, member } = run located(project)
   let mut workspace = move loaded
@@ -393,7 +402,7 @@ pub effect fn addDependencies(project: &[u8], store: &Store, pool: &Pool, host: 
 ///   changed then.
 /// - [`ResolveError`] and [`InstallError`] from the resolution and the install.
 pub effect fn removeDependencies(project: &[u8], store: &Store, pool: &Pool, host: Host, names: &[Bytes]) -> Outcome
-  ! CommandError | ResolveError | InstallError | OutOfMemoryError ? &mut Registry | &mut Allocator {
+  ! CommandError | ResolveError | InstallError | OutOfMemoryError ? &mut Registry | &mut ChildProcess | &mut Allocator {
   let Located { workspace: loaded, member } = run located(project)
   let mut workspace = move loaded
   let original = run manifestText(project)
@@ -422,4 +431,290 @@ pub effect fn removeDependencies(project: &[u8], store: &Store, pool: &Pool, hos
   let mut downloader = Downloader.make(store, pool, host)
   let settled = run plan(&workspace, Pins.Kept, &[]) |> Effect.provideMut<Tarballs>(&mut downloader)
   return run finish(&workspace, move settled, move downloader, move changes)
+}
+
+effect fn ran(outcome: Result<i32, ScriptError | OutOfMemoryError>) -> i32 ! CommandError | OutOfMemoryError {
+  return match move outcome {
+    Result.Success { value } => value
+    Result.Failure { error } => match move error {
+      ScriptError failed => { fail CommandError { message: failed.message, subject: move failed.subject } }
+      OutOfMemoryError exhausted => { fail move exhausted }
+    }
+  }
+}
+
+/// The scripts of the `package.json` in `project`, a line each: the name, a colon and the
+/// command line.
+///
+/// # Errors
+///
+/// - [`CommandError`] when there is no `package.json` in `project`.
+pub effect fn scriptList(project: &[u8]) -> Bytes ! CommandError | OutOfMemoryError ? &mut Allocator {
+  let text = run manifestText(project)
+  let scripts = run scriptsOf(Bytes.asSlice(&text))
+  let all = List<Script>.asSlice(&scripts)
+  let mut lines = Bytes.make()
+  let mut index: usize = 0
+  while index < all.length {
+    run lines.append(Bytes.asSlice(&all[index].name))
+    run lines.append(b": ")
+    run lines.append(Bytes.asSlice(&all[index].command))
+    run lines.append(b"\n")
+    index = index + 1
+  }
+  return move lines
+}
+
+/// Runs the script `name` of the `package.json` in `project`, with the input and the output of
+/// this process, and returns its exit code. `arguments` are added to its command line. A script
+/// named `pre<name>` runs before it and one named `post<name>` after it, when the package has
+/// them; the first that does not end with 0 ends the run. `origin` is the directory the person
+/// is in, which the scripts get as `INIT_CWD`. The fallback commands of `store` are the last
+/// place the scripts look for a command.
+///
+/// # Errors
+///
+/// - [`CommandError`] when the package has no such script, or the shell cannot be started.
+pub effect fn runScript(project: &[u8], store: &Store, origin: &[u8], host: Host, name: &[u8], arguments: &[Bytes]) -> i32
+  ! CommandError | OutOfMemoryError ? &mut Allocator {
+  let Located { workspace, member } = run located(project)
+  let text = run manifestText(project)
+  let scripts = run scriptsOf(Bytes.asSlice(&text))
+  let all = List<Script>.asSlice(&scripts)
+  if commandOf(all, name).length == 0 {
+    run stop("package.json has no script named", name)
+  }
+  let manifest = &Workspace.all(&workspace)[member].manifest
+  let package = Manifest.text(manifest, manifest.name)
+  let version = Manifest.text(manifest, manifest.version)
+  let fallback = run Store.commands(store)
+  let runner = run Runner.make(Workspace.root(&workspace), origin, host, Bytes.asSlice(&fallback))
+  let commands = run inProject(project, b"node_modules/.bin")
+  let mut before = run Bytes.copy(b"pre")
+  run before.append(name)
+  let mut after = run Bytes.copy(b"post")
+  run after.append(name)
+  let events: [&[u8]; 3] = [Bytes.asSlice(&before), name, Bytes.asSlice(&after)]
+  let mut index: usize = 0
+  while index < events.length {
+    let command = commandOf(all, events[index])
+    if command.length > 0 {
+      let given: &[Bytes] = if index == 1 { arguments } else { &[] }
+      let code = run ran(run Effect.result(Runner.start(&runner, package, version, project, Bytes.asSlice(&commands), events[index], command, given)))
+      if code != 0 {
+        return code
+      }
+    }
+    index = index + 1
+  }
+  return 0
+}
+
+/// Runs the command `words[0]` with the other words as its arguments, as a script of the
+/// package in `project` would: in its directory, with the commands of its dependencies first on
+/// `PATH`. Returns the exit code of the command.
+///
+/// # Errors
+///
+/// - [`CommandError`] when the shell cannot be started.
+pub effect fn executeCommand(project: &[u8], store: &Store, origin: &[u8], host: Host, words: &[Bytes]) -> i32
+  ! CommandError | OutOfMemoryError ? &mut Allocator {
+  let Located { workspace, member } = run located(project)
+  let manifest = &Workspace.all(&workspace)[member].manifest
+  let fallback = run Store.commands(store)
+  let runner = run Runner.make(Workspace.root(&workspace), origin, host, Bytes.asSlice(&fallback))
+  let commands = run inProject(project, b"node_modules/.bin")
+  return run ran(run Effect.result(Runner.execute(&runner, Manifest.text(manifest, manifest.name), Manifest.text(manifest, manifest.version), project, Bytes.asSlice(&commands), words)))
+}
+
+// Puts package `member` of the workspace at the end of `order`, after the packages of the
+// workspace it depends on.
+effect fn after(workspace: &Workspace, member: usize, seen: &mut [bool], order: &mut List<usize>) -> () ! OutOfMemoryError ? &mut Allocator {
+  if seen[member] {
+    return ()
+  }
+  seen[member] = true
+  let manifest = &Workspace.all(workspace)[member].manifest
+  let needs = Manifest.allDependencies(manifest)
+  let mut index: usize = 0
+  while index < needs.length {
+    match Workspace.named(workspace, Manifest.text(manifest, needs[index].name)) {
+      Option.Some { value: other } => { run after(workspace, other, &mut seen, &mut order) }
+      Option.None => {}
+    }
+    index = index + 1
+  }
+  run order.append(member)
+}
+
+/// The directories of the packages that have a script named `name`, in the workspace of the
+/// package in `project`: each one after the packages of the workspace it depends on. The root
+/// project is not among them.
+///
+/// # Errors
+///
+/// - [`CommandError`] when the workspace cannot be read.
+pub effect fn scriptedPackages(project: &[u8], name: &[u8]) -> List<Bytes> ! CommandError | OutOfMemoryError ? &mut Allocator {
+  let Located { workspace, .. } = run located(project)
+  let count = Workspace.all(&workspace).length
+  let mut seen = List<bool>.make()
+  let mut order = List<usize>.make()
+  let mut member: usize = 0
+  while member < count {
+    run seen.append(false)
+    member = member + 1
+  }
+  member = 1
+  while member < count {
+    run after(&workspace, member, List<bool>.asMutSlice(&mut seen), &mut order)
+    member = member + 1
+  }
+  let mut directories = List<Bytes>.make()
+  let turns = List<usize>.asSlice(&order)
+  let mut turn: usize = 0
+  while turn < turns.length {
+    if turns[turn] != 0 {
+      let directory = run Workspace.directory(&workspace, turns[turn])
+      let text = run manifestText(Bytes.asSlice(&directory))
+      let scripts = run scriptsOf(Bytes.asSlice(&text))
+      if commandOf(List<Script>.asSlice(&scripts), name).length > 0 {
+        run directories.append(move directory)
+      }
+    }
+    turn = turn + 1
+  }
+  return move directories
+}
+
+// Adds `text` to `path` as one path segment: a slash becomes `+`.
+effect fn appendSegment(path: &mut Bytes, text: &[u8]) -> () ! OutOfMemoryError ? &mut Allocator {
+  let start = Bytes.length(&path)
+  run path.append(text)
+  let written = Bytes.asMutSlice(&mut path)
+  let mut index = start
+  while index < written.length {
+    if written[index] == 47 {
+      written[index] = 43
+    }
+    index = index + 1
+  }
+}
+
+// Whether `text` can stand between the quotes of a JSON string as it is, and is one line.
+fn plain(text: &[u8]) -> bool {
+  let mut index: usize = 0
+  while index < text.length {
+    if text[index] == 34 || text[index] == 92 || text[index] < 32 {
+      return false
+    }
+    index = index + 1
+  }
+  return text.length > 0
+}
+
+/// Runs the command of a package the project does not have: `words[0]` is the package, as
+/// [`addDependencies`] takes it, and the other words are the arguments of the command. The
+/// package is installed in a project of its own in `store`, one for each package and range, and
+/// its command runs in `origin`, the directory the person is in. A range that is one version is
+/// installed once; any other range or tag is resolved again each time. The command is the one
+/// command of the package, or the one named like the package. Returns its exit code.
+///
+/// # Errors
+///
+/// - [`CommandError`] when `words[0]` is not a package, the package has no such command, or the
+///   shell cannot be started.
+/// - [`ResolveError`] and [`InstallError`] from the resolution and the install.
+pub effect fn runPackage(store: &Store, pool: &Pool, host: Host, origin: &[u8], words: &[Bytes]) -> i32
+  ! CommandError | ResolveError | InstallError | OutOfMemoryError ? &mut Registry | &mut ChildProcess | &mut Allocator {
+  if words.length == 0 {
+    run stop("dlx needs a package", b"")
+  }
+  let asked = Bytes.asSlice(&words[0])
+  let end = nameEnd(asked)
+  let name = Slice.view<u8>(asked, 0, end)
+  let spec: &[u8] = if end + 1 < asked.length { Slice.view<u8>(asked, end + 1, asked.length - end - 1) } else { b"latest" }
+  if plain(name) == false || plain(spec) == false {
+    run stop("this is not a package name", asked)
+  }
+  let mut project = run Bytes.copy(Store.directory(store))
+  run project.append(b"/dlx/")
+  run appendSegment(&mut project, name)
+  run project.append(b"@")
+  run appendSegment(&mut project, spec)
+  let here = Bytes.asSlice(&project)
+  match run Effect.result(makeDirectories(here)) {
+    Result.Success {..} => {}
+    Result.Failure {..} => { run stop("could not write", here) }
+  }
+  let mut text = run Bytes.copy(b"{\"private\":true,\"dependencies\":{\"")
+  run text.append(name)
+  run text.append(b"\":\"")
+  run text.append(spec)
+  run text.append(b"\"}}\n")
+  let manifest = run inProject(here, MANIFEST)
+  run save(Bytes.asSlice(&manifest), Bytes.asSlice(&text))
+  // One version stays what it is; anything else may have moved since the last time.
+  let installed = if Option.isSome(&Version.parse(spec)) {
+    run Effect.result(installProject(here, store, pool, host, false))
+  } else {
+    run Effect.result(updateProject(here, store, pool, host, &[]))
+  }
+  match move installed {
+    Result.Success {..} => {}
+    Result.Failure { error } => {
+      // Nothing is kept of a package that could not be installed.
+      drop run Effect.result(removeTree(here))
+      match move error {
+        CommandError failed => { fail move failed }
+        ResolveError failed => { fail move failed }
+        InstallError failed => { fail move failed }
+        OutOfMemoryError failed => { fail move failed }
+      }
+    }
+  }
+
+  let mut placed = run inProject(here, b"node_modules/")
+  run placed.append(name)
+  run placed.append(b"/")
+  run placed.append(MANIFEST)
+  let package = match move run readOptional(Bytes.asSlice(&placed)) {
+    Option.Some { value: found } => run parsed(Bytes.asSlice(&found))
+    Option.None => { run stop("this package could not be installed", asked) }
+  }
+  let bins = Manifest.allBins(&package)
+  // The command without a scope, which is what a package with one `bin` string gets.
+  let mut bare = name
+  let mut index: usize = 0
+  while index < name.length {
+    if name[index] == 47 {
+      bare = Slice.view<u8>(name, index + 1, name.length - index - 1)
+    }
+    index = index + 1
+  }
+  let mut chosen = Option<usize>.none()
+  if bins.length == 1 {
+    chosen = Option<usize>.some(0)
+  }
+  index = 0
+  while index < bins.length {
+    if same(Manifest.text(&package, bins[index].name), bare) {
+      chosen = Option<usize>.some(index)
+    }
+    index = index + 1
+  }
+  let command = match chosen {
+    Option.Some { value } => Manifest.text(&package, bins[value].name)
+    Option.None => { run stop("this package has no command of its name, and not one command alone", asked) }
+  }
+  let mut line = List<Bytes>.make()
+  run line.append(run Bytes.copy(command))
+  index = 1
+  while index < words.length {
+    run line.append(run Bytes.copy(Bytes.asSlice(&words[index])))
+    index = index + 1
+  }
+  let fallback = run Store.commands(store)
+  let runner = run Runner.make(here, origin, host, Bytes.asSlice(&fallback))
+  let commands = run inProject(here, b"node_modules/.bin")
+  return run ran(run Effect.result(Runner.execute(&runner, name, Manifest.text(&package, package.version), origin, Bytes.asSlice(&commands), List<Bytes>.asSlice(&line))))
 }
