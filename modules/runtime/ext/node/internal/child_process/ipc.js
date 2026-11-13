@@ -6,6 +6,7 @@ const { AsyncResource } = require('async_hooks');
 const native = (op, args) => host.processNative(op, args);
 const failure = (code, message) => Object.assign(new Error(message), { code });
 const { codes: { ERR_INVALID_ARG_TYPE, ERR_MISSING_ARGS }, codedError, validateObject } = require('internal/validators');
+const { ErrnoException } = require('internal/errors');
 // Node's target[kChannelHandle]: the channel's pipe handle, null once it closes.
 const kChannelHandle = Symbol('kChannelHandle');
 function setupChannel(target, fd, mode = 'json', onClose) {
@@ -84,9 +85,9 @@ function setupChannel(target, fd, mode = 'json', onClose) {
     const result = Buffer.allocUnsafe(payload.length + 4);
     result.writeUInt32BE(payload.length, 0); payload.copy(result, 4); return result;
   }
-  function submit(value, handleFD = -1, callback, transfer) {
+  function submit(value, handleFD = -1, callback, transfer, swallowErrors = false) {
     const buffer = encode(value);
-    queue.push({ buffer, offset: 0, fd: handleFD, callback, transfer }); bytes += buffer.length;
+    queue.push({ buffer, offset: 0, fd: handleFD, callback, transfer, swallowErrors }); bytes += buffer.length;
     flush(); refState(); return bytes < 131072;
   }
   function flush() {
@@ -98,7 +99,17 @@ function setupChannel(target, fd, mode = 'json', onClose) {
       if (n < 0) {
         const code = native('errorName', [n]);
         if (code === 'EAGAIN' || code === 'EINTR') break;
-        const error = failure(code, `write ${code}`); complete(error); if (!item.callback) target.emit('error', error); return;
+        // Node's target._send: a failed write drops that message and reports an
+        // ErrnoException(err, 'write') on the next tick; the channel stays open until its
+        // read side ends, so later sends fail the same way.
+        queue.shift(); bytes -= item.buffer.length - item.offset;
+        if (item.transfer) { native('closeFd', [item.transfer.fd]); releaseSent(item.transfer); }
+        if (!item.swallowErrors) {
+          const error = new ErrnoException(n, 'write');
+          if (item.callback) process.nextTick(item.callback, error);
+          else process.nextTick(() => target.emit('error', error));
+        }
+        continue;
       }
       if (!n) break;
       item.fd = -1; item.offset += n; bytes -= n;
@@ -271,13 +282,13 @@ function setupChannel(target, fd, mode = 'json', onClose) {
     // Like Node, messages sent while a handle waits for its ACK queue behind it; the
     // first of them reports true, later ones false.
     if (!handle && (pendingHandle || queue.some(item => item.transfer))) {
-      submit(value, -1, callback);
+      submit(value, -1, callback, undefined, options.swallowErrors);
       let waiting = 0, behind = false;
       for (const item of queue) { if (item.transfer) { behind = true; waiting = 0; } else if (behind && !item.control) waiting++; }
       if (pendingHandle && !queue.some(item => item.transfer)) waiting = queue.filter(item => !item.control).length;
       return waiting === 1;
     }
-    if (!handle) return submit(value, -1, callback);
+    if (!handle) return submit(value, -1, callback, undefined, options.swallowErrors);
     const net = require('net'); let type, handleFD;
     if (handle instanceof net.Socket) { type = 'net.Socket'; handleFD = handle._transport?.call('fileno'); }
     else if (handle instanceof net.Server) { type = 'net.Server'; handleFD = handle._transport?.call('fileno'); }
@@ -326,7 +337,7 @@ function setupChannel(target, fd, mode = 'json', onClose) {
       }
     }
     const transfer = { handle, fd: handleFD, options, type, message: envelope, retries: 0 };
-    queue.push({ buffer, offset: 0, fd: handleFD, callback, transfer }); bytes += buffer.length;
+    queue.push({ buffer, offset: 0, fd: handleFD, callback, transfer, swallowErrors: options.swallowErrors }); bytes += buffer.length;
     flush(); refState(); return bytes < 131072;
   };
   // Node's internal _send for its own NODE_ messages, queued in order with user messages.
