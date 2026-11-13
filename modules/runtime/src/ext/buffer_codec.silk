@@ -21,7 +21,8 @@ import silk.collections.slice { Slice }
 import silkjs.js_engine { Engine }
 import silkjs.js_engine_host { EngineServices }
 import silkjs.js_heap { HeapHeader, HeapCell }
-import silkjs.js_core_types { ObjectData, ObjectPayload }
+import silkjs.js_core_types { ObjectData, ObjectPayload, RuntimeState }
+import silkjs.js_property_get as propertyGet
 import silkjs.js_core_types { FrameSlots, NativeErrorKind }
 import silkjs.js_value { ValueBits }
 import silkjs.js_exceptions { JsException }
@@ -40,7 +41,6 @@ import silkjs.js_promise as promise
 import silkjs.js_runtime as runtime
 import silkjs.js_gc as gc
 import silkjs.js_native_functions as functions
-import libs.core.common as host
 
 const END: u32 = 0xffffffff
 // RopeIterator visits each leaf once, avoiding a root traversal for every unit.
@@ -576,7 +576,19 @@ unsafe fn poolSlots(pool: ValueBits, out: &mut FrameSlots) -> bool {
 // Buffer.poolSize >>> 1, the largest request the pool serves (exclusive).
 unsafe effect fn poolLimit<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, pool: &FrameSlots) -> f64
   ! JsException ? &mut Allocator {
-  let size = run unsafe host.get(&mut engine, context, unsafe pool.get(POOL_BUFFER), b"poolSize")
+  // The atom is looked up, not interned: buffer.js defined the property, so it exists.
+  let rt = unsafe runtime.contextRuntime(context)
+  let mut anchor = () let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, rt)
+  let atom = state.atoms.findAscii(b"poolSize") drop state
+  if atom == 0 { return 0.0 }
+  let realm = unsafe lendRealm(&context, context)
+  let owner = unsafe pool.get(POOL_BUFFER)
+  let got = run Effect.result(propertyGet.getProperty(&mut engine, realm, unsafe lendFor(owner), atom))
+  let atoms = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, rt) atoms.atoms.release(atom) drop atoms
+  let size = match move got {
+    Result<ValueBits, OutOfMemoryError | JsException>.Success { value } => value
+    Result<ValueBits, OutOfMemoryError | JsException>.Failure { error } => run core.materialize(&mut engine, realm, move error)
+  }
   let limit = match size {
     ValueBits.Int { value } => u32.toF64(u32.shiftRight(i32.toU32(value), 1))
     ValueBits.Float64 { value } => u32.toF64(u32.shiftRight(i32.toU32(primitives.numberToInt32(value)), 1))
@@ -608,10 +620,9 @@ unsafe effect fn poolTake<'m, S: EngineServices>(engine: &mut Engine<'m, S>, con
   let object = core.reference(view)
   let state = unsafe buffers.view(object)
   let offset = match unsafe pool.get(POOL_OFFSET) { ValueBits.Int { value } => i32.toU64(value) _ => 0 }
-  let mut callArgs = [ValueBits.Object { reference: state.buffer }, ValueBits.number(u64.toF64(state.offset + offset)), ValueBits.number(u64.toF64(count))]
-  let arguments = FrameSlots { data: Pointer.fromMutRef<ValueBits>(&mut callArgs[0]), count: 3 }
+  let buffer = ValueBits.Object { reference: state.buffer }
   let memory = engine.memory
-  let made = run typed.constructor(&mut engine, memory, unsafe lendRealm(&context, context), unsafe lendFor(unsafe pool.get(POOL_FAST)), unsafe lendArguments(&arguments), classes.JS_CLASS_UINT8_ARRAY)
+  let made = run unsafe typed.newView(&mut engine, memory, unsafe lendRealm(&context, context), unsafe lendFor(unsafe pool.get(POOL_FAST)), unsafe lendFor(buffer), state.offset + offset, count, classes.JS_CLASS_UINT8_ARRAY)
   drop unsafe pool.replace(POOL_OFFSET, ValueBits.Int { value: u64.toI32(alignedOffset(offset + count)) })
   return made
 }
@@ -623,23 +634,27 @@ unsafe effect fn poolAllocate<'m, S: EngineServices>(engine: &mut Engine<'m, S>,
   if !run unsafe poolReserve(&mut engine, context, &mut pool, i32.toU64(size)) { return ValueBits.Exception }
   return run unsafe poolTake(&mut engine, context, &mut pool, i32.toU64(size))
 }
-// Buffer.from(string[, 'utf8']): Node's fromStringFast on the pool.
+// Buffer.from(string[, 'utf8' | 'latin1' | 'binary' | 'ascii']): Node's fromStringFast on the pool.
 unsafe effect fn poolString<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, pool: &mut FrameSlots, input: ValueBits, encoding: ValueBits) -> ValueBits
   ! OutOfMemoryError | JsException ? &mut Allocator {
   if !input.isString() { return ValueBits.Exception }
-  match encoding {
-    ValueBits.Undefined => ()
-    _ => {
-      if !flatNarrow(encoding) { return ValueBits.Exception }
-      let name = unsafe Strings.flatLatin1(&encoding, encoding)
-      if !(name.length == 4 && name[0] == 117 && name[1] == 116 && name[2] == 102 && name[3] == 56) { return ValueBits.Exception }
-    }
-  }
+  let kind = encodingKind(encoding)
+  if kind < 0 || kind > 2 { return ValueBits.Exception }
   let units = Strings.length(input)
   if units == 0 { return ValueBits.Exception }
   let limit = run unsafe poolLimit(&mut engine, context, &pool)
   let mut length = usize.toF64(units)
   if !(length < limit) { return ValueBits.Exception }
+  if kind != 0 {
+    // latin1, binary and ascii: one byte per code unit, as Node's latin1Write.
+    let count = usize.toU64(units)
+    if !run unsafe poolReserve(&mut engine, context, &mut pool, count) { return ValueBits.Exception }
+    let view = core.reference(unsafe pool.get(POOL_VIEW))
+    let state = unsafe buffers.view(view)
+    let offset = match unsafe pool.get(POOL_OFFSET) { ValueBits.Int { value } => i32.toU64(value) _ => 0 }
+    let written = unsafe encodeLatin1(input, unsafe buffers.snapshot(state.buffer), state.offset + offset, count)
+    return run unsafe poolTake(&mut engine, context, &mut pool, written)
+  }
   length = length * 4.0
   if !(length < limit) { length = usize.toF64(utf8Count(input)) }
   if !(length < limit) { return ValueBits.Exception }
@@ -771,10 +786,9 @@ unsafe effect fn bufferSubarray<'m, S: EngineServices>(engine: &mut Engine<'m, S
   if !adjustOffset(startValue, length, 0.0, &mut start) || !adjustOffset(endValue, length, length, &mut end) { return ValueBits.Exception }
   let state = unsafe buffers.view(object)
   let size = if end > start { end - start } else { 0.0 }
-  let mut callArgs = [ValueBits.Object { reference: state.buffer }, ValueBits.number(u64.toF64(state.offset) + start), ValueBits.number(size)]
-  let arguments = FrameSlots { data: Pointer.fromMutRef<ValueBits>(&mut callArgs[0]), count: 3 }
+  let buffer = ValueBits.Object { reference: state.buffer }
   let memory = engine.memory
-  return run typed.constructor(&mut engine, memory, unsafe lendRealm(&context, context), unsafe lendFor(unsafe pool.get(POOL_FAST)), unsafe lendArguments(&arguments), classes.JS_CLASS_UINT8_ARRAY)
+  return run unsafe typed.newView(&mut engine, memory, unsafe lendRealm(&context, context), unsafe lendFor(unsafe pool.get(POOL_FAST)), unsafe lendFor(buffer), state.offset + f64.toU64(start), f64.toU64(size), classes.JS_CLASS_UINT8_ARRAY)
 }
 unsafe fn arrayLength(value: ValueBits) -> usize {
   if !value.isObject() { return usize.MAX }
