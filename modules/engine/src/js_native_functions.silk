@@ -49,6 +49,8 @@ import js_atom_data as atoms
 import js_class_data as classes
 import js_collection_intrinsics as collections
 import js_number_intrinsics as numberIntrinsics
+import js_primitives as primitives
+import js_primitives { EqualityMode }
 import js_string_intrinsics_metadata as stringIds
 import js_string_intrinsics_basic as stringBasic
 import js_math_intrinsics_callbacks as mathIds
@@ -185,7 +187,7 @@ pub effect fn newFunctionWithPrototype<'a, 'b, H: HeapHooks + OwnPropertyHooks +
   unsafe HeapCell.retain(context)
   data.payload = ObjectPayload.NativeFunction { function: NativeFunctionData {
     context: context, function: id, length: i32.toU8(length & 255), protocol: protocol,
-    magicBits: i32.toU16(magic & 65535)
+    magicBits: i32.toU16(magic & 65535), callKind: callKindOf(id, protocol)
   } }
   data.setIsConstructor(constructorProtocol(protocol)) drop data
   let interned = run Intrinsic.catchFailure<OutOfMemoryError | StringLengthError>(internName(realm, name), failedOomLength)
@@ -235,7 +237,7 @@ pub effect fn newDataFunction<'a, H: HeapHooks + OwnPropertyHooks + CoercionHook
   let mut anchor = () let data = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut anchor, reference(object))
   data.payload = ObjectPayload.NativeFunction { function: NativeFunctionData {
     context: values, function: id, length: i32.toU8(length & 255), protocol: NativeCallProtocol.Data,
-    magicBits: i32.toU16(magic & 65535)
+    magicBits: i32.toU16(magic & 65535), callKind: CALL_KIND_SLOW
   } } drop data
   let configured = run Effect.result(setFunctionProperties(&mut hooks, realm, unsafe lendBits(&object, object), atoms.JS_ATOM_empty_string, length))
   return match move configured {
@@ -333,6 +335,7 @@ unsafe effect fn dispatch<'a, 'b, H: HeapHooks + OwnPropertyHooks + CoercionHook
   match protocol {
     // Data functions return through nativeData before any protocol dispatch.
     NativeCallProtocol.Data => { return Intrinsic.trap("data function dispatched by protocol") }
+    NativeCallProtocol.Frameless => { return run hooks.nativeGeneric(id, realm, unsafe lendBits(&receiver, receiver), argc, unsafe lendArguments(args.slots())) }
     NativeCallProtocol.Generic => { return run hooks.nativeGeneric(id, realm, unsafe lendBits(&receiver, receiver), argc, unsafe lendArguments(args.slots())) }
     NativeCallProtocol.Constructor => { return run hooks.nativeGeneric(id, realm, unsafe lendBits(&receiver, receiver), argc, unsafe lendArguments(args.slots())) }
     NativeCallProtocol.ConstructorOrFunction => { return run hooks.nativeGeneric(id, realm, unsafe lendBits(&receiver, receiver), argc, unsafe lendArguments(args.slots())) }
@@ -371,6 +374,14 @@ unsafe effect fn dispatch<'a, 'b, H: HeapHooks + OwnPropertyHooks + CoercionHook
 pub effect fn callPlain<'a, 'b, H: HeapHooks + OwnPropertyHooks + CoercionHooks + PropertyWriteHooks + NativeFunctionHooks>(
   hooks: &mut H, memory: &AllocationObserver, realm: Realm<'a>, function: ValueRef<'b>,
   receiver: ValueRef<'b>, args: Arguments<'a>) -> Option<ValueBits> ! JsException ? &mut Allocator {
+  return run callPlainInline(&mut hooks, memory, realm, function, receiver, args)
+}
+/// callPlain's body, for the VM's lean native call, which inlines it so the
+/// native frame is built in the VM's own frame.
+@inlineAlways
+pub effect fn callPlainInline<'a, 'b, H: HeapHooks + OwnPropertyHooks + CoercionHooks + PropertyWriteHooks + NativeFunctionHooks>(
+  hooks: &mut H, memory: &AllocationObserver, realm: Realm<'a>, function: ValueRef<'b>,
+  receiver: ValueRef<'b>, args: Arguments<'a>) -> Option<ValueBits> ! JsException ? &mut Allocator {
   let arguments = args.slots()
   let anchor = () let object = unsafe HeapCell.payload<ObjectData, ()>(&anchor, reference(function.view()))
   let mut id = NativeFunctionId.Host { id: 0 } let mut protocol = NativeCallProtocol.Data let mut magic: i32 = 0
@@ -386,6 +397,7 @@ pub effect fn callPlain<'a, 'b, H: HeapHooks + OwnPropertyHooks + CoercionHooks 
   // Getters take no arguments, so they share the plain frame.
   let kind: u32 = match protocol {
     NativeCallProtocol.Generic => PLAIN_GENERIC
+    NativeCallProtocol.Frameless => PLAIN_GENERIC
     NativeCallProtocol.GenericMagic => PLAIN_MAGIC
     NativeCallProtocol.Getter => PLAIN_GETTER
     NativeCallProtocol.GetterMagic => PLAIN_GETTER_MAGIC
@@ -395,7 +407,8 @@ pub effect fn callPlain<'a, 'b, H: HeapHooks + OwnPropertyHooks + CoercionHooks 
   // Fewer arguments than the declared length (host natives declare 2): padded with
   // undefined as call pads them, up to PLAIN_PADDING slots.
   if argc < length && length > PLAIN_PADDING { return Option<ValueBits>.none() }
-  run unsafe restricted.native(realm, id, receiver.view())
+  // A restricted debugger evaluation is rare: its flag is read here, the classification out of line.
+  if restricted.active(realm) { run unsafe restricted.native(realm, id, receiver.view()) }
   let rt = realm.runtime()
   if unsafe runtime.checkStackOverflow(rt, currentFrameAddress(), length * Layout.of<ValueBits>().bytes, true) { return Option<ValueBits>.none() }
   let empty = unsafe Intrinsic.pointerRequalify<[*]mut ValueBits, *mut ValueBits>(unsafe Intrinsic.stackAllocate<ValueBits>(0))
@@ -487,6 +500,19 @@ unsafe fn callData(function: ValueBits) -> CallData {
     }
     _ => invariant()
   }
+}
+/// The captured values of a native data function object (newDataFunction), into
+/// out: slots its host may read and replace in place (FrameSlots.replace moves
+/// counts, so a replaced value is the host's to release). False for any other value.
+pub unsafe fn dataFunctionSlots(function: ValueBits, out: &mut FrameSlots) -> bool {
+  if !function.isObject() { return false }
+  let anchor = () let object = unsafe HeapCell.payload<ObjectData, ()>(&anchor, reference(function))
+  if object.classId() != classes.JS_CLASS_C_FUNCTION_DATA { return false }
+  drop object
+  let data = unsafe callData(function)
+  if data.capturedCount == 0 { return false }
+  out.* = FrameSlots { data: unsafe Intrinsic.pointerRequalify<?[*]const ValueBits, *mut ValueBits>(data.capturedPointer), count: data.capturedCount }
+  return true
 }
 // Frameless results for the hottest String builtins when they cannot throw,
 // allocate or call back into JS: charCodeAt and charAt on a flat string with an
@@ -605,6 +631,149 @@ fn quickParseInt(argv: FrameSlots) -> ValueBits {
     _ => ()
   }
   return ValueBits.Uninitialized
+}
+/// NativeFunctionData.callKind values. SLOW (0): the VM tries its frameless
+/// answers (quickInline, nativeInline and the arms' own) before the full call.
+/// 1 to 6 are pushInline's classes (the OBJECT_METHOD_ values; objectMethod is
+/// this byte). From LEAN on no frameless answer of the cascade applies, so the
+/// VM goes to leanInline: LEAN calls callPlain's body in its own frame, and the
+/// kinds after it first try a cheaper entry.
+pub const CALL_KIND_SLOW: u8 = 0
+pub const CALL_KIND_LEAN: u8 = 7
+/// A NativeCallProtocol.Frameless function: the VM calls it with no native frame.
+pub const CALL_KIND_FRAMELESS: u8 = 8
+/// A LEAN function that leanAnswer may answer before the native frame is built.
+pub const CALL_KIND_ANSWER: u8 = 9
+/// A String.prototype method with a primitive entry (stringBasic.quick): on a
+/// string receiver with plain arguments the VM calls that entry, no frame.
+pub const CALL_KIND_STRING: u8 = 10
+/// The callKind of a native function made with id and protocol (each SLOW
+/// case below names the VM path that may answer it).
+pub fn callKindOf(id: NativeFunctionId, protocol: NativeCallProtocol) -> u8 {
+  let native = protocol != NativeCallProtocol.Data
+  if let NativeFunctionId.Builtin { family, method } = id {
+    // pushInline's classes, as objectMethod decided them per call before.
+    if family == BuiltinFamily.Array && protocol == NativeCallProtocol.GenericMagic {
+      if method == ARRAY_PUSH { return OBJECT_METHOD_PUSH }
+      if method == ARRAY_POP { return OBJECT_METHOD_POP }
+    }
+    if family == BuiltinFamily.Map || family == BuiltinFamily.Set || family == BuiltinFamily.WeakMap || family == BuiltinFamily.WeakSet { return OBJECT_METHOD_COLLECTION }
+    if family == BuiltinFamily.String && method == stringIds.FROM_CHAR_CODE && native { return OBJECT_METHOD_FROM_CHAR_CODE }
+    if family == BuiltinFamily.Math && native { return OBJECT_METHOD_MATH }
+    if family == BuiltinFamily.Date && method == DATE_NOW && native { return OBJECT_METHOD_CLOCK }
+  }
+  if protocol == NativeCallProtocol.Frameless { return CALL_KIND_FRAMELESS }
+  if protocol != NativeCallProtocol.Generic && protocol != NativeCallProtocol.GenericMagic { return CALL_KIND_SLOW }
+  if answers(id) { return CALL_KIND_ANSWER }
+  return match id {
+    NativeFunctionId.Host { .. } => CALL_KIND_LEAN
+    NativeFunctionId.Builtin { family, method } => match family {
+      // collectionRead/Write/Inline, quick's collections.quickRead
+      BuiltinFamily.Map => CALL_KIND_SLOW BuiltinFamily.Set => CALL_KIND_SLOW
+      BuiltinFamily.WeakMap => CALL_KIND_SLOW BuiltinFamily.WeakSet => CALL_KIND_SLOW
+      // mathAnswer, quickMath
+      BuiltinFamily.Math => CALL_KIND_SLOW
+      // numberInline, quickParseInt, quickWrite's toString
+      BuiltinFamily.Number => CALL_KIND_SLOW
+      // unitInline, quickString, quickReplace, stringBasic.quick
+      BuiltinFamily.String => if method == stringIds.FROM_CHAR_CODE || method == STRING_REPLACE || method == stringIds.CHAR_CODE_AT || method == stringIds.CHAR_AT { CALL_KIND_SLOW }
+        else if stringBasic.hasPrimitiveEntry(method) { CALL_KIND_STRING } else { CALL_KIND_LEAN }
+      // pushInline, popInline, quickSplice
+      BuiltinFamily.Array => if method == ARRAY_PUSH || method == ARRAY_POP || method == ARRAY_SPLICE { CALL_KIND_SLOW } else { CALL_KIND_LEAN }
+      // clockInline
+      BuiltinFamily.Date => if method == DATE_NOW { CALL_KIND_SLOW } else { CALL_KIND_LEAN }
+      // nativeInline's quickExec
+      BuiltinFamily.RegExp => if method == REGEXP_EXEC || method == REGEXP_TEST { CALL_KIND_SLOW } else { CALL_KIND_LEAN }
+      // appliesInline and callInline (f.call, f.apply, Reflect.apply)
+      BuiltinFamily.Function => CALL_KIND_SLOW
+      BuiltinFamily.Reflect => CALL_KIND_SLOW
+      _ => CALL_KIND_LEAN
+    }
+  }
+}
+// The builtins leanAnswer knows, by family-local method id.
+const ARRAY_IS_ARRAY: u32 = 1
+const ARRAY_BUFFER_IS_VIEW: u32 = 1
+const NUMBER_IS_NAN: u32 = 1
+const NUMBER_IS_SAFE_INTEGER: u32 = 4
+const OBJECT_IS: u32 = 16
+fn answers(id: NativeFunctionId) -> bool {
+  return match id {
+    NativeFunctionId.Builtin { family, method } => match family {
+      BuiltinFamily.Array => method == ARRAY_IS_ARRAY
+      BuiltinFamily.ArrayBuffer => method == ARRAY_BUFFER_IS_VIEW
+      BuiltinFamily.Number => method >= NUMBER_IS_NAN && method <= NUMBER_IS_SAFE_INTEGER
+      BuiltinFamily.Object => method == OBJECT_IS
+      _ => false
+    }
+    _ => false
+  }
+}
+/// The answer of a CALL_KIND_ANSWER builtin when it needs no native frame: the
+/// predicates below read their arguments' tags and classes only, so nothing
+/// throws, allocates or runs JavaScript. Uninitialized declines (a Proxy for
+/// Array.isArray), leaving the full call.
+@inlineAlways
+pub unsafe fn leanAnswer(function: ValueBits, argv: &FrameSlots) -> ValueBits {
+  let anchor = () let object = unsafe HeapCell.payload<ObjectData, ()>(&anchor, reference(function))
+  let id = match &object.payload { ObjectPayload.NativeFunction { function: native } => native.function _ => { return ValueBits.Uninitialized } }
+  drop object
+  let mut family = BuiltinFamily.Runtime let mut method: u32 = 0
+  match id { NativeFunctionId.Builtin { family: f, method: m } => { family = f method = m } _ => { return ValueBits.Uninitialized } }
+  let mut first = ValueBits.Undefined
+  if argv.length() != 0 { first = unsafe argv.get(0) }
+  if family == BuiltinFamily.Number {
+    let number = match first {
+      ValueBits.Int { .. } => { return ValueBits.Bool { value: method != NUMBER_IS_NAN } }
+      ValueBits.Float64 { value } => value
+      _ => { return ValueBits.Bool { value: false } }
+    }
+    if method == NUMBER_IS_NAN { return ValueBits.Bool { value: f64.isNaN(number) } }
+    if method == NUMBER_IS_NAN + 1 { return ValueBits.Bool { value: f64.isFinite(number) } }
+    if method == NUMBER_IS_NAN + 2 { return ValueBits.Bool { value: f64.isFinite(number) && f64.floor(number) == number } }
+    return ValueBits.Bool { value: primitives.numberIsSafeInteger(number) }
+  }
+  if family == BuiltinFamily.Object {
+    let mut second = ValueBits.Undefined
+    if argv.length() > 1 { second = unsafe argv.get(1) }
+    return ValueBits.Bool { value: unsafe primitives.equal(first, second, EqualityMode.SameValue) }
+  }
+  let node = match first { ValueBits.Object { reference } => reference _ => { return ValueBits.Bool { value: false } } }
+  let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, node)
+  let class = data.classId()
+  if family == BuiltinFamily.Array {
+    if class == classes.JS_CLASS_PROXY { return ValueBits.Uninitialized }
+    return ValueBits.Bool { value: class == classes.JS_CLASS_ARRAY }
+  }
+  return ValueBits.Bool { value: class >= classes.JS_CLASS_UINT8C_ARRAY && class <= classes.JS_CLASS_DATAVIEW }
+}
+/// function's callKind; CALL_KIND_SLOW for anything but a native function.
+@inlineAlways
+pub unsafe fn callKind(function: ValueBits) -> u8 {
+  let anchor = () let object = unsafe HeapCell.payload<ObjectData, ()>(&anchor, reference(function))
+  return match &object.payload {
+    ObjectPayload.NativeFunction { function: native } => native.callKind
+    _ => CALL_KIND_SLOW
+  }
+}
+/// A CALL_KIND_STRING method's primitive entry (stringBasic.quick) on receiver;
+/// None declines (another receiver or argument), leaving the full call.
+@inlineAlways
+pub unsafe effect fn stringCall<H: HeapHooks + CoercionHooks>(hooks: &mut H, function: ValueBits, receiver: ValueBits, argv: &FrameSlots)
+  -> Option<ValueBits> ! JsException ? &mut Allocator {
+  let target = unsafe framelessTarget(function)
+  let realm = match Pointer.nonNullMut<HeapHeader>(target.realm) { Option<*mut HeapHeader>.Some { value } => value Option<*mut HeapHeader>.None => { return Option<ValueBits>.none() } }
+  let method = match target.id { NativeFunctionId.Builtin { method, .. } => method _ => { return Option<ValueBits>.none() } }
+  return run stringBasic.quick(&mut hooks, unsafe lendRealm(&realm, realm), receiver, argv, method)
+}
+/// function's id and realm, for the VM's frameless call (CALL_KIND_FRAMELESS).
+@inlineAlways
+pub unsafe fn framelessTarget(function: ValueBits) -> QuickTarget {
+  let anchor = () let object = unsafe HeapCell.payload<ObjectData, ()>(&anchor, reference(function))
+  return match &object.payload {
+    ObjectPayload.NativeFunction { function: native } => QuickTarget { id: native.function, protocol: native.protocol, realm: native.realm() }
+    _ => invariant()
+  }
 }
 /// What quick and quickWrite read of a native function: read once per call.
 pub struct QuickTarget { pub id: NativeFunctionId, pub protocol: NativeCallProtocol, pub realm: ?*mut HeapHeader }
@@ -739,25 +908,17 @@ pub const OBJECT_METHOD_COLLECTION: u8 = 4
 /// A Math method: mathCall answers it through quickMath when its arguments are numbers.
 pub const OBJECT_METHOD_MATH: u8 = 5
 pub const OBJECT_METHOD_CLOCK: u8 = 6
-/// Which of Array.prototype.push and String.fromCharCode function is, if either.
+/// This and every class after it (CALL_KIND_LEAN on): leanInline calls it.
+pub const OBJECT_METHOD_LEAN: u8 = 7
+/// pushInline's class of function: its callKind, decided when it was made
+/// (callKindOf); OBJECT_METHOD_NONE for anything but a native function.
 @inlineAlways
 pub unsafe fn objectMethod(function: ValueBits) -> u8 {
   let object = match function { ValueBits.Object { reference } => reference _ => { return OBJECT_METHOD_NONE } }
   let anchor = () let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, object)
   if data.classId() != classes.JS_CLASS_C_FUNCTION { return OBJECT_METHOD_NONE }
   return match &data.payload {
-    ObjectPayload.NativeFunction { function: native } => match native.function {
-      NativeFunctionId.Builtin { family, method } => {
-        if family == BuiltinFamily.Array && method == ARRAY_PUSH && native.protocol == NativeCallProtocol.GenericMagic { OBJECT_METHOD_PUSH }
-        else if family == BuiltinFamily.Array && method == ARRAY_POP && native.protocol == NativeCallProtocol.GenericMagic { OBJECT_METHOD_POP }
-        else if family == BuiltinFamily.Map || family == BuiltinFamily.Set || family == BuiltinFamily.WeakMap || family == BuiltinFamily.WeakSet { OBJECT_METHOD_COLLECTION }
-        else if family == BuiltinFamily.String && method == stringIds.FROM_CHAR_CODE && native.protocol != NativeCallProtocol.Data { OBJECT_METHOD_FROM_CHAR_CODE }
-        else if family == BuiltinFamily.Math && native.protocol != NativeCallProtocol.Data { OBJECT_METHOD_MATH }
-        else if family == BuiltinFamily.Date && method == DATE_NOW && native.protocol != NativeCallProtocol.Data { OBJECT_METHOD_CLOCK }
-        else { OBJECT_METHOD_NONE }
-      }
-      _ => OBJECT_METHOD_NONE
-    }
+    ObjectPayload.NativeFunction { function: native } => native.callKind
     _ => OBJECT_METHOD_NONE
   }
 }

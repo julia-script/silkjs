@@ -193,8 +193,8 @@ class ChannelWrap {
   #id;
   #lookups;
   #pending = 0;
-  constructor(timeout, tries) {
-    const id = host.net('dnsCreate', [timeout, tries]);
+  constructor(timeout, tries, maxTimeout) {
+    const id = host.net('dnsCreate', [timeout, tries, maxTimeout]);
     if (id < 0) {
       const err = new Error(`ares_init_options: ${strerror(-id)}`);
       err.code = codes[-id] ?? 'UNKNOWN';
