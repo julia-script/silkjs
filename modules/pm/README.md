@@ -88,6 +88,13 @@ project on `PATH` and the `npm_lifecycle_event`, `npm_package_name`, `npm_packag
 script that fails stops the install with the end of what it wrote, and the next install tries
 again.
 
+A repository holds sources where a registry holds what was built from them, and `prepare` is
+the script that builds. So a dependency that is a repository and has a `prepare` script is
+built when `allowBuilds` names it: its files are put in a directory of the store, an install
+there brings its development dependencies and runs its install scripts and `prepare`, and the
+files that are there then are the package. The build is kept in the store and happens once per
+commit. A repository that is not allowed is installed as it is, and listed.
+
 The `preinstall`, `install`, `postinstall` and `prepare` scripts of the project's own packages
 are the project's own commands and need no allowing. They run at the end of every install, in
 that order, a package after the packages of the workspace it depends on and the root project

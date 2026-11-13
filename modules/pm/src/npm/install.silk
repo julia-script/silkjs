@@ -49,6 +49,9 @@ pub const VIRTUAL_STORE: &'static [u8] = b".sjs"
 /// The file in the directory of a package that says its install scripts ran.
 pub const BUILT: &'static [u8] = b".built"
 
+// The first line of the marker of a package that was built from a repository.
+const FROM_SOURCE: &'static [u8] = b"built from source\n"
+
 /// How many tarballs are held in memory at once.
 const BATCH: usize = 96
 
@@ -90,8 +93,9 @@ effect fn stopAt(message: string<'static>, graph: &Graph, index: usize) -> never
   fail InstallError { message: message, subject: run label(graph, index) }
 }
 
-// What a package is recorded under in the store: its integrity string, or its SHA-1.
-effect fn identity(graph: &Graph, index: usize) -> Bytes ! OutOfMemoryError ? &mut Allocator {
+/// What package `index` of `graph` is recorded under in the store: its integrity string, or its
+/// SHA-1.
+pub effect fn identity(graph: &Graph, index: usize) -> Bytes ! OutOfMemoryError ? &mut Allocator {
   let integrity = Graph.integrity(graph, index)
   if integrity.length > 0 {
     return run Bytes.copy(integrity)
@@ -211,6 +215,10 @@ pub struct Downloader<'a> {
   // Whether a package is fetched as soon as a resolution names it. When only a part of the
   // graph is installed, what to fetch is known once the graph is whole.
   early: bool,
+  // How many packages were fetched and unpacked.
+  downloaded: usize,
+  // The packages whose files a build left, and not their tarball.
+  provided: List<usize>,
 }
 
 impl<'a> Downloader<'a> {
@@ -231,6 +239,8 @@ impl<'a> Downloader<'a> {
       running: List<PoolFiber<Done, OutOfMemoryError>>.make(),
       failure: Option<InstallError>.none(),
       early: early,
+      downloaded: 0,
+      provided: List<usize>.make(),
     }
   }
 
@@ -384,33 +394,29 @@ impl<'a> Downloader<'a> {
     }
   }
 
-  // Fetches what still waits, waits for the unpacking, and returns the files of every package.
-  effect fn finish(self: Self, graph: &Graph, summary: &mut Summary) -> List<Option<PackageFiles>>
-    ! InstallError | OutOfMemoryError ? &mut Registry | &mut Allocator {
-    let mut all = move self
+  // Fetches what waits and waits for the unpacking, so that every package that was expected
+  // has its files.
+  effect fn drain(self: &mut Self, graph: &Graph) -> () ! InstallError | OutOfMemoryError ? &mut Registry | &mut Allocator {
     while true {
-      let urls = run Downloader.next(&mut all)
+      let urls = run Downloader.next(&mut self)
       if List<Bytes>.length(&urls) == 0 {
         break
       }
       let none = List<usize>.make()
       let Fetched { documents, tarballs } = run Registry.fetch(&graph.names, List<usize>.asSlice(&none), List<Bytes>.asSlice(&urls))
       drop documents
-      run Downloader.take(&mut all, move tarballs)
+      run Downloader.take(&mut self, move tarballs)
     }
-    // Packages that were never asked about have no place in the list yet.
-    while List<Option<PackageFiles>>.length(&all.files) < Graph.count(graph) {
-      run all.files.append(Option<PackageFiles>.none())
+    let mut running = List<PoolFiber<Done, OutOfMemoryError>>.make()
+    while true {
+      match move List<PoolFiber<Done, OutOfMemoryError>>.pop(&mut self.running) {
+        Option.None => { break }
+        Option.Some { value } => { run running.append(move value) }
+      }
     }
-    let Downloader { pool, root, files: gathered, seen, waiting, asked, running, failure, .. } = move all
-    drop root
-    drop seen
-    drop waiting
-    drop asked
-    let mut files = move gathered
     let mut finished = List<Done>.make()
     if List<PoolFiber<Done, OutOfMemoryError>>.length(&running) > 0 {
-      finished = match move run Effect.result(pool.block(collect(move running))) {
+      finished = match move run Effect.result(self.pool.block(collect(move running))) {
         Result.Success { value } => move value
         Result.Failure { error } => match move error {
           OutOfMemoryError exhausted => { fail move exhausted }
@@ -418,8 +424,8 @@ impl<'a> Downloader<'a> {
         }
       }
     }
-    match move failure {
-      Option.Some { value } => { fail move value }
+    match &self.failure {
+      Option.Some { value } => { fail InstallError { message: value.message, subject: run Bytes.copy(Bytes.asSlice(&value.subject)) } }
       Option.None => {}
     }
     while true {
@@ -430,11 +436,49 @@ impl<'a> Downloader<'a> {
           if Option.isSome(&unpacked) == false {
             run stopAt(problem, graph, package)
           }
-          List<Option<PackageFiles>>.set(&mut files, package, move unpacked)
-          summary.downloaded = summary.downloaded + 1
+          List<Option<PackageFiles>>.set(&mut self.files, package, move unpacked)
+          self.downloaded = self.downloaded + 1
         }
       }
     }
+  }
+
+  /// Brings package `index` of `graph` into the store now, with whatever else was asked for,
+  /// and returns its files as they came. None when the package is not for the host.
+  ///
+  /// # Errors
+  ///
+  /// - [`InstallError`] when a package cannot be downloaded or does not match its digest.
+  pub effect fn fetch(self: &mut Self, graph: &Graph, index: usize) -> Option<&PackageFiles>
+    ! InstallError | OutOfMemoryError ? &mut Registry | &mut Allocator {
+    self.early = true
+    run Downloader.expect(&mut self, graph, index)
+    run Downloader.drain(&mut self, graph)
+    return match &List<Option<PackageFiles>>.asSlice(&self.files)[index] {
+      Option.Some { value } => Option<&PackageFiles>.some(&value)
+      Option.None => Option<&PackageFiles>.none()
+    }
+  }
+
+  /// Makes `files` what package `index` of `graph` is installed from, in place of what its
+  /// tarball holds: the package as a build left it.
+  pub effect fn provide(self: &mut Self, graph: &Graph, index: usize, files: PackageFiles) -> () ! OutOfMemoryError ? &mut Allocator {
+    drop run Downloader.missing(&mut self, graph, index)
+    List<Option<PackageFiles>>.set(&mut self.files, index, Option<PackageFiles>.some(move files))
+    run self.provided.append(index)
+  }
+
+  // Fetches what still waits, waits for the unpacking, and returns the files of every package.
+  effect fn finish(self: Self, graph: &Graph, summary: &mut Summary) -> List<Option<PackageFiles>>
+    ! InstallError | OutOfMemoryError ? &mut Registry | &mut Allocator {
+    let mut all = move self
+    run Downloader.drain(&mut all, graph)
+    // Packages that were never asked about have no place in the list yet.
+    while List<Option<PackageFiles>>.length(&all.files) < Graph.count(graph) {
+      run all.files.append(Option<PackageFiles>.none())
+    }
+    summary.downloaded = summary.downloaded + all.downloaded
+    let Downloader { files, .. } = move all
     return move files
   }
 }
@@ -985,31 +1029,9 @@ fn isChosen(workspace: &Workspace, graph: &Graph, importer: usize, chosen: &[boo
   }
 }
 
-/// Installs `graph`, the resolution of `workspace`, into the directories of the workspace.
-/// `downloader` names the store and the host, and may have fetched packages of `graph` during
-/// its resolution already; the others are fetched now. Packages that are not for the host are
-/// left out. The install scripts of the packages that `allowBuilds` of the root project allows
-/// run at the end.
-///
-/// `chosen` says, per package of the workspace, whether it is installed. A package that is not
-/// keeps the `node_modules` it has, and what only such packages depend on is neither fetched
-/// nor linked.
-///
-/// # Errors
-///
-/// - [`InstallError`] when a package cannot be downloaded or does not match its digest, when
-///   the store or `node_modules` cannot be written, or when an install script fails.
-pub effect fn install(workspace: &Workspace, graph: &Graph, downloader: Downloader<'_>, chosen: &[bool]) -> Summary
-  ! InstallError | OutOfMemoryError ? &mut Registry | &mut ChildProcess | &mut Allocator {
-  let mut summary = Summary { packages: 0, downloaded: 0, linked: 0, built: 0, blocked: Bytes.make() }
-  let rules = &Workspace.all(workspace)[0].manifest
-  // Per node: whether its install scripts are to run.
-  let mut building = List<bool>.make()
-  let mut builds = false
-  let mut fetcher = move downloader
-  let store = fetcher.store
-  let host = fetcher.host
-  // The nodes that a chosen package of the workspace reaches are the ones that are installed.
+/// Per node of `graph`, whether one of the `chosen` packages of `workspace` depends on it,
+/// directly or through other nodes.
+pub effect fn reachedNodes(workspace: &Workspace, graph: &Graph, chosen: &[bool]) -> List<bool> ! OutOfMemoryError ? &mut Allocator {
   let mut reached = List<bool>.make()
   run reached.appendRepeated(false, Graph.nodeCount(graph))
   let mut open = List<usize>.make()
@@ -1041,12 +1063,49 @@ pub effect fn install(workspace: &Workspace, graph: &Graph, downloader: Download
       edge = edge + 1
     }
   }
+  return move reached
+}
+
+/// Installs `graph`, the resolution of `workspace`, into the directories of the workspace.
+/// `downloader` names the store and the host, and may have fetched packages of `graph` during
+/// its resolution already; the others are fetched now. Packages that are not for the host are
+/// left out. The install scripts of the packages that `allowBuilds` of the root project allows
+/// run at the end.
+///
+/// `chosen` says, per package of the workspace, whether it is installed. A package that is not
+/// keeps the `node_modules` it has, and what only such packages depend on is neither fetched
+/// nor linked.
+///
+/// # Errors
+///
+/// - [`InstallError`] when a package cannot be downloaded or does not match its digest, when
+///   the store or `node_modules` cannot be written, or when an install script fails.
+pub effect fn install(workspace: &Workspace, graph: &Graph, downloader: Downloader<'_>, chosen: &[bool]) -> Summary
+  ! InstallError | OutOfMemoryError ? &mut Registry | &mut ChildProcess | &mut Allocator {
+  let mut summary = Summary { packages: 0, downloaded: 0, linked: 0, built: 0, blocked: Bytes.make() }
+  let rules = &Workspace.all(workspace)[0].manifest
+  // Per node: whether its install scripts are to run.
+  let mut building = List<bool>.make()
+  let mut builds = false
+  let mut fetcher = move downloader
+  let store = fetcher.store
+  let host = fetcher.host
+  // The nodes that a chosen package of the workspace reaches are the ones that are installed.
+  let reached = run reachedNodes(workspace, graph, chosen)
   fetcher.early = true
-  each = 0
+  let mut each: usize = 0
   while each < Graph.nodeCount(graph) {
     if List<bool>.get(&reached, each) {
       run Downloader.expect(&mut fetcher, graph, Graph.nodePackage(graph, each))
     }
+    each = each + 1
+  }
+  // Per package: whether it is installed as a build left it.
+  let mut made = List<bool>.make()
+  run made.appendRepeated(false, Graph.count(graph))
+  each = 0
+  while each < List<usize>.length(&fetcher.provided) {
+    List<bool>.set(&mut made, List<usize>.get(&fetcher.provided, each), true)
     each = each + 1
   }
   let files = run Downloader.finish(move fetcher, graph, &mut summary)
@@ -1084,7 +1143,13 @@ pub effect fn install(workspace: &Workspace, graph: &Graph, downloader: Download
     run appendDirectory(&mut home, graph, index)
     let mut marker = run Bytes.copy(Bytes.asSlice(&home))
     run marker.append(b"/.linked")
-    let links = run linksOf(graph, host, index)
+    // The marker of a package that was built from a repository says so first, since its
+    // files are other files.
+    let mut links = Bytes.make()
+    if List<bool>.get(&made, package) {
+      run links.append(FROM_SOURCE)
+    }
+    run links.append(Bytes.asSlice(&run linksOf(graph, host, index)))
     let mut unbuilt = false
     if allowed {
       let mut built = run Bytes.copy(Bytes.asSlice(&home))
@@ -1101,6 +1166,10 @@ pub effect fn install(workspace: &Workspace, graph: &Graph, downloader: Download
           false
         } else if same(Bytes.asSlice(&found), Bytes.asSlice(&links)) {
           true
+        } else if List<bool>.get(&made, package) != startsWith(Bytes.asSlice(&found), FROM_SOURCE) {
+          // In place as its tarball has it and now built, or the other way around.
+          run clear(Bytes.asSlice(&home))
+          false
         } else {
           // Linked for another graph: the dependencies beside the package are not these.
           run home.append(b"/node_modules")
