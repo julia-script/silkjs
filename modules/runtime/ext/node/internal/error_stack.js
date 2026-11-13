@@ -115,6 +115,18 @@ function install(global, isolated = false) {
     if (method && method !== name && !name.endsWith('.' + method)) display += ' [as ' + method + ']';
     return display + ' (' + place + ')';
   }
+  // A frame a source map moved, as Node's serializeJSStackFrame
+  // (lib/internal/source_map/prepare_stack_trace.js) writes it from the CallSite.
+  function stringifyMapped(frame) {
+    const fnName = (frame.functionName || (frame.isEval ? 'eval' : null)) ?? methodName(frame);
+    const prefix = frame.isAsync ? 'async ' : frame.isConstructor ? 'new ' : '';
+    // V8's GetTypeName is null unless the frame is a method call: not a constructor,
+    // not top-level code (a global or nullish receiver).
+    const type = frame.isConstructor || frame.isToplevel !== false || frame.receiver === global ? null : typeName(frame);
+    const namePrefix = type !== null && type !== 'global' ? type + '.' : '';
+    return prefix + namePrefix + (frame.mappedName || fnName || '<anonymous>') +
+      ' (' + frame.scriptName + ':' + frame.lineNumber + ':' + frame.columnNumber + ')';
+  }
   function coordinate(value) { return value > 0 ? value : null; }
   const methods = {
     getColumnNumber() { return coordinate(record(this).columnNumber); },
@@ -202,7 +214,7 @@ function install(global, isolated = false) {
         continue;
       }
       const frame = mapped ? sources.mapPosition(frames[index], { kind: 'stack', caller: frames[index + 1] }) : frames[index];
-      result += '\n    at ' + stringify(frame);
+      result += '\n    at ' + (frame.sourceMapped ? stringifyMapped(frame) : stringify(frame));
     }
     return result;
   }
