@@ -110,11 +110,12 @@ function legacyMainResolve(packageJSONUrl, packageConfig, base) {
 }
 
 /**
- * The default resolve hook: the runtime loader's import resolution of specifier
- * from context.parentURL (the cwd for an entry point), as { url, format }.
- * @param {string} specifier
+ * The default resolve hook, the end of every resolve chain: the runtime loader's
+ * resolution of specifier from context.parentURL (the cwd for an entry point), as
+ * { url, format }. A file whose format the load step detects has format null.
+ * @param {string|URL} specifier
  * @param {{ parentURL?: string, conditions?: string[] }} [context]
- * @returns {{ url: string, format?: string }}
+ * @returns {{ url: string, format?: string|null }}
  */
 function defaultResolve(specifier, context = {}) {
   const { parentURL } = context;
@@ -122,9 +123,9 @@ function defaultResolve(specifier, context = {}) {
     const { ERR_INVALID_URL } = require('internal/errors').codes;
     throw new ERR_INVALID_URL(`${parentURL}`);
   }
-  const { getOrInitializeCascadedLoader } = require('internal/modules/esm/loader');
   const parent = parentURL ?? pathToFileURL(`${process.cwd()}/`).href;
-  const { url, format } = getOrInitializeCascadedLoader().resolveSync(parent, { specifier, attributes: { __proto__: null } });
+  // Node reads a URL specifier as its href.
+  const { url, format } = host.loader.defaultResolve(`${specifier}`, { ...context, parentURL: parent });
   return { __proto__: null, url, format };
 }
 
