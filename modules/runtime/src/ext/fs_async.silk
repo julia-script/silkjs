@@ -89,11 +89,13 @@ unsafe extern "C" fn uv_metrics_idle_time(loop: *mut u8) -> u64
 /// events that were already waiting when a wait that could not block began.
 pub struct LoopMetrics { pub loopCount: u64, pub events: u64, pub eventsWaiting: u64 }
 impl Copy for LoopMetrics {}
-pub struct State { loop: *mut u8, reactor: Reactor, pool: Pool, waker: Waker, anchor: *mut u8, held: usize, due: u64, idle: u64, ready: [ReadyEvent; 64], readyCount: usize, waitBlocked: bool, guest: i32, shared: bool, skipped: bool, guestRan: u64, inflight: usize, first: ?*mut Request, delivering: ?*mut Request, watches: ?*mut Watch, nextWatch: i32, closing: bool, polling: bool, descriptors: descriptors.State, tracing: ?*mut u8, metrics: LoopMetrics }
+pub struct State { loop: *mut u8, reactor: Reactor, pool: Pool, waker: Waker, anchor: *mut u8, held: usize, due: u64, idle: u64, ready: [ReadyEvent; 64], readyCount: usize, waitBlocked: bool, guest: i32, shared: bool, skipped: bool, guestRan: u64, inflight: usize, first: ?*mut Request, delivering: ?*mut Request, watches: ?*mut Watch, nextWatch: i32, closing: bool, polling: bool, turn: u64, descriptors: descriptors.State, tracing: ?*mut u8, metrics: LoopMetrics }
 // A request is native memory that the loop owns. While it is queued or running, a worker reads
 // `call` and writes `result`; the loop reads them again only after the pool returns `job`.
 struct Request {
   next: ?*mut Request, job: pool.Job, done: bool, status: i32, requestKind: i32,
+  // The poll turn that submitted it: a turn delivers only work submitted before it began.
+  turn: u64,
   tracking: *mut descriptors.State, descriptorSettled: bool,
   callback: ValueBits, args: [ValueBits; 5], operation: List<u8>, call: ops.Call, result: ops.Outcome,
   offset: u64, bigint: bool,
@@ -141,7 +143,7 @@ pub effect fn make() -> *mut State ! OutOfMemoryError ? &mut Allocator {
     Result<Pool, OutOfMemoryError>.Failure { error } => { unsafe uv_close(loopAnchor, silkLoopAnchorClosed) let _drained = unsafe uv.uv_run(loop, 0) let _ignored = unsafe uv_loop_close(loop) unsafe free(loop) unsafe free(raw) fail move error }
   }
   let state = unsafe Intrinsic.pointerReinterpret<*mut u8, *mut State>(raw)
-  unsafe Pointer.put<State>(state, State { loop: loop, waker: reactor.waker(), reactor: move reactor, pool: move workers, anchor: loopAnchor, held: 0, due: 0, idle: 0, ready: [ReadyEvent.empty(); 64], readyCount: 0, waitBlocked: true, guest: 0, shared: false, skipped: false, guestRan: 0, inflight: 0, first: Pointer.null<Request>(), delivering: Pointer.null<Request>(), watches: Pointer.null<Watch>(), nextWatch: 1, closing: false, polling: false, descriptors: descriptors.make(), tracing: Pointer.null<u8>(), metrics: LoopMetrics { loopCount: 0, events: 0, eventsWaiting: 0 } })
+  unsafe Pointer.put<State>(state, State { loop: loop, waker: reactor.waker(), reactor: move reactor, pool: move workers, anchor: loopAnchor, held: 0, due: 0, idle: 0, ready: [ReadyEvent.empty(); 64], readyCount: 0, waitBlocked: true, guest: 0, shared: false, skipped: false, guestRan: 0, inflight: 0, first: Pointer.null<Request>(), delivering: Pointer.null<Request>(), watches: Pointer.null<Watch>(), nextWatch: 1, closing: false, polling: false, turn: 0, descriptors: descriptors.make(), tracing: Pointer.null<u8>(), metrics: LoopMetrics { loopCount: 0, events: 0, eventsWaiting: 0 } })
   return state
 }
 pub unsafe fn descriptorState(pointer: *mut State) -> *mut descriptors.State {
@@ -482,11 +484,11 @@ unsafe effect fn prepare<'m, S: EngineServices>(engine: &mut Engine<'m, S>, cont
   }
 }
 pub unsafe effect fn submit<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, pointer: *mut State, operation: ValueBits, args: ValueBits, callback: ValueBits, requestKind: i32) -> ValueBits ! OutOfMemoryError | JsException ? &mut Allocator {
-  let anchor = () let state = unsafe Pointer.borrow<(), State>(&anchor, pointer) let closing = state.closing drop state
+  let anchor = () let state = unsafe Pointer.borrow<(), State>(&anchor, pointer) let closing = state.closing let turn = state.turn drop state
   if closing { return run engine.throwError(unsafe lendRealm(&context, context), NativeErrorKind.Internal, b"filesystem executor is closed") }
   let raw = run allocate(Layout.of<Request>().bytes)
   let request = unsafe Intrinsic.pointerReinterpret<*mut u8, *mut Request>(raw)
-  unsafe Pointer.put<Request>(request, Request { next: Pointer.null<Request>(), job: pool.job(runRequest, finishRequest, raw, pool.KIND_NONE), done: false, status: 0, requestKind: requestKind, tracking: unsafe descriptorState(pointer), descriptorSettled: false, callback: unsafe callback.retained(), args: [ValueBits.Undefined; 5], operation: List<u8>.make(), call: ops.call(0), result: ops.outcome(), offset: 0, bigint: false, lease: Option<buffers.BufferReadLease>.none() })
+  unsafe Pointer.put<Request>(request, Request { next: Pointer.null<Request>(), job: pool.job(runRequest, finishRequest, raw, pool.KIND_NONE), done: false, turn: turn, status: 0, requestKind: requestKind, tracking: unsafe descriptorState(pointer), descriptorSettled: false, callback: unsafe callback.retained(), args: [ValueBits.Undefined; 5], operation: List<u8>.make(), call: ops.call(0), result: ops.outcome(), offset: 0, bigint: false, lease: Option<buffers.BufferReadLease>.none() })
   let mut mutable = () let entry = unsafe Pointer.borrowMut<(), Request>(&mut mutable, request)
   let prepared = run Effect.result(unsafe prepare(&mut engine, context, &mut entry, operation, args)) drop entry
   match move prepared { Result<(), OutOfMemoryError | JsException>.Success { .. } => () Result<(), OutOfMemoryError | JsException>.Failure { error } => { unsafe release(&mut engine, context, request) fail move error } }
@@ -512,13 +514,14 @@ unsafe fn allFinished(pointer: *mut State) -> bool {
   }
   return true
 }
-unsafe fn takeCompleted(pointer: *mut State) -> ?*mut Request {
+// The first finished request submitted before turn `before`.
+unsafe fn takeCompleted(pointer: *mut State, before: u64) -> ?*mut Request {
   let mut anchor = () let state = unsafe Pointer.borrowMut<(), State>(&mut anchor, pointer)
   let mut link = Pointer.fromMutRef<?*mut Request>(&mut state.first) drop state
   while !Pointer.isNull<Request>(unsafe Pointer.read<?*mut Request>(link)) {
     let request = unsafe nonnull(unsafe Pointer.read<?*mut Request>(link))
     let entry = unsafe Pointer.borrowMut<(), Request>(&mut anchor, request)
-    if entry.done { unsafe Pointer.put<?*mut Request>(link, entry.next) drop entry return request }
+    if entry.done && entry.turn < before { unsafe Pointer.put<?*mut Request>(link, entry.next) drop entry return request }
     link = Pointer.fromMutRef<?*mut Request>(&mut entry.next) drop entry
   }
   return Pointer.null<Request>()
@@ -591,8 +594,13 @@ unsafe effect fn pollInner<'m, S: EngineServices>(engine: &mut Engine<'m, S>, co
   let mut ran = false
   let mut mode: i32 = 2
   if timeout > 0 || (timeout < 0 && unsafe hasPending(pointer)) { mode = 1 }
+  // As libuv's uv__work_done: a turn delivers the work that finished before its callbacks ran.
+  // Work submitted from this turn's callbacks waits for the next turn, after the check phase,
+  // even when a worker finishes it first (readFile with an AbortSignal aborted by setImmediate).
+  let mut bump = () let counter = unsafe Pointer.borrowMut<(), State>(&mut bump, pointer)
+  counter.turn = counter.turn + 1 let turn = counter.turn drop counter
   unsafe collectFinished(pointer)
-  let immediate = unsafe takeCompleted(pointer)
+  let immediate = unsafe takeCompleted(pointer, turn)
   if !Pointer.isNull<Request>(immediate) {
     run unsafe deliverCompleted(&mut engine, context, pointer, unsafe nonnull(immediate))
     ran = true mode = 2
@@ -615,7 +623,7 @@ unsafe effect fn pollInner<'m, S: EngineServices>(engine: &mut Engine<'m, S>, co
   }
   unsafe collectFinished(pointer)
   while true {
-    let entry = unsafe takeCompleted(pointer) if Pointer.isNull<Request>(entry) { break }
+    let entry = unsafe takeCompleted(pointer, turn) if Pointer.isNull<Request>(entry) { break }
     run unsafe deliverCompleted(&mut engine, context, pointer, unsafe nonnull(entry))
     ran = true
   }
@@ -927,7 +935,7 @@ pub unsafe fn close<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: 
   // and handle has completed before freeing native memory or JS roots.
   unsafe uv_close(loopAnchor, silkLoopAnchorClosed)
   let _ignored = unsafe uv.uv_run(loop, 0)
-  while true { let entry = unsafe takeCompleted(pointer) if Pointer.isNull<Request>(entry) { break } unsafe release(&mut engine, context, unsafe nonnull(entry)) }
+  while true { let entry = unsafe takeCompleted(pointer, 0xffffffffffffffff) if Pointer.isNull<Request>(entry) { break } unsafe release(&mut engine, context, unsafe nonnull(entry)) }
   let state2 = unsafe Pointer.take<State>(pointer) watch = state2.watches
   while !Pointer.isNull<Watch>(watch) {
     let owner = unsafe nonnull(watch) let entry = unsafe Pointer.borrow<(), Watch>(&anchor, owner) watch = entry.next drop entry unsafe releaseWatch(&mut engine, context, owner)

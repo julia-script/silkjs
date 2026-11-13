@@ -74,7 +74,8 @@ function createLoader(host, builtins) {
   let activeConditions;
   const hooks = createHooks(defaultResolve, defaultLoad, () => builtins.get('worker_threads'),
     host.awaitModuleHook, host.loaderWorkerStatus,
-    () => builtins.get('internal/options').loaderWorkerArguments(host.workerRuntimeArgs || []));
+    () => builtins.get('internal/options').loaderWorkerArguments(host.workerRuntimeArgs || []),
+    () => builtins.get('internal/worker')._drainControl);
 
   // Node's own errors come from internal/errors, built with the arguments Node's loader
   // passes. A missing CommonJS module is a plain Error with a code, as in Node.
