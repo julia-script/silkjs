@@ -14,6 +14,7 @@ silk run -- install                 # install the package.json of the working di
 |---|---|
 | `pm install` | Installs what `package.json` lists. The lockfile decides the versions while it matches. |
 | `pm install --frozen-lockfile`, `pm ci` | The same, and fails when the lockfile is missing or out of date. |
+| `pm install --filter <name>` | Installs for one package of the workspace. `--filter <name>...` adds the packages of the workspace it depends on. The flag can be repeated. |
 | `pm add <name>[@range or tag]...` | Adds dependencies and installs them. `-D` for development, `-O` for optional, `-E` for an exact version. |
 | `pm remove <name>...` | Takes dependencies out and removes what nothing needs any more. |
 | `pm update [name]...` | Moves the named packages, or all, to the newest versions the ranges allow. |
@@ -143,6 +144,10 @@ list under `packages`. The packages are installed together:
 - Every command works from the directory of any package and installs for the whole workspace.
   `add`, `remove`, `run` and `exec` work on the package they are run in; `--filter <name>`
   (`-F`) picks another one by name, and `-w` the root project.
+- `install --filter <name>` makes the `node_modules` of that package alone and fetches only
+  what it uses, which is what the image of one service wants. A package of the workspace it
+  depends on is linked, and gets its own dependencies when the filter is `<name>...`. The
+  lockfile always covers the whole workspace, and the other packages keep what they have.
 - `.npmrc` is read from the home directory, then the root of the workspace, then the working
   directory.
 
