@@ -520,6 +520,22 @@ function setPosition(node, pos) {
   node.priorityQueuePosition = pos;
 }
 
+// Calls an immediate's callback as Node's processImmediate does. A throw clears
+// _onImmediate before the error reaches the uncaught handler, which formats its
+// stack: V8 looks method names up then, so the callback's frame reads
+// "Immediate.<anonymous>" rather than "Immediate._onImmediate".
+function runImmediate() {
+  const argv = this._argv;
+  try {
+    if (argv === undefined) this._onImmediate();
+    else this._onImmediate(...argv);
+  } catch (error) {
+    this._onImmediate = undefined;
+    this._argv = undefined;
+    // A plain rethrow would move the throw site the uncaught report prints.
+    host.rethrow(error);
+  }
+}
 function getTimerCallbacks(runNextTicks) {
   // Set when a callback threw, until the next callback runs: Node unwinds to the
   // loop then and starts the queue again without draining nextTicks first.
@@ -562,12 +578,8 @@ function getTimerCallbacks(runNextTicks) {
 
       prevImmediate = immediate;
 
-      const argv = immediate._argv;
-      afterThrow = host.invokeTimer(immediate[kAsyncResource], immediate._onImmediate,
-                                    immediate, argv === undefined ? [] : argv);
+      afterThrow = host.invokeTimer(immediate[kAsyncResource], runImmediate, immediate, []);
       if (afterThrow) {
-        immediate._onImmediate = undefined;
-        immediate._argv = undefined;
         enqueueRemoveStoresFromResource(immediate);
       } else {
         cleanImmediate(immediate);
