@@ -2071,7 +2071,7 @@ function loop() {
 const imageModules = ['fs', 'fs/promises', 'internal/fs/streams', 'internal/streams/fast-utf8-stream', 'path', 'os',
   'events', 'stream', 'stream/promises', 'string_decoder', 'util', 'assert', 'console', 'net', 'tty', 'http',
   'internal/tty/write', 'url', 'internal/url', 'internal/encoding', 'internal/abort_controller',
-  'internal/process/execution'];
+  'internal/process/execution', 'internal/modules/package_json_reader'];
 globalThis.__silkRuntime = {
   normalize(name, parent, attributes) { return loader.importKey(name, parent, attributes); },
   load(name, attributes) { return loader.loadESM(name, attributes).source; },

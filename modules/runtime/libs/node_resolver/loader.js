@@ -240,9 +240,33 @@ function createLoader(host, builtins) {
   }
 
   function packageScope(filename) {
-    const start = path.dirname(filesystemName(filename));
+    return packageScopeAt(path.dirname(filesystemName(filename)));
+  }
+
+  // The package that holds the files of a directory: the nearest package.json at or
+  // above it, short of a node_modules directory.
+  function packageScopeAt(start) {
     let scope = scopes.get(start);
     if (scope === undefined) scopes.set(start, scope = findScope(start));
+    return scope;
+  }
+
+  // The package scope of a file that require() loads. Node's CommonJS loader asks
+  // package_json_reader, which keeps the answer for the file's directory; this asks the
+  // same once for each directory (keeping its answer too), so a modules binding patched
+  // by a program is called as Node calls it.
+  let packageJsonReader;
+  const requireScopes = new Map();
+  function requireScope(disk) {
+    const directory = path.dirname(disk);
+    let scope = requireScopes.get(directory);
+    if (scope === undefined) {
+      packageJsonReader ??= builtins.get('internal/modules/package_json_reader');
+      const found = packageJsonReader.getNearestParentPackageJSON(disk);
+      // The binding read it through readPackage: no second permission check.
+      scope = found.exists ? packages.get(path.dirname(found.path)) ?? readPackage(path.dirname(found.path)) : null;
+      requireScopes.set(directory, scope);
+    }
     return scope;
   }
 
@@ -349,7 +373,7 @@ function createLoader(host, builtins) {
     if (mode === 'import' && ext !== '.js' && ext !== '') {
       throw error('ERR_UNKNOWN_FILE_EXTENSION', ext, disk);
     }
-    const pkg = ext === '.js' || mode === 'import' ? packageScope(disk) : null;
+    const pkg = mode === 'import' ? packageScope(disk) : ext === '.js' ? requireScope(disk) : null;
     // get_format.js getFormatOfExtensionlessFile: a module scope's extensionless Wasm.
     if (pkg && pkg.data.type === 'module') return ext === '' && mode === 'import' && wasmMagic(disk) ? 'wasm' : 'module';
     if (ext === '' && mode === 'import' && (!pkg || pkg.data.type !== 'commonjs') && wasmMagic(disk)) return 'wasm';
@@ -2158,7 +2182,7 @@ function createLoader(host, builtins) {
 
   // A file's package scope "type" (run_main.js shouldUseESMLoader asks for the main).
   const packageType = filename => packageScope(filename)?.data.type;
-  return { packageType, decorateModuleError, moduleEvaluationError, realmResolve, resolveImport, importKey, moduleSource, requireFor, runMain, defaultRunMain, warmMain, resolve, resolveMain, loadESM, cleanSource, prepareSource, bridge, Module, mockModule };
+  return { packageType, readPackage, packageScopeAt, decorateModuleError, moduleEvaluationError, realmResolve, resolveImport, importKey, moduleSource, requireFor, runMain, defaultRunMain, warmMain, resolve, resolveMain, loadESM, cleanSource, prepareSource, bridge, Module, mockModule };
 }
 
 module.exports = { createLoader };

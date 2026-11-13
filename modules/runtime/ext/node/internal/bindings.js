@@ -114,6 +114,8 @@ const kBindings = {
   spawn_sync: () => require('internal/child_process').spawn_sync,
   zlib: () => require('internal/compression/handle'),
   builtins: () => builtins(),
+  // node_modules.cc: package.json reads and package scopes, as the loader keeps them.
+  modules: () => require('internal/modules_binding'),
   // node_options.cc: the option table, by type and by environment setting.
   options: () => {
     const { optionTypes, envVarSettings, getCLIOptionsInfo } = require('internal/options');

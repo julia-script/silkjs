@@ -232,6 +232,12 @@ const binding = {
     } finally { if (!isUserFd) c.native('close', [fd]); }
   },
   statfs(path, bigint, req) { return same(req, 'statfs', [path, { bigint: !!bigint }], value => fillStatFs(value, bigint)); },
+  // node_file.cc InternalModuleStat: 0 for a file, 1 for a directory, a negative errno
+  // otherwise, without the permission checks of a public stat.
+  internalModuleStat(path) {
+    const type = require('internal/host').moduleType(`${path}`, true);
+    return type === 0o100000 ? 0 : type === 0o040000 ? 1 : -2;
+  },
 };
 
 module.exports = binding;
