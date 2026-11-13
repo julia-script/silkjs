@@ -97,7 +97,17 @@ function install(global, isolated = false) {
   // V8's SerializeJSStackFrame: an async stack trace frame is "async " then the frame.
   // A combinator waiting in the async stack trace, as V8 writes it.
   const combinatorNames = ['all', 'allSettled', 'any'];
+  // V8's SerializeWasmStackFrame: [module.]name (url:wasm-function[index]:0xoffset).
+  function stringifyWasm(frame) {
+    const name = frame.functionName;
+    const module = frame.wasmModule;
+    const place = (frame.scriptName || '<anonymous>') + ':wasm-function[' + frame.wasmFunction + ']:0x' +
+      (frame.columnNumber - 1).toString(16);
+    if (!name && !module) return place;
+    return (module ? (name ? module + '.' + name : module) : name) + ' (' + place + ')';
+  }
   function stringify(frame) {
+    if (frame.wasmFunction >= 0) return stringifyWasm(frame);
     if (frame.promiseCombinator >= 0) return 'async Promise.' + combinatorNames[frame.promiseCombinator] + ' (index ' + frame.promiseIndex + ')';
     return frame.isAsync ? 'async ' + stringifyFrame(frame) : stringifyFrame(frame);
   }
@@ -199,6 +209,7 @@ function install(global, isolated = false) {
       scriptMetadata: raw[16],
       sourceLineNumber: raw[18], sourceColumnNumber: raw[19], isAsync: raw[20] === true,
       promiseCombinator: raw[23], promiseIndex: raw[24],
+      wasmFunction: raw[25], wasmModule: raw[26],
     };
   }
   function defaultFormat(error, frames, sites) {
@@ -313,7 +324,7 @@ function framesOf(error) {
 function origin(error) {
   const frames = (typeof error === 'object' && error !== null) ? host.errorStackState?.frames.get(error) : undefined;
   if (!frames) return undefined;
-  for (const frame of frames) if (!frame.isNative && frame.lineNumber > 0 && frame.scriptName) return frame;
+  for (const frame of frames) if (!frame.isNative && frame.wasmFunction < 0 && frame.lineNumber > 0 && frame.scriptName) return frame;
   return undefined;
 }
 

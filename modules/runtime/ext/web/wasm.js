@@ -4,6 +4,7 @@ const { wasmNative: native, wasmRealmState, registerWasmRealm, wasmCodeGeneratio
 const { Buffer } = require('buffer');
 const compileOptions = require('internal/web/wasm/compile_options');
 const { records, wrappers, suspension, exceptionStacks, builtinTraps } = wasmRealmState;
+const { captureStackTrace } = Error;
 const apply = Reflect.apply;
 const arrayBufferLength = Object.getOwnPropertyDescriptor(ArrayBuffer.prototype, 'byteLength').get;
 const typedArrayPrototype = Object.getPrototypeOf(Uint8Array.prototype);
@@ -453,18 +454,24 @@ for (const Constructor of Object.values(constructors).concat(Suspending)) {
 }
 for (const key of ['imports', 'exports', 'customSections']) Object.defineProperty(Module, key, { enumerable: true });
 const builtins = compileOptions.createBuiltins(RuntimeError, native, builtinTraps);
+// An error the native side raises. Its stack starts where V8's would: at the
+// trapping Wasm frame, or the JS frame that called into the API.
+function nativeError(kind, message) {
+  const Constructor = { compile: CompileError, link: LinkError, runtime: RuntimeError, suspend: SuspendError, type: TypeError, range: RangeError }[kind];
+  if (!Constructor) throw new TypeError('Invalid native WebAssembly error kind');
+  let error;
+  if (kind === 'runtime') error = new Constructor(trapMessage(message));
+  else if (kind === 'compile' || kind === 'link') error = new Constructor(apiMessage(engineMessage(message)));
+  else error = new Constructor(message);
+  captureStackTrace(error, nativeError);
+  return error;
+}
 registerWasmRealm(globalThis, {
   wrap,
   parseOptions: compileOptions.parse,
   builtin: builtins.resolve,
   builtinTrap: builtins.isTrap,
-  error(kind, message) {
-    const Constructor = { compile: CompileError, link: LinkError, runtime: RuntimeError, suspend: SuspendError, type: TypeError, range: RangeError }[kind];
-    if (!Constructor) throw new TypeError('Invalid native WebAssembly error kind');
-    if (kind === 'runtime') return new Constructor(trapMessage(message));
-    if (kind === 'compile' || kind === 'link') return new Constructor(apiMessage(engineMessage(message)));
-    return new Constructor(message);
-  },
+  error: nativeError,
   unwrap(value, kind) {
     const state = records.get(value);
     return state && state.kind === kind ? state.handle : undefined;

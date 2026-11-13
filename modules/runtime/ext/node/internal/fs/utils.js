@@ -22,8 +22,9 @@ Object.assign(errnoNames, os.platform === 'darwin' ? { 11: 'EDEADLK', 35: 'EAGAI
 function error(code, syscall, path, dest, errno) {
   const message = errno === undefined ? code : host.utilErrorMessage(-Math.abs(errno));
   const e = new Error(`${code}: ${message}, ${syscall}${path === undefined ? '' : ` '${path}'`}${dest === undefined ? '' : ` -> '${dest}'`}`);
-  e.code = code; e.syscall = syscall;
+  // uvException's order: errno, code, syscall, path, dest.
   if (errno !== undefined) e.errno = -Math.abs(errno);
+  e.code = code; e.syscall = syscall;
   if (path !== undefined) e.path = path;
   if (dest !== undefined) e.dest = dest;
   return e;
@@ -104,37 +105,11 @@ function syncFlag() { if (constants.O_SYNC === undefined) throw error('ENOSYS', 
 // pread/pwrite receive [fd, ArrayBuffer, absoluteByteOffset, length, position]
 // and preserve the descriptor's current offset. Metadata includes blksize,
 // birthtimeMs and, for bigint requests, exact integer fields and *timeNs.
-const kSyncCategory = 'node,node.fs,node.fs.sync';
-// Node names a sync trace event after its binding call: copyFile is copyfile, scandir readdir.
-const syncNames = { __proto__: null, copyFile: 'copyfile', scandir: 'readdir' };
-function traced(operation, call, self, args) {
-  const name = `fs.sync.${syncNames[operation] ?? operation}`;
-  trace.emit(kSyncCategory, name, 'B');
-  try { return Reflect.apply(call, self, args); }
-  finally { trace.emit(kSyncCategory, name, 'E'); }
-}
-// Node's Environment::PrintSyncTrace for --trace-sync-io: host.traceSyncIO is set when
-// the event loop starts, and each sync call then prints up to 10 frames of its stack.
-function printSyncTrace() {
-  const frames = host.captureCallSites(10, native);
-  let text = `(node:${process.pid}) WARNING: Detected use of sync API\n`;
-  for (let index = 0; index < frames.length; index++) {
-    const { functionName, scriptName, lineNumber, columnNumber } = frames[index];
-    text += functionName ? `    at ${functionName} (${scriptName}:${lineNumber}:${columnNumber})\n` : `    at ${scriptName}:${lineNumber}:${columnNumber}\n`;
-  }
-  host.stderr.write(text);
-}
-function native(operation, args) {
-  if (typeof host.fsSync !== 'function') throw error('ENOSYS', operation, typeof args[0] === 'string' ? args[0] : undefined);
-  if (host.traceSyncIO) printSyncTrace();
-  if (!syncTracing) return host.fsSync(operation, args);
-  return traced(operation, host.fsSync, host, [operation, args]);
-}
+const { native, traced, setSyncTracing } = require('internal/fs/sync_call');
 // The sync calls fs makes on os directly, traced only while the category is on.
 const tracedOS = ['mkdir', 'read', 'readlink', 'realpath', 'rename', 'symlink', 'utimes', 'write'];
-let syncTracing = false;
-trace.watch(kSyncCategory, on => {
-  syncTracing = on;
+trace.watch('node,node.fs,node.fs.sync', on => {
+  setSyncTracing(on);
   for (const name of tracedOS) {
     if (on) os[name] = function (...args) { return traced(name, rawOS[name], rawOS, args); };
     else delete os[name];
