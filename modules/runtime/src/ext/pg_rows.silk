@@ -1,0 +1,210 @@
+//! Postgres DataRow decoding for postgres.js (see internal/postgres_rows.js).
+//! Native host 39: pgRows(buffer, template, result, rows) reads the DataRow
+//! messages at the start of buffer into row objects with template's shape and
+//! appends them to result, which must be a fast Array holding exactly rows
+//! elements. template's slots name the columns in order and say how to read
+//! each one: 0 text, 1 number (decimal integers only), 2 boolean. Returns the
+//! bytes consumed: it stops at the first message that is not a complete
+//! DataRow of that width, or whose numbers are not plain integers, and the
+//! caller handles that message itself.
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.mem.pointer { Pointer }
+import silk.core.effect { Effect }
+import silk.core.result { Result }
+import silk.num.i32
+import silk.num.i64
+import silk.num.u8
+import silk.num.u32
+import silk.num.u64
+import silk.num.usize
+import silkjs.js_engine { Engine }
+import silkjs.js_engine_host { EngineServices }
+import silkjs.js_heap { HeapCell, HeapHeader }
+import silkjs.js_core_types { FrameSlots, ObjectData, ObjectPayload, ShapeData, SlotBits }
+import silkjs.js_value { ValueBits }
+import silkjs.js_exceptions { JsException }
+import silkjs.js_string_types { StringLengthError }
+import silkjs.js_strings { Strings }
+import silkjs.js_realm { lendRealm }
+import silkjs.js_buffer_storage { BufferState }
+import silkjs.js_buffer_storage as buffers
+import silkjs.js_object_allocate as objects
+import silkjs.js_array_storage as arrays
+import silkjs.js_shapes as shapes
+import silkjs.js_class_data as classes
+import silkjs.js_proxy_core as core
+import silkjs.js_runtime as runtime
+import silkjs.js_std_support as common
+import libs.core.owners as owners
+import ext.buffer_codec as codec
+
+const MAX_COLUMNS: usize = 64
+
+/// The bytes of a private buffer from start on, borrowed for the call: nothing
+/// in it runs JavaScript, so the backing stays put.
+unsafe fn bytesAt<'a>(anchor: &'a (), state: BufferState, start: u64, length: u64) -> &'a [u8] {
+  return unsafe Pointer.borrowMany<(), u8>(anchor, unsafe Pointer.assumeMany<u8>(unsafe buffers.dataAt(state.data, start)), u64.toUsize(length))
+}
+@inlineAlways
+unsafe fn at(bytes: &[u8], offset: usize) -> *const u8 {
+  return unsafe Pointer.at<u8>(unsafe Intrinsic.pointerRequalify<?[*]const u8, [*]const u8>(Pointer.fromSlice<u8>(bytes)), offset)
+}
+/// The big-endian u32 at offset, which the caller has checked is at least four
+/// bytes from the end.
+@inlineAlways
+unsafe fn word(bytes: &[u8], offset: usize) -> u64 {
+  let raw = unsafe Pointer.readUnaligned<u32>(unsafe Intrinsic.pointerReinterpret<*const u8, *const align(1) u32>(unsafe at(bytes, offset)))
+  return u32.toU64(u32.shiftLeft(raw, 24) | u32.bitAnd(u32.shiftLeft(raw, 8), 0xff0000) | u32.bitAnd(u32.shiftRight(raw, 8), 0xff00) | u32.shiftRight(raw, 24))
+}
+/// A plain decimal integer of at most 15 digits, or none.
+fn integer(bytes: &[u8], start: usize, end: usize, out: &mut ValueBits) -> bool {
+  let mut index = start
+  let negative = index < end && bytes[index] == 45
+  if negative { index = index + 1 }
+  if index == end || end - index > 15 { return false }
+  let mut value: i64 = 0
+  while index < end {
+    let digit = bytes[index]
+    if digit < 48 || digit > 57 { return false }
+    value = value * 10 + u8.toI64(digit - 48)
+    index = index + 1
+  }
+  if negative {
+    if value == 0 { out.* = ValueBits.Float64 { value: -0.0 } return true }
+    value = 0 - value
+  }
+  out.* = if value >= -2147483648 && value <= 2147483647 { ValueBits.Int { value: i64.toI32(value) } } else { ValueBits.number(i64.toF64(value)) }
+  return true
+}
+/// Whether bytes[start..end] are all ASCII.
+fn ascii(bytes: &[u8], start: usize, end: usize) -> bool {
+  let mut i = start
+  while end - i >= 8 {
+    let eight = unsafe Pointer.readUnaligned<u64>(unsafe Intrinsic.pointerReinterpret<*const u8, *const align(1) u64>(unsafe at(bytes, i)))
+    if u64.bitAnd(eight, 0x8080808080808080) != 0 { return false }
+    i = i + 8
+  }
+  while i < end { if bytes[i] >= 0x80 { return false } i = i + 1 }
+  return true
+}
+unsafe fn fastCount(array: *mut HeapHeader) -> i64 {
+  let anchor = () let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, array)
+  if data.classId() != classes.JS_CLASS_ARRAY || !data.extensible() { return -1 }
+  return match &data.payload {
+    ObjectPayload.FastArray { array: fast } => usize.toI64(fast.values().length())
+    _ => -1
+  }
+}
+pub unsafe effect fn dispatch<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, argc: i32, argv: &FrameSlots) -> ValueBits
+  ! OutOfMemoryError | JsException ? &mut Allocator {
+  let input = unsafe common.argument(argv, argc, 0)
+  let template = unsafe common.argument(argv, argc, 1)
+  let result = unsafe common.argument(argv, argc, 2)
+  let rowsArgument = unsafe common.argument(argv, argc, 3)
+  let none = ValueBits.Int { value: 0 }
+  if unsafe buffers.classId(input) != classes.JS_CLASS_UINT8_ARRAY { return none }
+  let templateNode = match template { ValueBits.Object { reference } => reference _ => { return none } }
+  let resultNode = match result { ValueBits.Object { reference } => reference _ => { return none } }
+  let expected = match rowsArgument { ValueBits.Int { value } => i32.toI64(value) _ => { return none } }
+  if unsafe fastCount(resultNode) != expected { return none }
+  // The template's kinds, one per slot.
+  let mut kinds: [u8; 64] = [0; 64]
+  let anchor = ()
+  let templateData = unsafe HeapCell.payload<ObjectData, ()>(&anchor, templateNode)
+  if templateData.classId() != classes.JS_CLASS_OBJECT { return none }
+  let shape = templateData.shape
+  // Rows share the template's shape, which only an interned shape allows.
+  if !(unsafe HeapCell.payload<ShapeData, ()>(&anchor, shape)).isHashed { return none }
+  let width = (unsafe HeapCell.payload<ShapeData, ()>(&anchor, shape)).properties.length()
+  if width == 0 || width > MAX_COLUMNS || templateData.slotCount() != width { return none }
+  let mut c: usize = 0
+  while c < width {
+    match (unsafe templateData.slotUnchecked(c)).valueBits() {
+      ValueBits.Int { value } => { if value < 0 || value > 2 { return none } kinds[c] = i32.toU8(value) }
+      _ => { return none }
+    }
+    c = c + 1
+  }
+  drop templateData
+  let object = core.reference(input)
+  if unsafe buffers.isOutOfBounds(object) { return none }
+  let count = unsafe buffers.count(object)
+  let view = unsafe buffers.view(object)
+  let state = unsafe buffers.snapshot(view.buffer)
+  let base = view.offset
+  // Shared memory takes the JavaScript path, which loads it atomically.
+  if state.physicalCapacity != 0 || count < 7 { return none }
+  let bytesAnchor = ()
+  let bytes = unsafe bytesAt(&bytesAnchor, state, base, count)
+  let memory = engine.memory
+  let realm = unsafe lendRealm(&context, context)
+  // The row's values, owned until the row takes them.
+  let mut values: [ValueBits; 64] = [ValueBits.Undefined; 64]
+  let mut filled: usize = 0
+  let total = u64.toUsize(count)
+  let mut offset: usize = 0
+  while total - offset >= 7 {
+    if bytes[offset] != 68 { break }
+    let length = unsafe word(bytes, offset + 1)
+    if length < 6 || length > usize.toU64(total - offset - 1) { break }
+    let end = offset + 1 + u64.toUsize(length)
+    let columns = u32.toUsize(u32.shiftLeft(u8.toU32(bytes[offset + 5]), 8) | u8.toU32(bytes[offset + 6]))
+    if columns != width { break }
+    // Read every column before making anything, so a decline leaves no row.
+    let mut index = offset + 7
+    let mut complete = true
+    let mut i: usize = 0
+    while i < width {
+      if end - index < 4 { complete = false break }
+      let size = unsafe word(bytes, index)
+      index = index + 4
+      if size == 0xffffffff { values[i] = ValueBits.Null filled = i + 1 i = i + 1 continue }
+      if size > usize.toU64(end - index) { complete = false break }
+      let stop = index + u64.toUsize(size)
+      let kind = kinds[i]
+      if kind == 1 {
+        let mut number = ValueBits.Undefined
+        if !integer(bytes, index, stop, &mut number) { complete = false break }
+        values[i] = number
+      } else if kind == 2 {
+        values[i] = ValueBits.Bool { value: size == 1 && bytes[index] == 116 }
+      } else {
+        let made = if ascii(bytes, index, stop) {
+          run Effect.result(Strings.fromLatin1(unsafe bytesAt(&bytesAnchor, state, base + usize.toU64(index), size)))
+        } else {
+          run Effect.result(unsafe codec.decode(state, base + usize.toU64(index), base + usize.toU64(stop), false))
+        }
+        match move made {
+          Result<ValueBits, OutOfMemoryError | StringLengthError>.Success { value } => { values[i] = value }
+          Result<ValueBits, OutOfMemoryError | StringLengthError>.Failure { .. } => { complete = false break }
+        }
+      }
+      index = stop
+      i = i + 1
+      filled = i
+    }
+    if !complete || index != end {
+      let mut r: usize = 0 while r < filled { unsafe owners.release(&mut engine, context, values[r]) r = r + 1 }
+      break
+    }
+    unsafe shapes.take(unsafe runtime.contextRuntime(context), shape)
+    let created = run Effect.result(unsafe objects.recordFromShapeWritten(&mut engine, memory, realm, shape, width))
+    let node = match move created {
+      Result<ValueBits, OutOfMemoryError>.Success { value } => match value { ValueBits.Object { reference } => reference _ => Intrinsic.trap("postgres row is not an object") }
+      Result<ValueBits, OutOfMemoryError>.Failure { error } => {
+        let mut r: usize = 0 while r < filled { unsafe owners.release(&mut engine, context, values[r]) r = r + 1 }
+        fail move error
+      }
+    }
+    let mut rowAnchor = ()
+    let data = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut rowAnchor, node)
+    data.slotListMut().clear()
+    let mut k: usize = 0
+    while k < width { data.pushSlot(SlotBits.value(values[k])) k = k + 1 }
+    drop data
+    filled = 0
+    let _stored = run unsafe arrays.appendFastElement(&mut engine, realm, resultNode, ValueBits.Object { reference: node })
+    offset = end
+  }
+  return ValueBits.number(usize.toF64(offset))
+}

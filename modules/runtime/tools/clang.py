@@ -39,6 +39,12 @@ if arguments and not non_final.intersection(arguments):
             # Code generation options have nothing left to apply to.
             while '-mllvm' in arguments:
                 del arguments[arguments.index('-mllvm'):arguments.index('-mllvm') + 2]
-            with open(os.path.join(BUILD, 'link-command.json'), 'w') as record:
-                json.dump({'directory': os.getcwd(), 'compiler': compiler, 'arguments': arguments}, record)
+    # A Silk that compiles the program to an object itself (one kept beside the output)
+    # links that object: record every final link, not only one from IR.
+    os.makedirs(BUILD, exist_ok=True)
+    with open(os.path.join(BUILD, 'link-command.json'), 'w') as record:
+        json.dump({'directory': os.getcwd(), 'compiler': compiler, 'arguments': arguments}, record)
+elif '-c' in arguments and '-x' in arguments and arguments[arguments.index('-x') + 1] == 'ir' and sys.platform != 'darwin':
+    # The program's own compile, by such a Silk: one section per function, as above.
+    arguments.append('-ffunction-sections')
 os.execvp(compiler, [compiler, *arguments])

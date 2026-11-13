@@ -21,11 +21,11 @@ function bytes(value, name = 'value') {
   throw invalidArgType(name, ['string', 'Buffer', 'TypedArray', 'DataView'], value);
 }
 // Views pass as they are: the binding copies their bytes from the backing.
-function native(op) {
-  const args = [];
-  for (let index = 1; index < arguments.length; index++) {
-    const value = arguments[index];
-    args.push(typeof value === 'boolean' ? Number(value) : value);
+// The rest array is the argument list host.tls takes (booleans as numbers): no
+// arguments object and no second array.
+function native(op, ...args) {
+  for (let index = 0; index < args.length; index++) {
+    if (typeof args[index] === 'boolean') args[index] = Number(args[index]);
   }
   try { return host.tls(op, args); }
   catch (err) { throw decorate(err); }

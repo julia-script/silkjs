@@ -966,42 +966,55 @@ function writeFloatBackwards(val, offset = 0) {
   return offset;
 }
 
-class FastBuffer extends Uint8Array {}
+class FastBuffer extends Uint8Array {
+  // Node's explicit constructor: the default one spreads its arguments through
+  // Array.prototype[Symbol.iterator], which user code can replace, and allocates.
+  // eslint-disable-next-line no-useless-constructor
+  constructor(bufferOrLength, byteOffset, length) {
+    super(bufferOrLength, byteOffset, length);
+  }
+}
 
 function asciiWrite(buf, string, offset = 0, length) {
-  offset = Number(offset);
-  if (offset < 0 || offset > buf.byteLength) {
+  // Numbers as they are: Number() is a call, and pool offsets are numbers already.
+  if (typeof offset !== 'number') offset = Number(offset);
+  const byteLength = buf.byteLength;
+  if (offset < 0 || offset > byteLength) {
     throw new ERR_BUFFER_OUT_OF_BOUNDS('offset');
   }
-  if (length === undefined) length = buf.byteLength - offset;
-  else length = Number(length);
-  if (length < 0 || length > buf.byteLength - offset) {
+  if (length === undefined) length = byteLength - offset;
+  else if (typeof length !== 'number') length = Number(length);
+  if (length < 0 || length > byteLength - offset) {
     throw new ERR_BUFFER_OUT_OF_BOUNDS('length');
   }
   return asciiWriteStatic(buf, string, offset, length);
 }
 
 function latin1Write(buf, string, offset = 0, length) {
-  offset = Number(offset);
-  if (offset < 0 || offset > buf.byteLength) {
+  // Numbers as they are: Number() is a call, and pool offsets are numbers already.
+  if (typeof offset !== 'number') offset = Number(offset);
+  const byteLength = buf.byteLength;
+  if (offset < 0 || offset > byteLength) {
     throw new ERR_BUFFER_OUT_OF_BOUNDS('offset');
   }
-  if (length === undefined) length = buf.byteLength - offset;
-  else length = Number(length);
-  if (length < 0 || length > buf.byteLength - offset) {
+  if (length === undefined) length = byteLength - offset;
+  else if (typeof length !== 'number') length = Number(length);
+  if (length < 0 || length > byteLength - offset) {
     throw new ERR_BUFFER_OUT_OF_BOUNDS('length');
   }
   return latin1WriteStatic(buf, string, offset, length);
 }
 
 function utf8Write(buf, string, offset = 0, length) {
-  offset = Number(offset);
-  if (offset < 0 || offset > buf.byteLength) {
+  // Numbers as they are: Number() is a call, and pool offsets are numbers already.
+  if (typeof offset !== 'number') offset = Number(offset);
+  const byteLength = buf.byteLength;
+  if (offset < 0 || offset > byteLength) {
     throw new ERR_BUFFER_OUT_OF_BOUNDS('offset');
   }
-  if (length === undefined) length = buf.byteLength - offset;
-  else length = Number(length);
-  if (length < 0 || length > buf.byteLength - offset) {
+  if (length === undefined) length = byteLength - offset;
+  else if (typeof length !== 'number') length = Number(length);
+  if (length < 0 || length > byteLength - offset) {
     throw new ERR_BUFFER_OUT_OF_BOUNDS('length');
   }
   return utf8WriteStatic(buf, string, offset, length);

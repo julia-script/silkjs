@@ -155,7 +155,7 @@ host.stripTypeScriptModuleTypes = (source, filename, sourceURL = filename) => {
   }
   // --experimental-transform-types implies --enable-source-maps unless it is turned off.
   const mode = transform ? 'transform' : 'strip-only', sourceMap = transform && host.enableSourceMaps !== false;
-  const strip = () => internalRequire('internal/typescript').stripTypeScriptModuleTypes(source, filename, mode, sourceMap, sourceURL);
+  const strip = () => internalRequire('internal/modules/typescript').stripTypeScriptModuleTypes(source, filename, mode, sourceMap, sourceURL);
   return moduleHas('internal/compile_cache') ? internalRequire('internal/compile_cache').transpile(source, filename, mode, sourceMap, strip) : strip();
 };
 // These ephemeron registries share brands without rooting other realms. Only
@@ -359,16 +359,11 @@ host.diagnostics = {
   watch(name, callback) { this.watchers.set(name, callback); },
   status(name, active) { const callback = this.watchers.get(name); if (callback !== undefined) callback(active); },
 };
-host.nextTick = function nextTick(callback) {
+host.nextTick = function nextTick(callback, ...args) {
   if (typeof callback !== 'function') throw new (internalRequire('internal/errors').codes.ERR_INVALID_ARG_TYPE)('callback', 'function', callback);
-  // As Node's nextTick: an arguments array only when there are arguments.
-  const count = arguments.length;
-  let args;
-  if (count > 1) {
-    args = [];
-    for (let index = 1; index < count; index++) args.push(arguments[index]);
-  }
-  ticks.push(callback, args, tickScope());
+  // As Node's nextTick: an arguments array only when there are arguments. A rest array
+  // costs a fifth of an arguments object, and runs no iterator.
+  ticks.push(callback, args.length === 0 ? undefined : args, tickScope());
 };
 // A tick's async scope. With no hooks it is the callback context itself, the TickObject
 // resource: no InternalResource to build and destroy. The run emits before, after and
@@ -2140,6 +2135,9 @@ globalThis.__silkRuntime = {
       meta.filename = filename;
     }
     meta.main = mainModuleName !== undefined && url === asURL(mainModuleName);
+    // The loader's patched postgres.js connection.js reads its row decoder here.
+    if (meta.filename !== undefined && /[\\/]node_modules[\\/]postgres[\\/]src[\\/]connection\.js$/.test(meta.filename))
+      Object.defineProperty(meta, 'silkPostgresRows', { value: internalRequire('internal/postgres_rows') });
     meta.resolve = function resolve(specifier, parent) {
       // Only --experimental-import-meta-resolve gives the second argument meaning.
       let from = name;
@@ -2165,6 +2163,11 @@ globalThis.__silkRuntime = {
   asyncDestroy: asyncHooks._nativeDestroy,
   drainDestroy: asyncHooks._drainDestroy,
   workerError: workerThreads._reportError,
+  // A worker that terminate() stopped still ends its profilers (Node's EndStartedProfilers).
+  stopped() {
+    if (moduleHas('internal/heap_prof')) internalRequire('internal/heap_prof').finish();
+    if (moduleHas('internal/profiler_binding')) internalRequire('internal/profiler_binding').finish();
+  },
   run: () => invoke(run, undefined, []), loop, onRejection,
   // The loop for an embedder (src/runtime/embed.silk).
   loopStart, loopTimeout, loopEnd,

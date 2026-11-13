@@ -5,7 +5,7 @@
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.mem.pointer { Pointer }
 import silkjs.js_owned_value { lendFor }
-import silkjs.js_realm { lendRealm }
+import silkjs.js_realm { lendRealm, lendArguments }
 import silk.core.effect { Effect }
 import silk.core.result { Result }
 import silk.core.option { Option }
@@ -67,7 +67,24 @@ fn utf8Length(input: ValueBits) -> usize {
     else { length = length + 4 }
   }
 }
+// A flat narrow string's bytes into private (unshared) bytes, up to capacity: what
+// latin1 writes, and what UTF-8 writes too when the text is all ASCII. No rope walk
+// and no per-byte store dispatch, for the short header and body texts HTTP writes.
+unsafe fn copyNarrow(input: ValueBits, state: BufferState, offset: u64, capacity: u64) -> u64 {
+  let bytes = unsafe Strings.flatLatin1(&input, input)
+  let mut count = bytes.length
+  if usize.toU64(count) > capacity { count = u64.toUsize(capacity) }
+  let target = unsafe buffers.dataAt(state.data, offset)
+  let mut i: usize = 0
+  while i < count {
+    unsafe Pointer.write<u8>(unsafe Pointer.atMut<u8>(unsafe Pointer.assumeManyMut<u8>(target), i), bytes[i])
+    i = i + 1
+  }
+  return usize.toU64(count)
+}
+fn flatNarrow(input: ValueBits) -> bool { return input.tag() == -7 && !Strings.isWide(input) }
 unsafe fn encode(input: ValueBits, state: BufferState, offset: u64, capacity: u64, utf16: bool) -> u64 {
+  if !utf16 && state.physicalCapacity == 0 && Strings.isFlatAscii(input) { return unsafe copyNarrow(input, state, offset, capacity) }
   let mut iterator = RopeIterator.make(&input)
   let mut pending = END
   let mut written: u64 = 0
@@ -104,6 +121,7 @@ unsafe fn encode(input: ValueBits, state: BufferState, offset: u64, capacity: u6
 }
 // latin1 and ascii write: each UTF-16 unit's low byte, as Node does.
 unsafe fn encodeLatin1(input: ValueBits, state: BufferState, offset: u64, capacity: u64) -> u64 {
+  if state.physicalCapacity == 0 && flatNarrow(input) { return unsafe copyNarrow(input, state, offset, capacity) }
   let mut iterator = RopeIterator.make(&input)
   let mut written: u64 = 0
   while written < capacity {
@@ -144,7 +162,7 @@ unsafe fn decodeScalar(state: BufferState, index: &mut u64, end: u64) -> u32 {
   }
   return point
 }
-unsafe effect fn decode(state: BufferState, start: u64, end: u64, utf16: bool) -> ValueBits
+pub unsafe effect fn decode(state: BufferState, start: u64, end: u64, utf16: bool) -> ValueBits
   ! OutOfMemoryError | StringLengthError ? &mut Allocator {
   let mut builder = StringBuilder.make()
   let mut index = start
@@ -208,10 +226,46 @@ unsafe effect fn extent<'m, S: EngineServices>(engine: &mut Engine<'m, S>, conte
 // 5: latin1/ascii write(string, Uint8Array, offset, capacity) -> byte count
 // 6/7: latin1/ascii decode(Uint8Array, start, end) -> owned string
 // 8: utf8 decode as 3, or undefined when the view or offsets need the generic path
+// 9: subarray (see subarray above)
+// Node's adjustOffset for a number; none for anything that needs coercion.
+fn adjustOffset(value: ValueBits, length: f64, fallback: f64, out: &mut f64) -> bool {
+  match value { ValueBits.Undefined => { out.* = fallback return true } _ => () }
+  if !value.isNumber() { return false }
+  let number = value.numericValue()
+  if number != number { out.* = 0.0 return true }
+  let offset = f64.trunc(number)
+  if offset == 0.0 { out.* = 0.0 return true }
+  if offset < 0.0 { let from = offset + length out.* = if from > 0.0 { from } else { 0.0 } return true }
+  out.* = if offset < length { offset } else { length }
+  return true
+}
+// 9: Buffer.prototype.subarray(view, start, end, FastBuffer): a FastBuffer over
+// view's bytes, constructed as `new FastBuffer(buffer, offset, length)` without
+// running its (implicit) constructor; undefined when the view or offsets need
+// the generic path.
+unsafe effect fn subarray<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, argc: i32, argv: &FrameSlots) -> ValueBits
+  ! OutOfMemoryError | JsException ? &mut Allocator {
+  let input = unsafe common.argument(argv, argc, 1)
+  if unsafe buffers.classId(input) != classes.JS_CLASS_UINT8_ARRAY { return ValueBits.Undefined }
+  let object = core.reference(input)
+  if unsafe buffers.isOutOfBounds(object) { return ValueBits.Undefined }
+  let length = u64.toF64(unsafe buffers.count(object))
+  let mut start: f64 = 0.0
+  let mut end: f64 = 0.0
+  if !adjustOffset(unsafe common.argument(argv, argc, 2), length, 0.0, &mut start) { return ValueBits.Undefined }
+  if !adjustOffset(unsafe common.argument(argv, argc, 3), length, length, &mut end) { return ValueBits.Undefined }
+  let view = unsafe buffers.view(object)
+  let size = if end > start { end - start } else { 0.0 }
+  let mut callArgs = [ValueBits.Object { reference: view.buffer }, ValueBits.number(u64.toF64(view.offset) + start), ValueBits.number(size)]
+  let arguments = FrameSlots { data: Pointer.fromMutRef<ValueBits>(&mut callArgs[0]), count: 3 }
+  let memory = engine.memory
+  return run typed.constructor(&mut engine, memory, unsafe lendRealm(&context, context), unsafe lendFor(unsafe common.argument(argv, argc, 4)), unsafe lendArguments(&arguments), classes.JS_CLASS_UINT8_ARRAY)
+}
 pub unsafe effect fn dispatch<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, argc: i32, argv: &FrameSlots) -> ValueBits
   ! OutOfMemoryError | JsException ? &mut Allocator {
   let mut operation = run unsafe extent(&mut engine, context, unsafe common.argument(argv, argc, 0))
   let input = unsafe common.argument(argv, argc, 1)
+  if operation == 9 { return run unsafe subarray(&mut engine, context, argc, argv) }
   if operation == 8 {
     // Buffer.prototype.toString's utf8 fast path: undefined (the caller takes
     // the generic path) unless input is a Uint8Array and both offsets are

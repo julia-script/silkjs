@@ -14,6 +14,7 @@ silk run -- install                 # install the package.json of the working di
 |---|---|
 | `pm install` | Installs what `package.json` lists. The lockfile decides the versions while it matches. |
 | `pm install --frozen-lockfile`, `pm ci` | The same, and fails when the lockfile is missing or out of date. |
+| `pm install --filter <name>` | Installs for one package of the workspace. `--filter <name>...` adds the packages of the workspace it depends on. The flag can be repeated. |
 | `pm add <name>[@range or tag]...` | Adds dependencies and installs them. `-D` for development, `-O` for optional, `-E` for an exact version. |
 | `pm remove <name>...` | Takes dependencies out and removes what nothing needs any more. |
 | `pm update [name]...` | Moves the named packages, or all, to the newest versions the ranges allow. |
@@ -32,6 +33,11 @@ The resolved graph is written to `sjs.lock`, one line per package. The next inst
 asks the registry nothing when it still matches `package.json`. The graph holds the packages of
 every platform, so the file is the same on every machine; the install skips what the host cannot
 run.
+
+The metadata the registry sends is kept in the `metadata` directory of the store. A resolution
+within five minutes of the last one, such as an `add` after an install, asks the registry
+nothing. After that the registry is asked whether each document changed, and sends only the ones
+that did.
 
 A package gets its peer dependencies from what is above it: the nearest package, up to the
 project, that depends on something under that name. When the same version of a package is used
@@ -81,6 +87,13 @@ project on `PATH` and the `npm_lifecycle_event`, `npm_package_name`, `npm_packag
 `binding.gyp` and no `install` script runs `node-gyp rebuild`, which has to be on `PATH`. A
 script that fails stops the install with the end of what it wrote, and the next install tries
 again.
+
+A repository holds sources where a registry holds what was built from them, and `prepare` is
+the script that builds. So a dependency that is a repository and has a `prepare` script is
+built when `allowBuilds` names it: its files are put in a directory of the store, an install
+there brings its development dependencies and runs its install scripts and `prepare`, and the
+files that are there then are the package. The build is kept in the store and happens once per
+commit. A repository that is not allowed is installed as it is, and listed.
 
 The `preinstall`, `install`, `postinstall` and `prepare` scripts of the project's own packages
 are the project's own commands and need no allowing. They run at the end of every install, in
@@ -138,13 +151,18 @@ list under `packages`. The packages are installed together:
 - Every command works from the directory of any package and installs for the whole workspace.
   `add`, `remove`, `run` and `exec` work on the package they are run in; `--filter <name>`
   (`-F`) picks another one by name, and `-w` the root project.
+- `install --filter <name>` makes the `node_modules` of that package alone and fetches only
+  what it uses, which is what the image of one service wants. A package of the workspace it
+  depends on is linked, and gets its own dependencies when the filter is `<name>...`. The
+  lockfile always covers the whole workspace, and the other packages keep what they have.
 - `.npmrc` is read from the home directory, then the root of the workspace, then the working
   directory.
 
 ## Layout
 
 - `src/pkg` knows nothing about npm: versions and ranges, the content-addressable store,
-  integrity checks, name interning, file linking, the ref list of a git server, a one-pass JSON
+  integrity checks, name interning, file linking, the ref list of a git server, kept HTTP
+  documents with their validators, a one-pass JSON
   walker and an editor for JSON text. A package manager for another ecosystem can use it
   as is.
 - `src/npm` is what is specific to the npm ecosystem: manifests, registry metadata, the registry
