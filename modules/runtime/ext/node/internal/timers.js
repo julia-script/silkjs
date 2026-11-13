@@ -86,6 +86,7 @@
 // of both.
 
 const ReflectApply = Reflect.apply;
+const ObjectCreate = Object.create;
 const binding = require('internal/timers_binding');
 const {
   immediateInfo,
@@ -555,92 +556,70 @@ function getTimerCallbacks(runNextTicks) {
   // loop then and starts the queue again without draining nextTicks first.
   let afterThrow = false;
 
-  function processImmediate() {
-    const queue = immediateQueue;
-    let immediate = queue.head;
+  // One Immediate that the native queue (ext/immediates) does not run itself: one made by
+  // the constructor (async hooks, async context stores), with more arguments than it
+  // takes, or whose shape changed. Returns whether its callback threw (afterThrow).
+  function runSlowImmediate(context, immediate) {
+    // It's possible for this Immediate to have been cleared by an earlier callback or
+    // the tick queue between them: Node skips it.
+    if (immediate._destroyed) return false;
+    afterThrow = false;
+    immediate._destroyed = true;
+    host.immediateSettle(immediate[kRefed] === true);
+    immediate[kRefed] = null;
 
-    // Clear the linked list early in case new `setImmediate()`
-    // calls occur while immediate callbacks are executed
-    queue.head = queue.tail = null;
-    immediateInfo[kHasOutstanding] = 1;
-    // Each callback, and the ticks between, restore the context they found: this one.
-    const context = host.getAsyncContext();
-
-    let prevImmediate;
-    let ranAtLeastOneImmediate = false;
-    while (immediate !== null) {
-      if (ranAtLeastOneImmediate && !afterThrow)
-        runNextTicks();
-      else
-        ranAtLeastOneImmediate = true;
-      afterThrow = false;
-
-      // It's possible for this current Immediate to be cleared while executing
-      // the next tick queue above, which means we need to use the previous
-      // Immediate's _idleNext which is guaranteed to not have been cleared.
-      if (immediate._destroyed) {
-        immediate = prevImmediate._idleNext;
-        continue;
-      }
-
-      // TODO(RaisinTen): Destroy and unref the Immediate after _onImmediate()
-      // gets executed, just like how Timeouts work.
-      immediate._destroyed = true;
-
-      immediateInfo[kCount]--;
-      if (immediate[kRefed])
-        immediateInfo[kRefCount]--;
-      immediate[kRefed] = null;
-
-      prevImmediate = immediate;
-
-      const argv = immediate._argv;
-      // The callback's async context, as an InternalResource would build it.
-      const scope = {
-        stores: framesEnabled ? immediate[async_context_frame] : immediate[async_local_storage_context_symbol],
-        id: immediate[async_id_symbol],
-        trigger: immediate[trigger_async_id_symbol],
-        resource: immediate,
-      };
-      if (hookFields[kTotalHooks] === 0) {
-        // No hook observes it: host.invokeImmediate's work, inline.
-        host.setAsyncContext(scope);
+    const argv = immediate._argv;
+    // The callback's async context, as an InternalResource would build it.
+    const scope = {
+      stores: framesEnabled ? immediate[async_context_frame] : immediate[async_local_storage_context_symbol],
+      id: immediate[async_id_symbol],
+      trigger: immediate[trigger_async_id_symbol],
+      resource: immediate,
+    };
+    if (hookFields[kTotalHooks] === 0) {
+      // No hook observes it: host.invokeImmediate's work, inline.
+      host.setAsyncContext(scope);
+      try {
         try {
-          try {
-            if (argv === undefined) immediate._onImmediate();
-            else ReflectApply(immediate._onImmediate, immediate, argv);
-            afterThrow = false;
-          } catch (error) {
-            // Node's processImmediate clears these before the error reaches the
-            // uncaught handler, which formats its stack: V8 looks method names up
-            // then, so the callback's frame reads "Immediate.<anonymous>".
-            immediate._onImmediate = undefined;
-            immediate._argv = undefined;
-            host.triggerUncaughtException(error);
-            afterThrow = true;
-          }
-        } finally {
-          host.setAsyncContext(context);
+          if (argv === undefined) immediate._onImmediate();
+          else ReflectApply(immediate._onImmediate, immediate, argv);
+          afterThrow = false;
+        } catch (error) {
+          // Node's processImmediate clears these before the error reaches the
+          // uncaught handler, which formats its stack: V8 looks method names up
+          // then, so the callback's frame reads "Immediate.<anonymous>".
+          immediate._onImmediate = undefined;
+          immediate._argv = undefined;
+          host.triggerUncaughtException(error);
+          afterThrow = true;
         }
-      } else {
-        afterThrow = host.invokeImmediate(context, scope, scope.id, runImmediate, immediate, noArguments);
+      } finally {
+        host.setAsyncContext(context);
       }
-      if (afterThrow) {
-        immediate._onImmediate = undefined;
-        immediate._argv = undefined;
-        enqueueRemoveStoresFromResource(immediate);
-      } else {
-        cleanImmediate(immediate);
-      }
-
-      emitDestroy(immediate);
-
-      immediate = immediate._idleNext;
+    } else {
+      afterThrow = host.invokeImmediate(context, scope, scope.id, runImmediate, immediate, noArguments);
+    }
+    if (afterThrow) {
+      immediate._onImmediate = undefined;
+      immediate._argv = undefined;
+      enqueueRemoveStoresFromResource(immediate);
+    } else {
+      cleanImmediate(immediate);
     }
 
-    immediateInfo[kHasOutstanding] = 0;
+    emitDestroy(immediate);
+    return afterThrow;
   }
 
+  // The check phase's processImmediate runs in the native queue; it answers -1 until it
+  // is set up (in a process that starts from the heap image, the native side starts empty).
+  function processImmediate() {
+    const refs = host.immediateRun();
+    if (refs !== -1) return refs;
+    setupNative();
+    return host.immediateRun();
+  }
+  setupNative = () => host.immediateSetup(immediateTemplate(), immediateScopeTemplate, runSlowImmediate, immediateThrew, runNextTicks);
 
   function processTimers(now) {
     debug('process timer lists %d', now);
@@ -773,7 +752,8 @@ function getTimerCallbacks(runNextTicks) {
 // own symbol properties (initAsyncResource keeps a Timeout's in a runtime resource), and
 // processImmediate builds the callback's context from them.
 class Immediate {
-  constructor(callback, args) {
+  // id: an async id createImmediate already took for its native try.
+  constructor(callback, args, id) {
     this._idleNext = null;
     this._idlePrev = null;
     this._onImmediate = callback;
@@ -781,12 +761,12 @@ class Immediate {
     this._destroyed = false;
     // this.ref(), inline.
     this[kRefed] = true;
-    if (immediateInfo[kRefCount]++ === 0) {
+    if (host.immediateRefs(1) === 1) {
       binding.toggleImmediateRef(true);
     }
 
     const context = host.getAsyncContext();
-    const asyncId = newAsyncId();
+    const asyncId = id ?? newAsyncId();
     const triggerId = context?.id ?? 1;
     this[async_id_symbol] = asyncId;
     this[trigger_async_id_symbol] = triggerId;
@@ -798,15 +778,14 @@ class Immediate {
     if (hookFields[kInitHooks] !== 0)
       emitInit(asyncId, 'Immediate', triggerId, this);
 
-    immediateInfo[kCount]++;
-    immediateQueue.append(this);
+    host.immediateEnqueue(this);
   }
 
   ref() {
     if (this[kRefed] === false) {
       this[kRefed] = true;
 
-      if (immediateInfo[kRefCount]++ === 0) {
+      if (host.immediateRefs(1) === 1) {
         binding.toggleImmediateRef(true);
       }
     }
@@ -816,7 +795,7 @@ class Immediate {
   unref() {
     if (this[kRefed] === true) {
       this[kRefed] = false;
-      if (--immediateInfo[kRefCount] === 0) {
+      if (host.immediateRefs(-1) === 0) {
         binding.toggleImmediateRef(false);
       }
     }
@@ -826,6 +805,46 @@ class Immediate {
   hasRef() {
     return !!this[kRefed];
   }
+}
+
+// The native queue's (ext/immediates) templates: a plain Immediate, with the
+// constructor's own properties in its order, and the async context processImmediate
+// builds around its callback.
+function immediateTemplate() {
+  const template = ObjectCreate(Immediate.prototype);
+  template._idleNext = null;
+  template._idlePrev = null;
+  template._onImmediate = undefined;
+  template._argv = undefined;
+  template._destroyed = false;
+  template[kRefed] = true;
+  template[async_id_symbol] = 0;
+  template[trigger_async_id_symbol] = 0;
+  if (framesEnabled ??= AsyncContextFrame.enabled) template[async_context_frame] = undefined;
+  return template;
+}
+const immediateScopeTemplate = { stores: undefined, id: 0, trigger: 0, resource: undefined };
+// Set up once processImmediate first runs (and again in a process that starts from the
+// heap image, whose native queue starts empty).
+let setupNative;
+// A plain Immediate's callback threw: processImmediate's catch.
+function immediateThrew(immediate, error) {
+  immediate._onImmediate = undefined;
+  immediate._argv = undefined;
+  host.triggerUncaughtException(error);
+}
+// setImmediate's Immediate when its own try at the native queue (host.immediateCreate
+// with id) did not make one: false before the queue is set up, undefined for an
+// Immediate the queue does not take. Without an id, the constructor's.
+function createImmediate(callback, argv, id, made) {
+  if (id !== undefined && made === false && setupNative !== undefined && setupNative()) {
+    const immediate = host.immediateCreate(callback, argv, id);
+    if (typeof immediate === 'object') {
+      host.timerLoop.state.immediateRefed = true;
+      return immediate;
+    }
+  }
+  return new Immediate(callback, argv, id);
 }
 
 module.exports = {
@@ -848,6 +867,7 @@ module.exports = {
   getTimerDuration,
   immediateQueue,
   getTimerCallbacks,
+  createImmediate,
   immediateInfoFields: {
     kCount,
     kRefCount,

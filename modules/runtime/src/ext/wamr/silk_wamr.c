@@ -163,6 +163,7 @@ static void destroy_shell(SilkWasmHandle *handle)
         if (handle->as.module.module) wasm_unload(handle->as.module.module);
         free(handle->as.module.bytes);
         free(handle->as.module.loaded_bytes);
+        silk_wasm_module_frames_destroy(handle);
     }
     free(handle);
     if (--store->handle_count == 0 && store->closed) store_destroy(store);

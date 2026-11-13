@@ -40,6 +40,9 @@ typedef struct output {
 } output;
 typedef struct client {
     int fd, websocket, closing, dead, fragmented;
+    /* Node's WsHandler::WaitForCloseReply: the server sent the close and keeps the
+       connection until the peer's close frame or EOF, with no deadline. */
+    int awaiting_close;
     uint64_t id, deadline;
     unsigned char *input, *fragment;
     size_t input_length, input_capacity, fragment_length, fragment_capacity;
@@ -56,6 +59,9 @@ struct silk_inspector {
     int running, listener, notify[2], stopped;
     _Atomic int pending;
     int stopping;
+    /* silk_inspector_close: Node's TransportAction::kKill, every session closed
+       with the close handshake before the IO thread ends. */
+    int terminating;
     void *wake;
     silk_inspector_packet *first, *last, *out_first, *out_last;
     size_t in_bytes, out_bytes, in_count, out_count;
@@ -139,6 +145,7 @@ static int frame(client *c, unsigned opcode, const unsigned char *bytes, size_t 
     return append_output(c, header, n, bytes, length);
 }
 static void close_frame(client *c, unsigned code) {
+    if (c->awaiting_close) { c->dead = 1; return; }
     unsigned char bytes[2] = { (unsigned char)(code >> 8), (unsigned char)code };
     if (!c->closing && frame(c, 8, bytes, 2)) c->dead = 1;
     c->closing = 1; c->deadline = milliseconds() + 1000;
@@ -181,7 +188,7 @@ static int valid_close(unsigned code) {
 }
 static void websocket_input(silk_inspector *s, client *c) {
     size_t consumed = 0;
-    while (!c->closing && c->input_length - consumed >= 2) {
+    while ((!c->closing || c->awaiting_close) && !c->dead && c->input_length - consumed >= 2) {
         unsigned char *p = c->input + consumed;
         unsigned opcode = p[0] & 15, fin = p[0] & 128;
         uint64_t length = p[1] & 127;
@@ -206,6 +213,12 @@ static void websocket_input(silk_inspector *s, client *c) {
         unsigned char *mask = p + header, *body = mask + 4;
         for (size_t i = 0; i < (size_t)length; i++) body[i] ^= mask[i & 3];
         consumed += header + 4 + (size_t)length;
+        if (c->awaiting_close) {
+            /* The peer's close reply ends the connection; anything before it is dropped. */
+            if (opcode == 8) { c->dead = 1; break; }
+            if (opcode == 9 && frame(c, 10, body, (size_t)length)) c->dead = 1;
+            continue;
+        }
         if (opcode == 8) {
             if (length == 1 || (length >= 2 && !valid_close(((unsigned)body[0] << 8) | body[1]))) { close_frame(c, 1002); break; }
             if (length >= 2 && !utf8(body + 2, (size_t)length - 2)) { close_frame(c, 1007); break; }
@@ -364,7 +377,7 @@ static void http_input(silk_inspector *s, client *c) {
 static void read_client(silk_inspector *s, client *c) {
     /* Bound work per ready connection so one peer cannot starve discovery. */
     size_t budget = 65536;
-    while (budget && !c->dead && !c->closing) {
+    while (budget && !c->dead && (!c->closing || c->awaiting_close)) {
         size_t limit = c->websocket ? MESSAGE_LIMIT + 14 : HTTP_LIMIT;
         size_t wanted = limit - c->input_length;
         if (wanted > 16384) wanted = 16384;
@@ -388,7 +401,7 @@ static void write_client(client *c) {
         p->offset += (size_t)n; c->output_bytes -= (size_t)n; budget -= (size_t)n;
         if (p->offset == p->length) { c->first = p->next; if (!c->first) c->last = NULL; free(p); }
     }
-    if (c->closing && !c->first) c->dead = 1;
+    if (c->closing && !c->awaiting_close && !c->first) c->dead = 1;
 }
 static unsigned free_slot(const silk_inspector *s) {
     unsigned index; for (index = 0; index < MAX_CLIENTS && s->clients[index].fd >= 0; index++) {}
@@ -441,20 +454,44 @@ static int process_output(silk_inspector *s) {
     pthread_mutex_unlock(&s->mutex);
     return stopping;
 }
+/* InspectorSocketServer::TerminateConnections: each WebSocket session gets Node's
+   empty close frame (0x88 0x00) and waits for the peer's reply; other connections end. */
+static void terminate_clients(silk_inspector *s) {
+    static const unsigned char close_bytes[2] = { 0x88, 0x00 };
+    for (unsigned i = 0; i < MAX_CLIENTS; i++) {
+        client *c = &s->clients[i];
+        if (c->fd < 0) continue;
+        if (!c->websocket || c->closing) { if (!c->websocket) c->dead = 1; continue; }
+        if (append_output(c, NULL, 0, close_bytes, sizeof(close_bytes))) { c->dead = 1; continue; }
+        c->closing = 1; c->awaiting_close = 1; c->deadline = 0;
+    }
+}
+static int live_clients(const silk_inspector *s) {
+    for (unsigned i = 0; i < MAX_CLIENTS; i++) if (s->clients[i].fd >= 0) return 1;
+    return 0;
+}
 static void *io_thread(void *opaque) {
     silk_inspector *s = opaque;
+    int terminated = 0;
     for (;;) {
         if (process_output(s)) break;
+        if (!terminated) {
+            pthread_mutex_lock(&s->mutex); terminated = s->terminating; pthread_mutex_unlock(&s->mutex);
+            if (terminated) terminate_clients(s);
+        }
+        if (terminated && !live_clients(s)) break;
         struct pollfd descriptors[MAX_CLIENTS + 2]; int indexes[MAX_CLIENTS + 2];
         nfds_t count = 2;
         descriptors[0] = (struct pollfd){ s->notify[0], POLLIN, 0 };
-        descriptors[1] = (struct pollfd){ s->listener, (short)(free_slot(s) < MAX_CLIENTS ? POLLIN : 0), 0 };
+        /* A terminating server accepts no new connection (InspectorSocketServer::Stop),
+           and a full one leaves connections in the backlog. */
+        descriptors[1] = (struct pollfd){ terminated ? -1 : s->listener, (short)(free_slot(s) < MAX_CLIENTS ? POLLIN : 0), 0 };
         uint64_t now = milliseconds();
         for (unsigned i = 0; i < MAX_CLIENTS; i++) {
             client *c = &s->clients[i];
             if (c->fd < 0) continue;
             if (c->dead || (c->deadline && now >= c->deadline)) { retire(s, c); continue; }
-            descriptors[count] = (struct pollfd){ c->fd, (short)((c->closing ? 0 : POLLIN) | (c->first ? POLLOUT : 0)), 0 };
+            descriptors[count] = (struct pollfd){ c->fd, (short)((c->closing && !c->awaiting_close ? 0 : POLLIN) | (c->first ? POLLOUT : 0)), 0 };
             indexes[count++] = (int)i;
         }
         int result = poll(descriptors, count, 250);
@@ -527,16 +564,27 @@ int silk_inspector_start(silk_inspector *s, const unsigned char *host, size_t le
     s->running = 1;
     return 0;
 }
-void silk_inspector_stop(silk_inspector *s) {
-    if (!s || !s->running) return;
-    pthread_mutex_lock(&s->mutex); s->stopping = 1; notify_io(s); pthread_cond_broadcast(&s->changed); pthread_cond_broadcast(&s->drained); pthread_mutex_unlock(&s->mutex);
+static void finish(silk_inspector *s) {
     pthread_join(s->thread, NULL);
     pthread_mutex_lock(&s->mutex);
+    s->terminating = 0;
     close(s->listener); close(s->notify[0]); close(s->notify[1]);
     s->listener = s->notify[0] = s->notify[1] = -1; s->running = 0; s->url[0] = 0;
     while (s->out_first) { silk_inspector_packet *next = s->out_first->next; free(s->out_first); s->out_first = next; }
     s->out_last = NULL; s->out_count = s->out_bytes = 0;
     pthread_mutex_unlock(&s->mutex);
+}
+void silk_inspector_stop(silk_inspector *s) {
+    if (!s || !s->running) return;
+    pthread_mutex_lock(&s->mutex); s->stopping = 1; notify_io(s); pthread_cond_broadcast(&s->changed); pthread_cond_broadcast(&s->drained); pthread_mutex_unlock(&s->mutex);
+    finish(s);
+}
+/* Node's Agent::Stop (inspector.close()): blocks until every session has finished
+   the close handshake, as InspectorIo's destructor joins its thread. */
+void silk_inspector_close(silk_inspector *s) {
+    if (!s || !s->running) return;
+    pthread_mutex_lock(&s->mutex); s->terminating = 1; notify_io(s); pthread_cond_broadcast(&s->changed); pthread_cond_broadcast(&s->drained); pthread_mutex_unlock(&s->mutex);
+    finish(s);
 }
 void silk_inspector_destroy(silk_inspector *s) {
     if (!s) return;
@@ -589,7 +637,7 @@ static int outgoing(silk_inspector *s, uint32_t kind, uint64_t connection, const
     /* A full queue blocks the sender until the IO thread drains it, as V8's
        synchronous sends never drop a message: large heap snapshots stream through. */
     for (;;) {
-        if (s->stopped || s->stopping) { error = ENOTCONN; break; }
+        if (s->stopped || s->stopping || s->terminating) { error = ENOTCONN; break; }
         if (s->out_count < PACKET_LIMIT && length <= QUEUE_LIMIT - s->out_bytes) break;
         notify_io(s); pthread_cond_wait(&s->drained, &s->mutex);
     }

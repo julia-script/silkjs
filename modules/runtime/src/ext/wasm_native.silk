@@ -26,7 +26,7 @@ import silk.num.f64
 import silkjs.js_engine { Engine }
 import silkjs.js_heap { HeapCell, HeapHeader }
 import silkjs.js_value { ValueBits }
-import silkjs.js_core_types { ContextState, RuntimeState, FrameSlots, NativeErrorKind, NativeFunctionId, NativeCallProtocol, ObjectData, ObjectPayload }
+import silkjs.js_core_types { ForeignFrame, ForeignFrameSource, ContextState, RuntimeState, FrameSlots, NativeErrorKind, NativeFunctionId, NativeCallProtocol, ObjectData, ObjectPayload }
 import silkjs.js_exceptions { JsException }
 import silkjs.js_interrupt_host { InterruptHooks }
 import silkjs.js_errors as errors
@@ -61,7 +61,7 @@ import silkjs.js_atomics_native as atomics
 import silkjs.js_atomics_native { WaitResult }
 import silkjs.js_shared_memory { Span }
 
-pub struct State { owner: *mut ownership.State, store: ?*mut u8, callbackResolver: ValueBits, temporary: ?*mut Temporary, jobs: ?*mut Job, current: ?*mut Job, depth: u32, interrupted: bool }
+pub struct State { owner: *mut ownership.State, store: ?*mut u8, callbackResolver: ValueBits, temporary: ?*mut Temporary, jobs: ?*mut Job, current: ?*mut Job, depth: u32, interrupted: bool, live: u32 }
 struct Temporary { next: ?*mut Temporary, value: ValueBits, reference: ?*mut u8 }
 struct Job { next: ?*mut Job, context: *mut HeapHeader, invocation: ?*mut u8, function: ValueBits, capability: Capability, awaiting: ValueBits, awaitToken: ValueBits, resultTypes: List<u8>, resumeTypes: List<u8>, ready: bool }
 fn nil() -> ?*mut u8 { return Pointer.null<u8>() }
@@ -203,7 +203,7 @@ unsafe effect fn wrap<'m>(engine: &mut Engine<'m, host.Services>, ctx: *mut Heap
 pub effect fn open(allocator: *mut RuntimeHeap) -> *mut State ! OutOfMemoryError {
   let state = run alloc<State>() let opened = run Effect.result(ownership.open(allocator))
   let own = match move opened { Result<*mut ownership.State, OutOfMemoryError>.Success { value } => value Result<*mut ownership.State, OutOfMemoryError>.Failure { error } => { unsafe c.free(unsafe raw(state)) fail move error } }
-  unsafe Pointer.put<State>(state, State { owner: own, store: nil(), callbackResolver: ValueBits.Undefined, temporary: Pointer.null<Temporary>(), jobs: Pointer.null<Job>(), current: Pointer.null<Job>(), depth: 0, interrupted: false })
+  unsafe Pointer.put<State>(state, State { owner: own, store: nil(), callbackResolver: ValueBits.Undefined, temporary: Pointer.null<Temporary>(), jobs: Pointer.null<Job>(), current: Pointer.null<Job>(), depth: 0, interrupted: false, live: 0 })
   unsafe ownership.setUser(own, unsafe raw(state), silkWasmDestroyState)
   return state
 }
@@ -217,6 +217,29 @@ unsafe effect fn initialize(state: *mut State) -> () ! OutOfMemoryError {
   let native = unsafe c.silk_wasm_open(Pointer.fromRef<c.Callbacks>(&callbacks), unsafe raw(unsafe owner(state)))
   if Pointer.isNull<u8>(native) { fail OutOfMemoryError {} }
   let mut a = () let s = unsafe Pointer.borrowMut<(), State>(&mut a, state) s.store = native
+}
+// Stack traces show Wasm frames while a call into Wasm runs (or its trap is being
+// reported): the engine asks for them only while the source is set.
+unsafe fn liveEnter(state: *mut State, ctx: *mut HeapHeader) -> () {
+  let mut a = () let s = unsafe Pointer.borrowMut<(), State>(&mut a, state) s.live = s.live + 1 let first = s.live == 1 drop s
+  if first { unsafe runtime.setForeignFrameSource(unsafe runtime.contextRuntime(ctx), Option<ForeignFrameSource>.some(ForeignFrameSource { frame: silkWasmFrame, opaque: nil() })) }
+}
+unsafe fn liveLeave(state: *mut State, ctx: *mut HeapHeader) -> () {
+  let mut a = () let s = unsafe Pointer.borrowMut<(), State>(&mut a, state) s.live = s.live - 1 let last = s.live == 0 drop s
+  if last { unsafe runtime.setForeignFrameSource(unsafe runtime.contextRuntime(ctx), Option<ForeignFrameSource>.none()) }
+}
+// The C side names the entry by its function handle; the engine wants the exported
+// function object made for it (an invocation is only ever entered through one).
+export "C" fn silkWasmFrame(opaque: ?*mut u8, frame: usize, index: u32, out: *mut ForeignFrame) -> i32 {
+  if unsafe c.silk_wasm_frame(opaque, frame, index, out) == 0 { return 0 }
+  let mut a = () let written = unsafe Pointer.borrowMut<(), ForeignFrame>(&mut a, out)
+  written.entry = match unsafe ownership.cachedBuffer(written.entry) { ValueBits.Object { reference } => unsafe Intrinsic.pointerReinterpret<*mut HeapHeader, *mut u8>(reference) _ => nil() }
+  return 1
+}
+// The current StackFrame of ctx's runtime (a native call may push none): Wasm frames show above it.
+unsafe fn nativeFrame(ctx: *mut HeapHeader) -> usize {
+  let a = () let state = unsafe HeapCell.payload<RuntimeState, ()>(&a, unsafe runtime.contextRuntime(ctx))
+  return Pointer.address(state.currentStackFrame)
 }
 export "C" fn silkWasmInterrupt(context: ?*mut u8) -> u8 {
   let a = () let own = unsafe Pointer.borrow<(), ownership.State>(&a, unsafe cast<ownership.State>(context))
@@ -334,7 +357,17 @@ unsafe effect fn instantiate<'m>(engine: &mut Engine<'m, host.Services>, ctx: *m
     run unsafe checked(&mut engine, ctx, state, (unsafe c.silk_wasm_check_import(module, i, Pointer.fromRef<c.Import>(&entry)) != 0))
     run resolved.append(move entry) i = i + 1
   }
-  return run unsafe handle(&mut engine, ctx, state, unsafe c.silk_wasm_instantiate(module, ptr(&resolved), count))
+  // A start function runs as a call into Wasm: its frames show while it runs and
+  // in the stack of the RuntimeError its trap makes.
+  unsafe liveEnter(state, ctx)
+  let instance = unsafe c.silk_wasm_instantiate(module, ptr(&resolved), count, unsafe nativeFrame(ctx))
+  let result = run Effect.result(unsafe handle(&mut engine, ctx, state, instance))
+  unsafe c.silk_wasm_release_start_trap(unsafe store(state))
+  unsafe liveLeave(state, ctx)
+  return match move result {
+    Result<ValueBits, OutOfMemoryError | JsException>.Success { value } => value
+    Result<ValueBits, OutOfMemoryError | JsException>.Failure { error } => { fail move error }
+  }
 }
 unsafe effect fn instanceExports<'m>(engine: &mut Engine<'m, host.Services>, ctx: *mut HeapHeader, state: *mut State, instance: ?*mut u8) -> ValueBits ! OutOfMemoryError | JsException ? &mut Allocator {
   let output = run unsafe object(&mut engine, ctx, state) let count = unsafe c.silk_wasm_export_count(instance) let mut i: u32 = 0
@@ -470,7 +503,9 @@ unsafe effect fn invoke<'m>(engine: &mut Engine<'m, host.Services>, ctx: *mut He
     executionContext = unsafe carrierContext(carrier)
   }
   let bridge = unsafe enter(&mut engine, executionContext, state)
+  unsafe liveEnter(state, executionContext)
   let result = run Effect.result(unsafe invokeInRealm(&mut engine, executionContext, state, function, arguments, promising, ctx))
+  unsafe liveLeave(state, executionContext)
   unsafe leave(&mut engine, executionContext, state, move bridge)
   return match move result {
     Result<ValueBits, OutOfMemoryError | JsException>.Success { value } => value
@@ -487,7 +522,7 @@ unsafe effect fn invokeInRealm<'m>(engine: &mut Engine<'m, host.Services>, ctx: 
   unsafe HeapCell.retain(ctx)
   unsafe Pointer.put<Job>(jobPointer, Job { next: Pointer.null<Job>(), context: ctx, invocation: nil(), function: unsafe function.retained(), capability: move capability, awaiting: ValueBits.Undefined, awaitToken: ValueBits.Undefined, resultTypes: move resultTypes, resumeTypes: List<u8>.make(), ready: false })
   let mut a = () let s = unsafe Pointer.borrowMut<(), State>(&mut a, state) let previous = s.current s.current = jobPointer drop s
-  let invocation = unsafe c.silk_wasm_call(native, ptr(&converted), t.parameterCount, flag(promising))
+  let invocation = unsafe c.silk_wasm_call(native, ptr(&converted), t.parameterCount, flag(promising), unsafe nativeFrame(ctx))
   let restored = unsafe Pointer.borrowMut<(), State>(&mut a, state) restored.current = previous drop restored
   let job = unsafe Pointer.borrowMut<(), Job>(&mut a, jobPointer) job.invocation = invocation let promiseValue = job.capability.promise.view() drop job
   if Pointer.isNull<u8>(invocation) { unsafe freeJob(&mut engine, ctx, jobPointer) run unsafe checked(&mut engine, ctx, state, false) }
@@ -552,7 +587,7 @@ unsafe effect fn dispatchBody<'m>(engine: &mut Engine<'m, host.Services>, ctx: *
     return ValueBits.Undefined
   }
   run unsafe initialize(state)
-  if eq(op, b"compile") || eq(op, b"validate") || eq(op, b"compileParsed") { return run unsafe compileOperation(&mut engine, ctx, state, a, b, d, e, eq(op, b"validate"), eq(op, b"compileParsed")) }
+  if eq(op, b"compile") || eq(op, b"validate") || eq(op, b"compileParsed") { return run unsafe compileOperation(&mut engine, ctx, state, a, b, d, e, f, eq(op, b"validate"), eq(op, b"compileParsed")) }
   if eq(op, b"promising") { let native = run unsafe required(&mut engine, ctx, state, a, 2) return run unsafe handle(&mut engine, ctx, state, unsafe c.silk_wasm_promising(native)) }
   if eq(op, b"moduleImports") || eq(op, b"moduleExports") { let native = run unsafe required(&mut engine, ctx, state, a, 0) return run unsafe moduleInfo(&mut engine, ctx, state, native, eq(op, b"moduleImports")) }
   if eq(op, b"customSections") {
@@ -752,7 +787,7 @@ unsafe effect fn resumeJob<'m>(engine: &mut Engine<'m, host.Services>, ctx: *mut
     }
   }
   let s = unsafe Pointer.borrowMut<(), State>(&mut a, state) let previous = s.current s.current = pointer drop s
-  let _status = unsafe c.silk_wasm_resume(invocation, ptr(&converted), usize.toU32(converted.length()), exception)
+  let _status = unsafe c.silk_wasm_resume(invocation, ptr(&converted), usize.toU32(converted.length()), exception, unsafe nativeFrame(ctx))
   let restored = unsafe Pointer.borrowMut<(), State>(&mut a, state) restored.current = previous
 }
 unsafe fn linkJob(state: *mut State, pointer: *mut Job) -> () {
@@ -760,6 +795,12 @@ unsafe fn linkJob(state: *mut State, pointer: *mut Job) -> () {
   let job = unsafe Pointer.borrowMut<(), Job>(&mut a, pointer) job.next = first
 }
 unsafe effect fn advanceJob<'m>(engine: &mut Engine<'m, host.Services>, ctx: *mut HeapHeader, state: *mut State, current: *mut Job) -> bool ! OutOfMemoryError | JsException ? &mut Allocator {
+  unsafe liveEnter(state, ctx)
+  let result = run Effect.result(unsafe resumeAndSettle(&mut engine, ctx, state, current))
+  unsafe liveLeave(state, ctx)
+  return match move result { Result<bool, OutOfMemoryError | JsException>.Success { value } => value Result<bool, OutOfMemoryError | JsException>.Failure { error } => { fail move error } }
+}
+unsafe effect fn resumeAndSettle<'m>(engine: &mut Engine<'m, host.Services>, ctx: *mut HeapHeader, state: *mut State, current: *mut Job) -> bool ! OutOfMemoryError | JsException ? &mut Allocator {
   let resumed = run Effect.result(unsafe resumeJob(&mut engine, ctx, state, current))
   match move resumed {
     Result<(), OutOfMemoryError | JsException>.Success { .. } => {
@@ -831,7 +872,7 @@ unsafe effect fn spanString<'m>(engine: &mut Engine<'m, host.Services>, ctx: *mu
 unsafe effect fn functionName<'m>(engine: &mut Engine<'m, host.Services>, ctx: *mut HeapHeader, state: *mut State, native: ?*mut u8) -> ValueBits ! OutOfMemoryError | JsException ? &mut Allocator {
   let mut length: u32 = 0 let bytes = unsafe c.silk_wasm_function_name(native, Pointer.fromMutRef<u32>(&mut length)) return run unsafe spanString(&mut engine, ctx, state, bytes, length)
 }
-unsafe effect fn compileOperation<'m>(engine: &mut Engine<'m, host.Services>, ctx: *mut HeapHeader, state: *mut State, buffer: ValueBits, offsetValue: ValueBits, lengthValue: ValueBits, rawOptions: ValueBits, validate: bool, normalized: bool) -> ValueBits ! OutOfMemoryError | JsException ? &mut Allocator {
+unsafe effect fn compileOperation<'m>(engine: &mut Engine<'m, host.Services>, ctx: *mut HeapHeader, state: *mut State, buffer: ValueBits, offsetValue: ValueBits, lengthValue: ValueBits, rawOptions: ValueBits, url: ValueBits, validate: bool, normalized: bool) -> ValueBits ! OutOfMemoryError | JsException ? &mut Allocator {
   let offset = run unsafe extent(&mut engine, ctx, offsetValue) let length = run unsafe extent(&mut engine, ctx, lengthValue)
   if length == 0 {
     if validate { return ValueBits.Bool { value: false } }
@@ -866,7 +907,13 @@ unsafe effect fn compileOperation<'m>(engine: &mut Engine<'m, host.Services>, ct
     if Pointer.isNull<u8>(native) && unsafe c.silk_wasm_error_kind(unsafe store(state)) == 3 { fail OutOfMemoryError {} }
     return ValueBits.Bool { value: !Pointer.isNull<u8>(native) }
   }
-  return run unsafe handle(&mut engine, ctx, state, native)
+  let value = run unsafe handle(&mut engine, ctx, state, native)
+  // A streaming compile's response URL names the module's script in stack traces.
+  if !Pointer.isNull<u8>(native) && url.isString() {
+    let urlText = run text.text(&mut engine, unsafe lendRealm(&ctx, ctx), unsafe lendFor(url))
+    if urlText.length() > 4294967295 || unsafe c.silk_wasm_module_set_url(native, ptr(&urlText), usize.toU32(urlText.length())) == 0 { fail OutOfMemoryError {} }
+  }
+  return value
 }
 unsafe effect fn builtinFailure<'m>(engine: &mut Engine<'m, host.Services>, ctx: *mut HeapHeader, state: *mut State, invocation: ?*mut u8, value: ValueBits) -> bool ! OutOfMemoryError | JsException ? &mut Allocator {
   let classified = run unsafe callback(&mut engine, ctx, state, b"builtinTrap", &[value])

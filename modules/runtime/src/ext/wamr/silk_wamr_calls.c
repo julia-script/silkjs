@@ -157,6 +157,15 @@ static int native_call(void *context, WASMExecEnv *env,
     return 0;
 }
 
+/* A trap's frames stay under the native's frame until the invocation is freed,
+   so the RuntimeError made for it shows them; otherwise the frame is past. */
+static void keep_trap_frame(SilkWasmInvocation *invocation, WASMInterpInvocationStatus status)
+{
+    if (status != WASM_INVOCATION_THREW
+        || wasm_interp_invocation_exception(invocation->invocation))
+        invocation->frame = 0;
+}
+
 static void complete(SilkWasmInvocation *invocation, WASMInterpInvocationStatus status)
 {
     if (invocation->error_kind != SILK_WASM_OK) {
@@ -218,7 +227,7 @@ static void complete(SilkWasmInvocation *invocation, WASMInterpInvocationStatus 
 
 SilkWasmInvocation *silk_wasm_call(SilkWasmHandle *function,
                                   const SilkWasmValue *arguments,
-                                  uint32_t count, uint8_t promising)
+                                  uint32_t count, uint8_t promising, uintptr_t frame)
 {
     SilkWasmStore *store = function->store;
     silk_wasm_set_error(store, SILK_WASM_OK, "");
@@ -264,6 +273,7 @@ SilkWasmInvocation *silk_wasm_call(SilkWasmHandle *function,
     uint32_t root_count = silk_wasm_pin_cells(env, type->types, count, cells, roots);
     SilkWasmInvocation *previous_invocation = current_invocation;
     current_invocation = invocation;
+    invocation->frame = frame;
     WASMInterpInvocationStatus status = wasm_interp_invocation_start(invocation->invocation,
                                                                      cells, type->param_cell_num);
     current_invocation = previous_invocation;
@@ -271,6 +281,7 @@ SilkWasmInvocation *silk_wasm_call(SilkWasmHandle *function,
     if (root_count) wasm_runtime_pop_local_obj_refs(env, root_count);
     free(roots); free(cells);
     complete(invocation, status);
+    keep_trap_frame(invocation, status);
     return invocation;
 failure:
     silk_wasm_invocation_free(invocation);
@@ -278,7 +289,7 @@ failure:
 }
 
 int silk_wasm_resume(SilkWasmInvocation *invocation, const SilkWasmValue *values,
-                     uint32_t count, SilkWasmHandle *exception)
+                     uint32_t count, SilkWasmHandle *exception, uintptr_t frame)
 {
     if (invocation->status != SILK_WASM_YIELD || !invocation->pending_type) {
         invocation_error(invocation, SILK_WASM_RUNTIME_ERROR, "WebAssembly invocation is not suspended");
@@ -319,6 +330,7 @@ int silk_wasm_resume(SilkWasmInvocation *invocation, const SilkWasmValue *values
     invocation->status = SILK_WASM_OK;
     SilkWasmInvocation *previous_invocation = current_invocation;
     current_invocation = invocation;
+    invocation->frame = frame;
     WASMInterpInvocationStatus status = wasm_interp_invocation_resume(invocation->invocation,
         cells, guest_exception ? 0 : type->ret_cell_num, guest_exception);
     current_invocation = previous_invocation;
@@ -326,6 +338,7 @@ int silk_wasm_resume(SilkWasmInvocation *invocation, const SilkWasmValue *values
     if (root_count) wasm_runtime_pop_local_obj_refs(env, root_count);
     free(roots); free(cells);
     complete(invocation, status);
+    keep_trap_frame(invocation, status);
     return invocation->status;
 failure:
     free(roots); free(cells);

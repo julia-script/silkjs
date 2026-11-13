@@ -174,10 +174,19 @@ bool silk_wasm_bind_function(WASMModuleInstance *native, uint32_t index,
     return true;
 }
 
+void silk_wasm_release_start_trap(SilkWasmStore *store)
+{
+    SilkWasmInvocation *invocation = store->start_trap;
+    store->start_trap = NULL;
+    silk_wasm_invocation_free(invocation);
+}
+
 SilkWasmHandle *silk_wasm_instantiate(SilkWasmHandle *module,
-                                     const SilkWasmImport *imports, uint32_t count)
+                                     const SilkWasmImport *imports, uint32_t count,
+                                     uintptr_t frame)
 {
     SilkWasmStore *store = module->store;
+    silk_wasm_release_start_trap(store);
     silk_wasm_set_error(store, SILK_WASM_OK, "");
     store->last_exception = NULL;
     if (count != module->as.module.module->import_count) {
@@ -227,7 +236,7 @@ SilkWasmHandle *silk_wasm_instantiate(SilkWasmHandle *module,
         if (!wasm_silk_tag_identity(instance->as.instance.instance, i)) return NULL;
     uint32_t start = module->as.module.module->start_function;
     if (start != UINT32_MAX) {
-        SilkWasmInvocation *invocation = silk_wasm_call(instance->as.instance.functions[start], NULL, 0, false);
+        SilkWasmInvocation *invocation = silk_wasm_call(instance->as.instance.functions[start], NULL, 0, false, frame);
         if (!invocation) return NULL;
         int status = silk_wasm_invocation_status(invocation);
         if (status != SILK_WASM_OK) {
@@ -239,9 +248,13 @@ SilkWasmHandle *silk_wasm_instantiate(SilkWasmHandle *module,
                 }
                 store->last_exception = exception;
                 silk_wasm_set_error(store, SILK_WASM_THROW, "WebAssembly start function threw");
-            } else silk_wasm_set_error(store, silk_wasm_invocation_error_kind(invocation),
-                                      silk_wasm_invocation_error(invocation));
-            silk_wasm_invocation_free(invocation);
+                silk_wasm_invocation_free(invocation);
+            } else {
+                /* A trap: its frames show in the RuntimeError's stack. */
+                silk_wasm_set_error(store, silk_wasm_invocation_error_kind(invocation),
+                                    silk_wasm_invocation_error(invocation));
+                store->start_trap = invocation;
+            }
             return NULL;
         }
         silk_wasm_invocation_free(invocation);
