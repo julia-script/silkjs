@@ -1,40 +1,59 @@
 'use strict';
 
 const { validateInteger } = require('internal/path_events/support');
+const { ArrayPrototypePush } = require('internal/per_context/primordials');
 // Event, CustomEvent and EventTarget are Node's (internal/event_target); this module adds
 // the runtime's AbortSignal, AbortController and DOMException on top of them.
 const {
   Event, CustomEvent, EventTarget, isEventTarget, kEvents, kResistStopPropagation, kTrustEvent,
-  kNewListener, kRemoveListener,
+  kNewListener, kRemoveListener, defineEventHandler,
 } = require('internal/event_target');
-// AbortSignal state lives under a symbol on the signal, as Node keeps kAborted and kReason, so
-// the brand check also passes for a Proxy of a signal.
-const kSignalState = Symbol('kSignalState');
-const signalState = {
-  get(value) { return (typeof value === 'object' && value !== null) || typeof value === 'function' ? value[kSignalState] : undefined; },
-  has(value) { return signalState.get(value) !== undefined; },
-};
+// AbortSignal and AbortController follow Node.js v24.22.1 lib/internal/abort_controller.js:
+// state under the same symbols, composite signals that follow their sources through
+// WeakRefs in kSourceSignals/kDependantSignals, and gcPersistentSignals for observed
+// timeout and composite signals. The runtime's structured clone carries transferred
+// signals (internal/abort_controller), so a received signal also stays alive while it
+// is observed or followed, until its port closes (kTransferred).
+const signalToken = Symbol('kDontThrowSymbol');
+const kAborted = Symbol('kAborted');
+const kReason = Symbol('kReason');
+const kTimeout = Symbol('kTimeout');
+const kComposite = Symbol('kComposite');
+const kFollowing = Symbol('kFollowing');
+const kResultSignalWeakRef = Symbol('kResultSignalWeakRef');
+const kSourceSignals = Symbol('kSourceSignals');
+const kDependantSignals = Symbol('kDependantSignals');
+const kTransferred = Symbol('kTransferred');
 // Node's #brand: only constructed signals, not a Proxy of one or an object inheriting from one.
 const signalBrands = new WeakSet();
-const controllerState = new WeakMap();
-const signalToken = {};
 
-// Composite dependencies are weak in both directions. Observed composites
-// remain alive only while a live source can still trigger their listeners.
-const persistentSignals = new Set();
-const sourceCleanup = new FinalizationRegistry(unlinkSignals);
-const dependentCleanup = new FinalizationRegistry(unlinkSignals);
-const timeoutCleanup = new FinalizationRegistry(timer => clearTimeout(timer));
+const clearTimeoutRegistry = new FinalizationRegistry(timer => clearTimeout(timer));
+const dependantSignalsCleanupRegistry = new FinalizationRegistry(
+  ({ sourceSignalRef, dependantSignalRef, sourceSignalsCleanupToken }) => {
+    sourceSignalsCleanupRegistry.unregister(sourceSignalsCleanupToken);
 
-// Whether a listener that is not weak (kWeakHandler) waits for abort: only those keep a
-// timeout or composite signal alive, as in Node. `added` is one just added, which
-// EventTarget announces before the first listener's list is in kEvents.
-function strongAbortListener(signal) {
-  for (let node = signal[kEvents]?.get('abort')?.next; node !== undefined; node = node.next) {
-    if (!node.removed && !node.weak) return true;
+    const sourceSignal = sourceSignalRef.deref();
+    if (sourceSignal === undefined) {
+      return;
+    }
+    sourceSignal[kDependantSignals].delete(dependantSignalRef);
+    updateTransferredRetention(sourceSignal);
+  });
+
+const gcPersistentSignals = new Set();
+
+const sourceSignalsCleanupRegistry = new FinalizationRegistry(({ sourceSignalRef, composedSignalRef }) => {
+  const composedSignal = composedSignalRef.deref();
+  if (composedSignal !== undefined) {
+    composedSignal[kSourceSignals].delete(sourceSignalRef);
+
+    if (composedSignal[kSourceSignals].size === 0) {
+      // This signal will no longer abort. There's no need to keep it in the gcPersistentSignals set.
+      gcPersistentSignals.delete(composedSignal);
+    }
   }
-  return false;
-}
+});
+
 // Node's lib/internal/abort_controller.js customInspect.
 function customInspect(self, obj, depth, options) {
   if (depth < 0)
@@ -48,44 +67,112 @@ function customInspect(self, obj, depth, options) {
 }
 const customInspectSymbol = Symbol.for('nodejs.util.inspect.custom');
 
-function updateSignalRetention(signal, added = false) {
-  const state = signalState.get(signal);
-  if (!state) return;
-  const observed = added || strongAbortListener(signal);
-  if (!state.aborted && ((state.timeout && (observed || state.dependents.size > 0)) ||
-      (state.composite && observed && state.sources.size > 0) ||
-      (state.transferred && (observed || state.dependents.size > 0)))) {
-    persistentSignals.add(signal);
+function isAbortSignal(value) {
+  return ((typeof value === 'object' && value !== null) || typeof value === 'function') && value[kAborted] !== undefined;
+}
+function validateThisAbortSignal(obj) {
+  if (obj?.[kAborted] === undefined) {
+    const error = new TypeError('Value of "this" must be of type AbortSignal');
+    error.code = 'ERR_INVALID_THIS';
+    throw error;
+  }
+}
+
+// A received transferred signal can be aborted only through its port, which holds it weakly:
+// it stays alive while something could still observe that abort.
+function hasStrongAbortListener(signal) {
+  for (let node = signal[kEvents]?.get('abort')?.next; node !== undefined; node = node.next) {
+    if (!node.removed && !node.weak) return true;
+  }
+  return false;
+}
+function updateTransferredRetention(signal, added = false) {
+  if (!signal[kTransferred]) return;
+  if (!signal[kAborted] && (added || signal[kDependantSignals]?.size > 0 || hasStrongAbortListener(signal))) {
+    gcPersistentSignals.add(signal);
   } else {
-    persistentSignals.delete(signal);
+    gcPersistentSignals.delete(signal);
   }
 }
 
-function unlinkSignals(link) {
-  sourceCleanup.unregister(link);
-  dependentCleanup.unregister(link);
-  const source = link.source.deref();
-  const dependent = link.dependent.deref();
-  if (source) {
-    signalState.get(source).dependents.delete(link);
-    updateSignalRetention(source);
+function refreshCompositeSignal(signal) {
+  if (!signal[kComposite] || signal[kAborted] || !signal[kSourceSignals]?.size) {
+    return;
   }
-  if (dependent) {
-    signalState.get(dependent).sources.delete(link);
-    updateSignalRetention(dependent);
+
+  for (const sourceSignalWeakRef of signal[kSourceSignals]) {
+    const sourceSignal = sourceSignalWeakRef.deref();
+    if (sourceSignal === undefined) {
+      signal[kSourceSignals].delete(sourceSignalWeakRef);
+      continue;
+    }
+
+    if (sourceSignal[kAborted]) {
+      abortSignal(signal, sourceSignal[kReason]);
+      return;
+    }
   }
 }
 
-function createSignalTimeout(reference, delay) {
-  const timer = setTimeout(() => {
-    const signal = reference.deref();
-    if (signal) {
-      timeoutCleanup.unregister(signal);
-      abortSignal(signal, new DOMException('The operation was aborted due to timeout', 'TimeoutError'));
+function followCompositeSignal(signal) {
+  if (signal[kFollowing] || signal[kAborted] || !signal[kSourceSignals]?.size) {
+    return;
+  }
+
+  const resultSignalWeakRef = signal[kResultSignalWeakRef] ??= new WeakRef(signal);
+
+  for (const sourceSignalWeakRef of signal[kSourceSignals]) {
+    const sourceSignal = sourceSignalWeakRef.deref();
+    if (sourceSignal === undefined) {
+      signal[kSourceSignals].delete(sourceSignalWeakRef);
+      continue;
+    }
+
+    if (sourceSignal[kAborted]) {
+      abortSignal(signal, sourceSignal[kReason]);
+      return;
+    }
+
+    sourceSignal[kDependantSignals] ??= new Set();
+    sourceSignal[kDependantSignals].add(resultSignalWeakRef);
+    updateTransferredRetention(sourceSignal);
+    dependantSignalsCleanupRegistry.register(signal, {
+      sourceSignalRef: sourceSignalWeakRef,
+      dependantSignalRef: resultSignalWeakRef,
+      sourceSignalsCleanupToken: sourceSignalWeakRef,
+    });
+    sourceSignalsCleanupRegistry.register(sourceSignal, {
+      sourceSignalRef: sourceSignalWeakRef,
+      composedSignalRef: resultSignalWeakRef,
+    }, sourceSignalWeakRef);
+  }
+
+  signal[kFollowing] = true;
+}
+
+// Because the AbortSignal timeout cannot be canceled, we don't want the
+// presence of the timer alone to keep the AbortSignal from being garbage
+// collected if it otherwise no longer accessible. We also don't want the
+// timer to keep the Node.js process open on it's own. Therefore, we wrap
+// the AbortSignal in a WeakRef and have the setTimeout callback close
+// over the WeakRef rather than directly over the AbortSignal, and we unref
+// the created timer object. Separately, we add the signal to a
+// FinalizerRegistry that will clear the timeout when the signal is gc'd.
+function setWeakAbortSignalTimeout(weakRef, delay) {
+  const timeout = setTimeout(() => {
+    const signal = weakRef.deref();
+    if (signal !== undefined) {
+      clearTimeoutRegistry.unregister(signal);
+      gcPersistentSignals.delete(signal);
+      abortSignal(
+        signal,
+        new DOMException(
+          'The operation was aborted due to timeout',
+          'TimeoutError'));
     }
   }, delay);
-  timer.unref?.();
-  return timer;
+  timeout.unref();
+  return timeout;
 }
 
 const exceptionNames = [
@@ -136,161 +223,269 @@ for (let i = 0; i < exceptionConstants.length; i++) {
 }
 Object.defineProperty(DOMException.prototype, Symbol.toStringTag, { value: 'DOMException', configurable: true });
 
-function signalData(signal) {
-  const state = signalState.get(signal);
-  if (!state) throw new TypeError('Value of this must be of AbortSignal');
-  return state;
-}
+// https://dom.spec.whatwg.org/#dom-abortsignal-abort
 function abortSignal(signal, reason) {
-  if (signalData(signal).aborted) return;
-  const pending = [signal];
-  signalData(signal).aborted = true;
-  signalData(signal).reason = reason;
-  for (let i = 0; i < pending.length; i++) {
-    const state = signalData(pending[i]);
-    for (const link of state.dependents) {
-      const dependent = link.dependent.deref();
-      if (!dependent) {
-        unlinkSignals(link);
-        continue;
-      }
-      const dependentState = signalData(dependent);
-      if (dependentState.aborted) continue;
-      dependentState.aborted = true;
-      dependentState.reason = reason;
-      pending.push(dependent);
+  // 1. If signal is aborted, then return.
+  if (signal[kAborted]) return;
+
+  // 2. Set signal's abort reason to reason if it is given;
+  //    otherwise to a new "AbortError" DOMException.
+  signal[kAborted] = true;
+  signal[kReason] = reason;
+
+  // 3. Let dependentSignalsToAbort be a new list.
+  const dependentSignalsToAbort = Object.setPrototypeOf([], null);
+
+  // 4. For each dependentSignal of signal's dependent signals:
+  signal[kDependantSignals]?.forEach((s) => {
+    const dependentSignal = s.deref();
+    // 1. If dependentSignal is not aborted, then:
+    if (dependentSignal && !dependentSignal[kAborted]) {
+      // 1. Set dependentSignal's abort reason to signal's abort reason.
+      dependentSignal[kReason] = reason;
+      dependentSignal[kAborted] = true;
+      // 2. Append dependentSignal to dependentSignalsToAbort.
+      ArrayPrototypePush(dependentSignalsToAbort, dependentSignal);
     }
+  });
+
+  // 5. Run the abort steps for signal
+  runAbort(signal);
+
+  // 6. For each dependentSignal of dependentSignalsToAbort,
+  //    run the abort steps for dependentSignal.
+  for (let i = 0; i < dependentSignalsToAbort.length; i++) {
+    const dependentSignal = dependentSignalsToAbort[i];
+    runAbort(dependentSignal);
+    // A transitively-aborted dependent signal can never abort again, so there
+    // is no longer any reason to keep it alive.
+    gcPersistentSignals.delete(dependentSignal);
   }
-  for (const item of pending) {
-    const state = signalData(item);
-    for (const link of state.sources) unlinkSignals(link);
-    for (const link of state.dependents) unlinkSignals(link);
-    persistentSignals.delete(item);
-    item.dispatchEvent(new Event('abort', { [kTrustEvent]: true }));
+
+  // Clean up the signal from gcPersistentSignals
+  gcPersistentSignals.delete(signal);
+
+  // If this is a composite signal, also remove all of its source signals from gcPersistentSignals
+  // when they get dereferenced from the signal's kSourceSignals set
+  if (signal[kComposite] && signal[kSourceSignals]) {
+    signal[kSourceSignals].forEach((sourceWeakRef) => {
+      const sourceSignal = sourceWeakRef.deref();
+      if (sourceSignal) {
+        gcPersistentSignals.delete(sourceSignal);
+      }
+    });
   }
 }
+
+// To run the abort steps for an AbortSignal signal
+function runAbort(signal) {
+  const event = new Event('abort', {
+    [kTrustEvent]: true,
+  });
+  signal.dispatchEvent(event);
+}
+
 let sequenceOfSignals;
 class AbortSignal extends EventTarget {
-  constructor(token) {
-    if (token !== signalToken) {
+  constructor(dontThrowSymbol = undefined, init = undefined) {
+    if (dontThrowSymbol !== signalToken) {
       const error = new TypeError('Illegal constructor');
       error.code = 'ERR_ILLEGAL_CONSTRUCTOR';
       throw error;
     }
     super();
     signalBrands.add(this);
-    // Signals warn about no listener count (Node: kMaxEventTargetListeners = 0).
+
     this[require('events').kMaxEventTargetListeners] = 0;
-    Object.defineProperty(this, kSignalState, { value: {
-      aborted: false, reason: undefined, onabort: null, handler: null,
-      dependents: new Set(), sources: new Set(), composite: false, timeout: false,
-      reference: new WeakRef(this),
-    }, writable: true });
+    this[kAborted] = init?.aborted ?? false;
+    this[kReason] = init?.reason;
+    this[kComposite] = init?.composite ?? false;
   }
-  [kNewListener](size, type, listener, once, capture, passive, weak) {
-    super[kNewListener](size, type, listener, once, capture, passive, weak);
-    if (type === 'abort') updateSignalRetention(this, !weak);
+
+  get aborted() {
+    validateThisAbortSignal(this);
+    refreshCompositeSignal(this);
+    return !!this[kAborted];
   }
-  [kRemoveListener](size, type, listener, capture) {
-    super[kRemoveListener](size, type, listener, capture);
-    if (type === 'abort') updateSignalRetention(this);
+
+  get reason() {
+    validateThisAbortSignal(this);
+    refreshCompositeSignal(this);
+    return this[kReason];
   }
-  [customInspectSymbol](depth, options) {
-    return customInspect(this, { aborted: this.aborted }, depth, options);
-  }
-  get aborted() { return signalData(this).aborted; }
-  get reason() { return signalData(this).reason; }
-  throwIfAborted() { const state = signalData(this); if (state.aborted) throw state.reason; }
-  get onabort() { return signalData(this).onabort; }
-  set onabort(callback) {
-    const state = signalData(this);
-    state.onabort = typeof callback === 'function' ? callback : null;
-    if (state.onabort && !state.handler) {
-      state.handler = event => signalData(this).onabort?.call(this, event);
-      this.addEventListener('abort', state.handler);
-    } else if (!state.onabort && state.handler) {
-      this.removeEventListener('abort', state.handler);
-      state.handler = null;
+
+  throwIfAborted() {
+    validateThisAbortSignal(this);
+    refreshCompositeSignal(this);
+    if (this[kAborted]) {
+      throw this[kReason];
     }
   }
-  static abort(reason = new DOMException('This operation was aborted', 'AbortError')) {
-    const signal = new AbortSignal(signalToken);
-    signalData(signal).aborted = true;
-    signalData(signal).reason = reason;
-    return signal;
+
+  [customInspectSymbol](depth, options) {
+    return customInspect(this, {
+      aborted: this.aborted,
+    }, depth, options);
   }
+
+  static abort(
+    reason = new DOMException('This operation was aborted', 'AbortError')) {
+    return new AbortSignal(signalToken, { aborted: true, reason });
+  }
+
   static timeout(delay) {
     validateInteger(delay, 'delay', 0, 0xffffffff);
     const signal = new AbortSignal(signalToken);
-    const state = signalData(signal);
-    state.timeout = true;
-    const timer = createSignalTimeout(state.reference, delay);
-    timeoutCleanup.register(signal, timer, signal);
+    signal[kTimeout] = true;
+    clearTimeoutRegistry.register(
+      signal,
+      setWeakAbortSignalTimeout(new WeakRef(signal), delay),
+      signal);
     return signal;
   }
+
   static any(signals) {
-    // Node's converters['sequence<AbortSignal>'] (lib/internal/abort_controller.js).
     const { converters, createSequenceConverter } = require('internal/webidl');
     sequenceOfSignals ??= createSequenceConverter(converters.AbortSignal);
-    const sources = sequenceOfSignals(signals, { __proto__: null, context: 'signals' });
-    const signal = new AbortSignal(signalToken);
-    for (const source of sources) {
-      // The internal state, not the getters: a source may have its own aborted or reason.
-      const sourceState = signalData(source);
-      if (sourceState.aborted) return AbortSignal.abort(sourceState.reason);
+    const signalsArray = sequenceOfSignals(
+      signals,
+      { __proto__: null, context: 'signals' },
+    );
+
+    const resultSignal = new AbortSignal(signalToken, { composite: true });
+    if (!signalsArray.length) {
+      return resultSignal;
     }
-    const state = signalData(signal);
-    state.composite = true;
-    const roots = new Set();
-    for (const source of sources) {
-      const sourceState = signalData(source);
-      if (sourceState.composite) {
-        for (const link of sourceState.sources) roots.add(link.source);
+
+    resultSignal[kSourceSignals] = new Set();
+
+    // Track if we have any timeout signals
+    let hasTimeoutSignals = false;
+
+    for (let i = 0; i < signalsArray.length; i++) {
+      const signal = signalsArray[i];
+
+      // Check if this is a timeout signal
+      if (signal[kTimeout]) {
+        hasTimeoutSignals = true;
+
+        // Add the timeout signal to gcPersistentSignals to keep it alive
+        // This is what the kNewListener method would do when adding abort listeners
+        gcPersistentSignals.add(signal);
+      }
+
+      refreshCompositeSignal(signal);
+      if (signal[kAborted]) {
+        abortSignal(resultSignal, signal[kReason]);
+        return resultSignal;
+      }
+
+      if (!signal[kComposite]) {
+        const signalWeakRef = new WeakRef(signal);
+        resultSignal[kSourceSignals].add(signalWeakRef);
+      } else if (!signal[kSourceSignals]) {
+        continue;
       } else {
-        roots.add(sourceState.reference);
+        for (const sourceSignalWeakRef of signal[kSourceSignals]) {
+          const sourceSignal = sourceSignalWeakRef.deref();
+          if (!sourceSignal) {
+            continue;
+          }
+
+          if (sourceSignal[kAborted]) {
+            abortSignal(resultSignal, sourceSignal[kReason]);
+            return resultSignal;
+          }
+
+          if (resultSignal[kSourceSignals].has(sourceSignalWeakRef)) {
+            continue;
+          }
+          resultSignal[kSourceSignals].add(sourceSignalWeakRef);
+        }
       }
     }
-    for (const reference of roots) {
-      const source = reference.deref();
-      if (!source) continue;
-      const link = { source: reference, dependent: state.reference };
-      signalData(source).dependents.add(link);
-      state.sources.add(link);
-      sourceCleanup.register(source, link, link);
-      dependentCleanup.register(signal, link, link);
-      updateSignalRetention(source);
+
+    if (hasTimeoutSignals && resultSignal[kSourceSignals].size > 0) {
+      resultSignal[kTimeout] = true;
     }
-    return signal;
+
+    // Preserve abort state even if sources are collected before this signal is
+    // observed. Following uses weak references so unused signals can be collected.
+    followCompositeSignal(resultSignal);
+
+    return resultSignal;
+  }
+
+  [kNewListener](size, type, listener, once, capture, passive, weak) {
+    super[kNewListener](size, type, listener, once, capture, passive, weak);
+
+    if (this[kComposite] && type === 'abort' && !this.aborted && size === 1) {
+      followCompositeSignal(this);
+    }
+
+    const isTimeoutOrNonEmptyCompositeSignal = this[kTimeout] || (this[kComposite] && this[kSourceSignals]?.size);
+    if (isTimeoutOrNonEmptyCompositeSignal &&
+        type === 'abort' &&
+        !this.aborted &&
+        !weak &&
+        size === 1) {
+      // If this is a timeout signal, or a non-empty composite signal, and we're adding a non-weak abort
+      // listener, then we don't want it to be gc'd while the listener
+      // is attached and the timer still hasn't fired. So, we retain a
+      // strong ref that is held for as long as the listener is registered.
+      gcPersistentSignals.add(this);
+    }
+    if (type === 'abort' && !weak) updateTransferredRetention(this, true);
+  }
+
+  [kRemoveListener](size, type, listener, capture) {
+    super[kRemoveListener](size, type, listener, capture);
+    const isTimeoutOrNonEmptyCompositeSignal = this[kTimeout] || (this[kComposite] && this[kSourceSignals]?.size);
+    if (isTimeoutOrNonEmptyCompositeSignal && type === 'abort' && size === 0) {
+      gcPersistentSignals.delete(this);
+    }
+    if (type === 'abort') updateTransferredRetention(this);
   }
 }
+Object.defineProperty(AbortSignal.prototype, 'aborted', { enumerable: true });
 Object.defineProperty(AbortSignal.prototype, Symbol.toStringTag, { value: 'AbortSignal', configurable: true });
+defineEventHandler(AbortSignal.prototype, 'abort');
+
 class AbortController {
-  constructor() { controllerState.set(this, new AbortSignal(signalToken)); }
+  #signal;
+
   get signal() {
-    const signal = controllerState.get(this);
-    if (!signal) throw new TypeError('Value of this must be of AbortController');
-    return signal;
+    this.#signal ??= new AbortSignal(signalToken);
+
+    return this.#signal;
   }
-  abort(reason = new DOMException('This operation was aborted', 'AbortError')) { abortSignal(this.signal, reason); }
+
+  abort(reason = new DOMException('This operation was aborted', 'AbortError')) {
+    abortSignal(this.#signal ??= new AbortSignal(signalToken), reason);
+  }
+
   [customInspectSymbol](depth, options) {
-    return customInspect(this, { signal: this.signal }, depth, options);
+    return customInspect(this, {
+      signal: this.signal,
+    }, depth, options);
   }
 }
-Object.defineProperty(AbortController.prototype, Symbol.toStringTag, { value: 'AbortController', configurable: true });
+Object.defineProperty(AbortController.prototype, 'signal', { enumerable: true });
+Object.defineProperty(AbortController.prototype, 'abort', { enumerable: true });
 
 module.exports = {
   Event, CustomEvent, EventTarget, AbortController, AbortSignal, DOMException,
   isEventTarget, kEvents, kResistStopPropagation,
-  isAbortSignal: value => signalState.has(value),
+  isAbortSignal,
   isAbortSignalInstance: value => signalBrands.has(value),
   createAbortSignal: () => {
     const signal = new AbortSignal(signalToken);
-    signalData(signal).transferred = true;
+    signal[kTransferred] = true;
     return signal;
   },
   closeTransferredSignal: signal => {
-    signalData(signal).transferred = false;
-    updateSignalRetention(signal);
+    signal[kTransferred] = false;
+    gcPersistentSignals.delete(signal);
   },
   abortSignal,
   isDOMException: value => exceptionState.has(value),
