@@ -440,7 +440,7 @@ const consoleMessages = [];
 function consoleMessage(session, message) {
   session.emit('Runtime.consoleAPICalled', { type: message.type, args: message.args.map(value => session.values.remote(value, 'console', false, true)), executionContextId: 1, timestamp: message.timestamp, stackTrace: message.stackTrace });
 }
-const consoleBridge = require('internal/inspector_console').create((type, args) => {
+function publishConsole(type, args) {
   if (!url() && sessions.size === 0) return;
   const message = { type, args, timestamp: Date.now(), stackTrace: consoleStack() };
   if (type === 'clear') consoleMessages.length = 0;
@@ -450,7 +450,21 @@ const consoleBridge = require('internal/inspector_console').create((type, args) 
     if (type === 'clear') session.values.releaseGroup('console');
     consoleMessage(session, message);
   }
-});
+}
+const consoleBridge = require('internal/inspector_console').create(publishConsole);
+// V8's console.context(): the methods V8 gives a context console, with counters
+// and timers of its own.
+function consoleContext() {
+  const own = require('internal/inspector_console').create(publishConsole, false).console;
+  const result = {};
+  const names = ['dir', 'dirXml', 'table', 'groupEnd', 'clear', 'count', 'countReset', 'profile', 'profileEnd', 'debug', 'error', 'info', 'log', 'warn', 'trace', 'group', 'groupCollapsed', 'assert', 'time', 'timeLog', 'timeEnd', 'timeStamp'];
+  for (let index = 0; index < names.length; index++) {
+    const name = names[index];
+    const target = name === 'dirXml' ? own.dirxml : name === 'profile' || name === 'profileEnd' ? consoleBridge.console[name] : own[name];
+    result[name] = { [name](...args) { if (target !== undefined) return Reflect.apply(target, undefined, args); } }[name];
+  }
+  return result;
+}
 consoleBridge.console.profile = function profile(title) {
   return profiles.consoleProfile(title, profiles.emitConsoleEvent, profile);
 };
@@ -470,4 +484,4 @@ if (native(10) === 0) {
   // Native state does not come with a heap image: a start from one registers again.
   host.onHydrate(() => { native(0, onNative); });
 }
-module.exports = { connect, open, close, url, waitForDebugger, _start: start, _atExit: atExit, _installProcess: installProcess, _waitForWorker: waitForWorkerStart, _armStartup: armStartup, _breakFirstLine: () => workerBreakFirst, broadcast, console: consoleBridge.console, emitConsole: consoleBridge.emitConsole, putNetworkResource: network.put };
+module.exports = { connect, open, close, url, waitForDebugger, _start: start, _atExit: atExit, _installProcess: installProcess, _waitForWorker: waitForWorkerStart, _armStartup: armStartup, _breakFirstLine: () => workerBreakFirst, broadcast, console: consoleBridge.console, consoleContext, emitConsole: consoleBridge.emitConsole, putNetworkResource: network.put };
