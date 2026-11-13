@@ -8,6 +8,7 @@ const host = require('internal/host');
 // name is the script name ([eval] or [stdin]); the caller has installed the
 // module globals under the cwd and handled ESM input.
 function evalScript(name, body, print) {
+  host.clearRegExpStatics();
   const result = host.compileFunction(body, name, undefined, undefined, undefined, true);
   // As Node, --print logs the result on exit, after the loop has run (a promise
   // settled in a later tick prints settled).

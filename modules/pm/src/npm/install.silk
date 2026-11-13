@@ -7,8 +7,13 @@
 //! The project's own dependencies are symbolic links in `node_modules`, and their commands are
 //! links in `node_modules/.bin`.
 //!
+//! A workspace has one hidden directory, in the `node_modules` of its root. Each of its packages
+//! has a `node_modules` of its own with links into it, and a link to the directory of every
+//! other package of the workspace it depends on.
+//!
 //! Tarballs are downloaded on the calling thread, a window at a time, and checked and unpacked
-//! on the threads of a pool while the next window downloads.
+//! on the threads of a pool while the next window downloads. A [`Downloader`] that is given to
+//! the resolution starts on them before the graph is complete.
 
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.collections.bytes { Bytes }
@@ -19,15 +24,16 @@ import silk.concurrency.thread_pool { Pool, PoolFiber }
 import silk.core.effect { Effect }
 import silk.core.option { Option }
 import silk.core.result { Result }
-import silk.platform.native.file { NativeFile, NativeFileError, OPEN_CREATE, OPEN_TRUNCATE, OPEN_WRITE_ONLY }
+import silk.platform.native.file { NativeFile, NativeFileError }
 import npm.manifest { Manifest }
-import npm.registry { Registry, RegistryError }
-import npm.resolve { Graph, Host }
-import pkg.files { linkFile, linkTo, makeDirectories }
+import npm.registry { Fetched, Registry, RegistryError }
+import npm.resolve { Graph, Host, Tarballs }
+import npm.workspace { Workspace }
+import pkg.files { Listed, linkFile, linkTo, list, makeDirectories, readOptional, removeTree, writeFile }
 import pkg.integrity { Integrity }
 import pkg.names { Names }
 import pkg.store { PackageFiles, Store, StoreError }
-import pkg.text { same, startsWith }
+import pkg.text { compare, same, startsWith }
 
 /// The hidden directory in `node_modules` that holds the packages.
 pub const VIRTUAL_STORE: &'static [u8] = b".sjs"
@@ -79,8 +85,19 @@ effect fn identity(graph: &Graph, index: usize) -> Bytes ! OutOfMemoryError ? &m
   return move text
 }
 
-// One downloaded tarball on its way to a worker thread, with what is needed to check and
-// unpack it. A job owns all of it, so it can move to another thread.
+// A package the store does not have, and what is needed to fetch, check and record it.
+struct Wanted {
+  package: usize,
+  // `name@version`, for messages.
+  label: Bytes,
+  url: Bytes,
+  integrity: Bytes,
+  shasum: Bytes,
+  id: Bytes,
+}
+
+// One downloaded tarball on its way to a worker thread. A job owns all of it, so it can move
+// to another thread.
 struct Job {
   package: usize,
   tarball: Bytes,
@@ -155,95 +172,178 @@ effect fn collect(fibers: List<PoolFiber<Done, OutOfMemoryError>>) -> List<Done>
   return move finished
 }
 
-// The files of every package, downloading the packages the store does not have.
-effect fn gather(graph: &Graph, store: &Store, host: Host, pool: &Pool, summary: &mut Summary) -> List<Option<PackageFiles>>
-  ! InstallError | OutOfMemoryError ? &mut Registry | &mut Allocator {
-  let mut files = List<Option<PackageFiles>>.make()
-  let mut missing = List<usize>.make()
-  let mut index: usize = 0
-  while index < Graph.count(graph) {
-    if Graph.supports(graph, index, host) {
-      let id = run identity(graph, index)
-      let found = run Store.recorded(store, Bytes.asSlice(&id))
-      if Option.isSome(&found) == false {
-        run missing.append(index)
-      }
-      run files.append(move found)
-    } else {
-      run files.append(Option<PackageFiles>.none())
-    }
-    index = index + 1
-  }
-  let wanted = List<usize>.asSlice(&missing)
-  let mut running = List<PoolFiber<Done, OutOfMemoryError>>.make()
-  let mut start: usize = 0
-  while start < wanted.length {
-    let mut end = start + BATCH
-    if end > wanted.length {
-      end = wanted.length
-    }
-    let mut urls = List<Bytes>.make()
-    index = start
-    while index < end {
-      run urls.append(run Bytes.copy(Graph.tarball(graph, wanted[index])))
-      index = index + 1
-    }
-    let mut answers = run Registry.tarballs(List<Bytes>.asSlice(&urls))
-    index = end
-    while index > start {
-      index = index - 1
-      let package = wanted[index]
-      let answer = match move List<Result<Bytes, RegistryError>>.pop(&mut answers) {
-        Option.Some { value } => move value
-        Option.None => { run stopAt("the registry gave no answer for", graph, package) }
-      }
-      let tarball = match move answer {
-        Result.Success { value } => move value
-        Result.Failure { error } => {
-          fail InstallError { message: error.message, subject: run label(graph, package) }
-        }
-      }
-      let job = Job {
-        package: package,
-        tarball: move tarball,
-        integrity: run Bytes.copy(Graph.integrity(graph, package)),
-        shasum: run Bytes.copy(Graph.shasum(graph, package)),
-        id: run identity(graph, package),
-        store: run Bytes.copy(Store.directory(store)),
-      }
-      run running.append(run pool.fork(work(move job)))
-    }
-    start = end
-  }
-  if List<PoolFiber<Done, OutOfMemoryError>>.length(&running) == 0 {
-    return move files
-  }
-  let mut finished = match move run Effect.result(pool.block(collect(move running))) {
-    Result.Success { value } => move value
-    Result.Failure { error } => match move error {
-      OutOfMemoryError exhausted => { fail move exhausted }
-      Cancelled _ => { run stop("the unpacking was interrupted", b"") }
-    }
-  }
-  while true {
-    match move List<Done>.pop(&mut finished) {
-      Option.None => { break }
-      Option.Some { value: done } => {
-        let Done { package, files: unpacked, problem } = move done
-        if Option.isSome(&unpacked) == false {
-          run stopAt(problem, graph, package)
-        }
-        List<Option<PackageFiles>>.set(&mut files, package, move unpacked)
-        summary.downloaded = summary.downloaded + 1
-      }
-    }
-  }
-  return move files
+/// Brings the packages of one graph into the store. It is the [`Tarballs`] of a resolution, so
+/// downloads start while the graph grows, and [`install`] hands it every package that is left.
+/// Downloaded tarballs are checked and unpacked on the threads of a pool.
+pub struct Downloader<'a> {
+  store: &'a Store,
+  pool: &'a Pool,
+  host: Host,
+  // Per package of the graph: its files, once the store has them.
+  files: List<Option<PackageFiles>>,
+  // Per package of the graph: whether `expect` saw it.
+  seen: List<bool>,
+  // Not asked for yet.
+  waiting: List<Wanted>,
+  // Handed out by the last `next`, in that order.
+  asked: List<Wanted>,
+  running: List<PoolFiber<Done, OutOfMemoryError>>,
+  // The first download that failed.
+  failure: Option<InstallError>,
 }
 
-// The directory name of a package in the hidden directory: `name@version`, with the slash of a
-// scope written as `+`.
-effect fn appendDirectory(path: &mut Bytes, graph: &Graph, index: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+impl<'a> Downloader<'a> {
+  /// A downloader into `store` for the packages `host` can run, unpacking on `pool`.
+  pub fn make(store: &'a Store, pool: &'a Pool, host: Host) -> Downloader<'a> {
+    return Downloader<'a> {
+      store: store,
+      pool: pool,
+      host: host,
+      files: List<Option<PackageFiles>>.make(),
+      seen: List<bool>.make(),
+      waiting: List<Wanted>.make(),
+      asked: List<Wanted>.make(),
+      running: List<PoolFiber<Done, OutOfMemoryError>>.make(),
+      failure: Option<InstallError>.none(),
+    }
+  }
+
+  effect fn expect(self: &mut Self, graph: &Graph, index: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+    while List<bool>.length(&self.seen) <= index {
+      run self.seen.append(false)
+      run self.files.append(Option<PackageFiles>.none())
+    }
+    if List<bool>.get(&self.seen, index) {
+      return ()
+    }
+    List<bool>.set(&mut self.seen, index, true)
+    if Graph.supports(graph, index, self.host) == false {
+      return ()
+    }
+    let id = run identity(graph, index)
+    let found = run Store.recorded(self.store, Bytes.asSlice(&id))
+    if Option.isSome(&found) {
+      List<Option<PackageFiles>>.set(&mut self.files, index, move found)
+      return ()
+    }
+    let wanted = Wanted {
+      package: index,
+      label: run label(graph, index),
+      url: run Bytes.copy(Graph.tarball(graph, index)),
+      integrity: run Bytes.copy(Graph.integrity(graph, index)),
+      shasum: run Bytes.copy(Graph.shasum(graph, index)),
+      id: move id,
+    }
+    run self.waiting.append(move wanted)
+  }
+
+  effect fn next(self: &mut Self) -> List<Bytes> ! OutOfMemoryError ? &mut Allocator {
+    let mut urls = List<Bytes>.make()
+    while List<Bytes>.length(&urls) < BATCH {
+      match move List<Wanted>.pop(&mut self.waiting) {
+        Option.None => { break }
+        Option.Some { value: wanted } => {
+          run urls.append(run Bytes.copy(Bytes.asSlice(&wanted.url)))
+          run self.asked.append(move wanted)
+        }
+      }
+    }
+    return move urls
+  }
+
+  effect fn take(self: &mut Self, answers: List<Result<Bytes, RegistryError>>) -> () ! OutOfMemoryError ? &mut Allocator {
+    let mut arrived = move answers
+    while true {
+      let wanted = match move List<Wanted>.pop(&mut self.asked) {
+        Option.None => { break }
+        Option.Some { value } => move value
+      }
+      let Wanted { package, label: subject, url, integrity, shasum, id } = move wanted
+      drop url
+      let problem: string<'static> = match move List<Result<Bytes, RegistryError>>.pop(&mut arrived) {
+        Option.None => "the registry gave no answer for"
+        Option.Some { value: answer } => match move answer {
+          Result.Failure { error } => error.message
+          Result.Success { value: tarball } => {
+            let job = Job {
+              package: package,
+              tarball: move tarball,
+              integrity: move integrity,
+              shasum: move shasum,
+              id: move id,
+              store: run Bytes.copy(Store.directory(self.store)),
+            }
+            run self.running.append(run self.pool.fork(work(move job)))
+            continue
+          }
+        }
+      }
+      if Option.isSome(&self.failure) == false {
+        self.failure = Option<InstallError>.some(InstallError { message: problem, subject: move subject })
+      }
+    }
+  }
+
+  // Fetches what still waits, waits for the unpacking, and returns the files of every package.
+  effect fn finish(self: Self, graph: &Graph, summary: &mut Summary) -> List<Option<PackageFiles>>
+    ! InstallError | OutOfMemoryError ? &mut Registry | &mut Allocator {
+    let mut all = move self
+    while true {
+      let urls = run Downloader.next(&mut all)
+      if List<Bytes>.length(&urls) == 0 {
+        break
+      }
+      let none = List<usize>.make()
+      let Fetched { documents, tarballs } = run Registry.fetch(&graph.names, List<usize>.asSlice(&none), List<Bytes>.asSlice(&urls))
+      drop documents
+      run Downloader.take(&mut all, move tarballs)
+    }
+    let Downloader { pool, files: gathered, seen, waiting, asked, running, failure, .. } = move all
+    drop seen
+    drop waiting
+    drop asked
+    let mut files = move gathered
+    let mut finished = List<Done>.make()
+    if List<PoolFiber<Done, OutOfMemoryError>>.length(&running) > 0 {
+      finished = match move run Effect.result(pool.block(collect(move running))) {
+        Result.Success { value } => move value
+        Result.Failure { error } => match move error {
+          OutOfMemoryError exhausted => { fail move exhausted }
+          Cancelled _ => { run stop("the unpacking was interrupted", b"") }
+        }
+      }
+    }
+    match move failure {
+      Option.Some { value } => { fail move value }
+      Option.None => {}
+    }
+    while true {
+      match move List<Done>.pop(&mut finished) {
+        Option.None => { break }
+        Option.Some { value: done } => {
+          let Done { package, files: unpacked, problem } = move done
+          if Option.isSome(&unpacked) == false {
+            run stopAt(problem, graph, package)
+          }
+          List<Option<PackageFiles>>.set(&mut files, package, move unpacked)
+          summary.downloaded = summary.downloaded + 1
+        }
+      }
+    }
+    return move files
+  }
+}
+
+impl<'a> Tarballs for Downloader<'a> {
+  expect: Downloader.expect
+  next: Downloader.next
+  take: Downloader.take
+}
+
+// The directory name of a node in the hidden directory: `name@version`, with the slash of a
+// scope written as `+`, and then what tells the node from the others of its package.
+effect fn appendDirectory(path: &mut Bytes, graph: &Graph, node: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+  let index = Graph.nodePackage(graph, node)
   let name = Graph.name(graph, index)
   let start = Bytes.length(&path)
   run path.append(name)
@@ -257,6 +357,7 @@ effect fn appendDirectory(path: &mut Bytes, graph: &Graph, index: usize) -> () !
   }
   run path.append(b"@")
   run path.append(Graph.version(graph, index))
+  run path.append(Graph.nodeSuffix(graph, node))
 }
 
 fn isScoped(name: &[u8]) -> bool {
@@ -297,13 +398,14 @@ effect fn io<T>(outcome: Result<T, NativeFileError>, path: &[u8]) -> T ! Install
   }
 }
 
-// Links the files of one package into its directory, and its dependencies beside it.
-effect fn place(graph: &Graph, store: &Store, host: Host, virtual: &[u8], index: usize, files: &PackageFiles) -> ()
+// Links the files of one node into its directory, and its dependencies beside it.
+effect fn place(graph: &Graph, store: &Store, host: Host, virtual: &[u8], node: usize, files: &PackageFiles) -> ()
   ! InstallError | OutOfMemoryError ? &mut Allocator {
+  let index = Graph.nodePackage(graph, node)
   let manifest = &Graph.package(graph, index).manifest
   let mut home = run Bytes.copy(virtual)
   run home.append(b"/")
-  run appendDirectory(&mut home, graph, index)
+  run appendDirectory(&mut home, graph, node)
   run home.append(b"/node_modules/")
   let modules = Bytes.length(&home)
   run home.append(Graph.name(graph, index))
@@ -332,16 +434,16 @@ effect fn place(graph: &Graph, store: &Store, host: Host, virtual: &[u8], index:
     each = each + 1
   }
 
-  let edges = Graph.edges(graph, index)
+  let edges = Graph.nodeEdges(graph, node)
   each = 0
   while each < edges.length {
     let edge = edges[each]
     let alias = Names.bytes(&graph.names, edge.alias)
     each = each + 1
-    if edge.target == index && same(alias, Graph.name(graph, index)) {
+    if edge.target == node && same(alias, Graph.name(graph, index)) {
       continue
     }
-    if Graph.supports(graph, edge.target, host) == false {
+    if Graph.supports(graph, Graph.nodePackage(graph, edge.target), host) == false {
       continue
     }
     Bytes.truncate(&mut home, modules)
@@ -349,69 +451,326 @@ effect fn place(graph: &Graph, store: &Store, host: Host, virtual: &[u8], index:
     let mut target = if isScoped(alias) { run Bytes.copy(b"../../../") } else { run Bytes.copy(b"../../") }
     run appendDirectory(&mut target, graph, edge.target)
     run target.append(b"/node_modules/")
-    run target.append(Graph.name(graph, edge.target))
+    run target.append(Graph.name(graph, Graph.nodePackage(graph, edge.target)))
     run io<()>(run Effect.result(linkTo(Bytes.asSlice(&target), Bytes.asSlice(&home))), Bytes.asSlice(&home))
   }
 }
 
-// Links what the project depends on into `node_modules`, and the commands into `.bin`.
-effect fn expose(graph: &Graph, host: Host, modules: &[u8]) -> () ! InstallError | OutOfMemoryError ? &mut Allocator {
-  let edges = Graph.rootEdges(graph)
+// Links the commands of the package linked as `alias` in `modules` into `.bin`.
+effect fn exposeBins(modules: &[u8], alias: &[u8], manifest: &Manifest) -> () ! InstallError | OutOfMemoryError ? &mut Allocator {
+  let bins = Manifest.allBins(manifest)
+  let mut bin: usize = 0
+  while bin < bins.length {
+    let command = Manifest.text(manifest, bins[bin].name)
+    bin = bin + 1
+    // A command name is one path segment; anything else could point outside `.bin`.
+    if command.length == 0 || isScoped(command) || same(command, b"..") || same(command, b".") {
+      continue
+    }
+    let mut shim = run Bytes.copy(modules)
+    run shim.append(b"/.bin/")
+    run shim.append(command)
+    let mut file = run Bytes.copy(b"../")
+    run file.append(alias)
+    run file.append(b"/")
+    run file.append(plainPath(Manifest.text(manifest, bins[bin - 1].path)))
+    run io<()>(run Effect.result(linkTo(Bytes.asSlice(&file), Bytes.asSlice(&shim))), Bytes.asSlice(&shim))
+  }
+}
+
+// How many segments a directory of the workspace has; 0 for the root.
+fn depthOf(path: &[u8]) -> usize {
+  if same(path, b".") {
+    return 0
+  }
+  let mut depth: usize = 1
+  let mut index: usize = 0
+  while index < path.length {
+    if path[index] == 47 {
+      depth = depth + 1
+    }
+    index = index + 1
+  }
+  return depth
+}
+
+// Links what importer `importer` depends on into its `node_modules`, which is `modules`, and
+// the commands into `.bin`.
+effect fn expose(workspace: &Workspace, graph: &Graph, host: Host, importer: usize, modules: &[u8]) -> ()
+  ! InstallError | OutOfMemoryError ? &mut Allocator {
+  // The way from `modules` up to the root of the workspace.
+  let depth = depthOf(Graph.importerPath(graph, importer))
+  let mut up = Bytes.make()
+  let mut level: usize = 0
+  while level <= depth {
+    run up.append(b"../")
+    level = level + 1
+  }
+  let edges = Graph.importerEdges(graph, importer)
   let mut each: usize = 0
   while each < edges.length {
     let edge = edges[each]
     let alias = Names.bytes(&graph.names, edge.alias)
-    if Graph.supports(graph, edge.target, host) == false {
-      each = each + 1
+    each = each + 1
+    let package = Graph.nodePackage(graph, edge.target)
+    if Graph.supports(graph, package, host) == false {
       continue
     }
     let mut path = run Bytes.copy(modules)
     run path.append(b"/")
     run path.append(alias)
     let mut target = if isScoped(alias) { run Bytes.copy(b"../") } else { Bytes.make() }
+    if depth > 0 {
+      run target.append(Bytes.asSlice(&up))
+      run target.append(b"node_modules/")
+    }
     run target.append(VIRTUAL_STORE)
     run target.append(b"/")
     run appendDirectory(&mut target, graph, edge.target)
     run target.append(b"/node_modules/")
-    run target.append(Graph.name(graph, edge.target))
+    run target.append(Graph.name(graph, package))
     run io<()>(run Effect.result(linkTo(Bytes.asSlice(&target), Bytes.asSlice(&path))), Bytes.asSlice(&path))
-
-    let manifest = &Graph.package(graph, edge.target).manifest
-    let bins = Manifest.allBins(manifest)
-    let mut bin: usize = 0
-    while bin < bins.length {
-      let command = Manifest.text(manifest, bins[bin].name)
-      bin = bin + 1
-      // A command name is one path segment; anything else could point outside `.bin`.
-      if command.length == 0 || isScoped(command) || same(command, b"..") || same(command, b".") {
-        continue
-      }
-      let mut shim = run Bytes.copy(modules)
-      run shim.append(b"/.bin/")
-      run shim.append(command)
-      let mut file = run Bytes.copy(b"../")
-      run file.append(alias)
-      run file.append(b"/")
-      run file.append(plainPath(Manifest.text(manifest, bins[bin - 1].path)))
-      run io<()>(run Effect.result(linkTo(Bytes.asSlice(&file), Bytes.asSlice(&shim))), Bytes.asSlice(&shim))
-    }
+    run exposeBins(modules, alias, &Graph.package(graph, package).manifest)
+  }
+  let locals = Graph.importerLocals(graph, importer)
+  each = 0
+  while each < locals.length {
+    let alias = Names.bytes(&graph.names, locals[each].alias)
+    let there = Graph.importerPath(graph, locals[each].target)
     each = each + 1
+    let mut path = run Bytes.copy(modules)
+    run path.append(b"/")
+    run path.append(alias)
+    let mut target = if isScoped(alias) { run Bytes.copy(b"../") } else { Bytes.make() }
+    run target.append(Bytes.asSlice(&up))
+    if same(there, b".") {
+      let length = Bytes.length(&target)
+      Bytes.truncate(&mut target, length - 1)
+    } else {
+      run target.append(there)
+    }
+    run io<()>(run Effect.result(linkTo(Bytes.asSlice(&target), Bytes.asSlice(&path))), Bytes.asSlice(&path))
+    match Workspace.at(workspace, there) {
+      Option.Some { value: member } => { run exposeBins(modules, alias, &Workspace.all(workspace)[member].manifest) }
+      Option.None => {}
+    }
   }
 }
 
-/// Installs `graph` into the project directory `project` for `host`, using `store`. Packages
-/// that are not for `host` are left out. Tarballs are unpacked on the threads of `pool`.
+// Removes the directory at `path` with everything in it.
+effect fn clear(path: &[u8]) -> () ! InstallError | OutOfMemoryError ? &mut Allocator {
+  match move run Effect.result(removeTree(path)) {
+    Result.Success {..} => {}
+    Result.Failure { error } => match move error {
+      NativeFileError _ => { run stop("could not remove", path) }
+      OutOfMemoryError exhausted => { fail move exhausted }
+    }
+  }
+}
+
+// Writes the marker of a package directory.
+effect fn mark(path: &[u8], links: &[u8]) -> () ! InstallError | OutOfMemoryError ? &mut Allocator {
+  match move run Effect.result(writeFile(path, links)) {
+    Result.Success {..} => {}
+    Result.Failure { error } => match move error {
+      NativeFileError _ => { run stop("could not write", path) }
+      OutOfMemoryError exhausted => { fail move exhausted }
+    }
+  }
+}
+
+// The dependencies that are linked beside node `index`, a line each: the name it is linked
+// under and the directory it points into. The marker of a package directory holds this text.
+effect fn linksOf(graph: &Graph, host: Host, index: usize) -> Bytes ! OutOfMemoryError ? &mut Allocator {
+  let edges = Graph.nodeEdges(graph, index)
+  // The lines are sorted, so the text does not depend on the order the graph was built in.
+  let mut order = List<usize>.make()
+  let mut each: usize = 0
+  while each < edges.length {
+    if Graph.supports(graph, Graph.nodePackage(graph, edges[each].target), host) {
+      let alias = Names.bytes(&graph.names, edges[each].alias)
+      let mut at = List<usize>.length(&order)
+      run order.append(each)
+      let sorted = List<usize>.asMutSlice(&mut order)
+      while at > 0 && compare(Names.bytes(&graph.names, edges[sorted[at - 1]].alias), alias) > 0 {
+        sorted[at] = sorted[at - 1]
+        at = at - 1
+      }
+      sorted[at] = each
+    }
+    each = each + 1
+  }
+  let mut text = Bytes.make()
+  let sorted = List<usize>.asSlice(&order)
+  each = 0
+  while each < sorted.length {
+    let edge = edges[sorted[each]]
+    run text.append(Names.bytes(&graph.names, edge.alias))
+    run text.append(b" ")
+    run appendDirectory(&mut text, graph, edge.target)
+    run text.append(b"\n")
+    each = each + 1
+  }
+  return move text
+}
+
+// Removes the symbolic links in `directory` and in the scope directories in it. Files and other
+// directories stay.
+effect fn unlink(directory: &[u8]) -> () ! InstallError | OutOfMemoryError ? &mut Allocator {
+  let entries = match move run list(directory) {
+    Option.None => { return () }
+    Option.Some { value } => move value
+  }
+  let all = List<Listed>.asSlice(&entries)
+  let mut index: usize = 0
+  while index < all.length {
+    let name = Bytes.asSlice(&all[index].name)
+    let mut path = run Bytes.copy(directory)
+    run path.append(b"/")
+    run path.append(name)
+    if all[index].link {
+      run io<()>(run Effect.result(NativeFile.remove(Bytes.asSlice(&path))), Bytes.asSlice(&path))
+    } else if all[index].directory && name.length > 0 && name[0] == 64 {
+      run unlink(Bytes.asSlice(&path))
+    }
+    index = index + 1
+  }
+}
+
+// Removes from `directory` the symbolic links whose names, with `prefix` before them, are not
+// in `kept`, and goes into its scope directories.
+effect fn pruneLinks(directory: &[u8], prefix: &[u8], kept: &Names) -> () ! InstallError | OutOfMemoryError ? &mut Allocator {
+  let entries = match move run list(directory) {
+    Option.None => { return () }
+    Option.Some { value } => move value
+  }
+  let all = List<Listed>.asSlice(&entries)
+  let mut index: usize = 0
+  while index < all.length {
+    let name = Bytes.asSlice(&all[index].name)
+    index = index + 1
+    if name.length == 0 || name[0] == 46 {
+      continue
+    }
+    let mut path = run Bytes.copy(directory)
+    run path.append(b"/")
+    run path.append(name)
+    let mut full = run Bytes.copy(prefix)
+    run full.append(name)
+    if all[index - 1].link {
+      if Option.isSome(&Names.find(kept, Bytes.asSlice(&full))) == false {
+        run io<()>(run Effect.result(NativeFile.remove(Bytes.asSlice(&path))), Bytes.asSlice(&path))
+      }
+    } else if all[index - 1].directory && name[0] == 64 && prefix.length == 0 {
+      run full.append(b"/")
+      run pruneLinks(Bytes.asSlice(&path), Bytes.asSlice(&full), kept)
+      // Goes when the scope has nothing left in it.
+      drop run Effect.result(NativeFile.removeDirectory(Bytes.asSlice(&path)))
+    }
+  }
+}
+
+// Takes out of `modules`, the `node_modules` of importer `importer`, the links to dependencies
+// it dropped.
+effect fn pruneImporter(graph: &Graph, host: Host, importer: usize, modules: &[u8]) -> () ! InstallError | OutOfMemoryError ? &mut Allocator {
+  let mut kept = Names.make()
+  let edges = Graph.importerEdges(graph, importer)
+  let mut each: usize = 0
+  while each < edges.length {
+    if Graph.supports(graph, Graph.nodePackage(graph, edges[each].target), host) {
+      drop run Names.intern(&mut kept, Names.bytes(&graph.names, edges[each].alias))
+    }
+    each = each + 1
+  }
+  let locals = Graph.importerLocals(graph, importer)
+  each = 0
+  while each < locals.length {
+    drop run Names.intern(&mut kept, Names.bytes(&graph.names, locals[each].alias))
+    each = each + 1
+  }
+  run pruneLinks(modules, b"", &kept)
+}
+
+// Takes out of the `.bin` of `modules` the commands that lead nowhere.
+effect fn pruneCommands(modules: &[u8]) -> () ! InstallError | OutOfMemoryError ? &mut Allocator {
+  let mut commands = run Bytes.copy(modules)
+  run commands.append(b"/.bin")
+  match move run list(Bytes.asSlice(&commands)) {
+    Option.None => {}
+    Option.Some { value: entries } => {
+      let all = List<Listed>.asSlice(&entries)
+      let mut index: usize = 0
+      while index < all.length {
+        if all[index].link {
+          let mut path = run Bytes.copy(Bytes.asSlice(&commands))
+          run path.append(b"/")
+          run path.append(Bytes.asSlice(&all[index].name))
+          match run Effect.result(NativeFile.status(Bytes.asSlice(&path), true)) {
+            Result.Success {..} => {}
+            Result.Failure {..} => { run io<()>(run Effect.result(NativeFile.remove(Bytes.asSlice(&path))), Bytes.asSlice(&path)) }
+          }
+        }
+        index = index + 1
+      }
+    }
+  }
+}
+
+// Takes out of the hidden directory the package directories no node of the graph lives in.
+effect fn prune(graph: &Graph, host: Host, virtual: &[u8]) -> () ! InstallError | OutOfMemoryError ? &mut Allocator {
+  let mut homes = Names.make()
+  let mut each: usize = 0
+  while each < Graph.nodeCount(graph) {
+    if Graph.supports(graph, Graph.nodePackage(graph, each), host) {
+      let mut home = Bytes.make()
+      run appendDirectory(&mut home, graph, each)
+      drop run Names.intern(&mut homes, Bytes.asSlice(&home))
+    }
+    each = each + 1
+  }
+  match move run list(virtual) {
+    Option.None => {}
+    Option.Some { value: entries } => {
+      let all = List<Listed>.asSlice(&entries)
+      let mut index: usize = 0
+      while index < all.length {
+        let name = Bytes.asSlice(&all[index].name)
+        if all[index].directory && Option.isSome(&Names.find(&homes, name)) == false {
+          let mut path = run Bytes.copy(virtual)
+          run path.append(b"/")
+          run path.append(name)
+          run clear(Bytes.asSlice(&path))
+        }
+        index = index + 1
+      }
+    }
+  }
+}
+
+/// Installs `graph`, the resolution of `workspace`, into the directories of the workspace.
+/// `downloader` names the store and the host, and may have fetched packages of `graph` during
+/// its resolution already; the others are fetched now. Packages that are not for the host are
+/// left out.
 ///
 /// # Errors
 ///
 /// - [`InstallError`] when a package cannot be downloaded or does not match its digest, or when
 ///   the store or `node_modules` cannot be written.
-pub effect fn install(project: &[u8], graph: &Graph, store: &Store, host: Host, pool: &Pool) -> Summary
+pub effect fn install(workspace: &Workspace, graph: &Graph, downloader: Downloader<'_>) -> Summary
   ! InstallError | OutOfMemoryError ? &mut Registry | &mut Allocator {
   let mut summary = Summary { packages: 0, downloaded: 0, linked: 0 }
-  let files = run gather(graph, store, host, pool, &mut summary)
+  let mut fetcher = move downloader
+  let store = fetcher.store
+  let host = fetcher.host
+  // The packages that have a node are the ones that are installed.
+  let mut each: usize = 0
+  while each < Graph.nodeCount(graph) {
+    run Downloader.expect(&mut fetcher, graph, Graph.nodePackage(graph, each))
+    each = each + 1
+  }
+  let files = run Downloader.finish(move fetcher, graph, &mut summary)
 
-  let mut modules = run Bytes.copy(project)
+  let mut modules = run Bytes.copy(Workspace.root(workspace))
   run modules.append(b"/node_modules")
   let mut virtual = run Bytes.copy(Bytes.asSlice(&modules))
   run virtual.append(b"/")
@@ -420,33 +779,57 @@ pub effect fn install(project: &[u8], graph: &Graph, store: &Store, host: Host, 
 
   let all = List<Option<PackageFiles>>.asSlice(&files)
   let mut index: usize = 0
-  while index < all.length {
-    if Graph.supports(graph, index, host) == false {
+  while index < Graph.nodeCount(graph) {
+    let package = Graph.nodePackage(graph, index)
+    if Graph.supports(graph, package, host) == false {
       index = index + 1
       continue
     }
     summary.packages = summary.packages + 1
-    // A package directory is complete when its marker is there; the marker is written last.
-    let mut marker = run Bytes.copy(Bytes.asSlice(&virtual))
-    run marker.append(b"/")
-    run appendDirectory(&mut marker, graph, index)
+    // A package directory is complete when its marker is there and names the dependencies the
+    // graph gives the package now; the marker is written last.
+    let mut home = run Bytes.copy(Bytes.asSlice(&virtual))
+    run home.append(b"/")
+    run appendDirectory(&mut home, graph, index)
+    let mut marker = run Bytes.copy(Bytes.asSlice(&home))
     run marker.append(b"/.linked")
-    let done = match run Effect.result(NativeFile.status(Bytes.asSlice(&marker), false)) {
-      Result.Success {..} => true
-      Result.Failure {..} => false
+    let links = run linksOf(graph, host, index)
+    let done = match move run readOptional(Bytes.asSlice(&marker)) {
+      Option.Some { value: found } => {
+        if same(Bytes.asSlice(&found), Bytes.asSlice(&links)) {
+          true
+        } else {
+          // Linked for another graph: the dependencies beside the package are not these.
+          run home.append(b"/node_modules")
+          run unlink(Bytes.asSlice(&home))
+          false
+        }
+      }
+      Option.None => false
     }
     if done == false {
-      match &all[index] {
-        Option.Some { value: listed } => { run place(graph, store, host, Bytes.asSlice(&virtual), index, &listed) }
-        Option.None => { run stopAt("the store has no files for", graph, index) }
+      match &all[package] {
+        Option.Some { value: found } => { run place(graph, store, host, Bytes.asSlice(&virtual), index, &found) }
+        Option.None => { run stopAt("the store has no files for", graph, package) }
       }
-      let made = run Effect.result(NativeFile.open(Bytes.asSlice(&marker), OPEN_WRITE_ONLY | OPEN_CREATE | OPEN_TRUNCATE, 420))
-      let fd = run io<i32>(move made, Bytes.asSlice(&marker))
-      drop run Effect.result(NativeFile.close(fd))
+      run mark(Bytes.asSlice(&marker), Bytes.asSlice(&links))
       summary.linked = summary.linked + 1
     }
     index = index + 1
   }
-  run expose(graph, host, Bytes.asSlice(&modules))
+  run prune(graph, host, Bytes.asSlice(&virtual))
+  let mut importer: usize = 0
+  while importer < Graph.importerCount(graph) {
+    let mut own = run Bytes.copy(Workspace.root(workspace))
+    if same(Graph.importerPath(graph, importer), b".") == false {
+      run own.append(b"/")
+      run own.append(Graph.importerPath(graph, importer))
+    }
+    run own.append(b"/node_modules")
+    run pruneImporter(graph, host, importer, Bytes.asSlice(&own))
+    run expose(workspace, graph, host, importer, Bytes.asSlice(&own))
+    run pruneCommands(Bytes.asSlice(&own))
+    importer = importer + 1
+  }
   return move summary
 }

@@ -373,20 +373,6 @@ function tickScope() {
   scope.resource = scope;
   return scope;
 }
-function runTick(callback, args, scope) {
-  if (scope instanceof InternalResourceClass) { invokeResource(scope, callback, undefined, args ?? noTickArguments); return; }
-  const previous = host.getAsyncContext();
-  if (asyncHookFields[5] !== 0) {
-    try { invokeIdFrom(previous, scope, scope.id, invokeReporting, callback, undefined, args ?? noTickArguments); }
-    finally { queueDestroyId(scope.id); }
-    return;
-  }
-  host.setAsyncContext(scope);
-  try {
-    try { if (args === undefined) callback(); else Reflect.apply(callback, undefined, args); }
-    catch (error) { reportUncaught(error); }
-  } finally { host.setAsyncContext(previous); }
-}
 const noTickArguments = [];
 host.queueMicrotask = function queueMicrotask(callback) {
   checkCallback(callback);
@@ -425,20 +411,55 @@ host.privateSymbols = {
   arrow_message_private_symbol: native.privateSymbol('node:arrowMessage'),
   decorated_private_symbol: native.privateSymbol('node:decorated'),
 };
+// Where the engine puts a SyntaxError's origin. V8 keeps it in the message, so the
+// error itself has only its stack and message as own properties.
+const syntaxOrigin = host.syntaxOrigin = {
+  __proto__: null,
+  file: native.privateSymbol('node:syntaxFile'),
+  line: native.privateSymbol('node:syntaxLine'),
+  column: native.privateSymbol('node:syntaxColumn'),
+};
+native.workerNative('syntaxOriginKeys', [syntaxOrigin.file, syntaxOrigin.line, syntaxOrigin.column]);
+// V8 starts a context with empty RegExp statics (RegExp.$1, lastMatch...), and
+// Node's startup leaves them so. The runtime's own startup runs regexps in the
+// user's realm, so the user's code starts from the empty match V8 starts from.
+const regExpExec = RegExp.prototype.exec;
+const emptyPattern = /(?:)/;
+host.clearRegExpStatics = () => { Reflect.apply(regExpExec, emptyPattern, ['']); };
+// Whether value starts with a URL scheme ("file:", "node:"). A scan, not a RegExp:
+// the loader runs it in the user's realm, where a RegExp would set RegExp.input.
+host.hasURLScheme = value => {
+  if (typeof value !== 'string') value = String(value);
+  const first = value.charCodeAt(0) | 0x20;
+  if (first < 0x61 || first > 0x7a) return false;
+  for (let index = 1; index < value.length; index++) {
+    const code = value.charCodeAt(index);
+    if (code === 0x3a) return true;
+    const lower = code | 0x20;
+    if (!((lower >= 0x61 && lower <= 0x7a) || (code >= 0x30 && code <= 0x39) || code === 0x2b || code === 0x2e || code === 0x2d)) return false;
+  }
+  return false;
+};
+// The carets under a SyntaxError's site, from column (0-based) of text: V8 underlines
+// the token a message names ("Unexpected identifier 'line'"), else one character.
+const namedToken = /^Unexpected (?:identifier|token|reserved word|strict mode reserved word) '(.+)'$/;
+host.syntaxUnderline = (message, text, column) => {
+  const token = Reflect.apply(regExpExec, namedToken, [String(message)])?.[1];
+  const width = token !== undefined && stringStartsWith(text, token, column) ? token.length : 1;
+  let underline = '';
+  for (let index = 0; index < width; index++) underline += '^';
+  return underline;
+};
 host.attachArrow = (error, scriptName, source, prefix) => {
-  if (!(error instanceof SyntaxError) || host.errorArrows.has(error) || !Number.isInteger(error.lineNumber)) return;
-  const line = error.lineNumber;
+  if (!(error instanceof SyntaxError) || host.errorArrows.has(error) || !Number.isInteger(error[syntaxOrigin.line])) return;
+  const line = error[syntaxOrigin.line];
   const text = String(source).split(/\r\n|[\n\r\u2028\u2029]/)[line - 1];
   if (text === undefined) return;
-  const column = error.columnNumber - 1 - (line === 1 ? prefix : 0);
+  const column = error[syntaxOrigin.column] - 1 - (line === 1 ? prefix : 0);
   let caret = '';
   if (column >= 0 && column < text.length) {
     for (let index = 0; index < column; index++) caret += text[index] === '\t' ? '\t' : ' ';
-    // V8 underlines the token a message names ("Unexpected identifier 'line'").
-    const token = /^Unexpected (?:identifier|token|reserved word|strict mode reserved word) '(.+)'$/.exec(error.message)?.[1];
-    const width = token !== undefined && stringStartsWith(text, token, column) ? token.length : 1;
-    for (let index = 0; index < width; index++) caret += '^';
-    caret += '\n';
+    caret += host.syntaxUnderline(error.message, text, column) + '\n';
   }
   const arrow = scriptName + ':' + line + '\n' + text + '\n' + caret;
   host.errorArrows.set(error, arrow);
@@ -495,6 +516,39 @@ function onRejection(promise, reason, handled) {
 // settle before the next ticks it queued run (test-esm-dynamic-import-commonjs).
 let mainJobsFirst = false;
 host.mainModuleEvaluated = () => { mainJobsFirst = true; };
+// Node's tick queue drain (lib/internal/process/task_queues.js), called with process as
+// its receiver: a tick's callback runs straight from it, so its stack shows
+// process.processTicksAndRejections below the callback, as Node's does.
+function processTicksAndRejections() {
+  while (tickHead !== ticks.length) {
+    const at = tickHead;
+    const callback = ticks[at], args = ticks[at + 1], scope = ticks[at + 2];
+    ticks[at] = ticks[at + 1] = ticks[at + 2] = undefined;
+    tickHead = at + 3;
+    // A tick queued with no hook enabled has a plain scope (tickScope): switch to it, and
+    // emit before, after and destroy only for hooks enabled since.
+    if (!(scope instanceof InternalResourceClass)) {
+      const previous = host.getAsyncContext();
+      if (asyncHookFields[5] !== 0) {
+        try { invokeIdFrom(previous, scope, scope.id, invokeReporting, callback, undefined, args ?? noTickArguments); }
+        finally { queueDestroyId(scope.id); }
+        continue;
+      }
+      host.setAsyncContext(scope);
+      try { if (args === undefined) callback(); else Reflect.apply(callback, undefined, args); }
+      catch (error) { reportUncaught(error); }
+      finally { host.setAsyncContext(previous); }
+      continue;
+    }
+    asyncHooks._enterResource(scope);
+    try { Reflect.apply(callback, undefined, args ?? noTickArguments); }
+    catch (error) { reportUncaught(error); }
+    finally {
+      try { asyncHooks._leaveResource(scope); }
+      finally { scope.emitDestroy(); }
+    }
+  }
+}
 // Node's async_hook_fields: index 5 counts the callbacks of every enabled hook.
 function checkpoint() {
   // The usual case, nothing queued but promise jobs: drain them once, and leave when they
@@ -512,13 +566,7 @@ function checkpoint() {
       // Jobs after nextTick callbacks run inside Node's processTicksAndRejections;
       // otherwise they are V8's own checkpoint, below which no stack shows.
       const alone = tickHead === ticks.length;
-      while (tickHead !== ticks.length) {
-        const at = tickHead;
-        const callback = ticks[at], args = ticks[at + 1], scope = ticks[at + 2];
-        ticks[at] = ticks[at + 1] = ticks[at + 2] = undefined;
-        tickHead = at + 3;
-        runTick(callback, args, scope);
-      }
+      if (!alone) native.runTicks(processTicksAndRejections, process);
       ticks.length = tickHead = 0;
       native.drainJobs(alone);
       if (ticksPending()) continue;
@@ -1075,6 +1123,7 @@ function evaluateMain(source, name) {
   // Node's ModuleJob.run hint for a CommonJS global (an --eval module has no load step
   // that would add it).
   let result;
+  host.clearRegExpStatics();
   try { result = native.evaluateModule(source, name, true); }
   catch (cause) { throw loader.decorateModuleError(cause, name); }
   host.entryModule = { name, source, promise: result };
@@ -1123,6 +1172,22 @@ function runPreloads(entry, loadImports = true, loadRequires = true, runImports 
 }
 const optionFlag = entry => internalRequire('internal/options').optionFlag(entry);
 let heapPercentage = false;
+let traceSyncIO = false;
+const perfOutput = { basic: false, jitdump: false, basicPath: '/tmp' };
+// V8's LinuxPerfBasicLogger and LinuxPerfJitLogger open their files when the isolate starts.
+function writePerfOutput() {
+  const fs = internalRequire('fs');
+  if (perfOutput.basic) fs.writeFileSync(`${perfOutput.basicPath}/perf-${process.pid}.map`, '');
+  if (perfOutput.jitdump) {
+    // The jitdump header (tools/perf/Documentation/jitdump-specification.txt), with no code records.
+    const header = internalRequire('buffer').Buffer.alloc(40);
+    header.writeUInt32LE(0x4A695444, 0); header.writeUInt32LE(1, 4); header.writeUInt32LE(40, 8);
+    header.writeUInt32LE(process.arch === 'arm64' ? 183 : process.arch === 'arm' ? 40 : 62, 12);
+    header.writeUInt32LE(process.pid, 20);
+    header.writeBigUInt64LE(process.hrtime.bigint(), 24);
+    fs.writeFileSync(`jit-${process.pid}.dump`, header);
+  }
+}
 function runtimeFlag(arg) {
   try {
     if (internalRequire('internal/permission').applyOption(arg) ||
@@ -1181,8 +1246,11 @@ function runtimeFlag(arg) {
   // wherever each comes (PerIsolateOptions::HandleMaxOldSpaceSizePercentage).
   const heapSize = /^--max[-_](old|semi)[-_]space[-_]size=(\d+)$/.exec(arg);
   if (heapSize) {
-    if (heapSize[1] === 'semi') native.workerNative('setHeapLimit', [undefined, Number(heapSize[2])]);
-    else if (!heapPercentage) native.workerNative('setHeapLimit', [Number(heapSize[2]), undefined]);
+    // 0 keeps V8's default heap configuration.
+    const size = Number(heapSize[2]);
+    if (size === 0) return true;
+    if (heapSize[1] === 'semi') native.workerNative('setHeapLimit', [undefined, size]);
+    else if (!heapPercentage) native.workerNative('setHeapLimit', [size, undefined]);
     return true;
   }
   if (arg.startsWith('--max-old-space-size-percentage=') || arg.startsWith('--max_old_space_size_percentage=')) {
@@ -1203,6 +1271,28 @@ function runtimeFlag(arg) {
   if (arg === '--enable-sharedarraybuffer-per-context' || arg === '--no-harmony-sharedarraybuffer' ||
       arg === '--no-harmony_sharedarraybuffer') {
     host.noSharedArrayBuffer = true; return true;
+  }
+  // V8's --use-strict: scripts and eval compile as strict code from here on.
+  if (arg === '--use-strict' || arg === '--no-use-strict') { native.workerNative('setUseStrict', [arg === '--use-strict']); return true; }
+  // V8's perf integration writes, at startup, a map of the machine code it generates
+  // (perf-PID.map) or a jitdump file (jit-PID.dump). The runtime generates no machine
+  // code, so the files it writes list none: perf resolves the interpreter's own frames
+  // from the binary's symbols.
+  const perfPath = /^--perf[-_]basic[-_]prof[-_]path=(.*)$/.exec(arg);
+  if (perfPath) { perfOutput.basicPath = perfPath[1]; return true; }
+  if (/^--(no-)?perf[-_]basic[-_]prof([-_]only[-_]functions)?$/.test(arg)) { perfOutput.basic = !arg.startsWith('--no-'); return true; }
+  if (/^--(no-)?perf[-_]prof$/.test(arg)) { perfOutput.jitdump = !arg.startsWith('--no-'); return true; }
+  // Both only change the machine code V8 generates: unwinding records for --perf-prof's
+  // code, and a trampoline copy per interpreted function for native profilers.
+  if (/^--(no-)?(perf[-_]prof[-_]unwinding[-_]info|interpreted[-_]frames[-_]native[-_]stack)$/.test(arg)) return true;
+  // Node's --trace-sync-io: once the event loop starts, sync fs calls print their stack.
+  if (arg === '--trace-sync-io' || arg === '--no-trace-sync-io') { traceSyncIO = arg === '--trace-sync-io'; return true; }
+  // Node's --track-heap-objects (HeapProfiler::StartTrackingHeapObjects(true)): every
+  // allocation's stack is recorded from startup, for the heap snapshots taken later.
+  if (arg === '--track-heap-objects' || arg === '--no-track-heap-objects') {
+    if (arg === '--track-heap-objects') host.allocationProfileStart(1, 2048);
+    else host.allocationProfileStop();
+    return true;
   }
   if (arg === '--trace-gc' || arg === '--no-trace-gc') { host.traceNative('printGC', arg === '--trace-gc'); return true; }
   if (arg === '--expose-gc' || arg === '--no-expose-gc') {
@@ -1286,6 +1376,10 @@ function runtimeFlag(arg) {
   if (arg === '--experimental-require-module' || arg === '--no-experimental-require-module' ||
       arg === '--require-module' || arg === '--no-require-module') {
     host.requireModuleDisabled = arg.startsWith('--no-'); return true;
+  }
+  // --no-experimental-detect-module: an ambiguous .js file is CommonJS (get_format.js detectModuleFormat).
+  if (arg === '--experimental-detect-module' || arg === '--no-experimental-detect-module') {
+    host.detectModuleDisabled = arg === '--no-experimental-detect-module'; return true;
   }
   if (arg === '--experimental-import-meta-resolve') { host.importMetaResolveParent = true; return true; }
   if (arg === '--experimental-print-required-tla') { host.printRequiredTLA = true; return true; }
@@ -1465,9 +1559,11 @@ function runWorker() {
 }
 function startRepl() {
   console.log('Welcome to SilkJS Runtime.\nType ".help" for more information.');
-  return internalRequire('internal/repl').createInternalRepl(process.env, {
+  const repl = internalRequire('internal/repl').createInternalRepl(process.env, {
     input: process.stdin, output: process.stdout, terminal: !!process.stdout.isTTY, preview: !!process.stdout.isTTY,
   }, error => { if (error) console.error('REPL history:', error.message); });
+  host.clearRegExpStatics();
+  return repl;
 }
 function installCommonJSInputGlobals(filename, id) {
   // Node's createModule (lib/internal/process/execution.js): lookup paths from the cwd.
@@ -1478,77 +1574,6 @@ function installCommonJSInputGlobals(filename, id) {
   globalThis.module = module; globalThis.exports = module.exports;
   globalThis.__filename = id; globalThis.__dirname = '.';
 }
-const HELP_TEXT = `Usage: silkjsruntime [options] [script.js] [arguments]
-  -e, --eval CODE    Evaluate JavaScript (also --eval=CODE)
-  -p, --print [CODE] Evaluate and print; read stdin when CODE is omitted
-  -c, --check        Check syntax without executing
-  -i, --interactive Start the REPL, also after evaluating a script
-  --inspect[=[HOST:]PORT]       Activate the inspector (default 127.0.0.1:9229)
-  --inspect-brk[=[HOST:]PORT]   Wait for a debugger and break at user entry
-  --inspect-wait[=[HOST:]PORT]  Wait for Runtime.runIfWaitingForDebugger
-  --inspect-port=[HOST:]PORT   Set the inspector address without activating
-  --experimental-inspector-network-resource  Enable inspector network resources
-  -r, --require ID  Preload a CommonJS module (repeatable)
-  --import ID       Preload a module, awaiting evaluation (repeatable)
-  -C, --conditions NAME  Add a package resolution condition (repeatable)
-  --preserve-symlinks, --no-preserve-symlinks
-  --preserve-symlinks-main, --no-preserve-symlinks-main
-  --env-file=PATH, --env-file-if-exists=PATH
-  --watch, --watch-path=PATH
-  --watch-preserve-output, --watch-kill-signal=SIGNAL
-  --run [SCRIPT]    Run a package.json script; pass arguments after --
-  --permission, --permission-audit
-  --allow-fs-read=PATH, --allow-fs-write=PATH
-  --allow-child-process, --allow-worker, --allow-addons
-  --allow-wasi, --allow-inspector, --allow-openssl-store
-  --input-type=module|commonjs|module-typescript|commonjs-typescript
-  --strip-types, --no-strip-types
-  --experimental-transform-types, --no-experimental-transform-types
-  --enable-source-maps, --no-enable-source-maps
-  --warnings, --no-warnings, --trace-warnings, --no-trace-warnings
-  --trace-sigint, --no-trace-sigint
-  --deprecation, --no-deprecation, --trace-deprecation, --throw-deprecation
-  --pending-deprecation, --no-pending-deprecation
-  --disable-warning=CODE|NAME, --redirect-warnings=PATH
-  --unhandled-rejections=throw|strict|warn|warn-with-error-code|none
-  --insecure-http-parser, --no-insecure-http-parser, --max-http-header-size=SIZE,
-  --dns-result-order=ORDER, --no-extra-info-on-fatal-exception
-  --async-context-frame, --no-async-context-frame
-  --expose-gc, --no-expose-gc
-  --experimental-eventsource
-  --experimental-webstorage, --localstorage-file=PATH
-  --experimental-stream-iter
-  --experimental-shadow-realm, --no-experimental-shadow-realm
-  --experimental-vm-modules, --no-experimental-vm-modules
-  --experimental-test-module-mocks, --no-experimental-test-module-mocks
-  --trace-events-enabled
-  --trace-event-categories=CATEGORIES
-  --trace-event-file-pattern=PATH
-  --experimental-sea-config=PATH
-  --report-directory=PATH, --report-filename=PATH
-  --report-signal=SIGNAL, --report-on-signal
-  --report-uncaught-exception, --report-on-fatalerror
-  --report-compact, --report-exclude-env, --report-exclude-network
-  --test [files]    Run Node tests
-  --test-isolation=process|none
-  --test-concurrency=N, --test-timeout=MS, --test-only
-  --test-name-pattern=REGEXP, --test-skip-pattern=REGEXP
-  --test-shard=INDEX/TOTAL
-  --test-update-snapshots
-  --experimental-test-coverage
-  --test-coverage-include=GLOB, --test-coverage-exclude=GLOB
-  --test-coverage-lines=N, --test-coverage-branches=N, --test-coverage-functions=N
-  --test-reporter=NAME, --test-reporter-destination=PATH
-  --build-snapshot ENTRY.js, --build-snapshot-config=FILE
-                     Run ENTRY.js and save the heap after its loop as a startup snapshot
-  --snapshot-blob=PATH Where --build-snapshot saves the snapshot, or the snapshot to start from
-  -h, --help         Print these options
-  -v, --version
-Environment:
-  NODE_OPTIONS      Supported runtime flags, applied before CLI flags
-  NODE_PATH         Additional CommonJS package lookup directories
-  NODE_NO_WARNINGS, NODE_REDIRECT_WARNINGS, NODE_PENDING_DEPRECATION
-`;
 function cliError(messages) {
   if (typeof messages === 'string') messages = [messages];
   host.writeStartupDiagnostic(messages.map((message) => process.execPath + ': ' + message + '\n').join(''));
@@ -1685,7 +1710,8 @@ function run(restored = false) {
       case '--check': check = value; continue;
       case '--test': testMode = value; continue;
       case '--version': host.stdout.write('silkjsruntime 0.1.0 (QuickJS; Node 24 target)\n'); return;
-      case '--help': host.stdout.write(HELP_TEXT); return;
+      // node.cc: --help runs internal/main/print_help from Node's option table.
+      case '--help': internalRequire('internal/main/print_help').print(process.stdout); return;
     }
     // The test runner and the watch supervisor read their options with getOptionValue, as Node's do.
     if (name.startsWith('--test-') || name.startsWith('--experimental-test-') || name.startsWith('--watch-')) continue;
@@ -1696,6 +1722,7 @@ function run(restored = false) {
     if (entry.type === 'NoOp' || runtimeFlag(optionFlag(entry)) || entry.implied) continue;
     return cliError('bad option: ' + entry.raw);
   }
+  if (perfOutput.basic || perfOutput.jitdump) writePerfOutput();
   // node.cc: --build-snapshot runs the builder, --snapshot-blob alone starts from a blob.
   // Both take a process of their own (src/runtime/worker.silk), so this one becomes it.
   if (!restored && !snapshotState.building && (buildSnapshot || snapshotBlob !== undefined)) {
@@ -1810,7 +1837,7 @@ function run(restored = false) {
     const code = !inputType.startsWith('module') && /\bcrypto\b/.test(expression) ?
       (print ? 'let crypto=require("node:crypto");{' + expression + '}' : '(crypto=>{{' + expression + '}})(require("node:crypto"))') : expression;
     if (inputType.startsWith('module') || (!inputTypeSet && native.detectModuleSyntax(code))) {
-      if (print) throw Object.assign(new Error('--print cannot be used with ESM'), { code: 'ERR_EVAL_ESM_CANNOT_PRINT' });
+      if (print) throw new (internalRequire('internal/errors').codes.ERR_EVAL_ESM_CANNOT_PRINT)();
       return afterMain(evaluateMain(code, evalModuleURL()));
     }
     installCommonJSInputGlobals(name, '[eval]');
@@ -1824,7 +1851,7 @@ function run(restored = false) {
     process._eval = source;
     source = prepareInput(source, name, inputType, inputTypeSet);
     if (inputType.startsWith('module') || (!inputTypeSet && native.detectModuleSyntax(source))) {
-      if (print) throw Object.assign(new Error('--print cannot be used with ESM'), { code: 'ERR_EVAL_ESM_CANNOT_PRINT' });
+      if (print) throw new (internalRequire('internal/errors').codes.ERR_EVAL_ESM_CANNOT_PRINT)();
       return afterMain(evaluateMain(source, evalModuleURL()));
     }
     installCommonJSInputGlobals(name, '[stdin]');
@@ -1851,7 +1878,7 @@ function run(restored = false) {
     return afterMain(loader.Module.runMain(path));
   }
   // Only a preload can register a hook or a mock that resolves it differently.
-  const resolved = early !== undefined && !requirePreloads.length && !importPreloads.length ? early : loader.resolveMain(path);
+  const resolved = early !== undefined && !requirePreloads.length && !importPreloads.length && !loaderPreloads.length ? early : loader.resolveMain(path);
   mainModuleName = resolved.filename;
   armInspectorEntry();
   return afterMain(loader.runMain(path, inputTypeSet, resolved));
@@ -1944,7 +1971,7 @@ function checkUnsettledTopLevelAwait() {
       const sourceLine = sources.get(name)[line - 1] ?? '';
       let caret = '';
       for (let at = 0; at < column - 1 && at < sourceLine.length; at++) caret += sourceLine[at] === '\t' ? '\t' : ' ';
-      const location = /^[A-Za-z][A-Za-z\d+.-]*:/.test(name) ? name : url.pathToFileURL(name).href;
+      const location = host.hasURLScheme(name) ? name : url.pathToFileURL(name).href;
       host.writeText(2, `Warning: Detected unsettled top-level await at ${location}:${line}\n${sourceLine}\n${caret}^\n\n\n\n`);
     }
   }
@@ -1953,6 +1980,7 @@ function checkUnsettledTopLevelAwait() {
 // The loop in three parts, so that an embedder can turn it from its own loop:
 // loopStart once, loopStep until it returns false, then loopEnd for the exit status.
 function loopStart() {
+  if (traceSyncIO) host.traceSyncIO = true;
   performanceMilestones.loopStart = native.now() - startTime;
   initialNativeIdleTime = native.loopIdleTime();
 }
@@ -2031,7 +2059,7 @@ globalThis.__silkRuntime = {
   importTrace(specifier, referrer, promise) {
     const channels = host.diagnostics.tracing('module.import');
     if (channels === undefined) return promise;
-    const parentURL = typeof referrer === 'string' ? (/^[A-Za-z][A-Za-z\d+.-]*:/.test(referrer) ? referrer : fileHref(referrer)) : undefined;
+    const parentURL = typeof referrer === 'string' ? (host.hasURLScheme(referrer) ? referrer : fileHref(referrer)) : undefined;
     const context = { __proto__: null, parentURL, url: specifier };
     const { end, asyncStart, asyncEnd, error } = channels;
     const resolve = result => {
@@ -2055,11 +2083,11 @@ globalThis.__silkRuntime = {
   registerSource(filename, source, metadata) {
     host.registerSource(filename, source, { ...metadata, owner: metadata });
     if (!metadata.generated && typeof filename === 'string') {
-      return /^[A-Za-z][A-Za-z\d+.-]*:/.test(filename) ? filename : fileHref(filename);
+      return host.hasURLScheme(filename) ? filename : fileHref(filename);
     }
   },
   importMeta(name) {
-    const asURL = value => /^[A-Za-z][A-Za-z\d+.-]*:/.test(value) ? value : fileHref(value);
+    const asURL = value => host.hasURLScheme(value) ? value : fileHref(value);
     const url = asURL(name);
     // As in Node: a null prototype, keys in this order, filename and dirname for file: only.
     const meta = { __proto__: null };

@@ -30,7 +30,6 @@ const {
   ArrayPrototypePush,
   ArrayPrototypeSlice,
   FunctionPrototypeBind,
-  RegExpPrototypeExec,
   StringPrototypeCharCodeAt,
   StringPrototypeIncludes,
   StringPrototypeIndexOf,
@@ -96,7 +95,20 @@ function isWindowsDeviceRoot(code) {
 // dropped, less one leading and one trailing separator. Most paths a program passes
 // are like that (a resolved './x' among them), and this is much cheaper than the walk
 // below.
-const unnormalizedPosix = /\/\/|(?:^|\/)\.\.(?:\/|$)/;
+// A scan, not a RegExp, so that path calls leave RegExp.lastMatch and the other legacy
+// statics as they are, as Node's path does.
+function unnormalizedPosix(path) {
+  if (StringPrototypeIndexOf(path, '//') !== -1) return true;
+  let dots = StringPrototypeIndexOf(path, '..');
+  while (dots !== -1) {
+    if ((dots === 0 || StringPrototypeCharCodeAt(path, dots - 1) === CHAR_FORWARD_SLASH) &&
+        (dots + 2 === path.length || StringPrototypeCharCodeAt(path, dots + 2) === CHAR_FORWARD_SLASH)) {
+      return true;
+    }
+    dots = StringPrototypeIndexOf(path, '..', dots + 1);
+  }
+  return false;
+}
 // Drops the . segments of a path, each with the separator before it. No RegExp: user code
 // may have replaced RegExp.prototype[Symbol.replace].
 function dropDotSegments(path) {
@@ -116,7 +128,7 @@ function dropDotSegments(path) {
 
 // Resolves . and .. elements in a path with directory names
 function normalizeString(path, allowAboveRoot, separator, isPathSeparator) {
-  if (isPathSeparator === isPosixPathSeparator && !RegExpPrototypeExec(unnormalizedPosix, path)) {
+  if (isPathSeparator === isPosixPathSeparator && !unnormalizedPosix(path)) {
     path = dropDotSegments(path);
     const start = StringPrototypeCharCodeAt(path, 0) === CHAR_FORWARD_SLASH ? 1 : 0;
     const end = path.length > start && StringPrototypeCharCodeAt(path, path.length - 1) === CHAR_FORWARD_SLASH ? path.length - 1 : path.length;

@@ -1,8 +1,8 @@
 //! Talks to an npm registry: fetches the metadata of packages and their tarballs.
 //!
 //! [`Registry`] is the service the resolver and the installer ask. [`NetworkRegistry`] provides
-//! it over HTTP: requests of one call run at the same time, metadata is asked for in the
-//! abbreviated install format, which leaves out everything an install does not need, and
+//! it over HTTP: requests of one call run at the same time, metadata is asked for compressed and
+//! in the abbreviated install format, which leaves out everything an install does not need, and
 //! credentials come from the [`Npmrc`] and go only to URLs below the path they were set for.
 
 import silk.mem.allocator { Allocator, OutOfMemoryError }
@@ -18,6 +18,7 @@ import silk.http.client_native { NativeHttp }
 import silk.text.string { String }
 import npm.npmrc { Npmrc }
 import pkg.names { Names }
+import pkg.store { StoreError, gunzip }
 
 /// What a registry request failed with, apart from the transport errors of the HTTP client.
 pub enum RegistryErrorKind {
@@ -70,23 +71,25 @@ pub effect fn packumentUrl(registry: &[u8], name: &[u8]) -> Bytes ! OutOfMemoryE
   return move url
 }
 
+/// What one round of requests brought back.
+pub struct Fetched {
+  /// The metadata documents, in the order they were asked for.
+  pub documents: List<Result<Bytes, RegistryError>>,
+  /// The tarballs, in the order they were asked for.
+  pub tarballs: List<Result<Bytes, RegistryError>>,
+}
+
 /// Where package metadata and tarballs come from.
 pub service Registry {
-  /// Fetches the metadata documents of the packages `ids` names in `names`. The results are in
-  /// the order of `ids`.
+  /// Fetches, in one round, the metadata documents of the packages `ids` names in `names` and
+  /// the tarballs at `tarballs`. Asking for both at once lets downloads run while a resolution
+  /// still waits for metadata. The bytes of a tarball are not checked; the caller holds the
+  /// integrity values.
   ///
   /// # Errors
   ///
   /// - `OutOfMemoryError` if the `Allocator` fails. The failure of one fetch is its result.
-  effect fn documents(names: &Names, ids: &[usize]) -> List<Result<Bytes, RegistryError>>
-    ! OutOfMemoryError ? &mut Registry | &mut Allocator
-  /// Fetches the tarballs at `urls`. The results are in the order of `urls`. The bytes are not
-  /// checked; the caller holds the integrity values.
-  ///
-  /// # Errors
-  ///
-  /// - `OutOfMemoryError` if the `Allocator` fails. The failure of one fetch is its result.
-  effect fn tarballs(urls: &[Bytes]) -> List<Result<Bytes, RegistryError>>
+  effect fn fetch(names: &Names, ids: &[usize], tarballs: &[Bytes]) -> Fetched
     ! OutOfMemoryError ? &mut Registry | &mut Allocator
 }
 
@@ -121,8 +124,9 @@ fn settle(result: Result<Response, HttpError>) -> Result<Bytes, RegistryError> {
   }
 }
 
-// Sends one GET per URL at the same time. A URL that is not valid text fails alone.
-effect fn getOnce(config: &Npmrc, urls: &[Bytes], accept: string<'static>, limit: usize) -> List<Result<Bytes, RegistryError>>
+// Sends one GET per URL at the same time. `metadata` says, per URL, whether it is a metadata
+// document or a tarball. A URL that is not valid text fails alone.
+effect fn getOnce(config: &Npmrc, urls: &[Bytes], metadata: &[bool]) -> List<Result<Bytes, RegistryError>>
   ! OutOfMemoryError ? &mut Http | &mut Allocator {
   let mut credentials = List<Bytes>.make()
   let mut index: usize = 0
@@ -143,8 +147,18 @@ effect fn getOnce(config: &Npmrc, urls: &[Bytes], accept: string<'static>, limit
     match String.fromUtf8(Bytes.asSlice(&urls[index])) {
       Result.Failure {..} => {}
       Result.Success { value: url } => {
-        let mut request = Request.get(url).maxBodyBytes(limit)
-        run request.header("accept", accept)
+        let mut request = if metadata[index] {
+          Request.get(url).maxBodyBytes(METADATA_LIMIT)
+        } else {
+          Request.get(url).maxBodyBytes(TARBALL_LIMIT)
+        }
+        if metadata[index] {
+          run request.header("accept", METADATA_ACCEPT)
+          // Metadata compresses five to one. The client leaves the body as sent.
+          run request.header("accept-encoding", "gzip")
+        } else {
+          run request.header("accept", "*/*")
+        }
         if Bytes.length(&headers[index]) > 0 {
           match String.fromUtf8(Bytes.asSlice(&headers[index])) {
             Result.Failure {..} => {}
@@ -174,9 +188,16 @@ effect fn getOnce(config: &Npmrc, urls: &[Bytes], accept: string<'static>, limit
       run reversed.append(Result<Bytes, RegistryError>.failResult(failure(RegistryErrorKind.Url, "the URL is not valid text")))
     }
   }
+  return run turned(move reversed)
+}
+
+// The same results in the opposite order.
+effect fn turned(list: List<Result<Bytes, RegistryError>>) -> List<Result<Bytes, RegistryError>>
+  ! OutOfMemoryError ? &mut Allocator {
+  let mut from = move list
   let mut ordered = List<Result<Bytes, RegistryError>>.make()
   while true {
-    match move List<Result<Bytes, RegistryError>>.pop(&mut reversed) {
+    match move List<Result<Bytes, RegistryError>>.pop(&mut from) {
       Option.None => { break }
       Option.Some { value } => { run ordered.append(move value) }
     }
@@ -195,13 +216,14 @@ fn transient(error: &RegistryError) -> bool {
 
 // Sends one GET per URL at the same time, and asks again, up to three more times, for the ones
 // that failed in a way that can pass.
-effect fn getAll(config: &Npmrc, urls: &[Bytes], accept: string<'static>, limit: usize) -> List<Result<Bytes, RegistryError>>
+effect fn getAll(config: &Npmrc, urls: &[Bytes], metadata: &[bool]) -> List<Result<Bytes, RegistryError>>
   ! OutOfMemoryError ? &mut Http | &mut Allocator {
-  let mut results = run getOnce(config, urls, accept, limit)
+  let mut results = run getOnce(config, urls, metadata)
   let mut attempt: u8 = 0
   while attempt < 3 {
     attempt = attempt + 1
     let mut again = List<Bytes>.make()
+    let mut kinds = List<bool>.make()
     let mut which = List<usize>.make()
     let current = List<Result<Bytes, RegistryError>>.asSlice(&results)
     let mut index: usize = 0
@@ -211,6 +233,7 @@ effect fn getAll(config: &Npmrc, urls: &[Bytes], accept: string<'static>, limit:
         Result.Failure { error } => {
           if transient(&error) {
             run again.append(run Bytes.copy(Bytes.asSlice(&urls[index])))
+            run kinds.append(metadata[index])
             run which.append(index)
           }
         }
@@ -220,7 +243,7 @@ effect fn getAll(config: &Npmrc, urls: &[Bytes], accept: string<'static>, limit:
     if List<usize>.length(&which) == 0 {
       break
     }
-    let mut answers = run getOnce(config, List<Bytes>.asSlice(&again), accept, limit)
+    let mut answers = run getOnce(config, List<Bytes>.asSlice(&again), List<bool>.asSlice(&kinds))
     index = List<usize>.length(&which)
     while index > 0 {
       index = index - 1
@@ -233,32 +256,69 @@ effect fn getAll(config: &Npmrc, urls: &[Bytes], accept: string<'static>, limit:
   return move results
 }
 
+// A metadata body as JSON: decompressed when the registry sent it as gzip.
+effect fn plain(answer: Result<Bytes, RegistryError>) -> Result<Bytes, RegistryError> ! OutOfMemoryError ? &mut Allocator {
+  let body = match move answer {
+    Result.Success { value } => move value
+    Result.Failure { error } => { return Result<Bytes, RegistryError>.failResult(error) }
+  }
+  let bytes = Bytes.asSlice(&body)
+  if bytes.length < 2 || bytes[0] != 31 || bytes[1] != 139 {
+    return Result<Bytes, RegistryError>.succeed(move body)
+  }
+  return match move run Effect.result(gunzip(bytes)) {
+    Result.Success { value } => Result<Bytes, RegistryError>.succeed(move value)
+    Result.Failure { error } => match move error {
+      StoreError _ => Result<Bytes, RegistryError>.failResult(failure(RegistryErrorKind.Transport, "the registry sent metadata that cannot be decompressed"))
+      OutOfMemoryError exhausted => { fail move exhausted }
+    }
+  }
+}
+
 impl<'c> NetworkRegistry<'c> {
   /// A registry client with these settings, sending through `http`.
   pub fn make(config: Npmrc, http: NativeHttp<'c>) -> NetworkRegistry<'c> {
     return NetworkRegistry<'c> { config: move config, http: move http }
   }
 
-  effect fn documents(self: &mut Self, names: &Names, ids: &[usize]) -> List<Result<Bytes, RegistryError>>
+  effect fn fetch(self: &mut Self, names: &Names, ids: &[usize], tarballs: &[Bytes]) -> Fetched
     ! OutOfMemoryError ? &mut Allocator {
     let mut urls = List<Bytes>.make()
+    let mut metadata = List<bool>.make()
     let mut index: usize = 0
     while index < ids.length {
       let name = Names.bytes(names, ids[index])
       run urls.append(run packumentUrl(Npmrc.registryFor(&self.config, name), name))
+      run metadata.append(true)
       index = index + 1
     }
-    return run getAll(&self.config, List<Bytes>.asSlice(&urls), METADATA_ACCEPT, METADATA_LIMIT)
+    index = 0
+    while index < tarballs.length {
+      run urls.append(run Bytes.copy(Bytes.asSlice(&tarballs[index])))
+      run metadata.append(false)
+      index = index + 1
+    }
+    let mut answers = run getAll(&self.config, List<Bytes>.asSlice(&urls), List<bool>.asSlice(&metadata))
       |> Effect.provideMut<Http>(&mut self.http)
-  }
-
-  effect fn tarballs(self: &mut Self, urls: &[Bytes]) -> List<Result<Bytes, RegistryError>>
-    ! OutOfMemoryError ? &mut Allocator {
-    return run getAll(&self.config, urls, "*/*", TARBALL_LIMIT) |> Effect.provideMut<Http>(&mut self.http)
+    // The tarballs are the tail; take both parts from the end and turn them back.
+    let mut tail = List<Result<Bytes, RegistryError>>.make()
+    let mut head = List<Result<Bytes, RegistryError>>.make()
+    while true {
+      match move List<Result<Bytes, RegistryError>>.pop(&mut answers) {
+        Option.None => { break }
+        Option.Some { value } => {
+          if List<Result<Bytes, RegistryError>>.length(&tail) < tarballs.length {
+            run tail.append(move value)
+          } else {
+            run head.append(run plain(move value))
+          }
+        }
+      }
+    }
+    return Fetched { documents: run turned(move head), tarballs: run turned(move tail) }
   }
 }
 
 impl<'c> Registry for NetworkRegistry<'c> {
-  documents: NetworkRegistry.documents
-  tarballs: NetworkRegistry.tarballs
+  fetch: NetworkRegistry.fetch
 }

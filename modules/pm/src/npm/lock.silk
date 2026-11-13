@@ -2,11 +2,18 @@
 //! metadata and gives the same tree on every machine.
 //!
 //! The file is JSON with one package per line and every map sorted, so a change to one package
-//! is a one line diff and merges rarely conflict. `importers` records what the project asked
-//! for, which is how a later install knows whether the file still matches `package.json`.
-//! `packages` has one entry per package, named `name@version`, with where its tarball is, its
-//! digest, what its dependencies resolved to (`links`), and the few manifest fields an install
-//! reads: `bin`, `os`, `cpu`, `libc` and `hasInstallScript`.
+//! is a one line diff and merges rarely conflict. `importers` has one entry per package of the
+//! workspace, named by its directory, with `.` for the root project. An entry records what the
+//! package asked for, which is how a later install knows whether the file still matches the
+//! `package.json` files, and what that resolved to: a package as `name@version`, or another
+//! package of the workspace as `link:` and its directory.
+//! `catalogs`, when the root project has any, records their ranges, as a `catalog:` dependency
+//! changes with them.
+//! `packages` has one entry per node of the graph, named `name@version`, with where its tarball
+//! is, its digest, what its dependencies resolved to (`links`), and the few manifest fields an
+//! install reads: `bin`, `os`, `cpu`, `libc` and `hasInstallScript`. A package that is used with
+//! more than one set of peers has an entry for each, with the peers after the version, as in
+//! `plugin@1.0.0_host@2.1.0`.
 
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.collections.bytes { Bytes }
@@ -14,15 +21,19 @@ import silk.collections.list { List }
 import silk.collections.slice { Slice }
 import silk.core.option { Option }
 import silk.core.ownership { Copy }
-import npm.manifest { DEVELOPMENT, Manifest, OPTIONAL, PRODUCTION, Span }
+import npm.manifest { CatalogEntry, DEVELOPMENT, Manifest, OPTIONAL, PRODUCTION, Span }
 import npm.resolve { Edge, Graph }
+import npm.workspace { Workspace }
 import pkg.json_walk { Text, Walker }
 import pkg.json_write { appendString }
 import pkg.names { Names }
-import pkg.text { compare, same }
+import pkg.text { compare, same, startsWith }
 
 /// The name of the lockfile in a project directory.
 pub const LOCKFILE: &'static [u8] = b"sjs.lock"
+
+// What comes before the directory of a package of the workspace in `links`.
+const LINK: &'static [u8] = b"link:"
 
 /// The format version this module reads and writes.
 const VERSION: u64 = 1
@@ -59,32 +70,41 @@ effect fn sorted(keys: &[Bytes]) -> List<usize> ! OutOfMemoryError ? &mut Alloca
   return move order
 }
 
-effect fn key(graph: &Graph, index: usize) -> Bytes ! OutOfMemoryError ? &mut Allocator {
+effect fn key(graph: &Graph, node: usize) -> Bytes ! OutOfMemoryError ? &mut Allocator {
+  let index = Graph.nodePackage(graph, node)
   let mut text = run Bytes.copy(Graph.name(graph, index))
   run text.append(b"@")
   run text.append(Graph.version(graph, index))
+  run text.append(Graph.nodeSuffix(graph, node))
   return move text
 }
 
-// Writes `"links":{…}` for a list of edges, sorted by alias.
-effect fn writeLinks(out: &mut Bytes, graph: &Graph, edges: &[Edge], keys: &[Bytes]) -> () ! OutOfMemoryError ? &mut Allocator {
+// Writes `"links":{…}`, sorted by alias: `edges` lead to packages, and `locals` to importers.
+effect fn writeLinks(out: &mut Bytes, graph: &Graph, edges: &[Edge], locals: &[Edge], keys: &[Bytes]) -> () ! OutOfMemoryError ? &mut Allocator {
   let mut aliases = List<Bytes>.make()
   let mut index: usize = 0
-  while index < edges.length {
-    run aliases.append(run Bytes.copy(Names.bytes(&graph.names, edges[index].alias)))
+  while index < edges.length + locals.length {
+    let alias = if index < edges.length { edges[index].alias } else { locals[index - edges.length].alias }
+    run aliases.append(run Bytes.copy(Names.bytes(&graph.names, alias)))
     index = index + 1
   }
   let order = run sorted(List<Bytes>.asSlice(&aliases))
   run out.append(b"\"links\":{")
   index = 0
-  while index < edges.length {
-    let edge = edges[List<usize>.get(&order, index)]
+  while index < edges.length + locals.length {
+    let which = List<usize>.get(&order, index)
     if index > 0 {
       run out.append(b",")
     }
-    run appendString(&mut out, Names.bytes(&graph.names, edge.alias))
+    run appendString(&mut out, Bytes.asSlice(&List<Bytes>.asSlice(&aliases)[which]))
     run out.append(b":")
-    run appendString(&mut out, Bytes.asSlice(&keys[edge.target]))
+    if which < edges.length {
+      run appendString(&mut out, Bytes.asSlice(&keys[edges[which].target]))
+    } else {
+      let mut target = run Bytes.copy(LINK)
+      run target.append(Graph.importerPath(graph, locals[which - edges.length].target))
+      run appendString(&mut out, Bytes.asSlice(&target))
+    }
     index = index + 1
   }
   run out.append(b"}")
@@ -139,32 +159,116 @@ effect fn writeSpecs(out: &mut Bytes, field: &[u8], root: &Manifest, kind: u8) -
   run out.append(b"}")
 }
 
-/// The lockfile text for the project `root` resolved to `graph`.
-pub effect fn write(root: &Manifest, graph: &Graph) -> Bytes ! OutOfMemoryError ? &mut Allocator {
+// The name of a catalog as the lockfile writes it.
+fn catalogName<'m>(root: &'m Manifest, entry: CatalogEntry) -> &'m [u8] {
+  let name = Manifest.text(root, entry.catalog)
+  if name.length == 0 {
+    return b"default"
+  }
+  return name
+}
+
+// Writes `"catalogs":{"default":{"name":"range"},…},` and a line end when the root project has
+// catalogs, sorted by catalog and then by name.
+effect fn writeCatalogs(out: &mut Bytes, root: &Manifest) -> () ! OutOfMemoryError ? &mut Allocator {
+  let entries = Manifest.allCatalogs(root)
+  if entries.length == 0 {
+    return ()
+  }
+  let mut labels = List<Bytes>.make()
+  let mut index: usize = 0
+  while index < entries.length {
+    let mut label = run Bytes.copy(catalogName(root, entries[index]))
+    run label.append(b"\n")
+    run label.append(Manifest.text(root, entries[index].name))
+    run labels.append(move label)
+    index = index + 1
+  }
+  let order = run sorted(List<Bytes>.asSlice(&labels))
+  run out.append(b"\"catalogs\":{")
+  index = 0
+  while index < entries.length {
+    let entry = entries[List<usize>.get(&order, index)]
+    let opens = index == 0 || same(catalogName(root, entries[List<usize>.get(&order, index - 1)]), catalogName(root, entry)) == false
+    if opens {
+      if index > 0 {
+        run out.append(b"},")
+      }
+      run appendString(&mut out, catalogName(root, entry))
+      run out.append(b":{")
+    } else {
+      run out.append(b",")
+    }
+    run appendString(&mut out, Manifest.text(root, entry.name))
+    run out.append(b":")
+    run appendString(&mut out, Manifest.text(root, entry.spec))
+    index = index + 1
+  }
+  run out.append(b"}},\n")
+}
+
+/// The lockfile text for `workspace` resolved to `graph`.
+pub effect fn write(workspace: &Workspace, graph: &Graph) -> Bytes ! OutOfMemoryError ? &mut Allocator {
   let mut keys = List<Bytes>.make()
   let mut index: usize = 0
-  while index < Graph.count(graph) {
+  while index < Graph.nodeCount(graph) {
     run keys.append(run key(graph, index))
     index = index + 1
   }
   let names = List<Bytes>.asSlice(&keys)
   let order = run sorted(names)
 
+  let members = Workspace.all(workspace)
+  let mut paths = List<Bytes>.make()
+  index = 0
+  while index < members.length {
+    run paths.append(run Bytes.copy(Bytes.asSlice(&members[index].path)))
+    index = index + 1
+  }
+  let places = run sorted(List<Bytes>.asSlice(&paths))
+  let none: [Edge; 0] = []
+
   let mut out = Bytes.make()
-  run out.append(b"{\n\"lockfileVersion\":1,\n\"importers\":{\n\".\":{")
-  run writeSpecs(&mut out, b"dependencies", root, PRODUCTION)
-  run out.append(b",")
-  run writeSpecs(&mut out, b"devDependencies", root, DEVELOPMENT)
-  run out.append(b",")
-  run writeSpecs(&mut out, b"optionalDependencies", root, OPTIONAL)
-  run out.append(b",")
-  run writeLinks(&mut out, graph, Graph.rootEdges(graph), names)
-  run out.append(b"}\n},\n\"packages\":{\n")
+  run out.append(b"{\n\"lockfileVersion\":1,\n")
+  run writeCatalogs(&mut out, &members[0].manifest)
+  run out.append(b"\"importers\":{\n")
+  index = 0
+  while index < members.length {
+    let member = &members[List<usize>.get(&places, index)]
+    let root = &member.manifest
+    run appendString(&mut out, Bytes.asSlice(&member.path))
+    run out.append(b":{")
+    if Manifest.text(root, root.name).length > 0 {
+      run out.append(b"\"name\":")
+      run appendString(&mut out, Manifest.text(root, root.name))
+      run out.append(b",")
+    }
+    run writeSpecs(&mut out, b"dependencies", root, PRODUCTION)
+    run out.append(b",")
+    run writeSpecs(&mut out, b"devDependencies", root, DEVELOPMENT)
+    run out.append(b",")
+    run writeSpecs(&mut out, b"optionalDependencies", root, OPTIONAL)
+    run out.append(b",")
+    match Graph.importerAt(graph, Bytes.asSlice(&member.path)) {
+      Option.Some { value: importer } => {
+        run writeLinks(&mut out, graph, Graph.importerEdges(graph, importer), Graph.importerLocals(graph, importer), names)
+      }
+      Option.None => { run writeLinks(&mut out, graph, &none, &none, names) }
+    }
+    run out.append(b"}")
+    if index + 1 < members.length {
+      run out.append(b",")
+    }
+    run out.append(b"\n")
+    index = index + 1
+  }
+  run out.append(b"},\n\"packages\":{\n")
   index = 0
   while index < List<usize>.length(&order) {
-    let package = List<usize>.get(&order, index)
+    let node = List<usize>.get(&order, index)
+    let package = Graph.nodePackage(graph, node)
     let manifest = &Graph.package(graph, package).manifest
-    run appendString(&mut out, Bytes.asSlice(&names[package]))
+    run appendString(&mut out, Bytes.asSlice(&names[node]))
     run out.append(b":{\"resolved\":")
     run appendString(&mut out, Graph.tarball(graph, package))
     if Graph.integrity(graph, package).length > 0 {
@@ -174,9 +278,9 @@ pub effect fn write(root: &Manifest, graph: &Graph) -> Bytes ! OutOfMemoryError 
       run out.append(b",\"shasum\":")
       run appendString(&mut out, Graph.shasum(graph, package))
     }
-    if Graph.edges(graph, package).length > 0 {
+    if Graph.nodeEdges(graph, node).length > 0 {
       run out.append(b",")
-      run writeLinks(&mut out, graph, Graph.edges(graph, package), names)
+      run writeLinks(&mut out, graph, Graph.nodeEdges(graph, node), &none, names)
     }
     let bins = Manifest.allBins(manifest)
     if bins.length > 0 {
@@ -217,8 +321,9 @@ struct Place {
 
 impl Copy for Place {}
 
-// What the project asked for when the lockfile was written.
+// What an importer asked for when the lockfile was written.
 struct Asked {
+  importer: usize,
   name: Place,
   spec: Place,
   kind: u8,
@@ -228,8 +333,10 @@ impl Copy for Asked {}
 
 // A link read from the file, before the package it names is known to exist.
 struct Link {
-  // The package index plus one; 0 for the project.
+  // The package index plus one; 0 for an importer.
   from: usize,
+  // The importer, when `from` is 0.
+  importer: usize,
   alias: Place,
   target: Place,
 }
@@ -242,7 +349,19 @@ pub struct Lock {
   pub graph: Graph,
   text: Bytes,
   asked: List<Asked>,
+  // Per importer of the graph: the name its package had, or an empty place.
+  names: List<Place>,
+  catalogs: List<Shared>,
 }
+
+// An entry of a catalog when the lockfile was written.
+struct Shared {
+  catalog: Place,
+  name: Place,
+  spec: Place,
+}
+
+impl Copy for Shared {}
 
 effect fn keep(text: &mut Bytes, value: &Text<'_>) -> Place ! OutOfMemoryError ? &mut Allocator {
   let start = Bytes.length(&text)
@@ -256,7 +375,7 @@ effect fn keep(text: &mut Bytes, value: &Text<'_>) -> Place ! OutOfMemoryError ?
 }
 
 // Reads a `links` object into `links`.
-effect fn readLinks(walker: &mut Walker<'_>, text: &mut Bytes, links: &mut List<Link>, from: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+effect fn readLinks(walker: &mut Walker<'_>, text: &mut Bytes, links: &mut List<Link>, from: usize, importer: usize) -> () ! OutOfMemoryError ? &mut Allocator {
   if Walker.enterObject(&mut walker) == false {
     return ()
   }
@@ -267,13 +386,13 @@ effect fn readLinks(walker: &mut Walker<'_>, text: &mut Bytes, links: &mut List<
         let target = Walker.string(&mut walker)
         let aliasPlace = run keep(&mut text, &alias)
         let targetPlace = run keep(&mut text, &target)
-        run links.append(Link { from: from, alias: aliasPlace, target: targetPlace })
+        run links.append(Link { from: from, importer: importer, alias: aliasPlace, target: targetPlace })
       }
     }
   }
 }
 
-effect fn readSpecs(walker: &mut Walker<'_>, text: &mut Bytes, asked: &mut List<Asked>, kind: u8) -> () ! OutOfMemoryError ? &mut Allocator {
+effect fn readSpecs(walker: &mut Walker<'_>, text: &mut Bytes, asked: &mut List<Asked>, importer: usize, kind: u8) -> () ! OutOfMemoryError ? &mut Allocator {
   if Walker.enterObject(&mut walker) == false {
     return ()
   }
@@ -284,7 +403,7 @@ effect fn readSpecs(walker: &mut Walker<'_>, text: &mut Bytes, asked: &mut List<
         let spec = Walker.string(&mut walker)
         let namePlace = run keep(&mut text, &name)
         let specPlace = run keep(&mut text, &spec)
-        run asked.append(Asked { name: namePlace, spec: specPlace, kind: kind })
+        run asked.append(Asked { importer: importer, name: namePlace, spec: specPlace, kind: kind })
       }
     }
   }
@@ -303,8 +422,12 @@ impl Lock {
     let mut text = Bytes.make()
     let mut asked = List<Asked>.make()
     let mut links = List<Link>.make()
-    // The package keys in file order; the number of a key is the index of its package.
+    let mut names = List<Place>.make()
+    let mut catalogs = List<Shared>.make()
+    // The package keys in file order; the number of a key is the index of its node.
     let mut keys = Names.make()
+    // The keys without what tells nodes apart; the number of one is the index of its package.
+    let mut bases = Names.make()
     let mut version: u64 = 0
     if Walker.enterObject(&mut walker) == false {
       return Option<Lock>.none()
@@ -319,29 +442,67 @@ impl Lock {
               Option.Some { value } => value
               Option.None => 0
             }
-          } else if same(name, b"importers") {
+          } else if same(name, b"catalogs") {
             if Walker.enterObject(&mut walker) {
               while true {
                 match move Walker.key(&mut walker) {
                   Option.None => { break }
-                  Option.Some { value: importer } => {
-                    if same(Text.bytes(&importer), b".") == false || Walker.enterObject(&mut walker) == false {
+                  Option.Some { value: catalog } => {
+                    let label = run keep(&mut text, &catalog)
+                    if Walker.enterObject(&mut walker) == false {
                       Walker.reject(&mut walker)
                       continue
                     }
                     while true {
                       match move Walker.key(&mut walker) {
                         Option.None => { break }
+                        Option.Some { value: entry } => {
+                          let spec = Walker.string(&mut walker)
+                          let namePlace = run keep(&mut text, &entry)
+                          let specPlace = run keep(&mut text, &spec)
+                          run catalogs.append(Shared { catalog: label, name: namePlace, spec: specPlace })
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          } else if same(name, b"importers") {
+            if Walker.enterObject(&mut walker) {
+              while true {
+                match move Walker.key(&mut walker) {
+                  Option.None => { break }
+                  Option.Some { value: importer } => {
+                    if Walker.enterObject(&mut walker) == false {
+                      Walker.reject(&mut walker)
+                      continue
+                    }
+                    let path = run Text.decode(&importer)
+                    if Option.isSome(&Graph.importerAt(&graph, Bytes.asSlice(&path))) {
+                      // The same directory twice.
+                      Walker.reject(&mut walker)
+                      continue
+                    }
+                    let at = run Graph.addImporter(&mut graph, Bytes.asSlice(&path))
+                    run names.append(Place { start: 0, length: 0 })
+                    while true {
+                      match move Walker.key(&mut walker) {
+                        Option.None => { break }
                         Option.Some { value: field } => {
                           let which = Text.bytes(&field)
                           if same(which, b"dependencies") {
-                            run readSpecs(&mut walker, &mut text, &mut asked, PRODUCTION)
+                            run readSpecs(&mut walker, &mut text, &mut asked, at, PRODUCTION)
                           } else if same(which, b"devDependencies") {
-                            run readSpecs(&mut walker, &mut text, &mut asked, DEVELOPMENT)
+                            run readSpecs(&mut walker, &mut text, &mut asked, at, DEVELOPMENT)
                           } else if same(which, b"optionalDependencies") {
-                            run readSpecs(&mut walker, &mut text, &mut asked, OPTIONAL)
+                            run readSpecs(&mut walker, &mut text, &mut asked, at, OPTIONAL)
+                          } else if same(which, b"name") {
+                            let name = Walker.string(&mut walker)
+                            let place = run keep(&mut text, &name)
+                            List<Place>.set(&mut names, at, place)
                           } else if same(which, b"links") {
-                            run readLinks(&mut walker, &mut text, &mut links, 0)
+                            run readLinks(&mut walker, &mut text, &mut links, 0, at)
                           } else {
                             Walker.skip(&mut walker)
                           }
@@ -379,7 +540,7 @@ impl Lock {
                           } else if same(which, b"shasum") {
                             shasum = Walker.string(&mut walker)
                           } else if same(which, b"links") {
-                            run readLinks(&mut walker, &mut text, &mut links, from)
+                            run readLinks(&mut walker, &mut text, &mut links, from, 0)
                           } else {
                             Walker.skip(&mut walker)
                           }
@@ -390,14 +551,22 @@ impl Lock {
                       continue
                     }
                     let object = Slice.view<u8>(source, start, Walker.position(&walker) + 1 - start)
-                    // The key is `name@version`, and a scoped name starts with `@`.
+                    // The key is `name@version`, and a scoped name starts with `@`. A node with
+                    // peers has them after the version, from a `_` on.
                     let full = run Text.decode(&entry)
                     let label = Bytes.asSlice(&full)
                     let mut at = label.length
                     let mut index: usize = 1
-                    while index < label.length {
+                    while index < label.length && at == label.length {
                       if label[index] == 64 {
                         at = index
+                      }
+                      index = index + 1
+                    }
+                    let mut end = label.length
+                    while index < label.length && end == label.length {
+                      if label[index] == 95 {
+                        end = index
                       }
                       index = index + 1
                     }
@@ -414,18 +583,26 @@ impl Lock {
                             Walker.reject(&mut walker)
                           } else {
                             drop run Names.intern(&mut keys, label)
-                            let tarball = run Text.decode(&resolved)
-                            let digest = run Text.decode(&integrity)
-                            let sha1 = run Text.decode(&shasum)
-                            drop run Graph.addPackage(
-                              &mut graph,
-                              Slice.view<u8>(label, 0, at),
-                              Slice.view<u8>(label, at + 1, label.length - at - 1),
-                              Bytes.asSlice(&tarball),
-                              Bytes.asSlice(&digest),
-                              Bytes.asSlice(&sha1),
-                              move fields,
-                            )
+                            let base = Slice.view<u8>(label, 0, end)
+                            let package = match Names.find(&bases, base) {
+                              Option.Some { value } => value
+                              Option.None => {
+                                drop run Names.intern(&mut bases, base)
+                                let tarball = run Text.decode(&resolved)
+                                let digest = run Text.decode(&integrity)
+                                let sha1 = run Text.decode(&shasum)
+                                run Graph.addPackage(
+                                  &mut graph,
+                                  Slice.view<u8>(label, 0, at),
+                                  Slice.view<u8>(label, at + 1, end - at - 1),
+                                  Bytes.asSlice(&tarball),
+                                  Bytes.asSlice(&digest),
+                                  Bytes.asSlice(&sha1),
+                                  move fields,
+                                )
+                              }
+                            }
+                            drop run Graph.addNode(&mut graph, package, Slice.view<u8>(label, end, label.length - end))
                           }
                         }
                       }
@@ -447,48 +624,63 @@ impl Lock {
     let mut index: usize = 0
     while index < all.length {
       let link = all[index]
-      let target = match Names.find(&keys, view(&text, link.target)) {
+      let named = view(&text, link.target)
+      if link.from == 0 && startsWith(named, LINK) {
+        let local = match Graph.importerAt(&graph, Slice.view<u8>(named, LINK.length, named.length - LINK.length)) {
+          Option.Some { value } => value
+          Option.None => { return Option<Lock>.none() }
+        }
+        run Graph.addLocalEdge(&mut graph, link.importer, view(&text, link.alias), local)
+        index = index + 1
+        continue
+      }
+      let target = match Names.find(&keys, named) {
         Option.Some { value } => value
         Option.None => { return Option<Lock>.none() }
       }
       if link.from == 0 {
-        run Graph.addRootEdge(&mut graph, view(&text, link.alias), target)
+        run Graph.addImporterEdge(&mut graph, link.importer, view(&text, link.alias), target)
       } else {
         run Graph.addEdge(&mut graph, link.from - 1, view(&text, link.alias), target)
       }
       index = index + 1
     }
-    return Option<Lock>.some(Lock { graph: move graph, text: move text, asked: move asked })
+    return Option<Lock>.some(Lock { graph: move graph, text: move text, asked: move asked, names: move names, catalogs: move catalogs })
   }
 
   /// Takes the graph out of the lock.
   pub fn intoGraph(self: Self) -> Graph {
-    let Lock { graph, text, asked } = move self
+    let Lock { graph, text, asked, names, catalogs } = move self
     drop text
     drop asked
+    drop names
+    drop catalogs
     return move graph
   }
 
-  /// Whether the lockfile was written for the dependencies `root` has now: the same names with
-  /// the same specs in the same fields.
-  pub fn matches(self: &Self, root: &Manifest) -> bool {
+  /// Whether the lockfile was written for `workspace` as it is now: the same packages in the
+  /// same directories under the same names, each with the same dependencies, specs and fields.
+  pub fn matches(self: &Self, workspace: &Workspace) -> bool {
     let asked = List<Asked>.asSlice(&self.asked)
-    let all = Manifest.allDependencies(root)
-    let mut wanted: usize = 0
-    let mut index: usize = 0
-    while index < all.length {
-      let entry = all[index]
-      index = index + 1
-      if entry.kind != PRODUCTION && entry.kind != DEVELOPMENT && entry.kind != OPTIONAL {
-        continue
-      }
-      wanted = wanted + 1
+    let members = Workspace.all(workspace)
+    if members.length != Graph.importerCount(&self.graph) {
+      return false
+    }
+    // The catalogs of the root project are the ones the file was written with.
+    let root = &members[0].manifest
+    let entries = Manifest.allCatalogs(root)
+    let shared = List<Shared>.asSlice(&self.catalogs)
+    if entries.length != shared.length {
+      return false
+    }
+    let mut entry: usize = 0
+    while entry < entries.length {
       let mut found = false
       let mut each: usize = 0
-      while each < asked.length {
-        if asked[each].kind == entry.kind
-          && same(view(&self.text, asked[each].name), Manifest.text(root, entry.name))
-          && same(view(&self.text, asked[each].spec), Manifest.text(root, entry.spec)) {
+      while each < shared.length {
+        if same(view(&self.text, shared[each].catalog), catalogName(root, entries[entry]))
+          && same(view(&self.text, shared[each].name), Manifest.text(root, entries[entry].name))
+          && same(view(&self.text, shared[each].spec), Manifest.text(root, entries[entry].spec)) {
           found = true
         }
         each = each + 1
@@ -496,6 +688,43 @@ impl Lock {
       if found == false {
         return false
       }
+      entry = entry + 1
+    }
+    let mut wanted: usize = 0
+    let mut member: usize = 0
+    while member < members.length {
+      let root = &members[member].manifest
+      let importer = match Graph.importerAt(&self.graph, Bytes.asSlice(&members[member].path)) {
+        Option.Some { value } => value
+        Option.None => { return false }
+      }
+      if same(view(&self.text, List<Place>.get(&self.names, importer)), Manifest.text(root, root.name)) == false {
+        return false
+      }
+      let all = Manifest.allDependencies(root)
+      let mut index: usize = 0
+      while index < all.length {
+        let entry = all[index]
+        index = index + 1
+        if entry.kind != PRODUCTION && entry.kind != DEVELOPMENT && entry.kind != OPTIONAL {
+          continue
+        }
+        wanted = wanted + 1
+        let mut found = false
+        let mut each: usize = 0
+        while each < asked.length {
+          if asked[each].importer == importer && asked[each].kind == entry.kind
+            && same(view(&self.text, asked[each].name), Manifest.text(root, entry.name))
+            && same(view(&self.text, asked[each].spec), Manifest.text(root, entry.spec)) {
+            found = true
+          }
+          each = each + 1
+        }
+        if found == false {
+          return false
+        }
+      }
+      member = member + 1
     }
     return wanted == asked.length
   }

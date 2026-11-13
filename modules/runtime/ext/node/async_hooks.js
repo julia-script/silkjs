@@ -64,6 +64,10 @@ function syncNativeHooks() {
   }
   host.setAsyncHooksEnabled(enabled);
 }
+// Read without calling anything that could overflow again.
+function stackOverflow(exception) {
+  return exception instanceof RangeError && exception.message === 'Maximum call stack size exceeded';
+}
 function emit(name, args, promise = false) {
   if (emitting || hookCount === 0) return;
   // Mutations during dispatch affect the next event, not this event's listeners.
@@ -79,6 +83,9 @@ function emit(name, args, promise = false) {
       if (callback !== undefined) apply(callback, hook, args);
     }
   } catch (exception) {
+    // Node's hook callers catch with kFatalRethrowStackOverflow: a stack overflow goes on
+    // to the code that caused the event, where uncaughtException may still see it.
+    if (stackOverflow(exception)) throw exception;
     host.asyncHookFatal(exception);
   } finally {
     emitting = false;
@@ -411,6 +418,15 @@ class AsyncLocalStorage {
 const hiddenPromise = Object.freeze({ hidden: true });
 let hideDepth = 0;
 const latePromises = new WeakMap();
+// Node's trackPromise: a promise the hooks see keeps its ids under the public
+// async_id_symbol and trigger_async_id_symbol keys, set once.
+let promiseSymbols;
+function trackPromise(promise, state) {
+  promiseSymbols ??= require('internal/async_hooks').symbols;
+  if (promise[promiseSymbols.async_id_symbol]) return;
+  promise[promiseSymbols.async_id_symbol] = state.id;
+  promise[promiseSymbols.trigger_async_id_symbol] = state.trigger;
+}
 function nativeEvent(event, token, parent, resource, parentResource) {
   if (promiseObserver !== undefined) promiseObserver(event, token, parentResource !== undefined);
   if (event === 0) {
@@ -421,6 +437,7 @@ function nativeEvent(event, token, parent, resource, parentResource) {
     const state = { id: nextId++, trigger: nativeResources.get(parent)?.id ?? executionAsyncId(),
       resource: new WeakRef(resource), destroyed: false, promise: true };
     nativeResources.set(token, state);
+    trackPromise(resource, state);
     emitPromise('init', resource, parentResource);
     emit('init', [state.id, 'PROMISE', state.trigger, resource], true);
     return;
@@ -439,6 +456,7 @@ function nativeEvent(event, token, parent, resource, parentResource) {
     if (state === undefined) {
       state = { id: nextId++, trigger: executionAsyncId(), resource: new WeakRef(resource), destroyed: true, promise: true };
       latePromises.set(resource, state);
+      trackPromise(resource, state);
     }
   }
   if (event === 1) {
