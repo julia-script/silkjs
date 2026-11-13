@@ -167,8 +167,10 @@ def append_heap_image(executable, data):
 def lay_out_heap_image(output, work):
     """The layout for output's heap image: the small blocks that the starts in
     tools/heap-image-starts write go to arenas of their own, packed into as few pages
-    as their bytes need. Every block is named by its allocation id, which each build
-    of the image hands out the same. A first image keeps every block where the
+    as their bytes need. Every block is named by its placed allocation id: its
+    requested size and how many blocks of that size came before it, which each build
+    of the image hands out the same even where a cache or a collection makes a build
+    allocate a little more or less elsewhere. A first image keeps every block where the
     bootstrap puts it, and the pages its starts write name the candidates; a second
     puts each candidate alone on its pages, and the pages written then name the
     blocks."""
