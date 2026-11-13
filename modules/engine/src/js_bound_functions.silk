@@ -12,6 +12,8 @@ import silk.mem.layout { Layout }
 import silk.num.f64
 import silk.num.i32
 import silk.num.usize
+import silk.num.u8
+import silk.num.u32
 import runtime_memory { AllocationObserver }
 import js_heap { HeapCell, HeapHeader, HeapKind, CellRef }
 import js_object_ref { ObjectRef }
@@ -20,7 +22,9 @@ import js_owned_value { Value, ValueList, ValueRef }
 import js_value { ValueBits }
 import js_intl_realm as ops
 import js_realm { Realm, Arguments, lendArguments }
-import js_core_types { ObjectData, ObjectPayload, ObjectPayloadFamily, NativeErrorKind, FrameSlots, JS_CALL_FLAG_CONSTRUCTOR }
+import js_core_types { ObjectData, ObjectPayload, ObjectPayloadFamily, NativeErrorKind, FrameSlots, ShapeData, SlotBits, JS_CALL_FLAG_CONSTRUCTOR, JS_PROP_TMASK, JS_PROP_CONFIGURABLE, JS_PROP_INITIAL_HASH_SIZE }
+import js_shapes as shapes
+import thin_list { ThinList }
 import js_gc { HeapHooks, Tracer }
 import js_object_allocate as objects
 import js_prototypes as prototypes
@@ -180,9 +184,122 @@ pub unsafe effect fn bind<'a, 'b, H: HeapHooks + OwnPropertyHooks + CoercionHook
     Result<ValueBits, OutOfMemoryError | StringLengthError | JsException>.Failure { error } => run materialize(&mut hooks, realm, move error)
   }
 }
+/// Own data property atom of object (not an accessor): 0 absent, 1 found
+/// (read into found, borrowed), 2 present but not plain data.
+unsafe fn ownData(object: *mut HeapHeader, atom: u32, found: &mut ValueBits) -> u32 {
+  let anchor = ()
+  let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, object)
+  return match unsafe shapes.lookup(data.shape, atom) {
+    Option<usize>.Some { value: index } => {
+      let shape = unsafe HeapCell.payload<ShapeData, ()>(&anchor, data.shape)
+      if (u8.toU32(shape.properties.get(index).flags) & JS_PROP_TMASK) != 0 { 2 } else {
+        found.* = (unsafe data.slotUnchecked(index)).valueBits()
+        1
+      }
+    }
+    Option<usize>.None => 0
+  }
+}
+/// The bound function shape when function's prototype is the realm's
+/// Function.prototype, else null. Made on first use.
+unsafe effect fn boundShape<'a>(realm: Realm<'a>, prototype: ?*mut HeapHeader) -> ?*mut HeapHeader ! OutOfMemoryError ? &mut Allocator {
+  let anchor = ()
+  let state = realm.state(&anchor)
+  let expected = match state.functionPrototype.view() { ValueBits.Object { reference } => reference _ => { return Pointer.null<HeapHeader>() } }
+  if Pointer.address<HeapHeader>(expected) != Pointer.address<HeapHeader>(unsafe Intrinsic.pointerRequalify<?*mut HeapHeader, *mut HeapHeader>(prototype)) || Pointer.isNull<HeapHeader>(prototype) {
+    return Pointer.null<HeapHeader>()
+  }
+  let cached = state.boundShape
+  drop state
+  if !Pointer.isNull<HeapHeader>(cached) { return cached }
+  let made = run unsafe shapes.create(realm.runtime(), prototype, JS_PROP_INITIAL_HASH_SIZE, 2)
+  let added = run Effect.result(unsafe shapes.addShapeProperty(realm.runtime(), made, atoms.JS_ATOM_length, u32.toU8(JS_PROP_CONFIGURABLE)))
+  let named = match move added {
+    Result<usize, OutOfMemoryError>.Success { .. } => run Effect.result(unsafe shapes.addShapeProperty(realm.runtime(), made, atoms.JS_ATOM_name, u32.toU8(JS_PROP_CONFIGURABLE)))
+    Result<usize, OutOfMemoryError>.Failure { error } => Result<usize, OutOfMemoryError>.Failure { error: move error }
+  }
+  match move named {
+    Result<usize, OutOfMemoryError>.Success { .. } => ()
+    Result<usize, OutOfMemoryError>.Failure { .. } => { return Pointer.null<HeapHeader>() }
+  }
+  let mut stateAnchor = ()
+  let owner = realm.stateMut(&mut stateAnchor) owner.boundShape = made drop owner
+  return made
+}
+/// "bound " + source (a string), owned: the realm's last one when source is
+/// the same string cell.
+unsafe effect fn boundName<'a>(realm: Realm<'a>, source: ValueBits) -> Value ! OutOfMemoryError | StringLengthError ? &mut Allocator {
+  let anchor = ()
+  let state = realm.state(&anchor)
+  match state.boundNameSource.view() {
+    ValueBits.String { reference: held } => {
+      match source {
+        ValueBits.String { reference } => {
+          if Pointer.address<HeapHeader>(held) == Pointer.address<HeapHeader>(reference) { return state.boundName.dup() }
+        }
+        _ => ()
+      }
+    }
+    _ => ()
+  }
+  drop state
+  let prefixed = unsafe Value.adoptBits(run prefixedName((unsafe Value.retain(source)).intoBits()))
+  let mut stateAnchor = ()
+  let owner = realm.stateMut(&mut stateAnchor)
+  let oldSource = Intrinsic.replace(owner.boundNameSource, unsafe Value.retain(source))
+  let oldName = Intrinsic.replace(owner.boundName, prefixed.dup())
+  drop owner
+  drop oldSource drop oldName
+  return move prefixed
+}
+/// bind for an ordinary function (not exotic) whose own length and name are
+/// plain data, name a string, and whose prototype is Function.prototype: the
+/// object is born with its final shape, with no property definitions or getter
+/// calls. Undefined when the function does not qualify.
+unsafe effect fn quickCreate<'a, 'b, H: HeapHooks>(hooks: &mut H, memory: &AllocationObserver, realm: Realm<'a>, function: ValueRef<'b>, arguments: &FrameSlots, count: usize) -> ValueBits
+  ! OutOfMemoryError | StringLengthError ? &mut Allocator {
+  let node = match function.view() { ValueBits.Object { reference } => reference _ => { return ValueBits.Undefined } }
+  let anchor = ()
+  let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, node)
+  if data.isExotic() { return ValueBits.Undefined }
+  let prototype = (unsafe HeapCell.payload<ShapeData, ()>(&anchor, data.shape)).prototype
+  let constructor = data.isConstructor()
+  drop data
+  let mut lengthBits = ValueBits.Int { value: 0 }
+  if unsafe ownData(node, atoms.JS_ATOM_length, &mut lengthBits) == 2 { return ValueBits.Undefined }
+  let mut nameBits = ValueBits.Undefined
+  if unsafe ownData(node, atoms.JS_ATOM_name, &mut nameBits) != 1 || !nameBits.isString() { return ValueBits.Undefined }
+  let shape = run unsafe boundShape(realm, prototype)
+  if Pointer.isNull<HeapHeader>(shape) { return ValueBits.Undefined }
+  let length = adjustedLength(lengthBits, count)
+  let name = run unsafe boundName(realm, nameBits)
+  let payload = run unsafe allocatePayload(function.view(), arguments)
+  let shapeNode = unsafe Intrinsic.pointerRequalify<?*mut HeapHeader, *mut HeapHeader>(shape)
+  unsafe HeapCell.retain(shapeNode)
+  let made = run Effect.result(unsafe objects.fromShape(&mut hooks, memory, realm, shapeNode, classes.JS_CLASS_BOUND_FUNCTION, Option<ThinList<SlotBits>>.none()))
+  let object = match move made {
+    Result<ValueBits, OutOfMemoryError>.Success { value } => value
+    Result<ValueBits, OutOfMemoryError>.Failure { error } => {
+      unsafe HeapCell.destroy<BoundFunctionData>(payload)
+      fail move error
+    }
+  }
+  let mut objectAnchor = ()
+  let installed = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut objectAnchor, reference(object))
+  installed.setIsConstructor(constructor)
+  installed.setSlot(0, SlotBits.value(length))
+  installed.setSlot(1, SlotBits.value(name.intoBits()))
+  installed.payload = ObjectPayload.Opaque { family: ObjectPayloadFamily.BoundFunction, reference: payload }
+  return object
+}
 unsafe effect fn create<'a, 'b, H: HeapHooks + OwnPropertyHooks + CoercionHooks + PropertyWriteHooks + PrototypeHooks>(
   hooks: &mut H, memory: &AllocationObserver, realm: Realm<'a>, function: ValueRef<'b>, arguments: &FrameSlots) -> ValueBits
   ! OutOfMemoryError | StringLengthError | JsException ? &mut Allocator {
+  let mut bound: usize = 0 if arguments.length() != 0 { bound = arguments.length() - 1 }
+  match run unsafe quickCreate(&mut hooks, memory, realm, function, arguments, bound) {
+    ValueBits.Undefined => ()
+    ValueBits quick => { return quick }
+  }
   let prototype = run prototypes.prototypeOf(&mut hooks, realm, function)
   let allocated = run Effect.result(objects.newWithPrototypeClass(&mut hooks, memory, realm, prototype.borrow(), classes.JS_CLASS_BOUND_FUNCTION))
   let object = match move allocated {

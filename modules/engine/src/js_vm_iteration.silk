@@ -1,0 +1,394 @@
+//! Array.prototype every, some, forEach, map, filter, reduce and reduceRight
+//! (quickjs.c:43511-43756) called from bytecode, run as a small loop of bytecode
+//! in the caller's dispatch loop. The callback is an ordinary call_method from
+//! that loop, so a bytecode callback gets an inline frame (or runs as a leaf)
+//! instead of a nested dispatch loop per element.
+//!
+//! The loop is a frame of the realm's iteration code (ContextState.iterationCode,
+//! reduceCode) whose current function is the intrinsic itself, so stack traces,
+//! Error.captureStackTrace and the CPU profile show the native as before. Its
+//! steps are OP_invalid with a phase byte, which no verified bytecode contains:
+//!
+//!    0  invalid INIT        validate, length, accumulator, then as NEXT
+//!                           (skipping NEXT when there is a call to make)
+//!    2  invalid NEXT        take the callback's result, find the next element,
+//!                           push the call's operands (or the result, jumping to 9)
+//!    4  call_method 3 | 4
+//!    7  goto8 -6            to NEXT
+//!    9  return
+//!
+//! The frame owns its state in locals, so an exception unwinding through it
+//! releases everything as for any frame.
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.mem.pointer { Pointer }
+import silk.num.u8
+import silk.num.u32
+import silk.num.i32
+import silk.num.i64
+import silk.num.f64
+import runtime_memory { AllocationObserver }
+import js_heap { HeapCell, HeapHeader, HeapKind }
+import js_value { ValueBits }
+import js_owned_value { Value, lendBits }
+import js_realm { Realm, lendRealm }
+import silk.core.result { Result }
+import js_core_types { RuntimeState, ContextState, ObjectData, ObjectPayload, FunctionBytecode, FunctionKind, KnownCall, ByteStorage,
+  VarDef, ClosureVar, FunctionDebugInfo, HostEdges, NativeFunctionId, BuiltinFamily,
+  JS_MODE_STRICT, JS_PROP_C_W_E, JS_PROP_THROW, FrameSlots }
+import js_compiler_types { PendingFunction }
+import js_debugger_metadata { Metadata as DebuggerMetadata }
+import js_gc { HeapHooks }
+import js_gc as gc
+import js_coercion_host { CoercionHooks }
+import js_property_host { OwnPropertyHooks, GetPropertyHooks, HasPropertyHooks }
+import js_property_write_host { PropertyWriteHooks }
+import js_call_host { CallHooks }
+import js_exceptions { JsException }
+import js_caught { Failed, failed }
+import js_string_types { StringLengthError }
+import js_bigint { BigIntError }
+import js_vm_state { Machine }
+import js_vm_activation as activation
+import js_scopes as scopes
+import js_boxing as boxing
+import js_function_invoke as invoke
+import js_property_get as properties
+import js_property_mutations as mutations
+import js_typed_array_methods_array_species as arraySpecies
+import js_array_intrinsics_support as arrays
+import js_array_intrinsics as arrayIds
+import js_intl_realm as ops
+import js_proxy_core as core
+import js_class_data as classes
+import js_opcode_data as op
+import js_debugger_restricted as restricted
+import thin_list { BoxList, ThinBox }
+
+// Method numbers, as js_typed_array_methods_iteration's (Array method - EVERY).
+const EVERY: u32 = 0
+const SOME: u32 = 1
+const FOR_EACH: u32 = 2
+const MAP: u32 = 3
+const FILTER: u32 = 4
+const REDUCE: u32 = 5
+const REDUCE_RIGHT: u32 = 6
+
+/// The phase byte after OP_invalid.
+const INIT: u8 = 0
+const NEXT: u8 = 1
+/// Where NEXT jumps once the loop is over: the return.
+const RETURN_PC: usize = 9
+
+// The frame's locals.
+const LOCAL_OBJECT: usize = 0
+const LOCAL_LENGTH: usize = 1
+const LOCAL_POSITION: usize = 2
+const LOCAL_ACCUMULATOR: usize = 3
+const LOCAL_SELECTED: usize = 4
+const LOCAL_INDEX: usize = 5
+const LOCAL_ELEMENT: usize = 6
+const LOCAL_METHOD: usize = 7
+const LOCALS: u16 = 8
+/// The reduce call's operands: receiver, callback, accumulator, element, index, object.
+const STACK: u16 = 6
+
+/// The iteration method of function, when it is one of the seven intrinsic
+/// Array.prototype callback methods this file runs; u32.MAX else.
+@inlineAlways
+pub unsafe fn methodOf(function: ValueBits) -> u32 {
+  let reference = match function { ValueBits.Object { reference } => reference _ => { return u32.MAX } }
+  let anchor = () let object = unsafe HeapCell.payload<ObjectData, ()>(&anchor, reference)
+  if object.classId() != classes.JS_CLASS_C_FUNCTION { return u32.MAX }
+  return match &object.payload {
+    ObjectPayload.NativeFunction { function: native } => match native.function {
+      NativeFunctionId.Builtin { family: BuiltinFamily.Array, method } =>
+        if method >= arrayIds.EVERY && method <= arrayIds.REDUCE_RIGHT && !native.isDataFunction() { method - arrayIds.EVERY } else { u32.MAX }
+      _ => u32.MAX
+    }
+    _ => u32.MAX
+  }
+}
+
+/// Enters the iteration frame for intrinsic function (methodOf gave method)
+/// called on receiver with argv (scratch the frame copies when copy), its
+/// caller's first call operand at first.
+/// Null, with nothing changed, when it cannot: an observed or restricted run,
+/// no room in the call-frame region or no memory for the realm's code.
+pub unsafe effect fn enter(machine: &mut Machine, function: ValueBits, method: u32, receiver: ValueBits, argv: FrameSlots,
+  first: *mut ValueBits, copy: bool) -> ?*mut Machine ? &mut Allocator {
+  let anchor = ()
+  let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, machine.runtime)
+  let observed = state.observeInstructions drop state
+  if observed { return Pointer.null<Machine>() }
+  // A native callback (arr.map(String)) is called native to native as before:
+  // through call_method it would only add the frame.
+  if argv.length() != 0 {
+    match unsafe argv.get(0) {
+      ValueBits.Object { reference } => {
+        if (unsafe HeapCell.payload<ObjectData, ()>(&anchor, reference)).classId() == classes.JS_CLASS_C_FUNCTION { return Pointer.null<Machine>() }
+      }
+      _ => ()
+    }
+  }
+  let object = unsafe HeapCell.payload<ObjectData, ()>(&anchor, core.reference(function))
+  let realm = match &object.payload {
+    ObjectPayload.NativeFunction { function: native } => native.realm()
+    _ => Pointer.null<HeapHeader>()
+  }
+  drop object
+  let home = match Pointer.nonNullMut<HeapHeader>(realm) { Option<*mut HeapHeader>.Some { value } => value _ => { return Pointer.null<Machine>() } }
+  if restricted.active(unsafe lendRealm(&home, home)) { return Pointer.null<Machine>() }
+  let code = run unsafe codeFor(home, method == REDUCE || method == REDUCE_RIGHT)
+  let bytecode = match Pointer.nonNullMut<HeapHeader>(code) { Option<*mut HeapHeader>.Some { value } => value _ => { return Pointer.null<Machine>() } }
+  let running = Pointer.fromMutRef<Machine>(&mut machine)
+  return match unsafe activation.enterIteration(machine.runtime, function, bytecode, argv, first, running, machine.context, receiver, copy) {
+    Option<*mut Machine>.Some { value } => {
+      let mut calleeAnchor = () let callee = unsafe Pointer.borrowMut<(), Machine>(&mut calleeAnchor, value)
+      drop unsafe callee.setLocal(LOCAL_METHOD, ValueBits.Int { value: u32.toI32(method) })
+      value
+    }
+    Option<*mut Machine>.None => Pointer.null<Machine>()
+  }
+}
+
+/// The realm's iteration code (reducing: the reduce variant, whose call passes
+/// four arguments), made on first use; null when there is no memory for it.
+unsafe effect fn codeFor(realm: *mut HeapHeader, reducing: bool) -> ?*mut HeapHeader ? &mut Allocator {
+  let anchor = ()
+  let context = unsafe HeapCell.payload<ContextState, ()>(&anchor, realm)
+  let present = if reducing { context.reduceCode } else { context.iterationCode }
+  drop context
+  if !Pointer.isNull<HeapHeader>(present) { return present }
+  let mut count: u8 = 3
+  if reducing { count = 4 }
+  let bytes = [op.OP_invalid, INIT, op.OP_invalid, NEXT, op.OP_call_method, count, 0, op.OP_goto8, 250, op.OP_return]
+  let made = run Effect.result(unsafe allocateCode(realm, &bytes))
+  let code = match move made {
+    Result<*mut HeapHeader, OutOfMemoryError>.Success { value } => value
+    Result<*mut HeapHeader, OutOfMemoryError>.Failure { error } => { drop error return Pointer.null<HeapHeader>() }
+  }
+  let mut contextAnchor = () let owner = unsafe HeapCell.payloadMut<ContextState, ()>(&mut contextAnchor, realm)
+  if reducing { owner.reduceCode = code } else { owner.iterationCode = code }
+  return code
+}
+unsafe effect fn allocateCode(realm: *mut HeapHeader, bytes: &[u8]) -> *mut HeapHeader ! OutOfMemoryError ? &mut Allocator {
+  let code = run ByteStorage.copy(bytes)
+  let made = run HeapCell.allocate(HeapKind.FunctionBytecode, FunctionBytecode {
+    scriptId: 0, scriptIsEval: false,
+    debugger: ThinBox<DebuggerMetadata>.none(), host: ThinBox<HostEdges>.none(),
+    mode: JS_MODE_STRICT, hasPrototype: false, hasSimpleParameterList: true, isDerivedClassConstructor: false,
+    needsHomeObject: false, kind: FunctionKind.Normal, newTargetAllowed: false, superCallAllowed: false,
+    superAllowed: false, argumentsAllowed: false, readOnlyBytecode: true, isDirectOrIndirectEval: false,
+    code: move code, name: 0, varDefs: BoxList<VarDef>.make(), closureVars: BoxList<ClosureVar>.make(),
+    argumentCount: 2, variableCount: LOCALS, definedArgumentCount: 1, stackSize: STACK, varRefCount: 0,
+    scopeCaptures: 0, scopeSlots: 0, scopeVarSlots: 0, frameCells: scopes.inlineFrameCells(LOCALS, STACK, 0, 0),
+    scopeParameters: BoxList<u32>.make(), scopeVariables: BoxList<u16>.make(), borrowsArguments: false, leaf: 0, constructForm: 0,
+    realm: realm, known: KnownCall.none(), constants: BoxList<ValueBits>.make(), debug: Option<FunctionDebugInfo>.none(),
+    pending: ThinBox<PendingFunction>.none()
+  })
+  // The code holds its realm, as compiled code does.
+  unsafe HeapCell.retain(realm)
+  let anchor = () let runtime = (unsafe HeapCell.payload<ContextState, ()>(&anchor, realm)).runtime
+  unsafe gc.publish(runtime, made)
+  return made
+}
+
+/// OP_invalid in an iteration frame (machine's ip at the phase byte). False when
+/// machine runs no iteration frame: the opcode is then invalid as ever.
+pub unsafe effect fn step<H: HeapHooks + CoercionHooks + OwnPropertyHooks + GetPropertyHooks + HasPropertyHooks + PropertyWriteHooks + CallHooks>(
+  hooks: &mut H, memory: &AllocationObserver, machine: &mut Machine) -> bool ! JsException ? &mut Allocator {
+  if !unsafe running(&machine) { return false }
+  let method = match unsafe machine.local(LOCAL_METHOD) { ValueBits.Int { value } => i32.toU32(value) _ => { return false } }
+  let phase = unsafe machine.readU8()
+  unsafe machine.publishPc()
+  let context = machine.context
+  let advanced = run Intrinsic.catchFailure<OutOfMemoryError | StringLengthError | BigIntError | JsException>(
+    unsafe advance(&mut hooks, memory, &mut machine, method, phase == INIT), failed)
+  match move advanced {
+    // INIT found an element: on to its call, past NEXT.
+    bool done => { if !done && phase == INIT { unsafe machine.skip(2) } }
+    Failed { error } => {
+      let _thrown = run Effect.catch<JsException>(ops.materialize(&mut hooks, unsafe lendRealm(&context, context), move error), core.exceptionValue)
+      fail JsException {}
+    }
+  }
+  return true
+}
+/// The executeLoop arm's first try, before step: forEach's and reduce's NEXT
+/// over a fast Array (nextFast), with no failure frame to set up.
+@inlineNever
+pub unsafe fn quick<H: HeapHooks>(hooks: &mut H, machine: &mut Machine) -> bool {
+  if !unsafe running(&machine) { return false }
+  let method = match unsafe machine.local(LOCAL_METHOD) { ValueBits.Int { value } => i32.toU32(value) _ => { return false } }
+  if (method != FOR_EACH && method != REDUCE && method != REDUCE_RIGHT) || unsafe machine.peekU8(0) == INIT { return false }
+  if !unsafe nextFast(&mut hooks, &mut machine, method) { return false }
+  unsafe machine.skip(1)
+  return true
+}
+/// NEXT for forEach and reduce when the next element sits in a fast Array:
+/// no failure frame and no property lookup. False, with nothing changed, when
+/// the loop is done or the element needs the full path.
+unsafe fn nextFast<H: HeapHooks>(hooks: &mut H, machine: &mut Machine, method: u32) -> bool {
+  let object = unsafe machine.local(LOCAL_OBJECT)
+  let length = number(unsafe machine.local(LOCAL_LENGTH))
+  let position = number(unsafe machine.local(LOCAL_POSITION))
+  if position >= length { return false }
+  let mut index = position
+  if method == REDUCE_RIGHT { index = length - position - 1 }
+  if index >= arrays.fastCount(unsafe lendBits(&object, object)) { return false }
+  let bits = arrays.fastGet(unsafe lendBits(&object, object), index).intoBits()
+  let result = unsafe machine.pop()
+  let runtime = machine.runtime
+  let callback = unsafe (unsafe machine.argument(0)).retained()
+  let indexValue = ValueBits.number(i64.toF64(index))
+  drop unsafe machine.setLocal(LOCAL_POSITION, ValueBits.number(i64.toF64(position + 1)))
+  drop unsafe machine.setLocal(LOCAL_INDEX, indexValue)
+  if method == FOR_EACH {
+    unsafe gc.release(&mut hooks, runtime, result)
+    let thisArg = unsafe (unsafe machine.argument(1)).retained()
+    unsafe machine.push(thisArg)
+    unsafe machine.push(callback)
+  } else {
+    unsafe gc.release(&mut hooks, runtime, unsafe machine.setLocal(LOCAL_ACCUMULATOR, result))
+    let accumulator = unsafe (unsafe machine.local(LOCAL_ACCUMULATOR)).retained()
+    unsafe machine.push(ValueBits.Undefined)
+    unsafe machine.push(callback)
+    unsafe machine.push(accumulator)
+  }
+  unsafe machine.push(bits)
+  unsafe machine.push(indexValue)
+  unsafe machine.push(unsafe object.retained())
+  return true
+}
+/// Whether machine's code is its realm's iteration code.
+unsafe fn running(machine: &Machine) -> bool {
+  let anchor = () let context = unsafe HeapCell.payload<ContextState, ()>(&anchor, machine.context)
+  let address = Pointer.address<HeapHeader>(machine.bytecode)
+  return address == Pointer.address<HeapHeader>(context.iterationCode) || address == Pointer.address<HeapHeader>(context.reduceCode)
+}
+
+unsafe effect fn advance<H: HeapHooks + CoercionHooks + OwnPropertyHooks + GetPropertyHooks + HasPropertyHooks + PropertyWriteHooks + CallHooks>(
+  hooks: &mut H, memory: &AllocationObserver, machine: &mut Machine, method: u32, init: bool) -> bool
+  ! OutOfMemoryError | StringLengthError | BigIntError | JsException ? &mut Allocator {
+  let context = machine.context
+  let realm = unsafe lendRealm(&context, context)
+  let reducing = method == REDUCE || method == REDUCE_RIGHT
+  if init {
+    let receiver = machine.thisValue
+    let owned = run boxing.toObjectValue(&mut hooks, memory, realm, unsafe lendBits(&receiver, receiver))
+    drop unsafe machine.setLocal(LOCAL_OBJECT, owned.intoBits())
+    let object = unsafe machine.local(LOCAL_OBJECT)
+    let mut length: i64 = 0
+    run invoke.getLength64(&mut hooks, realm, &mut length, unsafe lendBits(&object, object))
+    drop unsafe machine.setLocal(LOCAL_LENGTH, ValueBits.number(i64.toF64(length)))
+    let callback = unsafe machine.argument(0)
+    if !hooks.isCallable(realm, unsafe lendBits(&callback, callback)) { return run ops.error(&mut hooks, realm, b"not a function") }
+    let mut position: i64 = 0
+    let mut accumulator = ValueBits.Undefined
+    if method == EVERY { accumulator = ValueBits.Bool { value: true } }
+    if method == SOME { accumulator = ValueBits.Bool { value: false } }
+    if method == MAP { accumulator = (run arraySpecies.create(&mut hooks, memory, realm, unsafe lendBits(&object, object), length)).intoBits() }
+    if method == FILTER { accumulator = (run arraySpecies.create(&mut hooks, memory, realm, unsafe lendBits(&object, object), 0)).intoBits() }
+    if reducing {
+      if unsafe activation.argumentCountOf(&machine) > 1 { accumulator = unsafe (unsafe machine.argument(1)).retained() }
+      else { accumulator = (run initial(&mut hooks, realm, object, method, length, &mut position)).intoBits() }
+    }
+    drop unsafe machine.setLocal(LOCAL_ACCUMULATOR, accumulator)
+    drop unsafe machine.setLocal(LOCAL_POSITION, ValueBits.number(i64.toF64(position)))
+    drop unsafe machine.setLocal(LOCAL_SELECTED, ValueBits.Int { value: 0 })
+  } else {
+    // The callback's result.
+    let result = unsafe Value.adoptBits(unsafe machine.pop())
+    let index = unsafe machine.local(LOCAL_INDEX)
+    if reducing {
+      unsafe gc.release(&mut hooks, machine.runtime, unsafe machine.setLocal(LOCAL_ACCUMULATOR, result.intoBits()))
+    } else if method == MAP {
+      let target = unsafe machine.local(LOCAL_ACCUMULATOR)
+      let _defined = run mutations.definePropertyValueInt64(&mut hooks, realm, unsafe lendBits(&target, target), number(index), move result, JS_PROP_C_W_E | JS_PROP_THROW)
+    } else if method != FOR_EACH {
+      let accepted = core.toBoolFree(&mut hooks, realm, move result)
+      if method == EVERY && !accepted { return unsafe finish(&mut machine, ValueBits.Bool { value: false }) }
+      if method == SOME && accepted { return unsafe finish(&mut machine, ValueBits.Bool { value: true }) }
+      if method == FILTER {
+        let element = unsafe Value.adoptBits(unsafe machine.setLocal(LOCAL_ELEMENT, ValueBits.Undefined))
+        if accepted {
+          let selected = number(unsafe machine.local(LOCAL_SELECTED))
+          let target = unsafe machine.local(LOCAL_ACCUMULATOR)
+          let _appended = run mutations.definePropertyValueInt64(&mut hooks, realm, unsafe lendBits(&target, target), selected, move element, JS_PROP_C_W_E | JS_PROP_THROW)
+          drop unsafe machine.setLocal(LOCAL_SELECTED, ValueBits.number(i64.toF64(selected + 1)))
+        }
+      }
+    }
+  }
+  let object = unsafe machine.local(LOCAL_OBJECT)
+  let length = number(unsafe machine.local(LOCAL_LENGTH))
+  let mut position = number(unsafe machine.local(LOCAL_POSITION))
+  while position < length {
+    let mut index = position
+    if method == REDUCE_RIGHT { index = length - position - 1 }
+    position = position + 1
+    let mut bits = ValueBits.Undefined
+    // A fast Array's elements are plain data slots; the callback may shrink it,
+    // so the bound is read again for every element.
+    if index < arrays.fastCount(unsafe lendBits(&object, object)) { bits = arrays.fastGet(unsafe lendBits(&object, object), index).intoBits() }
+    else {
+      drop unsafe machine.setLocal(LOCAL_POSITION, ValueBits.number(i64.toF64(position)))
+      if !run properties.tryGetPropertyInt64(&mut hooks, realm, unsafe lendBits(&object, object), index, &mut bits) { continue }
+    }
+    drop unsafe machine.setLocal(LOCAL_POSITION, ValueBits.number(i64.toF64(position)))
+    let indexValue = ValueBits.number(i64.toF64(index))
+    drop unsafe machine.setLocal(LOCAL_INDEX, indexValue)
+    if method == FILTER { drop unsafe machine.setLocal(LOCAL_ELEMENT, unsafe bits.retained()) }
+    // call_method's operands: receiver, callback, then the arguments.
+    let callback = unsafe (unsafe machine.argument(0)).retained()
+    if reducing {
+      let accumulator = unsafe (unsafe machine.local(LOCAL_ACCUMULATOR)).retained()
+      unsafe machine.push(ValueBits.Undefined)
+      unsafe machine.push(callback)
+      unsafe machine.push(accumulator)
+    } else {
+      let thisArg = unsafe (unsafe machine.argument(1)).retained()
+      unsafe machine.push(thisArg)
+      unsafe machine.push(callback)
+    }
+    unsafe machine.push(bits)
+    unsafe machine.push(indexValue)
+    unsafe machine.push(unsafe object.retained())
+    return false
+  }
+  drop unsafe machine.setLocal(LOCAL_POSITION, ValueBits.number(i64.toF64(position)))
+  let accumulator = unsafe machine.setLocal(LOCAL_ACCUMULATOR, ValueBits.Undefined)
+  return unsafe finish(&mut machine, accumulator)
+}
+/// Ends the loop with result (owned): pushed for the return at RETURN_PC.
+unsafe fn finish(machine: &mut Machine, result: ValueBits) -> bool {
+  unsafe machine.push(result)
+  unsafe machine.setPc(RETURN_PC)
+  return true
+}
+/// reduce's accumulator when no initial value is given: the first present element.
+effect fn initial<'a, H: HeapHooks + CoercionHooks + OwnPropertyHooks + GetPropertyHooks + HasPropertyHooks>(
+  hooks: &mut H, realm: Realm<'a>, object: ValueBits, method: u32, length: i64, position: &mut i64) -> Value
+  ! OutOfMemoryError | StringLengthError | BigIntError | JsException ? &mut Allocator {
+  while true {
+    if position.* >= length { return run ops.error(&mut hooks, realm, b"Reduce of empty array with no initial value") }
+    let mut first = position.*
+    if method == REDUCE_RIGHT { first = length - position.* - 1 }
+    position.* = position.* + 1
+    let mut found = ValueBits.Undefined
+    let present = run properties.tryGetPropertyInt64(&mut hooks, realm, unsafe lendBits(&object, object), first, &mut found)
+    let value = unsafe Value.adoptBits(found)
+    if present { return move value }
+  }
+  return Value.immediate(ValueBits.Undefined)
+}
+/// A length, position or index local: an Int, or a Float64 past 2^31.
+fn number(value: ValueBits) -> i64 {
+  return match value {
+    ValueBits.Int { value: small } => i32.toI64(small)
+    ValueBits.Float64 { value: large } => f64.toI64(large)
+    _ => 0
+  }
+}
