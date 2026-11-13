@@ -89,6 +89,8 @@ struct SilkWasmStore {
     SilkWasmHandle *handles;
     SilkWasmHandle *last_exception;
     SilkWasmInvocation *invocations;
+    /* A start function's trap, kept until its RuntimeError has its stack. */
+    SilkWasmInvocation *start_trap;
     SilkWasmStore *next_thread_store;
     SilkWasmStore **previous_thread_store;
     SilkWasmMemoryObserver *memory_observers;

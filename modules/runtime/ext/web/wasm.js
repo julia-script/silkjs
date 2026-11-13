@@ -1,6 +1,8 @@
 'use strict';
 
 const { wasmNative: native, wasmRealmState, registerWasmRealm, wasmCodeGeneration } = require('internal/host');
+// The WebAssembly API is V8 builtins, which show no frames in a stack trace.
+require('internal/host').hideFrames();
 const { Buffer } = require('buffer');
 const compileOptions = require('internal/web/wasm/compile_options');
 const { records, wrappers, suspension, exceptionStacks, builtinTraps } = wasmRealmState;

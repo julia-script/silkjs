@@ -41,6 +41,8 @@ function install(global, isolated = false) {
     return 'eval at ' + (origin.functionName || '<anonymous>') + ' (' + location + ')';
   }
   function position(frame) {
+    // A Wasm frame's position is its byte offset in the module.
+    if (frame.wasmFunction >= 0) return frame.columnNumber - 1;
     if (frame.scriptId === '0') return 0;
     const metadata = scriptMetadata(frame);
     if (!metadata || typeof metadata.source !== 'string') return null;
