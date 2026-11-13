@@ -53,6 +53,7 @@ const packages = {
   sayer: {
     version: '3.0.0',
     dependencies: { worder: '^2.0.0' },
+    bin: 'cli.js',
     files: {
       'package.json': '{"name":"sayer","version":"3.0.0","bin":"cli.js","dependencies":{"worder":"^2.0.0"}}',
       'cli.js': '#!/usr/bin/env node\nconsole.log(require("worder"), process.argv.slice(2).join("|"));\n',
@@ -96,6 +97,7 @@ const server = http.createServer((request, response) => {
         version: found.version,
         dependencies: found.dependencies,
         hasInstallScript: found.hasInstallScript,
+        bin: found.bin,
         dist: {
           tarball: `${base}/${name}/-/${name}-${found.version}.tgz`,
           integrity: 'sha512-' + crypto.createHash('sha512').update(archive).digest('base64'),
