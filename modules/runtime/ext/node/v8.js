@@ -131,7 +131,12 @@ function setFlagsFromString(flags) {
   // V8 reads --stack-size when an isolate's thread starts, so a running isolate
   // keeps its limit and a Worker keeps its resourceLimits stack.
   const tokens = flags.split(/\s+/).filter(Boolean);
-  if (tokens.length && tokens.every(flag => /^--stack[-_]size=\d+$/.test(flag))) return;
+  const controls = require('internal/startup_controls');
+  const known = flag => /^--stack[-_]size=\d+$/.test(flag) || controls.applyV8Flag(flag, false);
+  if (tokens.length && tokens.every(known)) {
+    for (let index = 0; index < tokens.length; index++) controls.applyV8Flag(tokens[index], true);
+    return;
+  }
   unsupported('setFlagsFromString', 'V8 execution flags do not control the Silk engine');
 }
 function setHeapSnapshotNearHeapLimit(limit) {
