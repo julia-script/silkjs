@@ -195,6 +195,18 @@ fn trimEnd(input: &[u8], start: usize, end: usize) -> usize {
   while e > start && space(input[e - 1]) { e = e - 1 }
   return e
 }
+/// V8's CallPrinter text for an object literal from its `{` at open to its
+/// `}` at close: each property's value prints as (intermediate value).
+fn appendObjectLiteral(input: &[u8], open: usize, close: usize, out: &mut DiagnosticMessage) -> () {
+  out.append(b"{")
+  let mut property = trimStart(input, open + 1, close)
+  while property < close {
+    let comma = commaAt(input, property, close)
+    if trimEnd(input, property, comma) > property { out.append(b"(intermediate value)") }
+    property = trimStart(input, comma + 1, close)
+  }
+  out.append(b"}")
+}
 /// V8's CallPrinter text for the expression from start to end.
 fn render(input: &[u8], start: usize, end: usize, out: &mut DiagnosticMessage, depth: usize) -> () {
   let mut i = start
@@ -265,7 +277,11 @@ fn render(input: &[u8], start: usize, end: usize, out: &mut DiagnosticMessage, d
       if primary {
         let innerStart = trimStart(input, i + 1, close)
         let innerEnd = trimEnd(input, innerStart, close)
-        if innerStart < innerEnd && (input[innerStart] == 123 || opensWith(input, innerStart, innerEnd, b"function")
+        if arrowAt(input, innerStart, innerEnd) { out.append(b"(intermediate value)") }
+        else if innerStart < innerEnd && input[innerStart] == 123 && closingOf(input, innerStart, innerEnd, 123, 125) + 1 == innerEnd {
+          // V8 drops the parentheses: ({}).f prints {}.f.
+          appendObjectLiteral(input, innerStart, innerEnd - 1, &mut out)
+        } else if innerStart < innerEnd && (input[innerStart] == 123 || opensWith(input, innerStart, innerEnd, b"function")
           || opensWith(input, innerStart, innerEnd, b"class") || opensWith(input, innerStart, innerEnd, b"async")) {
           out.append(b"(intermediate value)")
         } else {
@@ -301,8 +317,9 @@ fn render(input: &[u8], start: usize, end: usize, out: &mut DiagnosticMessage, d
       continue
     }
     if c == 123 {
-      out.append(b"(intermediate value)")
-      i = closingOf(input, i, end, 123, 125) + 1
+      let close = closingOf(input, i, end, 123, 125)
+      appendObjectLiteral(input, i, close, &mut out)
+      i = close + 1
       primary = false
       continue
     }
@@ -402,46 +419,143 @@ fn expressionEnd(input: &[u8], start: usize) -> usize {
   }
   return input.length
 }
-/// V8's "x is not iterable" text: the iterable of the for-of statement whose
-/// iterator the innermost frame is getting, which starts at that instruction's
-/// position (js_parser_statements emits it there).
-pub unsafe fn appendIterable(runtime: *mut HeapHeader, out: &mut DiagnosticMessage) -> bool {
+/// What appendIterable found at the failed instruction.
+pub const SITE_NONE: u8 = 0
+/// The whole message is in out ("x is not iterable", "f is not a function or
+/// its return value is not iterable").
+pub const SITE_TEXT: u8 = 1
+/// A spread argument of a call (f(...x)), which V8 words on its own.
+pub const SITE_CALL_SPREAD: u8 = 2
+/// V8's "x is not iterable" text for the iterable the innermost frame is
+/// getting an iterator for. The parser places that instruction's position at
+/// the iterable of a for-of statement, at the argument of an array literal's
+/// spread, at the callee of a spread call, and at the `[` of an array pattern.
+/// Patterns are named only in a declaration with an initializer, as V8 does;
+/// every other site gives SITE_NONE and the caller's generic text.
+pub unsafe fn appendIterable(runtime: *mut HeapHeader, out: &mut DiagnosticMessage) -> u8 {
   let anchor = ()
   let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, runtime)
   let pointer = state.currentStackFrame
   drop state
-  if Pointer.isNull<StackFrame>(pointer) { return false }
+  if Pointer.isNull<StackFrame>(pointer) { return SITE_NONE }
   let frame = unsafe Pointer.borrow<(), StackFrame>(&anchor, present(pointer))
-  if frame.currentPc == NO_PC || frame.currentPc == 0 { return false }
+  if frame.currentPc == NO_PC || frame.currentPc == 0 { return SITE_NONE }
   let pc = u32.wrappingSubtract(usize.toU32(frame.currentPc), 1)
   let code = match unsafe backtrace.bytecode(frame.currentFunction) {
     Option<*mut HeapHeader>.Some { value } => value
-    Option<*mut HeapHeader>.None => { return false }
+    Option<*mut HeapHeader>.None => { return SITE_NONE }
   }
   let function = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, code)
   return match &function.debug {
     Option<FunctionDebugInfo>.Some { value: debug } => {
       let location = unsafe backtrace.lineLocation(&debug, pc)
-      if location.line <= 0 { return false }
+      if location.line <= 0 { return SITE_NONE }
       match &debug.source {
         Option<SourceText>.Some { value: source } => match source.input() {
           Option<&[u8]>.Some { value: input } => match offsetOf(input, location.line, location.column) {
             Option<usize>.Some { value: at } => {
-              if at < source.offset() || at >= input.length { return false }
-              let end = trimEnd(input, at, expressionEnd(input, at))
-              let before = out.length
-              render(input, at, end, &mut out, 0)
-              out.length > before
+              if at < source.offset() || at >= input.length { return SITE_NONE }
+              iterableSite(input, source.offset(), at, &mut out)
             }
-            Option<usize>.None => false
+            Option<usize>.None => SITE_NONE
           }
-          Option<&[u8]>.None => false
+          Option<&[u8]>.None => SITE_NONE
         }
-        Option<SourceText>.None => false
+        Option<SourceText>.None => SITE_NONE
       }
     }
-    Option<FunctionDebugInfo>.None => false
+    Option<FunctionDebugInfo>.None => SITE_NONE
   }
+}
+fn precededBy(input: &[u8], floor: usize, at: usize, word: &[u8]) -> bool {
+  let before = skipBack(input, floor, at)
+  if before - floor < word.length { return false }
+  let start = before - word.length
+  if !same(Slice.view<u8>(input, start, word.length), word) { return false }
+  return start == floor || !identByte(input[start - 1])
+}
+fn iterableSite(input: &[u8], floor: usize, at: usize, out: &mut DiagnosticMessage) -> u8 {
+  let before = skipBack(input, floor, at)
+  if before - floor >= 3 && input[before - 1] == 46 && input[before - 2] == 46 && input[before - 3] == 46 {
+    // [...x]: V8 names the spread argument.
+    return iterableText(input, at, false, &mut out)
+  }
+  if precededBy(input, floor, at, b"of") { return iterableText(input, at, false, &mut out) }
+  if input[at] == 91 {
+    if !(precededBy(input, floor, at, b"const") || precededBy(input, floor, at, b"let") || precededBy(input, floor, at, b"var")) { return SITE_NONE }
+    let close = closingOf(input, at, input.length, 91, 93)
+    let eq = skipForward(input, close + 1, input.length)
+    if eq + 1 >= input.length || input[eq] != 61 || input[eq + 1] == 61 || input[eq + 1] == 62 { return SITE_NONE }
+    return iterableText(input, skipForward(input, eq + 1, input.length), true, &mut out)
+  }
+  // The callee of f(a, ...x): OP_append runs at the call's position.
+  if identByte(input[at]) || input[at] == 40 { return SITE_CALL_SPREAD }
+  return SITE_NONE
+}
+/// The message for the iterable expression at start. An initializer shows only
+/// what V8's CallPrinter finds at the expression's own position: a name, a
+/// literal, a function, or a call.
+fn iterableText(input: &[u8], start: usize, initializer: bool, out: &mut DiagnosticMessage) -> u8 {
+  let expression = expressionEnd(input, start)
+  let end = trimEnd(input, start, commaAt(input, start, expression))
+  if start >= end { return SITE_NONE }
+  let before = out.length
+  if arrowAt(input, start, end) {
+    out.append(b"(intermediate value) is not iterable")
+    return SITE_TEXT
+  }
+  let mut calleeStart = start
+  if opensWith(input, start, end, b"new") { calleeStart = skipForward(input, start + 3, end) }
+  if input[end - 1] == 41 {
+    match openingOf(input, calleeStart, end, 40, 41) {
+      Option<usize>.Some { value: open } => {
+        let calleeEnd = skipBack(input, calleeStart, open)
+        if open > calleeStart && (calleeStart > start || continues(input, calleeStart, calleeEnd)) {
+          render(input, calleeStart, calleeEnd, &mut out, 0)
+          if out.length == before { return SITE_NONE }
+          out.append(b" is not a function or its return value is not iterable")
+          return SITE_TEXT
+        }
+      }
+      Option<usize>.None => ()
+    }
+  }
+  if initializer {
+    let c = input[start]
+    let literal = (c == 123 && closingOf(input, start, end, 123, 125) + 1 == end) || (c == 91 && closingOf(input, start, end, 91, 93) + 1 == end)
+    // A name, a number, or a string literal.
+    let mut name = identByte(c)
+    let mut i = start
+    while i < end && (identByte(input[i]) || (c >= 48 && c <= 57 && input[i] == 46)) { i = i + 1 }
+    if i != end { name = false }
+    if quote(c) && c != 96 && end - start >= 2 && input[end - 1] == c { name = true }
+    let function = opensWith(input, start, end, b"function") || opensWith(input, start, end, b"class") || opensWith(input, start, end, b"async")
+    if !literal && !name && !function { return SITE_NONE }
+  }
+  render(input, start, end, &mut out, 0)
+  if out.length == before { return SITE_NONE }
+  out.append(b" is not iterable")
+  return SITE_TEXT
+}
+/// Whether the expression from start to end is an arrow function: a => at
+/// depth 0.
+fn arrowAt(input: &[u8], start: usize, end: usize) -> bool {
+  let mut depth: usize = 0
+  let mut i = start
+  while i + 1 < end {
+    let c = input[i]
+    if quote(c) {
+      let mut j = i + 1
+      while j < end && !(input[j] == c && input[j - 1] != 92) { j = j + 1 }
+      i = j + 1
+      continue
+    }
+    if c == 40 || c == 91 || c == 123 { depth = depth + 1 }
+    else if c == 41 || c == 93 || c == 125 { if depth > 0 { depth = depth - 1 } }
+    else if c == 61 && input[i + 1] == 62 && depth == 0 { return true }
+    i = i + 1
+  }
+  return false
 }
 /// i moved forward over spaces and comments, not past end.
 fn skipForward(input: &[u8], start: usize, end: usize) -> usize {

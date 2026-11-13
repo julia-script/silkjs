@@ -239,6 +239,26 @@ class StreamHandle {
   writev(req, chunks, allBuffers) {
     let buffers = chunks;
     if (!allBuffers) {
+      // Small mixed writes (HTTP headers then body) are joined anyway: encode the
+      // strings straight into the joined buffer, without a Buffer per string.
+      let bytes = 0;
+      for (let i = 0; i < chunks.length && bytes <= kJoinLimit; i += 2) {
+        const chunk = chunks[i];
+        if (typeof chunk !== 'string') { bytes += chunk.byteLength; continue; }
+        const encoding = chunks[i + 1];
+        if (encoding !== 'latin1' && encoding !== 'utf8' && encoding !== 'utf-8' && encoding !== 'ascii' && encoding !== 'binary') { bytes = kJoinLimit + 1; break; }
+        bytes += Buffer.byteLength(chunk, encoding);
+      }
+      if (bytes <= kJoinLimit && chunks.length > 2) {
+        const joined = Buffer.allocUnsafe(bytes);
+        let offset = 0;
+        for (let i = 0; i < chunks.length; i += 2) {
+          const chunk = chunks[i];
+          if (typeof chunk === 'string') offset += joined.write(chunk, offset, chunks[i + 1]);
+          else { joined.set(chunk instanceof Uint8Array ? chunk : new Uint8Array(chunk.buffer, chunk.byteOffset, chunk.byteLength), offset); offset += chunk.byteLength; }
+        }
+        return this._write(req, [joined]);
+      }
       buffers = new Array(chunks.length >> 1);
       for (let i = 0; i < chunks.length; i += 2) {
         const chunk = chunks[i];
