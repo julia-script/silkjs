@@ -2,24 +2,30 @@
 const { Buffer } = require('buffer');
 const { native, NativeSecureContext, answerFor, answering } = require('internal/tls/context');
 const { codes } = require('internal/errors');
+const { FastBuffer } = require('internal/buffer');
+const { isStreamHandle } = require('internal/net/binding');
+// The native ops answer read and drain with a fresh ArrayBuffer of the exact size: a
+// Buffer over it, as Buffer.from(arrayBuffer) makes, without Buffer.from's dispatch.
+const bytesOf = arrayBuffer => new FastBuffer(arrayBuffer);
 
 // OpenSSL failures become TLS errors; anything else, such as an exception thrown
 // by a 'secure' or 'data' listener, propagates as it does from Node's callbacks.
 class Failure { constructor(cause) { this.cause = cause; } }
 // TLSWrap cancels the writes it still holds when it closes (UV_ECANCELED).
 function canceled() { return Object.assign(new Error('write ECANCELED'), { errno: -125, code: 'ECANCELED', syscall: 'write' }); }
-function op(name, a, b, c) {
+// The record pump calls this several times a request: a rest array (no arguments
+// object), handed on by index without a spread.
+function op(name, ...args) {
   try {
-    // Fixed arities without rest or spread arrays: the record pump calls this several times a request.
-    switch (arguments.length) {
-      case 1: return native(name);
-      case 2: return native(name, a);
-      case 3: return native(name, a, b);
-      case 4: return native(name, a, b, c);
+    switch (args.length) {
+      case 0: return native(name);
+      case 1: return native(name, args[0]);
+      case 2: return native(name, args[0], args[1]);
+      case 3: return native(name, args[0], args[1], args[2]);
       default: {
-        const args = [];
-        for (let index = 0; index < arguments.length; index++) args.push(arguments[index]);
-        return Reflect.apply(native, undefined, args);
+        const list = [name];
+        for (let index = 0; index < args.length; index++) list.push(args[index]);
+        return Reflect.apply(native, undefined, list);
       }
     }
   } catch (cause) { throw new Failure(cause); }
@@ -57,6 +63,27 @@ class TLSTransport {
       try { native('feed', this.id, chunk); } catch (err) { this.fail(err); return; }
       this.pump();
     });
+    // As TLSWrap reads its parent's StreamBase, an owned carrier's native handle hands the
+    // ciphertext to the session directly (the handle's consumer, as an HTTP parser that
+    // consumes a socket): no Readable push and 'data' emit for each record. The end of the
+    // stream and read errors still take the carrier's read path ('end', 'error'), and so
+    // does anything the carrier read before this. A paused carrier stops the handle, which
+    // holds what it reads until it reads again.
+    const handle = owned ? carrier._handle : undefined;
+    if (handle && isStreamHandle(handle)) {
+      this.consumer = { read: (status, payload) => {
+        if (status < 0) return false;
+        if (!payload?.byteLength) return true;
+        handle._countRead(payload.byteLength);
+        if (this.closing || !this.id) return true;
+        const bytes = payload instanceof ArrayBuffer ? new Uint8Array(payload) : payload;
+        try { native('feed', this.id, bytes); } catch (err) { this.fail(err); return true; }
+        this.pump();
+        return true;
+      } };
+      this.consumed = handle;
+      (handle._consumers ||= []).push(this.consumer);
+    }
     // A peer that closes without close_notify still ends the stream, as in Node.
     carrier.on('end', () => { if (!this.closing) this.end(); });
     // An owned carrier is TLSWrap's stream: its write errors once the TLS socket is destroyed
@@ -82,7 +109,7 @@ class TLSTransport {
   fail(err) {
     if (this.closing) return;
     if (this.id) {
-      try { const data = Buffer.from(op('drain', this.id)); if (data.length) this.alert = data; } catch {}
+      try { const data = bytesOf(op('drain', this.id)); if (data.length) this.alert = data; } catch {}
       // As TLSWrap::ClearOut, an established session flushes the alert before onerror:
       // the socket may stay open (a server whose 'error' listener keeps it) and the peer
       // must still learn why.
@@ -93,7 +120,7 @@ class TLSTransport {
   flush(callback) {
     // TLSWrap::EncOut: nothing leaves while a server waits for 'newSession'.
     if (this.awaitingSession) { if (callback) this.flushWaiters.push(callback); return; }
-    const data = Buffer.from(op('drain', this.id));
+    const data = bytesOf(op('drain', this.id));
     // After DoShutdown the carrier's write side is shut: like TLSWrap's EncOut, what OpenSSL
     // still makes (a client's Finished after an early end()) goes nowhere, and the read
     // side stays open so the peer's answer and end still arrive.
@@ -311,7 +338,7 @@ class TLSTransport {
         if (!this.handshakeEvents()) return;
       }
       while (this.reading && !this.closing) {
-        const data = Buffer.from(op('read', this.id));
+        const data = bytesOf(op('read', this.id));
         this.flush();
         if (!this.handshakeEvents()) return;
         if (!data.length) break;
@@ -324,7 +351,7 @@ class TLSTransport {
       if (item && !item.inflight) {
         if (!item.data.length) { this.writes.shift(); process.nextTick(() => { item.callback(); this.pump(); }); }
         else {
-          const n = op('write', this.id, item.data.subarray(item.offset));
+          const n = op('write', this.id, item.offset === 0 ? item.data : item.data.subarray(item.offset));
           if (n > 0) {
             item.offset += n; item.inflight = true;
             this.flush(err => {
@@ -351,7 +378,7 @@ class TLSTransport {
     this.shutdownInFlight = true;
     try { op('shutdown', this.id); } catch {}
     let data;
-    try { data = Buffer.from(op('drain', this.id)); } catch { data = Buffer.alloc(0); }
+    try { data = bytesOf(op('drain', this.id)); } catch { data = Buffer.alloc(0); }
     const finish = () => {
       const done = this.pendingShutdown; this.pendingShutdown = null;
       if (done) done(null);
@@ -385,10 +412,18 @@ class TLSTransport {
   }
   readStart() { this.reading = true; this.carrier.resume(); this.pump(); return 0; }
   readStop() { this.reading = false; if (this.ready) this.carrier.pause(); return 0; }
+  unconsume() {
+    const handle = this.consumed;
+    if (!handle) return;
+    this.consumed = null;
+    const at = handle._consumers ? handle._consumers.indexOf(this.consumer) : -1;
+    if (at !== -1) handle._consumers.splice(at, 1);
+  }
   // The TLS handle is closed: release the session and report the close once.
   finish() {
     if (this.closed) return;
     this.closed = true; this.closing = true;
+    this.unconsume();
     if (this.id) { answering.delete(this.id); native('release', this.id); this.id = 0; }
     for (const item of this.writes.splice(0)) item.callback(canceled());
     const done = this.pendingShutdown; this.pendingShutdown = null; if (done) done(null);
