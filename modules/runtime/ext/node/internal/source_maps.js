@@ -357,7 +357,7 @@ function mapPosition(frame, options = emptyOptions) {
     }
     const scriptName = entry.originalSource.startsWith('file://')
       ? require('url').fileURLToPath(entry.originalSource) : entry.originalSource;
-    return { ...frame, functionName: name || frame.functionName, scriptName,
+    return { ...frame, sourceMapped: true, mappedName: name, scriptName,
       lineNumber: entry.originalLine + 1, column: entry.originalColumn + 1, columnNumber: entry.originalColumn + 1 };
   }
   return { __proto__: null, functionName: entry.name || frame.functionName,
