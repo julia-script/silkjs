@@ -17,7 +17,7 @@ import js_string_types { AtomRegistry, AtomSlot }
 import runtime_memory { AllocationObserver }
 import js_heap { HeapCell, HeapHeader, HeapKind, CellRef }
 import silk.core.ownership { Copy }
-import js_core_types { ObjectData, ObjectPayload, ObjectPayloadFamily, ShapeData,
+import js_core_types { ObjectData, ObjectPayload, ObjectPayloadFamily, ShapeData, JS_PROP_TMASK, JS_PROP_GETSET,
   PropertyEnum, RuntimeState, NativeErrorKind, JS_PROP_ENUMERABLE, OwnedAtom }
 import js_value { ValueBits }
 import js_intl_realm as ops
@@ -51,7 +51,14 @@ import js_invariant { invariant }
 
 struct State {
   object: Value, index: usize, count: usize, inPrototypeChain: bool,
-  isArray: bool, atoms: List<PropertyEnum>
+  isArray: bool, atoms: List<PropertyEnum>,
+  /// The table lists every key the loop visits (ownTable made it): the
+  /// prototype chain had no enumerable property, so it is not walked.
+  ownOnly: bool,
+  /// The version of the object's shape when ownTable listed it: while the
+  /// object still has a shape of this version, every listed key is still an
+  /// own enumerable property (0: not known).
+  version: u64
 }
 
 // Observe both receiver ownership and interned property-name ownership.
@@ -214,6 +221,76 @@ fn fastCount<'o>(object: ValueRef<'o>) -> Option<usize> {
   }
   return Option<usize>.some(count)
 }
+/// Whether no object on the chain from prototype (a shape's prototype edge) has
+/// an enumerable property or elements, so for-in visits only the receiver's
+/// own keys. Every object must be ordinary: an exotic one may list keys its
+/// shape does not hold.
+unsafe fn quietChain(prototype: ?*mut HeapHeader) -> bool {
+  let mut cursor = prototype
+  let mut depth: usize = 0
+  while true {
+    let node = match Pointer.nonNullMut<HeapHeader>(cursor) { Option<*mut HeapHeader>.Some { value } => value Option<*mut HeapHeader>.None => { return true } }
+    depth = depth + 1
+    if depth > 8 { return false }
+    let anchor = () let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, node)
+    if data.isExotic() || data.fastArray() { return false }
+    let shape = unsafe HeapCell.payload<ShapeData, ()>(&anchor, data.shape)
+    let count = shape.properties.length()
+    let mut i: usize = 0
+    while i < count {
+      let property = unsafe shape.properties.getUnchecked(i)
+      if property.atom != 0 && (u8.toU32(property.flags) & JS_PROP_ENUMERABLE) != 0 { return false }
+      i = i + 1
+    }
+    cursor = shape.prototype
+  }
+  return true
+}
+/// The receiver's own enumerable string keys in for-in order, read from its
+/// shape, when they are all that for-in visits: object is ordinary with every
+/// property in its shape, none integer-like (those come first), and its
+/// prototype chain is quiet. Sets version to its shape's. None when it does not apply.
+unsafe effect fn ownTable<'a, 'o>(realm: Realm<'a>, object: ValueRef<'o>, version: &mut u64) -> Option<List<PropertyEnum>> ! OutOfMemoryError ? &mut Allocator {
+  if !object.view().isObject() { return Option<List<PropertyEnum>>.none() }
+  let anchor = () let data = ObjectRef.of(object).data(&anchor)
+  if data.isExotic() || data.fastArray() { return Option<List<PropertyEnum>>.none() }
+  let shape = unsafe HeapCell.payload<ShapeData, ()>(&anchor, data.shape)
+  let count = shape.properties.length()
+  if data.slotCount() != count || !unsafe quietChain(shape.prototype) { return Option<List<PropertyEnum>>.none() }
+  let state = realm.runtimeState(&anchor)
+  let mut listed: usize = 0
+  let mut i: usize = 0
+  while i < count {
+    let property = unsafe shape.properties.getUnchecked(i)
+    i = i + 1
+    if property.atom == 0 { continue }
+    if (property.atom & ATOM_INTEGER_TAG) != 0 { return Option<List<PropertyEnum>>.none() }
+    let flags = u8.toU32(property.flags)
+    if (flags & JS_PROP_ENUMERABLE) == 0 { continue }
+    let kind = flags & JS_PROP_TMASK
+    if kind != 0 && kind != JS_PROP_GETSET { return Option<List<PropertyEnum>>.none() }
+    if state.atoms.borrowedString(property.atom).isString() { listed = listed + 1 }
+  }
+  let mut table = List<PropertyEnum>.make()
+  run table.reserveExact(listed)
+  i = 0
+  while i < count {
+    let property = unsafe shape.properties.getUnchecked(i)
+    i = i + 1
+    if property.atom == 0 || (u8.toU32(property.flags) & JS_PROP_ENUMERABLE) == 0 { continue }
+    if !state.atoms.borrowedString(property.atom).isString() { continue }
+    run table.append(PropertyEnum { atom: state.atoms.duplicate(property.atom), isEnumerable: true })
+  }
+  version.* = shape.version
+  return Option<List<PropertyEnum>>.some(move table)
+}
+/// Whether object still has a shape of version, so every key ownTable listed
+/// for it is still an own enumerable property.
+fn sameShape<'o>(object: ValueRef<'o>, version: u64) -> bool {
+  if version == 0 || !object.view().isObject() { return false }
+  let anchor = () let data = ObjectRef.of(object).data(&anchor)
+  return (unsafe HeapCell.payload<ShapeData, ()>(&anchor, data.shape)).version == version
+}
 fn installTable<'a, 's>(realm: Realm<'a>, snapshot: Snapshot<'s>, table: List<PropertyEnum>, reset: bool) -> () {
   let mut anchor = () let state = snapshot.getMut(&mut anchor)
   let old = Intrinsic.replace(state.atoms, move table)
@@ -232,6 +309,18 @@ effect fn initialize<'a, 'b, H: HeapHooks + OwnKeysHooks + OwnPropertyHooks + Co
       state.isArray = true state.count = value
     }
     Option<usize>.None => {
+      let mut version: u64 = 0
+      let quick = run Effect.result(unsafe ownTable(realm, object, &mut version))
+      match move quick {
+        Result<Option<List<PropertyEnum>>, OutOfMemoryError>.Success { value: Option<List<PropertyEnum>>.Some { value: table } } => {
+          installTable(realm, snapshot, move table, false)
+          let mut anchor = () let state = snapshot.getMut(&mut anchor)
+          state.ownOnly = true state.version = version
+          return ()
+        }
+        Result<Option<List<PropertyEnum>>, OutOfMemoryError>.Success { .. } => ()
+        Result<Option<List<PropertyEnum>>, OutOfMemoryError>.Failure { error: _error } => { return run outOfMemory(&mut hooks, realm) }
+      }
       let table = run ownNames(&mut hooks, realm, object, JS_GPN_STRING_MASK | JS_GPN_SET_ENUM)
       installTable(realm, snapshot, move table, false)
     }
@@ -246,7 +335,7 @@ unsafe effect fn buildOwned<'a, H: HeapHooks + OwnKeysHooks + OwnPropertyHooks +
     if object.isException() { fail JsException {} }
   }
   let allocated = run Effect.result(HeapCell.allocate(HeapKind.Auxiliary, State { object: Value.immediate(ValueBits.Undefined),
-    index: 0, count: 0, inPrototypeChain: false, isArray: false, atoms: List<PropertyEnum>.make() }))
+    index: 0, count: 0, inPrototypeChain: false, isArray: false, atoms: List<PropertyEnum>.make(), ownOnly: false, version: 0 }))
   let node = match move allocated {
     Result<*mut HeapHeader, OutOfMemoryError>.Success { value } => value
     Result<*mut HeapHeader, OutOfMemoryError>.Failure { error: _error } => {
@@ -331,7 +420,7 @@ effect fn candidate<'a, 'b, H: HeapHooks + OwnPropertyHooks + CoercionHooks + Pr
   }
   if !enumerable { return Next { value: ValueBits.Undefined, done: true } }
   let anchor = () let object = snapshot.get(&anchor).object.borrow()
-  if !denseElement(object, atom) && !run exists(&mut hooks, realm, object, atom) { return Next { value: ValueBits.Undefined, done: true } }
+  if !denseElement(object, atom) && !sameShape(object, snapshot.get(&anchor).version) && !run exists(&mut hooks, realm, object, atom) { return Next { value: ValueBits.Undefined, done: true } }
   let mut converted = Result<ValueBits, OutOfMemoryError | StringLengthError>.Success { value: ValueBits.Undefined }
   if (atom & ATOM_INTEGER_TAG) != 0 && (atom & ~ATOM_INTEGER_TAG) < 256 {
     converted = run Effect.result(unitStrings.decimal(realm, atom & ~ATOM_INTEGER_TAG))
@@ -366,6 +455,7 @@ effect fn advance<'a, 'b, H: HeapHooks + OwnKeysHooks + OwnPropertyHooks + Coerc
     if state.index >= state.count {
       let object = state.object.view() let inherited = state.inPrototypeChain drop state
       if object.tag() == 2 || object.tag() == 3 { return Next { value: ValueBits.Undefined, done: true } }
+      if snapshot.get(&anchor).ownOnly { return Next { value: ValueBits.Undefined, done: true } }
       if !inherited {
         if run prepare(&mut hooks, memory, realm, iterator, snapshot) { return Next { value: ValueBits.Undefined, done: true } }
         let prepared = snapshot.getMut(&mut anchor)
@@ -406,7 +496,9 @@ effect fn advance<'a, 'b, H: HeapHooks + OwnKeysHooks + OwnPropertyHooks + Coerc
 /// index is a dense element (an own enumerable data property, as candidate
 /// checks) whose decimal text is in the runtime's unit string table. Returns that
 /// string retained and advances the iterator, or Uninitialized having changed
-/// nothing, and the caller runs next.
+/// nothing, and the caller runs next. An own-only iterator (ownTable) answers
+/// each listed key while the object keeps the shape it was listed from, and
+/// Undefined once they are all visited (done).
 pub unsafe fn quickNext(runtime: *mut HeapHeader, iterator: ValueBits) -> ValueBits {
   let node = match iterator { ValueBits.Object { reference } => reference _ => { return ValueBits.Uninitialized } }
   let anchor = () let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, node)
@@ -418,6 +510,16 @@ pub unsafe fn quickNext(runtime: *mut HeapHeader, iterator: ValueBits) -> ValueB
   }
   let mut stateAnchor = () let state = unsafe HeapCell.payloadMut<State, ()>(&mut stateAnchor, cell)
   let index = state.index
+  if state.ownOnly {
+    // Done, or a listed key the object still holds under the same shape.
+    if index >= state.count { return ValueBits.Undefined }
+    if !sameShape(state.object.borrow(), state.version) { return ValueBits.Uninitialized }
+    let atom = state.atoms.get(index).atom
+    state.index = index + 1
+    drop state
+    let registry = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, runtime)
+    return Strings.duplicate(registry.atoms.borrowedString(atom))
+  }
   if !state.isArray || index >= state.count || index >= 256 { return ValueBits.Uninitialized }
   if !denseElement(state.object.borrow(), usize.toU32(index) | ATOM_INTEGER_TAG) { return ValueBits.Uninitialized }
   let mut slot = index + 256

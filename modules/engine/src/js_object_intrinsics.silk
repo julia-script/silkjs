@@ -14,15 +14,20 @@ import silk.num.usize
 import silk.num.i64
 import silk.num.f64
 import runtime_memory { AllocationObserver }
-import js_heap { HeapCell }
+import js_heap { HeapCell, HeapHeader }
+import silk.num.u8
 import js_value { ValueBits }
 import js_intl_realm as ops
 import js_owned_value { Value, ValueList, ValueRef, lendBits, immediateRef }
 import js_core_types { ObjectData, StackFrame, PropertyDescriptor,
   NativeErrorKind, JS_PROP_C_W_E, JS_PROP_THROW, JS_PROP_GETSET, JS_PROP_ENUMERABLE,
   JS_PROP_CONFIGURABLE, JS_PROP_WRITABLE, JS_PROP_HAS_CONFIGURABLE,
-  JS_PROP_HAS_WRITABLE, JS_PROP_HAS_ENUMERABLE, JS_PROP_HAS_GET, JS_PROP_HAS_SET, OwnedAtom }
+  JS_PROP_HAS_WRITABLE, JS_PROP_HAS_ENUMERABLE, JS_PROP_HAS_GET, JS_PROP_HAS_SET, OwnedAtom,
+  ShapeData, SlotBits, JS_PROP_TMASK }
+import js_atoms { ATOM_INTEGER_TAG }
 import js_gc { HeapHooks }
+import js_gc as gc
+import js_array_intrinsics_support as arraySupport
 import js_runtime as runtime
 import js_class_data as classes
 import js_atom_data as atoms
@@ -218,7 +223,93 @@ effect fn definePropertiesBody<'a, 'b, H: HeapHooks + OwnPropertyHooks + HasProp
     i = i + 1
   }
 }
+/// How many keys quickEnumerate lists for node, or usize.MAX when it does not
+/// apply: node is an ordinary object (not exotic, no element storage) whose own
+/// properties all live in its shape, with no integer-like names (those would
+/// come first), and every enumerable string-keyed one is plain data (keys also
+/// takes accessors, whose names it lists without calling them). Symbols are
+/// skipped, as Object.keys, values and entries skip them.
+unsafe fn quickCount<'a>(realm: Realm<'a>, node: *mut HeapHeader, method: u32) -> usize {
+  let anchor = ()
+  let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, node)
+  if data.isExotic() || data.fastArray() { return usize.MAX }
+  let shape = unsafe HeapCell.payload<ShapeData, ()>(&anchor, data.shape)
+  let count = shape.properties.length()
+  if data.slotCount() != count { return usize.MAX }
+  let state = realm.runtimeState(&anchor)
+  let mut listed: usize = 0
+  let mut i: usize = 0
+  while i < count {
+    let property = unsafe shape.properties.getUnchecked(i)
+    i = i + 1
+    let flags = u8.toU32(property.flags)
+    if property.atom == 0 { continue }
+    if (property.atom & ATOM_INTEGER_TAG) != 0 { return usize.MAX }
+    if (flags & JS_PROP_ENUMERABLE) == 0 { continue }
+    let kind = flags & JS_PROP_TMASK
+    if kind != 0 && (method != KEYS || kind != JS_PROP_GETSET) { return usize.MAX }
+    if state.atoms.borrowedString(property.atom).isString() { listed = listed + 1 }
+  }
+  return listed
+}
+/// Object.keys, values or entries of an object quickCount accepts, read
+/// straight from its shape and slots into an array made at its final size.
+/// Nothing it does can run JS, so the object cannot change in between.
+/// Uninitialized when it does not apply.
+unsafe effect fn quickEnumerate<'a, H: HeapHooks>(hooks: &mut H, memory: &AllocationObserver, realm: Realm<'a>,
+  input: ValueBits, method: u32) -> ValueBits ! OutOfMemoryError ? &mut Allocator {
+  let node = match input { ValueBits.Object { reference } => reference _ => { return ValueBits.Uninitialized } }
+  let listed = unsafe quickCount(realm, node, method)
+  if listed == usize.MAX { return ValueBits.Uninitialized }
+  let array = run objects.arrayWithCapacity(&mut hooks, memory, realm, listed)
+  if listed == 0 { return array }
+  let target = match array { ValueBits.Object { reference } => reference _ => invariant() }
+  let anchor = ()
+  let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, node)
+  let shape = unsafe HeapCell.payload<ShapeData, ()>(&anchor, data.shape)
+  let state = realm.runtimeState(&anchor)
+  let mut i: usize = 0
+  let mut filled: usize = 0
+  while filled < listed {
+    let property = unsafe shape.properties.getUnchecked(i)
+    let index = i
+    i = i + 1
+    if property.atom == 0 || (u8.toU32(property.flags) & JS_PROP_ENUMERABLE) == 0 { continue }
+    let name = state.atoms.borrowedString(property.atom)
+    if !name.isString() { continue }
+    let mut item = ValueBits.Undefined
+    if method == KEYS { item = Strings.duplicate(name) }
+    else if method == VALUES { item = unsafe (unsafe data.slotUnchecked(index)).valueBits().retained() }
+    else {
+      let mut pair = [Strings.duplicate(name), unsafe (unsafe data.slotUnchecked(index)).valueBits().retained()]
+      let first = unsafe Intrinsic.pointerRequalify<*mut ValueBits, *const ValueBits>(Pointer.fromMutRef<ValueBits>(&mut pair[0]))
+      let made = run Effect.result(unsafe objects.literalArray(&mut hooks, memory, realm, first, 2))
+      match move made {
+        Result<ValueBits, OutOfMemoryError>.Success { value } => { item = value }
+        Result<ValueBits, OutOfMemoryError>.Failure { error } => {
+          unsafe gc.release(&mut hooks, realm.runtime(), pair[0]) unsafe gc.release(&mut hooks, realm.runtime(), pair[1])
+          unsafe publishFilled(target, filled)
+          unsafe gc.release(&mut hooks, realm.runtime(), array)
+          fail move error
+        }
+      }
+    }
+    run arraySupport.appendReserved(unsafe lendBits(&array, array), unsafe Value.adoptBits(item))
+    filled = filled + 1
+  }
+  unsafe publishFilled(target, filled)
+  return array
+}
+unsafe fn publishFilled(target: *mut HeapHeader, count: usize) -> () {
+  let mut anchor = ()
+  let made = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut anchor, target)
+  made.setSlot(0, SlotBits.value(ValueBits.Int { value: usize.toI32(count) }))
+}
 effect fn enumerate<'a, 'b, H: HeapHooks + OwnPropertyHooks + HasPropertyHooks + GetPropertyHooks + OwnKeysHooks + CoercionHooks + PropertyWriteHooks + PrototypeHooks + CallHooks + NativeFunctionHooks + InterruptHooks>(hooks: &mut H, memory: &AllocationObserver,realm: Realm<'a>, input: ValueRef<'b>, method: u32) -> ValueBits ! OutOfMemoryError | StringLengthError | BigIntError | OwnKeysError | PrototypeError | JsException ? &mut Allocator {
+  if method == KEYS || method == VALUES || method == ENTRIES {
+    let quick = run unsafe quickEnumerate(&mut hooks, memory, realm, input.view(), method)
+    if quick.tag() != 4 { return quick }
+  }
   let object = run boxing.toObjectValue(&mut hooks, memory, realm, input)
   let mut flags: u32 = 1
   if method == GET_OWN_PROPERTY_SYMBOLS { flags = 2 }

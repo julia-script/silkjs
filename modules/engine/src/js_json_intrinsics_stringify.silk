@@ -12,9 +12,16 @@ import silk.num.u8
 import silk.num.u16
 import silk.num.usize
 import js_value { ValueBits }
+import js_heap { HeapCell, HeapHeader }
+import js_shapes as shapes
+import js_atoms { ATOM_INTEGER_TAG }
+import dtoa { Dtoa }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import js_object_ref { ObjectRef }
 import js_realm { Realm }
 import js_owned_value { Value, lendBits, immediateRef, ValueRef, lendFor }
-import js_core_types { FrameSlots, PropertyEnum, JS_PROP_C_W_E, NativeErrorKind }
+import js_core_types { FrameSlots, PropertyEnum, JS_PROP_C_W_E, NativeErrorKind, ObjectData, ShapeData, JS_PROP_ENUMERABLE, JS_PROP_TMASK }
 import js_gc { HeapHooks }
 import js_coercion_host { CoercionHooks }
 import js_property_host { OwnPropertyHooks, OwnKeysHooks }
@@ -418,8 +425,153 @@ unsafe effect fn initialize<'a, 'b, H: HeapHooks + CoercionHooks + OwnPropertyHo
   let buffer = Intrinsic.replace(state.buffer, StringBuilder.make())
   return run buffer.finish()
 }
+
+// The quick serializer: JSON.stringify(value) with no replacer and no gap, over
+// plain data only. It reads shapes and slots and calls nothing, so nothing it
+// does is observable: when it meets anything else (toJSON anywhere on a
+// chain, an accessor, a proxy, a boxed primitive, a function, a holey or
+// non-fast array, integer-like keys, depth past QUICK_DEPTH) it gives up and
+// the full serializer starts over.
+const QUICK_DEPTH: usize = 24
+const QUICK_WRITTEN: u8 = 0
+/// value is omitted from an object (undefined or a symbol); an array writes null.
+const QUICK_ABSENT: u8 = 1
+const QUICK_GIVE_UP: u8 = 2
+struct QuickStack { objects: [usize; 24], depth: usize }
+/// Whether no object on the chain from prototype has a toJSON property. Only
+/// ordinary objects and Arrays are looked through.
+unsafe fn noToJson(prototype: ?*mut HeapHeader) -> bool {
+  let mut cursor = prototype
+  let mut depth: usize = 0
+  while true {
+    let node = match Pointer.nonNullMut<HeapHeader>(cursor) { Option<*mut HeapHeader>.Some { value } => value Option<*mut HeapHeader>.None => { return true } }
+    depth = depth + 1
+    if depth > 8 { return false }
+    let anchor = () let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, node)
+    let class = data.classId()
+    if class != classes.JS_CLASS_OBJECT && class != classes.JS_CLASS_ARRAY { return false }
+    if let Option<usize>.Some { .. } = unsafe shapes.lookup(data.shape, atoms.JS_ATOM_toJSON) { return false }
+    cursor = (unsafe HeapCell.payload<ShapeData, ()>(&anchor, data.shape)).prototype
+  }
+  return true
+}
+unsafe effect fn quickValue<'a>(realm: Realm<'a>, buffer: &mut StringBuilder, stack: &mut QuickStack, value: ValueBits) -> u8
+  ! OutOfMemoryError | StringLengthError ? &mut Allocator {
+  match value {
+    ValueBits.String { .. } => { run quote(&mut buffer, value, b"\"", b"\"") return QUICK_WRITTEN }
+    ValueBits.Rope { .. } => { run quote(&mut buffer, value, b"\"", b"\"") return QUICK_WRITTEN }
+    ValueBits.Int { value: integer } => { run buffer.appendInteger(integer) return QUICK_WRITTEN }
+    ValueBits.Float64 { value: number } => {
+      if !f64.isFinite(number) { run buffer.appendLatin1(b"null") return QUICK_WRITTEN }
+      // ToString(-0) is "0".
+      if number == 0.0 { run buffer.appendUnit(48) return QUICK_WRITTEN }
+      let mut bytes: [u8; 32] = [0; 32]
+      let length = Dtoa.shortest(&mut bytes, number)
+      run buffer.appendLatin1(Slice.view<u8>(&bytes, 0, length))
+      return QUICK_WRITTEN
+    }
+    ValueBits.Bool { value: flag } => {
+      if flag { run buffer.appendLatin1(b"true") } else { run buffer.appendLatin1(b"false") }
+      return QUICK_WRITTEN
+    }
+    ValueBits.Null => { run buffer.appendLatin1(b"null") return QUICK_WRITTEN }
+    ValueBits.Undefined => { return QUICK_ABSENT }
+    ValueBits.Symbol { .. } => { return QUICK_ABSENT }
+    ValueBits.Object { reference } => { return run unsafe quickObject(realm, &mut buffer, &mut stack, reference) }
+    _ => { return QUICK_GIVE_UP }
+  }
+}
+unsafe effect fn quickObject<'a>(realm: Realm<'a>, buffer: &mut StringBuilder, stack: &mut QuickStack, node: *mut HeapHeader) -> u8
+  ! OutOfMemoryError | StringLengthError ? &mut Allocator {
+  let address = Pointer.address<HeapHeader>(node)
+  let depth = stack.depth
+  if depth >= QUICK_DEPTH { return QUICK_GIVE_UP }
+  let mut i: usize = 0
+  while i < depth { if stack.objects[i] == address { return QUICK_GIVE_UP } i = i + 1 }
+  let anchor = () let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, node)
+  let class = data.classId()
+  let shape = unsafe HeapCell.payload<ShapeData, ()>(&anchor, data.shape)
+  if class == classes.JS_CLASS_ARRAY {
+    if !data.fastArray() { return QUICK_GIVE_UP }
+    let length = match data.slot(0).valueBits() { ValueBits.Int { value: n } => n _ => { return QUICK_GIVE_UP } }
+    let count = arrays.fastCount((unsafe ObjectRef.lend(&anchor, node)).value())
+    if count != i32.toI64(length) { return QUICK_GIVE_UP }
+    if let Option<usize>.Some { .. } = unsafe shapes.lookup(data.shape, atoms.JS_ATOM_toJSON) { return QUICK_GIVE_UP }
+    if !unsafe noToJson(shape.prototype) { return QUICK_GIVE_UP }
+    stack.objects[depth] = address stack.depth = depth + 1
+    run buffer.appendUnit(91)
+    let mut index: i64 = 0
+    while index < count {
+      if index != 0 { run buffer.appendUnit(44) }
+      let element = arrays.fastBorrow((unsafe ObjectRef.lend(&anchor, node)).value(), index).view()
+      let written = run unsafe quickValue(realm, &mut buffer, &mut stack, element)
+      if written == QUICK_GIVE_UP { return QUICK_GIVE_UP }
+      if written == QUICK_ABSENT { run buffer.appendLatin1(b"null") }
+      index = index + 1
+    }
+    run buffer.appendUnit(93)
+    stack.depth = depth
+    return QUICK_WRITTEN
+  }
+  if class != classes.JS_CLASS_OBJECT || data.isExotic() || data.fastArray() { return QUICK_GIVE_UP }
+  let count = shape.properties.length()
+  if data.slotCount() != count { return QUICK_GIVE_UP }
+  if let Option<usize>.Some { .. } = unsafe shapes.lookup(data.shape, atoms.JS_ATOM_toJSON) { return QUICK_GIVE_UP }
+  if !unsafe noToJson(shape.prototype) { return QUICK_GIVE_UP }
+  stack.objects[depth] = address stack.depth = depth + 1
+  let state = realm.runtimeState(&anchor)
+  let mut open: &[u8] = b"{\""
+  let mut wrote = false
+  i = 0
+  while i < count {
+    let property = unsafe shape.properties.getUnchecked(i)
+    let index = i
+    i = i + 1
+    if property.atom == 0 { continue }
+    if (property.atom & ATOM_INTEGER_TAG) != 0 { return QUICK_GIVE_UP }
+    let flags = u8.toU32(property.flags)
+    if (flags & JS_PROP_ENUMERABLE) == 0 { continue }
+    if (flags & JS_PROP_TMASK) != 0 { return QUICK_GIVE_UP }
+    let name = state.atoms.borrowedString(property.atom)
+    if !name.isString() { continue }
+    let element = (unsafe data.slotUnchecked(index)).valueBits()
+    match element {
+      ValueBits.Undefined => { continue }
+      ValueBits.Symbol { .. } => { continue }
+      _ => ()
+    }
+    run quote(&mut buffer, name, open, b"\":")
+    open = b",\""
+    wrote = true
+    let written = run unsafe quickValue(realm, &mut buffer, &mut stack, element)
+    if written != QUICK_WRITTEN { return QUICK_GIVE_UP }
+  }
+  if !wrote { run buffer.appendUnit(123) }
+  run buffer.appendUnit(125)
+  stack.depth = depth
+  return QUICK_WRITTEN
+}
+effect fn quickBody<'a>(realm: Realm<'a>, input: ValueBits) -> ValueBits ! OutOfMemoryError | StringLengthError ? &mut Allocator {
+  let mut buffer = StringBuilder.make()
+  let mut stack = QuickStack { objects: [0; 24], depth: 0 }
+  let written = run unsafe quickValue(realm, &mut buffer, &mut stack, input)
+  if written != QUICK_WRITTEN { return ValueBits.Uninitialized }
+  return run buffer.finish()
+}
+/// The quick serializer's string for input, or Uninitialized when the full one must run.
+effect fn quickStringify<'a>(realm: Realm<'a>, input: ValueBits) -> ValueBits ? &mut Allocator {
+  let result = run Effect.result(quickBody(realm, input))
+  return match move result {
+    Result<ValueBits, OutOfMemoryError | StringLengthError>.Success { value } => value
+    Result<ValueBits, OutOfMemoryError | StringLengthError>.Failure { error: _error } => ValueBits.Uninitialized
+  }
+}
 pub effect fn stringify<'a, 'b, H: HeapHooks + CoercionHooks + OwnPropertyHooks + OwnKeysHooks + PropertyWriteHooks + CallHooks + ErrorHooks>(hooks: &mut H,
   memory: &AllocationObserver, realm: Realm<'a>, input: ValueRef<'b>, replacer: ValueRef<'b>, space: ValueRef<'b>) -> ValueBits ! JsException ? &mut Allocator {
+  if shared.undefined(replacer.view()) && shared.undefined(space.view()) {
+    let quick = run quickStringify(realm, input.view())
+    if quick.tag() != 4 { return quick }
+  }
   let mut state = State.make()
   let result = run Intrinsic.catchFailure<OutOfMemoryError | StringLengthError | BigIntError | JsException>(unsafe initialize(&mut hooks, memory, realm, input, replacer, space, &mut state), failed)
   let output = match move result {
