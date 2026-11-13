@@ -17,8 +17,6 @@ import js_intl_realm as ops
 import js_owned_value { Value, ValueRef, immediateRef }
 import js_core_types { NativeCallProtocol, NativeErrorKind, JS_PROP_THROW }
 import js_gc { HeapHooks }
-import js_gc as gc
-import js_runtime as runtime
 import js_class_data as classes
 import js_atom_data as atoms
 import js_coercion_host { CoercionHooks, getPropertyOwned }
@@ -111,12 +109,13 @@ pub struct BufferInfo {
 }
 /// JS_GetTypedArrayBuffer: owns buffer; byteLength is the stored creation length,
 /// including for tracking views, rather than the live byteLength getter result.
-pub effect fn getTypedArrayBuffer<'a, 'b, H: CoercionHooks>(hooks: &mut H, realm: Realm<'a>,
+pub effect fn getTypedArrayBuffer<'a, 'b, H: HeapHooks + CoercionHooks>(hooks: &mut H, memory: &AllocationObserver, realm: Realm<'a>,
   value: ValueRef<'b>) -> BufferInfo ! JsException ? &mut Allocator {
   let object = run requireTypedArray(&mut hooks, realm, value)
   if object.isOutOfBounds() { return run outOfBounds(&mut hooks, realm) }
-  let view = object.state()
-  return BufferInfo { buffer: object.buffer().dup().intoBits(),
+  let buffer = run object.bufferObject(&mut hooks, memory, realm)
+  let view = object.viewState()
+  return BufferInfo { buffer: buffer.dup().intoBits(),
     byteOffset: view.offset, byteLength: view.byteLength,
     bytesPerElement: u32.shiftLeft(1, storage.sizeLog2(object.classId())) }
 }
@@ -130,14 +129,17 @@ pub fn quickGetter<'b>(method: u32, receiver: ValueRef<'b>) -> ValueBits {
     Option<ViewObject<'b>>.None => { return ValueBits.Uninitialized }
   }
   if method == GET_LENGTH { return ValueBits.number(u64.toF64(object.count())) }
-  if method == GET_BUFFER { return object.buffer().dup().intoBits() }
+  if method == GET_BUFFER {
+    if unsafe storage.isLazy(object.header()) { return ValueBits.Uninitialized }
+    return object.buffer().dup().intoBits()
+  }
   if object.isOutOfBounds() { return ValueBits.Int { value: 0 } }
-  let view = object.state()
+  let view = object.span()
   if method == GET_BYTE_OFFSET { return ValueBits.number(u64.toF64(view.offset)) }
   if !view.tracking { return ValueBits.number(u64.toF64(view.byteLength)) }
   return ValueBits.number(u64.toF64(u64.shiftLeft(object.count(), u32.toU64(storage.sizeLog2(object.classId())))))
 }
-pub effect fn getter<'a, 'b, H: CoercionHooks>(hooks: &mut H, realm: Realm<'a>,
+pub effect fn getter<'a, 'b, H: HeapHooks + CoercionHooks>(hooks: &mut H, memory: &AllocationObserver, realm: Realm<'a>,
   method: u32, receiver: ValueRef<'b>) -> ValueBits ! JsException ? &mut Allocator {
   let quick = quickGetter(method, receiver)
   match quick { ValueBits.Uninitialized => () _ => { return quick } }
@@ -155,8 +157,8 @@ pub effect fn getter<'a, 'b, H: CoercionHooks>(hooks: &mut H, realm: Realm<'a>,
   }
   let object = run requireTypedArray(&mut hooks, realm, receiver)
   if method == GET_LENGTH { return ValueBits.number(u64.toF64(object.count())) }
-  let view = object.state()
-  if method == GET_BUFFER { return object.buffer().dup().intoBits() }
+  if method == GET_BUFFER { return (run object.bufferObject(&mut hooks, memory, realm)).dup().intoBits() }
+  let view = object.span()
   if object.isOutOfBounds() { return ValueBits.Int { value: 0 } }
   if method == GET_BYTE_OFFSET { return ValueBits.number(u64.toF64(view.offset)) }
   if method == GET_BYTE_LENGTH {
@@ -204,10 +206,13 @@ pub effect fn arrayFromIterator<'a, 'b, H: HeapHooks + CoercionHooks + OwnProper
   return owners.array.take()
 }
 struct ConstructorOwners { array: Value, object: Value }
-effect fn allocateBuffer<'a, H: HeapHooks + CoercionHooks + BufferHooks>(hooks: &mut H,
-  memory: &AllocationObserver, realm: Realm<'a>, length: u64, shift: u32) -> ValueBits ! JsException ? &mut Allocator {
-  return run unsafe storage.create(&mut hooks, memory, realm, ValueBits.Undefined,
-    u64.shiftLeft(length, u32.toU64(shift)), Option<u64>.none(), false)
+/// A fresh typed array's own zeroed bytes, with no ArrayBuffer object until one is needed.
+unsafe effect fn initializeOwn<'a, 'b, H: HeapHooks + CoercionHooks>(hooks: &mut H, realm: Realm<'a>,
+  object: ValueRef<'b>, length: u64, shift: u32) -> () ! JsException ? &mut Allocator {
+  if length > u64.shiftRight(u64.MAX, u32.toU64(shift)) {
+    return run ops.throwError(&mut hooks, realm, NativeErrorKind.Range, b"invalid array buffer length")
+  }
+  run unsafe storage.initializeLazyView(&mut hooks, realm, core.reference(object.view()), u64.shiftLeft(length, u32.toU64(shift)))
 }
 unsafe effect fn initialize<'a, 'b, H: HeapHooks + CoercionHooks>(hooks: &mut H, realm: Realm<'a>,
   object: ValueRef<'b>, buffer: ValueBits, offset: u64, length: u64, shift: u32, tracking: bool) -> () ! JsException ? &mut Allocator {
@@ -235,16 +240,11 @@ effect fn copyTyped<'a, 'b, H: HeapHooks + CoercionHooks + BufferHooks + OwnProp
   ! OutOfMemoryError | StringLengthError | BigIntError | JsException ? &mut Allocator {
   let source = ViewObject<'b>.typedArray(input)
   if source.isOutOfBounds() { return run outOfBounds(&mut hooks, realm) }
-  let buffer = run allocateBuffer(&mut hooks, memory, realm, length, shift)
-  if source.isOutOfBounds() {
-    // Unlike the common failure path, QuickJS frees this buffer before throw.
-    unsafe gc.release(&mut hooks, realm.runtime(), buffer)
-    return run outOfBounds(&mut hooks, realm)
-  }
-  run unsafe initialize(&mut hooks, realm, object, buffer, 0, length, shift, false)
-  let sourceView = source.state()
-  let sourceBuffer = source.buffer().state()
-  let targetBuffer = ViewObject<'b>.typedArray(object).buffer().state()
+  run unsafe initializeOwn(&mut hooks, realm, object, length, shift)
+  if source.isOutOfBounds() { return run outOfBounds(&mut hooks, realm) }
+  let sourceView = source.span()
+  let sourceBuffer = sourceView.bytes
+  let targetBuffer = ViewObject<'b>.typedArray(object).span().bytes
   if source.classId() == classId && sourceView.offset + targetBuffer.byteLength <= sourceBuffer.byteLength {
     unsafe storage.copyBytes(targetBuffer, 0, sourceBuffer, sourceView.offset, targetBuffer.byteLength)
   } else { run copyElements(&mut hooks, realm, object, input, length, true) }
@@ -287,8 +287,7 @@ effect fn constructorBody<'a, 'b, H: HeapHooks + CoercionHooks + BufferHooks + O
       Option<f64>.None => ()
     }
     owners.object = run constructors.create(&mut hooks, memory, realm, newTarget.borrow(), classId)
-    let buffer = run allocateBuffer(&mut hooks, memory, realm, length, shift)
-    run unsafe initialize(&mut hooks, realm, owners.object.borrow(), buffer, 0, length, shift, false)
+    run unsafe initializeOwn(&mut hooks, realm, owners.object.borrow(), length, shift)
     return ()
   }
   // The source captures a typed source's count BEFORE newTarget.prototype runs.
@@ -350,8 +349,7 @@ effect fn constructorBody<'a, 'b, H: HeapHooks + CoercionHooks + BufferHooks + O
     length = i64.toU64(count)
     owners.array = unsafe Value.retain(input)
   }
-  let buffer = run allocateBuffer(&mut hooks, memory, realm, length, shift)
-  run unsafe initialize(&mut hooks, realm, owners.object.borrow(), buffer, 0, length, shift, false)
+  run unsafe initializeOwn(&mut hooks, realm, owners.object.borrow(), length, shift)
   run copyElements(&mut hooks, realm, owners.object.borrow(), owners.array.borrow(), length, false)
 }
 pub effect fn constructor<'a, 'b, H: HeapHooks + CoercionHooks + BufferHooks + OwnPropertyHooks + GetPropertyHooks + PropertyWriteHooks + CallHooks + NativeFunctionHooks>(
@@ -401,5 +399,5 @@ pub effect fn dispatch<'a, H: HeapHooks + CoercionHooks + BufferHooks + OwnPrope
  
   if method == BASE_CONSTRUCTOR { return run core.error(&mut hooks, realm, b"cannot be called") }
   if method == CONSTRUCTOR { return run constructor(&mut hooks, memory, realm, newTargetRef, argvArgs, i32.toU32(magic)) }
-  return run getter(&mut hooks, realm, method, receiverRef)
+  return run getter(&mut hooks, memory, realm, method, receiverRef)
 }
