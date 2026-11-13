@@ -17,6 +17,8 @@ silk run -- install                 # install the package.json of the working di
 | `pm add <name>[@range or tag]...` | Adds dependencies and installs them. `-D` for development, `-O` for optional, `-E` for an exact version. |
 | `pm remove <name>...` | Takes dependencies out and removes what nothing needs any more. |
 | `pm update [name]...` | Moves the named packages, or all, to the newest versions the ranges allow. |
+| `pm run <script> [argument]...` | Runs a script of `package.json`, between its `pre` and `post` scripts when it has them. Without a name it lists the scripts. |
+| `pm exec <command> [argument]...` | Runs a command of the dependencies. |
 
 An install resolves the dependencies against the registry, downloads what the store at
 `$SILKJS_STORE` (or `~/.silkjs/store`) does not have, and links an isolated `node_modules`: each
@@ -36,6 +38,15 @@ with different peers, each use is a node of its own in the graph, with its own e
 lockfile and its own directory, named after the peers: `node_modules/.sjs/plugin@1.0.0_host@2.1.0`.
 A peer nothing above provides is installed for the package that asks, and an optional one is
 left out.
+
+## Scripts and commands
+
+`run` and `exec` work in the directory of the package, with `node_modules/.bin` of the package
+and of the root of the workspace first on `PATH`, the input and the output of the terminal, and
+the variables scripts read (`npm_lifecycle_event`, `npm_package_name`, `INIT_CWD` and the others
+named below). They end with the exit code of what ran. The words after the script name go to
+the script as they are, each as one argument; a `--` before them is left out. In a workspace,
+`--filter <name>` and `-w` before the script name choose the package.
 
 ## Install scripts
 
@@ -77,8 +88,8 @@ list under `packages`. The packages are installed together:
   or `workspaces.catalog`; `catalog:<name>` reads `catalogs.<name>`. The lockfile records the
   catalogs, so changing one resolves again.
 - Every command works from the directory of any package and installs for the whole workspace.
-  `add` and `remove` change the package they are run in; `--filter <name>` (`-F`) picks another
-  one by name, and `-w` the root project.
+  `add`, `remove`, `run` and `exec` work on the package they are run in; `--filter <name>`
+  (`-F`) picks another one by name, and `-w` the root project.
 - `.npmrc` is read from the home directory, then the root of the workspace, then the working
   directory.
 
