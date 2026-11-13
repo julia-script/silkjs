@@ -1,7 +1,9 @@
 'use strict';
 const { Buffer } = require('buffer');
 const { native, NativeSecureContext, answerFor, answering } = require('internal/tls/context');
-const { codes } = require('internal/errors');
+const host = require('internal/host');
+const { decorate } = require('internal/tls/errors');
+const { codes, ErrnoException } = require('internal/errors');
 const { FastBuffer } = require('internal/buffer');
 const { isStreamHandle } = require('internal/net/binding');
 // The native ops answer read and drain with a fresh ArrayBuffer of the exact size: a
@@ -13,22 +15,14 @@ const bytesOf = arrayBuffer => new FastBuffer(arrayBuffer);
 class Failure { constructor(cause) { this.cause = cause; } }
 // TLSWrap cancels the writes it still holds when it closes (UV_ECANCELED).
 function canceled() { return Object.assign(new Error('write ECANCELED'), { errno: -125, code: 'ECANCELED', syscall: 'write' }); }
-// The record pump calls this several times a request: a rest array (no arguments
-// object), handed on by index without a spread.
-function op(name, ...args) {
-  try {
-    switch (args.length) {
-      case 0: return native(name);
-      case 1: return native(name, args[0]);
-      case 2: return native(name, args[0], args[1]);
-      case 3: return native(name, args[0], args[1], args[2]);
-      default: {
-        const list = [name];
-        for (let index = 0; index < args.length; index++) list.push(args[index]);
-        return Reflect.apply(native, undefined, list);
-      }
-    }
-  } catch (cause) { throw new Failure(cause); }
+// The record pump calls these several times a request: the session id and at most one
+// value, in the list host.tls takes (no booleans pass here), without native()'s rest
+// array and boolean pass.
+function op(name, id) {
+  try { return host.tls(name, [id]); } catch (err) { throw new Failure(decorate(err)); }
+}
+function op2(name, id, value) {
+  try { return host.tls(name, [id, value]); } catch (err) { throw new Failure(decorate(err)); }
 }
 
 // The carrier is an ordinary net.Socket (or user Duplex). Only ciphertext crosses
@@ -125,8 +119,24 @@ class TLSTransport {
     // still makes (a client's Finished after an early end()) goes nowhere, and the read
     // side stays open so the peer's answer and end still arrive.
     if (data.length && this.carrier.writableEnded) { if (callback) process.nextTick(callback); return; }
-    if (data.length) { this.socket._refreshTimeout(); this.carrier.write(data, callback); }
+    if (data.length) { this.socket._refreshTimeout(); if (!this.writeDirect(data, callback)) this.carrier.write(data, callback); }
     else if (callback) process.nextTick(callback);
+  }
+  // As TLSWrap writes its parent's StreamBase: an idle owned carrier's handle takes the
+  // ciphertext itself, without the carrier's Writable (whose queue and ordering only
+  // matter while it holds something). False leaves the write to the carrier.
+  writeDirect(data, callback) {
+    const handle = this.consumed, carrier = this.carrier;
+    if (!handle || carrier._handle !== handle || carrier.connecting || carrier.destroyed || !carrier.writable ||
+        carrier.writableLength !== 0 || carrier.writableCorked || carrier.writableEnded) return false;
+    const req = { async: false, oncomplete: status => {
+      if (status < 0) { carrier.destroy(new ErrnoException(status, 'write')); return; }
+      if (callback) callback();
+    } };
+    const status = handle.writeBuffer(req, data);
+    if (status !== 0) { carrier.destroy(new ErrnoException(status, 'write')); return true; }
+    if (!req.async && callback) process.nextTick(callback);
+    return true;
   }
   // Node's loadSNI and TLSWrap::CertCbDone.
   chooseCertificate() {
@@ -169,7 +179,7 @@ class TLSTransport {
       once = true;
       if (err) { this.socket.destroy(err); return; }
       if (this.closing || !this.id) { this.socket.destroy(new codes.ERR_SOCKET_CLOSED()); return; }
-      if (response) op('setOCSPResponse', this.id, response);
+      if (response) op2('setOCSPResponse', this.id, response);
       this.certificateDone(context);
     };
     try { server.emit('OCSPRequest', ctx.getCertificate(), ctx.getIssuer(), onOCSP); }
@@ -179,7 +189,7 @@ class TLSTransport {
   certificateDone(context) {
     if (this.closing) return;
     try {
-      op('select', this.id, context ? context._id : 0);
+      op2('select', this.id, context ? context._id : 0);
       this.selectALPN();
     } catch (failure) { if (!(failure instanceof Failure)) throw failure; this.socket.destroy(failure.cause); return; }
     if (this.closing) return;
@@ -195,7 +205,7 @@ class TLSTransport {
     const selected = this.socket._callALPNCallback(offered);
     if (this.closing) return;
     if (selected === undefined) op('rejectALPN', this.id);
-    else op('serverALPN', this.id, Buffer.concat([Buffer.from([selected.length]), Buffer.from(selected, 'latin1')]));
+    else op2('serverALPN', this.id, Buffer.concat([Buffer.from([selected.length]), Buffer.from(selected, 'latin1')]));
   }
   // With an ALPNCallback, a TLS 1.3 ClientHello waits until JS chose (see clientHelloDone).
   enableALPNCallback() { if (this.id) op('enableALPNCallback', this.id); }
@@ -206,7 +216,7 @@ class TLSTransport {
     op('enablePsk', this.id);
   }
   setPskIdentityHint(hint) {
-    try { op('pskHint', this.id, hint); return true; } catch (failure) { if (!(failure instanceof Failure)) throw failure; return false; }
+    try { op2('pskHint', this.id, hint); return true; } catch (failure) { if (!(failure instanceof Failure)) throw failure; return false; }
   }
   answer(kind, text, a, b) {
     if (this.closing || !this.pskHandler) return null;
@@ -351,7 +361,7 @@ class TLSTransport {
       if (item && !item.inflight) {
         if (!item.data.length) { this.writes.shift(); process.nextTick(() => { item.callback(); this.pump(); }); }
         else {
-          const n = op('write', this.id, item.offset === 0 ? item.data : item.data.subarray(item.offset));
+          const n = op2('write', this.id, item.offset === 0 ? item.data : item.data.subarray(item.offset));
           if (n > 0) {
             item.offset += n; item.inflight = true;
             this.flush(err => {
