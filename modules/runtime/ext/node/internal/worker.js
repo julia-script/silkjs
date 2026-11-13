@@ -305,7 +305,7 @@ class Worker extends EventEmitter {
       controlChannel.port1.postMessage({ type: messageTypes.LOAD_SCRIPT, cwdCounter: cwdCounter || sharedCwdCounter, workerData: config.options.workerData,
         environmentData: Array.from(environmentData), parentPort: userChannel.port2,
         options: config.metadata }, [userChannel.port2, ...list]);
-      host.workerActivity = true;
+      host.markWorkerActivity();
       state.id = host.workerNative('startWorker', [JSON.stringify(config.metadata), ports().id(controlChannel.port2), Math.floor(config.metadata.resourceLimits.stackSizeMb * 1048576), config.metadata.name, limitBytes(config.metadata.resourceLimits.maxOldGenerationSizeMb), limitBytes(config.metadata.resourceLimits.maxYoungGenerationSizeMb)]);
       // Native ownership of this endpoint moved into the new isolate.
       clone().commit({ moved: [controlChannel.port2] });

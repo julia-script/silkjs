@@ -43,10 +43,13 @@ const {
   kHasPrimitive,
   timerListMap,
   timerListQueue,
-  immediateQueue,
+  createImmediate,
   insert,
   knownTimersById,
 } = require('internal/timers');
+const host = require('internal/host');
+const { _newAsyncId: newAsyncId, _hookFields: hookFields } = require('async_hooks');
+const loopState = host.timerLoop.state;
 const customPromisify = Symbol.for('nodejs.util.promisify.custom');
 let debug = (...args) => {
   debug = require('internal/util/debuglog').debuglog('timer', (fn) => {
@@ -201,10 +204,18 @@ Timeout.prototype[Symbol.toPrimitive] = function() {
  * @returns {Immediate}
  */
 function setImmediate(callback, ...args) {
-  validateFunction(callback, 'callback');
+  if (typeof callback !== 'function') validateFunction(callback, 'callback');
   // Node's copy of the arguments, from a rest array: an arguments object costs five
   // times as much here. Node passes none (undefined) for a call without arguments.
-  return new Immediate(callback, args.length === 0 ? undefined : args);
+  const argv = args.length === 0 ? undefined : args;
+  if (hookFields[5] !== 0) return createImmediate(callback, argv);
+  // A plain Immediate from the native queue, which counts and refs it.
+  const id = newAsyncId();
+  const immediate = host.immediateCreate(callback, argv, id);
+  if (typeof immediate !== 'object') return createImmediate(callback, argv, id, immediate);
+  // binding.toggleImmediateRef(true), without the call.
+  loopState.immediateRefed = true;
+  return immediate;
 }
 // Node's declared parameters (callback, arg1, arg2, arg3).
 Object.defineProperty(setImmediate, 'length', { __proto__: null, value: 4 });
@@ -227,10 +238,11 @@ function clearImmediate(immediate) {
   if (!immediate?._onImmediate || immediate._destroyed)
     return;
 
-  immediateInfo[kCount]--;
   immediate._destroyed = true;
 
-  if (immediate[kRefed] && --immediateInfo[kRefCount] === 0) {
+  // The native queue (ext/immediates) counts it out; it skips a destroyed Immediate.
+  const refed = !!immediate[kRefed];
+  if (host.immediateSettle(refed) === 0 && refed) {
     // We need to use the binding as the receiver for fast API calls.
     binding.toggleImmediateRef(false);
   }
@@ -239,8 +251,6 @@ function clearImmediate(immediate) {
   emitDestroy(immediate);
 
   cleanImmediate(immediate);
-
-  immediateQueue.remove(immediate);
 }
 
 Immediate.prototype[Symbol.dispose] = function() {
