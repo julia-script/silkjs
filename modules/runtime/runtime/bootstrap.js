@@ -557,13 +557,17 @@ function onRejection(promise, reason, event) {
   } else {
     rejections.set(promise, { reason, id: ++nextRejectionId, domain: process.domain, context: asyncHooks._captureContext() });
     rejectionsQueued = true;
+    native.immediateAttention();
   }
 }
 // Node evaluates an ES main module inside a microtask checkpoint (its loader awaits
 // before evaluating), so the jobs the module queues, such as its import() calls,
 // settle before the next ticks it queued run (test-esm-dynamic-import-commonjs).
 let mainJobsFirst = false;
-host.mainModuleEvaluated = () => { mainJobsFirst = true; };
+host.mainModuleEvaluated = () => { mainJobsFirst = true; native.immediateAttention(); };
+// What a native immediate turn cannot see (immediateTurns) asks for attention.
+host.loopAttention = () => native.immediateAttention();
+host.markWorkerActivity = () => { host.workerActivity = true; native.immediateAttention(); };
 // Node's tick queue drain (lib/internal/process/task_queues.js), called with process as
 // its receiver: a tick's callback runs straight from it, so its stack shows
 // process.processTicksAndRejections below the callback, as Node's does.
@@ -792,6 +796,7 @@ host.performanceNodeTiming = () => ({ ...performanceMilestones, idleTime: host.p
 host.performanceAddLoopListener = callback => {
   loopListeners.add(callback);
   loopListenerCount = loopListeners.size;
+  native.immediateAttention();
   return () => { const removed = loopListeners.delete(callback); loopListenerCount = loopListeners.size; return removed; };
 };
 // The Node release whose API this runtime implements.
@@ -973,7 +978,7 @@ host.activeResources = () => {
     if ((row[7] ?? row[2]) && row[6] !== null) names.push(row[6]);
   // As node_process_methods.cc does: the referenced Timeouts, then the referenced Immediates.
   for (let count = timerLoop.timeoutInfo[0]; count > 0; count--) names.push('Timeout');
-  for (let count = timerLoop.immediateInfo[1]; count > 0; count--) names.push('Immediate');
+  for (let count = native.immediateRefs(0); count > 0; count--) names.push('Immediate');
   names.push(...native.workerNative('activeResources', []));
   return names;
 };
@@ -2020,15 +2025,36 @@ function loopTurn(pendingPromise, limit, keepAlive) {
     : keepAlive && !ticksPending() && !referencedWork() ? timerLoop.pollDelay() : pollTimeout(pendingPromise);
   if (limit !== undefined && limit >= 0 && (timeout === -1 || timeout > limit)) timeout = limit;
   native.pollIO(timeout);
+  afterPoll();
+  // Turns that only run immediates go on natively (ext/immediates) while no other phase
+  // has work: the executable's own loop, without a limit, keepAlive or pending promise.
+  if (limit === undefined && !keepAlive && pendingPromise === undefined && immediateTurnReady(native.immediateRefs(0), false) &&
+      native.immediateTurns(immediateTurnReady, ticks, completions) === 1) afterPoll();
+}
+// The rest of a loop turn after its poll phase.
+function afterPoll() {
   pollWorkers();
   checkpoint();
   if (loopListenerCount !== 0) {
     for (const listener of loopListeners) listener();
     checkpoint();
   }
-  if ((immediateInfo[0] !== 0 || nativeImmediates.length !== 0 || host.traceEnvironment) && timerLoop.checkImmediate()) checkpoint();
+  if ((nativeImmediates.length !== 0 || native.immediateCount() !== 0 || host.traceEnvironment) && timerLoop.checkImmediate()) checkpoint();
   // Every phase ended in a checkpoint: nothing is queued for the next step's.
   loopSettled = true;
+}
+// After a native immediates turn (settled: its check phase ran): the checkpoint that ends
+// it, then whether the next turn may be another such turn. That takes referenced
+// immediates and no due timer, native immediate, loop listener, worker or trace.
+// A settled answer of true is the loop timer's due time instead (-1 for none): native
+// turns may then skip this until it is due, or until something asks for attention.
+function immediateTurnReady(refs, settled = true) {
+  if (refs === 0) timerState.immediateRefed = false;
+  if (settled) checkpoint();
+  const due = timerState.timerDue;
+  const ready = refs !== 0 && nativeImmediates.length === 0 && loopListenerCount === 0 && host.workerActivity !== true &&
+    workerThreads.isMainThread && !host.traceEnvironment && (due === -1 || native.now() < due);
+  return ready && settled && !mainJobsFirst && !rejectionsQueued ? due : ready;
 }
 let loopSettled = false;
 // An exception in a 'beforeExit' or 'exit' listener is uncaught like any other.

@@ -35,6 +35,7 @@ const nativeImmediates = [];
 host.setNativeImmediate = (callback, ref = true) => {
   nativeImmediates.push({ callback, ref });
   if (ref) state.nativeRefs++;
+  host.loopAttention();
 };
 function runNativeImmediates() {
   // Callbacks queued while the queue runs run in the same pass, as RunAndClearNativeImmediates.
@@ -56,7 +57,7 @@ const binding = {
     processImmediateCallback = processImmediate;
     processTimersCallback = processTimers;
   },
-  scheduleTimer(duration) { state.timerDue = getLibuvNow() + Math.max(1, duration); },
+  scheduleTimer(duration) { state.timerDue = getLibuvNow() + Math.max(1, duration); host.loopAttention(); },
   toggleTimerRef(ref) { state.timerRefed = !!ref; },
   toggleImmediateRef(ref) { state.immediateRefed = !!ref; },
 };
@@ -114,10 +115,9 @@ function checkImmediate() {
     const start = trace.now();
     try { runNativeImmediates(); } finally { trace.phase('RunAndClearNativeImmediates', start); }
   } else if (ranNative) runNativeImmediates();
-  if (immediateInfo[0] === 0) return ranNative;
-  do processImmediateCallback();
-  while (immediateInfo[2] !== 0);
-  if (immediateInfo[1] === 0) state.immediateRefed = false;
+  // The queue is native (ext/immediates), and so are its counts (kCount, kRefCount).
+  if (host.immediateCount() === 0) return ranNative;
+  if (processImmediateCallback() === 0) state.immediateRefed = false;
   return true;
 }
 

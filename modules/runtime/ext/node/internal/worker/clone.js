@@ -476,7 +476,7 @@ function post(id, value, list, contextException = null) {
   try { prepared = prepare(value, list, id); }
   finally { contextDOMException = outer; }
   let postedToItself;
-  host.workerActivity = true;
+  host.markWorkerActivity();
   try { postedToItself = host.workerNative('post', [id, prepared.bytes, prepared.buffers, prepared.shared, prepared.ports]); }
   catch (error) { rollback(prepared); throw error; }
   commit(prepared);
@@ -535,7 +535,7 @@ function structuredClone(value, options) {
   }
   let send, receive;
   try {
-    host.workerActivity = true;
+    host.markWorkerActivity();
     [send, receive] = host.workerNative('channel', []);
     host.workerNative('post', [send, prepared.bytes, prepared.buffers, prepared.shared, prepared.ports]);
     commit(prepared);
