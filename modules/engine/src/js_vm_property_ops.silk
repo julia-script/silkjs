@@ -18,7 +18,7 @@ import js_vm_state { Machine }
 import js_heap { HeapCell, HeapHeader }
 import js_value { ValueBits }
 import js_owned_value { lendBits, lendFor, Value }
-import js_core_types { RuntimeState, FieldCacheEntry, TypedLengthEntry, FIELD_PASS_THROUGH, FIELD_PROTO_KEY, fieldCacheIndex, ContextState, ObjectData, ObjectPayload, ShapeData, ShapeProperty,
+import js_core_types { PolyFieldEntry, polyFieldIndex, POLY_OWN, POLY_PROTO, POLY_GETTER, POLY_ABSENT, RuntimeState, FieldCacheEntry, TypedLengthEntry, FIELD_PASS_THROUGH, FIELD_PROTO_KEY, fieldCacheIndex, ContextState, ObjectData, ObjectPayload, ShapeData, ShapeProperty,
   PropertySlot, SlotBits, NativeErrorKind, JS_PROP_TMASK, JS_PROP_GETSET, JS_PROP_WRITABLE, JS_PROP_LENGTH, JS_PROP_THROW_STRICT, JS_PROP_C_W_E, JS_PROP_CONFIGURABLE }
 import js_gc { HeapHooks }
 import js_gc as gc
@@ -373,8 +373,16 @@ pub unsafe fn readFieldCachedAt(runtime: *mut HeapHeader, ip: *const u8, object:
       }
     }
   }
+  // A filled entry that missed: the site sees several shapes (or shares its
+  // entry with another site), which the shape-keyed polymorphic cache answers
+  // without refilling the entry the other shapes hit.
+  let warm = entry.site != 0
   drop state
   let atom = unsafe fieldAtomAt(ip)
+  if warm {
+    let answer = unsafe readPolyFieldFilling(runtime, object, atom, target, retain)
+    if answer != POLY_MISSED { return answer == POLY_READ }
+  }
   let cursor = unsafe shapes.unchecked<u32>(&shape.hashIndices, u32.toUsize(atom & shape.propertyHashMask))
   // Walk the whole bucket: whether an own property sits at its head depends on
   // atom numbering, and a site whose objects alternate shapes refills here.
@@ -430,9 +438,16 @@ pub unsafe fn readFieldKeyedAt(runtime: *mut HeapHeader, ip: *const u8, object: 
 /// the site's inline key; anything else goes to the site cache (prototype hits).
 @inlineNever
 unsafe fn refillFieldKey(runtime: *mut HeapHeader, ip: *const u8, object: *mut HeapHeader, target: *mut ValueBits, retain: bool) -> bool {
+  let atom = unsafe fieldAtomAt(ip)
+  let inline = unsafe fieldKeyAt(ip)
+  // A site that ran before and missed (another own shape, or a property found
+  // past the own records, FIELD_KEY_POLY) reads through the polymorphic cache.
+  if inline != FIELD_KEY_COLD {
+    let answer = unsafe readPolyFieldFilling(runtime, object, atom, target, retain)
+    if answer != POLY_MISSED { return answer == POLY_READ }
+  }
   let anchor = () let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, object)
   let shape = unsafe HeapCell.payload<ShapeData, ()>(&anchor, data.shape)
-  let atom = unsafe fieldAtomAt(ip)
   let mut probe = unsafe shapes.unchecked<u32>(&shape.hashIndices, u32.toUsize(atom & shape.propertyHashMask))
   while probe != 0 {
     let index = u32.toUsize(probe - 1)
@@ -448,7 +463,155 @@ unsafe fn refillFieldKey(runtime: *mut HeapHeader, ip: *const u8, object: *mut H
     probe = property.hashNext
   }
   drop shape drop data
+  // Not an own data property: from its next run on, the site reads through
+  // the polymorphic cache, which also holds prototype properties at any depth,
+  // getters and missing properties.
+  if inline == FIELD_KEY_COLD { unsafe writeFieldKey(ip, FIELD_KEY_POLY) }
   return unsafe readFieldCachedAt(runtime, ip, object, target, retain)
+}
+/// The inline field key the compiler and the binary object reader start a site with.
+const FIELD_KEY_COLD: u64 = 0xffffffffffffffff
+/// The inline field key of a site whose last miss was not an own data property:
+/// version 0 matches no shape (versions start at 1), so every run misses into
+/// refillFieldKey, which then asks the polymorphic cache first.
+const FIELD_KEY_POLY: u64 = 0
+/// readPolyField's answers.
+pub const POLY_MISSED: u32 = 0
+pub const POLY_READ: u32 = 1
+/// The property is an accessor whose getter polyGetter gives; nothing was read.
+pub const POLY_ACCESSOR: u32 = 2
+/// The RuntimeState.polyFields entry for atom on object while it still holds:
+/// its POLY_* kind, with the object holding the property in holder and its
+/// slot in index; 0 when there is none.
+@inlineAlways
+unsafe fn polyLookup(runtime: *mut HeapHeader, object: *mut HeapHeader, atom: u32, holder: &mut *mut HeapHeader, index: &mut usize) -> u32 {
+  let anchor = () let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, object)
+  let shape = unsafe HeapCell.payload<ShapeData, ()>(&anchor, data.shape)
+  let version = shape.version
+  let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, runtime)
+  let entry = &state.polyFields[polyFieldIndex(version, atom)]
+  if entry.version != version || entry.atom != atom { return 0 }
+  let kind = entry.kind
+  // An exotic object (a Proxy) may share an ordinary object's shape: the entry
+  // holds for the receiver class it was filled for.
+  if data.isExotic() {
+    if u32.shiftRight(kind, 8) != data.classId() { return 0 }
+    if data.classId() == classes.JS_CLASS_ARRAY && !data.fastArray() { return 0 }
+  } else if kind > 0xff { return 0 }
+  let stamp = entry.stamp
+  index.* = u64.toUsize(stamp & 0xffff)
+  let answer = kind & 0xff
+  if answer == POLY_OWN { holder.* = object return answer }
+  // Past the receiver's own records the answer holds while no prototype changed.
+  if u64.shiftRight(stamp, 16) != state.shapeEpoch { return 0 }
+  holder.* = match Pointer.nonNullMut<HeapHeader>(entry.holder) {
+    Option<*mut HeapHeader>.Some { value } => value
+    Option<*mut HeapHeader>.None => object
+  }
+  return answer
+}
+/// A named get of atom on object answered by the polymorphic cache: POLY_READ
+/// with the value at target (retained when retain), POLY_ACCESSOR for a getter,
+/// POLY_MISSED otherwise.
+@inlineAlways
+unsafe fn readPolyField(runtime: *mut HeapHeader, object: *mut HeapHeader, atom: u32, target: *mut ValueBits, retain: bool) -> u32 {
+  let mut holder = object
+  let mut index: usize = 0
+  let kind = unsafe polyLookup(runtime, object, atom, &mut holder, &mut index)
+  if kind == POLY_OWN || kind == POLY_PROTO {
+    let anchor = () let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, holder)
+    let found = (unsafe data.slotUnchecked(index)).valueBits()
+    if retain { unsafe Pointer.write<ValueBits>(target, unsafe found.retained()) } else { unsafe Pointer.write<ValueBits>(target, found) }
+    return POLY_READ
+  }
+  if kind == POLY_ABSENT { unsafe Pointer.write<ValueBits>(target, ValueBits.Undefined) return POLY_READ }
+  if kind == POLY_GETTER { return POLY_ACCESSOR }
+  return POLY_MISSED
+}
+/// readPolyField, filling the entry on a miss when the get is cacheable.
+@inlineNever
+unsafe fn readPolyFieldFilling(runtime: *mut HeapHeader, object: *mut HeapHeader, atom: u32, target: *mut ValueBits, retain: bool) -> u32 {
+  let answer = unsafe readPolyField(runtime, object, atom, target, retain)
+  if answer != POLY_MISSED || !unsafe fillPolyField(runtime, object, atom) { return answer }
+  return unsafe readPolyField(runtime, object, atom, target, retain)
+}
+/// The getter a named get of atom on object reaches through the polymorphic
+/// cache (a bytecode or native function), or null.
+unsafe fn polyGetter(runtime: *mut HeapHeader, object: *mut HeapHeader, atom: u32) -> ?*mut HeapHeader {
+  let mut holder = object
+  let mut index: usize = 0
+  if unsafe polyLookup(runtime, object, atom, &mut holder, &mut index) != POLY_GETTER { return Pointer.null<HeapHeader>() }
+  let anchor = () let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, holder)
+  return unsafe accessorGetter(&data, index)
+}
+/// The getter of data's accessor at slot index when it is a bytecode or native function, or null.
+unsafe fn accessorGetter(data: &ObjectData, index: usize) -> ?*mut HeapHeader {
+  let anchor = ()
+  let shape = unsafe HeapCell.payload<ShapeData, ()>(&anchor, data.shape)
+  let flags = (unsafe shapes.unchecked<ShapeProperty>(&shape.properties, index)).flags
+  drop shape
+  return match data.slot(index).view(flags) {
+    PropertySlot.GetterSetter { getter, .. } => match Pointer.nonNullMut<HeapHeader>(getter) {
+      Option<*mut HeapHeader>.Some { value } => {
+        let function = unsafe HeapCell.payload<ObjectData, ()>(&anchor, value)
+        let id = function.classId()
+        if id == classes.JS_CLASS_BYTECODE_FUNCTION || id == classes.JS_CLASS_C_FUNCTION { value } else { Pointer.null<HeapHeader>() }
+      }
+      Option<*mut HeapHeader>.None => Pointer.null<HeapHeader>()
+    }
+    _ => Pointer.null<HeapHeader>()
+  }
+}
+/// Walks object's prototype chain for atom as readField would and records the
+/// answer in the polymorphic cache: an own data property, a prototype's data
+/// property, a function getter, or no property at all. False (nothing recorded)
+/// when an object on the way decides the get by more than its shape, or the
+/// property is another kind of slot.
+@inlineNever
+unsafe fn fillPolyField(runtime: *mut HeapHeader, object: *mut HeapHeader, atom: u32) -> bool {
+  let anchor = () let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, object)
+  if !unsafe namedOrdinary(runtime, &data, atom) { return false }
+  let classTag = if data.isExotic() { u32.shiftLeft(data.classId(), 8) } else { 0 }
+  let version = (unsafe HeapCell.payload<ShapeData, ()>(&anchor, data.shape)).version
+  drop data
+  let mut current = object
+  let mut depth: usize = 0
+  while depth < 64 {
+    let link = unsafe HeapCell.payload<ObjectData, ()>(&anchor, current)
+    if depth != 0 && link.isExotic() && !unsafe namedOrdinary(runtime, &link, atom) { return false }
+    let linkShape = unsafe HeapCell.payload<ShapeData, ()>(&anchor, link.shape)
+    let found = unsafe recordIndex(&linkShape, atom)
+    if found >= 0 {
+      let at = i64.toUsize(found)
+      if at >= 0x10000 { return false }
+      let flags = u8.toU32((unsafe shapes.unchecked<ShapeProperty>(&linkShape.properties, at)).flags) & JS_PROP_TMASK
+      let mut kind = POLY_PROTO
+      if flags != 0 {
+        if flags != JS_PROP_GETSET || Pointer.isNull<HeapHeader>(unsafe accessorGetter(&link, at)) { return false }
+        kind = POLY_GETTER
+      } else if depth == 0 { kind = POLY_OWN }
+      let mut holder = Pointer.null<HeapHeader>()
+      if depth != 0 { holder = current }
+      unsafe storePolyField(runtime, version, atom, kind | classTag, holder, at)
+      return true
+    }
+    match Pointer.nonNullMut<HeapHeader>(linkShape.prototype) {
+      Option<*mut HeapHeader>.Some { value } => { current = value }
+      Option<*mut HeapHeader>.None => {
+        unsafe storePolyField(runtime, version, atom, POLY_ABSENT | classTag, Pointer.null<HeapHeader>(), 0)
+        return true
+      }
+    }
+    depth = depth + 1
+  }
+  return false
+}
+@inlineAlways
+unsafe fn storePolyField(runtime: *mut HeapHeader, version: u64, atom: u32, kind: u32, holder: ?*mut HeapHeader, index: usize) -> () {
+  let mut anchor = ()
+  let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, runtime)
+  let stamp = u64.shiftLeft(state.shapeEpoch, 16) | usize.toU64(index)
+  state.polyFields[polyFieldIndex(version, atom)] = PolyFieldEntry { version: version, atom: atom, kind: kind, holder: holder, stamp: stamp }
 }
 /// readFieldKeyedAt at machine's ip.
 @inlineAlways
@@ -702,6 +865,13 @@ pub unsafe fn lookupField(object: *mut HeapHeader, atom: u32, target: *mut Value
 /// data property, a missing getter, a lazy slot, an exotic object on the way, no
 /// property). Walks at most GETTER_DEPTH objects.
 pub unsafe fn functionGetter(runtime: *mut HeapHeader, object: *mut HeapHeader, atom: u32) -> ?*mut HeapHeader {
+  let cached = unsafe polyGetter(runtime, object, atom)
+  if !Pointer.isNull<HeapHeader>(cached) { return cached }
+  let found = unsafe walkFunctionGetter(runtime, object, atom)
+  if !Pointer.isNull<HeapHeader>(found) { let _filled = unsafe fillPolyField(runtime, object, atom) }
+  return found
+}
+unsafe fn walkFunctionGetter(runtime: *mut HeapHeader, object: *mut HeapHeader, atom: u32) -> ?*mut HeapHeader {
   let mut current = object
   let mut depth: usize = 0
   while depth < GETTER_DEPTH {
@@ -1339,9 +1509,12 @@ pub unsafe fn readSymbolOperand<H: HeapHooks>(hooks: &mut H, machine: &mut Machi
   let key = unsafe machine.top(1)
   let anchor = ()
   let atom = (unsafe HeapCell.payload<RuntimeState, ()>(&anchor, machine.runtime)).atoms.borrowedSymbolAtom(key)
-  let value = match unsafe getters.quickGet(machine.runtime, node, atom) {
-    Option<ValueBits>.Some { value: found } => found
-    Option<ValueBits>.None => { return false }
+  let mut value = ValueBits.Undefined
+  if unsafe readPolyFieldFilling(machine.runtime, node, atom, Pointer.fromMutRef<ValueBits>(&mut value), true) != POLY_READ {
+    value = match unsafe getters.quickGet(machine.runtime, node, atom) {
+      Option<ValueBits>.Some { value: found } => found
+      Option<ValueBits>.None => { return false }
+    }
   }
   unsafe machine.set(2, value)
   unsafe machine.discard(1)
