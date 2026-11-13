@@ -38,7 +38,7 @@ const define = (name, factory) => {
   // Node runs lib/internal/per_context/* in every context; a realm compiles its own
   // copy of these the first time it needs them.
   if (name === 'internal/error_stack' || name === 'internal/per_context/primordials' ||
-      name === 'internal/per_context/domexception' ||
+      name === 'internal/per_context/domexception' || name === 'internal/per_context/messageport' ||
       name === 'internal/web/wasm' || name.startsWith('internal/web/wasm/'))
     realmSources.set(name, factory);
 };
@@ -89,6 +89,9 @@ const host = { ...native, rawOS, rawStd };
 // Node's internals keep SharedArrayBuffer when the global is left out
 // (--enable-sharedarraybuffer-per-context): a Worker still shares its cwd counter.
 host.SharedArrayBuffer = SharedArrayBuffer;
+// primordials has none of its methods (nor has Node's); internal/block_list_binding grows one.
+host.sharedArrayBufferByteLength = Object.getOwnPropertyDescriptor(SharedArrayBuffer.prototype, 'byteLength').get;
+host.sharedArrayBufferGrow = SharedArrayBuffer.prototype.grow;
 // Startup snapshots: what Node keeps in internalBinding('mksnapshot') for
 // internal/v8/startup_snapshot. With --build-snapshot (native.snapshotBuild) the
 // heap is saved as the blob when the loop ends; a start from the blob runs

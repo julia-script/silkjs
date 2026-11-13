@@ -45,7 +45,7 @@ function emit(port, type, data, ports) {
   const value = state(port);
   value.resource.runInAsyncScope(() => {
     if (value.realm) {
-      value.realm.deliver(port, type, data);
+      value.realm.deliver(port, type, data, ports);
       retain(port);
       return;
     }
@@ -299,6 +299,7 @@ function moveMessagePortToContext(port, context) {
     const handlers = new WeakMap();
     const errorHandlers = new WeakMap();
     const tag = Function.call.bind(Object.prototype.toString);
+    const apply = Reflect.apply;
     const prototypes = { Object: Object.prototype, Array: Array.prototype,
       Map: Map.prototype, Set: Set.prototype, Date: Date.prototype, RegExp: RegExp.prototype,
       ArrayBuffer: ArrayBuffer.prototype, SharedArrayBuffer: SharedArrayBuffer.prototype,
@@ -332,9 +333,13 @@ function moveMessagePortToContext(port, context) {
         Object.defineProperty(port, Symbol.toStringTag, { value: 'MessagePort' });
         return port;
       },
-      deliver(port, type, data) {
-        if (type === 'message') handlers.get(port)?.call(port, { data });
-        else if (type === 'messageerror') errorHandlers.get(port)?.call(port, { data });
+      // MessagePort::OnMessage: the context's own emitMessage, with the ports in an
+      // array of the context.
+      deliver(port, type, data, ports) {
+        if (type !== 'message' && type !== 'messageerror') return;
+        const list = [];
+        for (let index = 0; ports !== undefined && index < ports.length; index++) list[index] = ports[index];
+        apply(this.emitMessage(), port, [data, list, type]);
       }
     };
   })()`, context);
@@ -342,6 +347,7 @@ function moveMessagePortToContext(port, context) {
   // per-context exports), which the context compiles the first time one is thrown.
   const { realmRequire } = require('internal/vm').contextData(context);
   realm.DOMException = () => realmRequire('internal/per_context/domexception').DOMException;
+  realm.emitMessage = () => realmRequire('internal/per_context/messageport').emitMessage;
   // Creating a wrapper can throw; retain the old endpoint until it succeeds.
   const moved = wrap(endpoint, realm);
   dispose(port, false);

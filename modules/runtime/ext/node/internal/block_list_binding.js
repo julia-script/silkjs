@@ -13,22 +13,29 @@ const {
   AtomicsStore,
   AtomicsSub,
   AtomicsWait,
+  Error,
   Int32Array,
   NumberPrototypeToString,
-  ObjectGetOwnPropertyDescriptor,
   ReflectApply,
-  SharedArrayBuffer,
   StringPrototypeCharCodeAt,
   StringPrototypeIndexOf,
   TypedArrayPrototypeCopyWithin,
   TypedArrayPrototypeSlice,
   Uint8Array,
 } = require('internal/per_context/primordials');
-// primordials has no SharedArrayBuffer methods (nor has Node's).
-const sharedByteLength = ObjectGetOwnPropertyDescriptor(SharedArrayBuffer.prototype, 'byteLength').get;
-const sharedGrow = SharedArrayBuffer.prototype.grow;
+// primordials has no SharedArrayBuffer (nor has Node's): the ones bootstrap kept.
+const {
+  SharedArrayBuffer,
+  sharedArrayBufferByteLength: sharedByteLength,
+  sharedArrayBufferGrow: sharedGrow,
+} = require('internal/host');
 const { markTransferMode, kClone, kDeserialize } = require('internal/worker/js_transferable');
-const { codes: { ERR_INVALID_ADDRESS } } = require('internal/errors');
+// node_errors.h THROW_ERR_INVALID_ADDRESS: a plain Error with its code as an own property.
+function invalidAddress() {
+  const error = new Error('Invalid socket address');
+  error.code = 'ERR_INVALID_ADDRESS';
+  return error;
+}
 
 // The platform's address family numbers (sys/socket.h).
 const AF_INET = 2;
@@ -194,7 +201,7 @@ class SocketAddress {
     if (address === undefined) return;
     const family = type === AF_INET ? 4 : 6;
     const bytes = parseAddress(`${address}`, family);
-    if (bytes === null) throw new ERR_INVALID_ADDRESS();
+    if (bytes === null) throw invalidAddress();
     this.#family = family;
     this.#bytes = bytes;
     this.#port = port & 0xffff;
