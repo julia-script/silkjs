@@ -314,7 +314,9 @@ function SecureContext(secureProtocol, secureOptions, minVersion, maxVersion) {
     if (maxVersion != null) throw new codes.ERR_TLS_PROTOCOL_VERSION_CONFLICT(maxVersion, secureProtocol);
   }
   const tls = require('tls');
-  this.context = new NativeSecureContext();
+  // internalBinding('crypto').SecureContext read here, so a replaced class takes effect.
+  const { SecureContext: BindingSecureContext } = require('internal/crypto/binding');
+  this.context = new BindingSecureContext();
   this.context.init(secureProtocol, toV('minimum', minVersion, tls.DEFAULT_MIN_VERSION), toV('maximum', maxVersion, tls.DEFAULT_MAX_VERSION));
   if (secureOptions) {
     validateInteger(secureOptions, 'secureOptions');
