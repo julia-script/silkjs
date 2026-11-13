@@ -14,6 +14,7 @@ silk run -- install                 # install the package.json of the working di
 |---|---|
 | `pm install` | Installs what `package.json` lists. The lockfile decides the versions while it matches. |
 | `pm install --frozen-lockfile`, `pm ci` | The same, and fails when the lockfile is missing or out of date. |
+| `pm install --filter <name>` | Installs for one package of the workspace. `--filter <name>...` adds the packages of the workspace it depends on. The flag can be repeated. |
 | `pm add <name>[@range or tag]...` | Adds dependencies and installs them. `-D` for development, `-O` for optional, `-E` for an exact version. |
 | `pm remove <name>...` | Takes dependencies out and removes what nothing needs any more. |
 | `pm update [name]...` | Moves the named packages, or all, to the newest versions the ranges allow. |
@@ -87,6 +88,13 @@ project on `PATH` and the `npm_lifecycle_event`, `npm_package_name`, `npm_packag
 script that fails stops the install with the end of what it wrote, and the next install tries
 again.
 
+A repository holds sources where a registry holds what was built from them, and `prepare` is
+the script that builds. So a dependency that is a repository and has a `prepare` script is
+built when `allowBuilds` names it: its files are put in a directory of the store, an install
+there brings its development dependencies and runs its install scripts and `prepare`, and the
+files that are there then are the package. The build is kept in the store and happens once per
+commit. A repository that is not allowed is installed as it is, and listed.
+
 The `preinstall`, `install`, `postinstall` and `prepare` scripts of the project's own packages
 are the project's own commands and need no allowing. They run at the end of every install, in
 that order, a package after the packages of the workspace it depends on and the root project
@@ -143,6 +151,10 @@ list under `packages`. The packages are installed together:
 - Every command works from the directory of any package and installs for the whole workspace.
   `add`, `remove`, `run` and `exec` work on the package they are run in; `--filter <name>`
   (`-F`) picks another one by name, and `-w` the root project.
+- `install --filter <name>` makes the `node_modules` of that package alone and fetches only
+  what it uses, which is what the image of one service wants. A package of the workspace it
+  depends on is linked, and gets its own dependencies when the filter is `<name>...`. The
+  lockfile always covers the whole workspace, and the other packages keep what they have.
 - `.npmrc` is read from the home directory, then the root of the workspace, then the working
   directory.
 
