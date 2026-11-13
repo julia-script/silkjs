@@ -53,6 +53,11 @@ class BlobReader {
       require('fs').closeSync(fd);
     }
   }
+  // What is left of the part the next read starts in, past any empty parts.
+  partRemaining() {
+    while (this.index < this.parts.length && this.parts[this.index].byteLength === this.offset) { this.index++; this.offset = 0; }
+    return this.index < this.parts.length ? this.parts[this.index].byteLength - this.offset : 0;
+  }
   read(target) {
     let written = 0;
     try {
@@ -190,33 +195,37 @@ class Blob {
   async text() {
     return new TextDecoder().decode(copyBytes(state(this)));
   }
-  stream() {
-    const source = state(this);
-    const reader = new BlobReader(source);
-    let remaining = source.size;
-    return new ReadableStream({
-      type: 'bytes',
-      pull(controller) {
-        const request = controller.byobRequest;
-        if (remaining === 0) {
-          reader.read(new Uint8Array(0));
-          reader.close();
-          controller.close();
-          if (request) request.respond(0);
-          return;
-        }
-        const target = request
-          ? new Uint8Array(request.view.buffer, request.view.byteOffset, request.view.byteLength)
-          : new Uint8Array(Math.min(65536, remaining));
-        const written = reader.read(target);
-        remaining -= written;
-        if (request) request.respond(written);
-        else controller.enqueue(target);
-        if (remaining === 0) { reader.close(); controller.close(); }
-      },
-      cancel() { reader.close(); },
-    });
+  // The blob's text as it decodes, chunk by chunk.
+  textStream() {
+    return blobStream(state(this)).pipeThrough(new (require('internal/webstreams/encoding').TextDecoderStream)());
   }
+  stream() {
+    return blobStream(state(this));
+  }
+}
+// The bytes of a blob, as a byte stream that reads them as it is pulled.
+function blobStream(source) {
+  const reader = new BlobReader(source);
+  let remaining = source.size;
+  return new ReadableStream({
+    type: 'bytes',
+    // As Node's blob reader stream: each pull enqueues the next part (at most 64 KiB of
+    // it), which also fills a BYOB reader's view.
+    pull(controller) {
+      if (remaining === 0) {
+        reader.read(new Uint8Array(0));
+        reader.close();
+        controller.close();
+        controller.byobRequest?.respond(0);
+        return;
+      }
+      const chunk = new Uint8Array(Math.min(65536, reader.partRemaining()));
+      remaining -= reader.read(chunk);
+      controller.enqueue(chunk);
+      if (remaining === 0) { reader.close(); controller.close(); }
+    },
+    cancel() { reader.close(); },
+  });
 }
 
 class File extends Blob {
