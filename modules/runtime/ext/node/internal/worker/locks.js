@@ -93,6 +93,7 @@ class LockManager {
     if (signal && (steal || ifAvailable)) throw unsupported('signal cannot be used with steal or ifAvailable');
     if (startChannel.hasSubscribers) startChannel.publish({ name, mode });
     return new Promise((resolve, reject) => {
+      host.workerActivity = true;
       const id = host.workerNative('lockRequest', [name, mode === 'shared', steal, ifAvailable]);
       const request = { id, name, mode, ifAvailable, steal, callback, signal, resolve, reject, started: false, finished: false, abort: undefined };
       requests.set(id, request);

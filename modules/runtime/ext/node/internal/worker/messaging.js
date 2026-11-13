@@ -19,6 +19,7 @@ async function postMessageToThread(destination, value, transferList, timeout) {
     if (Number.isNaN(timeout) || timeout < 0) throw clone.codedError('ERR_OUT_OF_RANGE', 'The timeout argument must be >= 0', RangeError);
   }
   if (destination === threadId) throw failure('SAME_THREAD');
+  host.workerActivity = true;
   const route = host.workerNative('routeChannel', [destination]);
   if (route === null) {
     // A worker sends through a transport even for an unknown destination; main

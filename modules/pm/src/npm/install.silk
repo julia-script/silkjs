@@ -11,6 +11,12 @@
 //! has a `node_modules` of its own with links into it, and a link to the directory of every
 //! other package of the workspace it depends on.
 //!
+//! A package whose install scripts the root project allows, by naming it in `allowBuilds` of its
+//! `package.json`, is copied from the store and not linked, so its scripts change the project's
+//! copy alone. The scripts run once everything is linked, a package after its dependencies, and
+//! a `.built` file beside the `.linked` one says they are done. The scripts of any other package
+//! do not run.
+//!
 //! Tarballs are downloaded on the calling thread, a window at a time, and checked and unpacked
 //! on the threads of a pool while the next window downloads. A [`Downloader`] that is given to
 //! the resolution starts on them before the graph is complete.
@@ -25,11 +31,13 @@ import silk.core.effect { Effect }
 import silk.core.option { Option }
 import silk.core.result { Result }
 import silk.platform.native.file { NativeFile, NativeFileError }
+import silk.system.child_process { ChildProcess }
 import npm.manifest { Manifest }
 import npm.registry { Fetched, Registry, RegistryError }
 import npm.resolve { Graph, Host, Tarballs }
+import npm.scripts { Runner, ScriptError }
 import npm.workspace { Workspace }
-import pkg.files { Listed, linkFile, linkTo, list, makeDirectories, readOptional, removeTree, writeFile }
+import pkg.files { Listed, copyFile, linkFile, linkTo, list, makeDirectories, readOptional, removeTree, writeFile }
 import pkg.integrity { Integrity }
 import pkg.names { Names }
 import pkg.store { PackageFiles, Store, StoreError }
@@ -37,6 +45,9 @@ import pkg.text { compare, same, startsWith }
 
 /// The hidden directory in `node_modules` that holds the packages.
 pub const VIRTUAL_STORE: &'static [u8] = b".sjs"
+
+/// The file in the directory of a package that says its install scripts ran.
+pub const BUILT: &'static [u8] = b".built"
 
 /// How many tarballs are held in memory at once.
 const BATCH: usize = 96
@@ -57,6 +68,11 @@ pub struct Summary {
   pub downloaded: usize,
   /// How many package directories were made, the others being in place already.
   pub linked: usize,
+  /// How many packages ran their install scripts.
+  pub built: usize,
+  /// The packages put in place now whose install scripts did not run because `allowBuilds`
+  /// does not name them, a line each: `name@version`.
+  pub blocked: Bytes,
 }
 
 effect fn stop(message: string<'static>, subject: &[u8]) -> never ! InstallError | OutOfMemoryError ? &mut Allocator {
@@ -399,7 +415,8 @@ effect fn io<T>(outcome: Result<T, NativeFileError>, path: &[u8]) -> T ! Install
 }
 
 // Links the files of one node into its directory, and its dependencies beside it.
-effect fn place(graph: &Graph, store: &Store, host: Host, virtual: &[u8], node: usize, files: &PackageFiles) -> ()
+// With `copies` the files are copies, for a package whose scripts may write to them.
+effect fn place(graph: &Graph, store: &Store, host: Host, virtual: &[u8], node: usize, files: &PackageFiles, copies: bool) -> ()
   ! InstallError | OutOfMemoryError ? &mut Allocator {
   let index = Graph.nodePackage(graph, node)
   let manifest = &Graph.package(graph, index).manifest
@@ -430,7 +447,11 @@ effect fn place(graph: &Graph, store: &Store, host: Host, virtual: &[u8], node: 
     let source = run Store.filePath(store, &entry.key, executable)
     Bytes.truncate(&mut home, base)
     run home.append(name)
-    run io<()>(run Effect.result(linkFile(Bytes.asSlice(&source), Bytes.asSlice(&home))), Bytes.asSlice(&home))
+    if copies {
+      run io<()>(run Effect.result(copyFile(Bytes.asSlice(&source), Bytes.asSlice(&home))), Bytes.asSlice(&home))
+    } else {
+      run io<()>(run Effect.result(linkFile(Bytes.asSlice(&source), Bytes.asSlice(&home))), Bytes.asSlice(&home))
+    }
     each = each + 1
   }
 
@@ -747,18 +768,101 @@ effect fn prune(graph: &Graph, host: Host, virtual: &[u8]) -> () ! InstallError 
   }
 }
 
+// Puts node `node` and then, first, the nodes it depends on at the end of `order`, when they
+// are among `wanted` and not there yet.
+effect fn arrange(graph: &Graph, node: usize, wanted: &[bool], seen: &mut [bool], order: &mut List<usize>) -> () ! OutOfMemoryError ? &mut Allocator {
+  if seen[node] {
+    return ()
+  }
+  seen[node] = true
+  let edges = Graph.nodeEdges(graph, node)
+  let mut each: usize = 0
+  while each < edges.length {
+    run arrange(graph, edges[each].target, wanted, &mut seen, &mut order)
+    each = each + 1
+  }
+  if wanted[node] {
+    run order.append(node)
+  }
+}
+
+// Runs the install scripts of the nodes marked in `wanted`, dependencies first, and marks each
+// as built. Returns how many were built.
+effect fn build(workspace: &Workspace, graph: &Graph, store: &Store, host: Host, virtual: &[u8], wanted: &[bool]) -> usize
+  ! InstallError | OutOfMemoryError ? &mut ChildProcess | &mut Allocator {
+  let mut seen = List<bool>.make()
+  let mut order = List<usize>.make()
+  let mut node: usize = 0
+  while node < wanted.length {
+    run seen.append(false)
+    node = node + 1
+  }
+  node = 0
+  while node < wanted.length {
+    if wanted[node] {
+      run arrange(graph, node, wanted, List<bool>.asMutSlice(&mut seen), &mut order)
+    }
+    node = node + 1
+  }
+  let fallback = run Store.commands(store)
+  let runner = run Runner.make(Workspace.root(workspace), Workspace.root(workspace), host, Bytes.asSlice(&fallback))
+  let turns = List<usize>.asSlice(&order)
+  let mut turn: usize = 0
+  while turn < turns.length {
+    let index = turns[turn]
+    turn = turn + 1
+    let package = Graph.nodePackage(graph, index)
+    let mut home = run Bytes.copy(virtual)
+    run home.append(b"/")
+    run appendDirectory(&mut home, graph, index)
+    let mut modules = run Bytes.copy(Bytes.asSlice(&home))
+    run modules.append(b"/node_modules")
+    // The commands of its dependencies, for its scripts to call.
+    let edges = Graph.nodeEdges(graph, index)
+    let mut each: usize = 0
+    while each < edges.length {
+      let target = Graph.nodePackage(graph, edges[each].target)
+      if Graph.supports(graph, target, host) {
+        run exposeBins(Bytes.asSlice(&modules), Names.bytes(&graph.names, edges[each].alias), &Graph.package(graph, target).manifest)
+      }
+      each = each + 1
+    }
+    run pruneCommands(Bytes.asSlice(&modules))
+    let mut commands = run Bytes.copy(Bytes.asSlice(&modules))
+    run commands.append(b"/.bin")
+    run modules.append(b"/")
+    run modules.append(Graph.name(graph, package))
+    match move run Effect.result(Runner.build(&runner, Graph.name(graph, package), Graph.version(graph, package), Bytes.asSlice(&modules), Bytes.asSlice(&commands))) {
+      Result.Success {..} => {}
+      Result.Failure { error } => match move error {
+        ScriptError failed => { fail InstallError { message: failed.message, subject: move failed.subject } }
+        OutOfMemoryError exhausted => { fail move exhausted }
+      }
+    }
+    run home.append(b"/")
+    run home.append(BUILT)
+    run mark(Bytes.asSlice(&home), b"")
+  }
+  return turns.length
+}
+
 /// Installs `graph`, the resolution of `workspace`, into the directories of the workspace.
 /// `downloader` names the store and the host, and may have fetched packages of `graph` during
 /// its resolution already; the others are fetched now. Packages that are not for the host are
-/// left out.
+/// left out. The install scripts of the packages that `allowBuilds` of the root project allows
+/// run at the end.
 ///
 /// # Errors
 ///
-/// - [`InstallError`] when a package cannot be downloaded or does not match its digest, or when
-///   the store or `node_modules` cannot be written.
+/// - [`InstallError`] when a package cannot be downloaded or does not match its digest, when
+///   the store or `node_modules` cannot be written, or when an install script fails.
 pub effect fn install(workspace: &Workspace, graph: &Graph, downloader: Downloader<'_>) -> Summary
-  ! InstallError | OutOfMemoryError ? &mut Registry | &mut Allocator {
-  let mut summary = Summary { packages: 0, downloaded: 0, linked: 0 }
+  ! InstallError | OutOfMemoryError ? &mut Registry | &mut ChildProcess | &mut Allocator {
+  let mut summary = Summary { packages: 0, downloaded: 0, linked: 0, built: 0, blocked: Bytes.make() }
+  let rules = &Workspace.all(workspace)[0].manifest
+  // Per node: whether its install scripts are to run.
+  let mut building = List<bool>.make()
+  let mut builds = false
   let mut fetcher = move downloader
   let store = fetcher.store
   let host = fetcher.host
@@ -781,11 +885,21 @@ pub effect fn install(workspace: &Workspace, graph: &Graph, downloader: Download
   let mut index: usize = 0
   while index < Graph.nodeCount(graph) {
     let package = Graph.nodePackage(graph, index)
+    run building.append(false)
     if Graph.supports(graph, package, host) == false {
       index = index + 1
       continue
     }
     summary.packages = summary.packages + 1
+    let rule = if Graph.package(graph, package).manifest.hasInstallScript {
+      Manifest.buildRule(rules, Graph.name(graph, package), Graph.version(graph, package))
+    } else {
+      Option<bool>.some(false)
+    }
+    let allowed = match rule {
+      Option.Some { value } => value
+      Option.None => false
+    }
     // A package directory is complete when its marker is there and names the dependencies the
     // graph gives the package now; the marker is written last.
     let mut home = run Bytes.copy(Bytes.asSlice(&virtual))
@@ -794,9 +908,21 @@ pub effect fn install(workspace: &Workspace, graph: &Graph, downloader: Download
     let mut marker = run Bytes.copy(Bytes.asSlice(&home))
     run marker.append(b"/.linked")
     let links = run linksOf(graph, host, index)
+    let mut unbuilt = false
+    if allowed {
+      let mut built = run Bytes.copy(Bytes.asSlice(&home))
+      run built.append(b"/")
+      run built.append(BUILT)
+      unbuilt = Option.isSome(&run readOptional(Bytes.asSlice(&built))) == false
+    }
     let done = match move run readOptional(Bytes.asSlice(&marker)) {
       Option.Some { value: found } => {
-        if same(Bytes.asSlice(&found), Bytes.asSlice(&links)) {
+        if unbuilt {
+          // In place as links to the store, or left by scripts that failed: it starts again
+          // from copies.
+          run clear(Bytes.asSlice(&home))
+          false
+        } else if same(Bytes.asSlice(&found), Bytes.asSlice(&links)) {
           true
         } else {
           // Linked for another graph: the dependencies beside the package are not these.
@@ -809,11 +935,21 @@ pub effect fn install(workspace: &Workspace, graph: &Graph, downloader: Download
     }
     if done == false {
       match &all[package] {
-        Option.Some { value: found } => { run place(graph, store, host, Bytes.asSlice(&virtual), index, &found) }
+        Option.Some { value: found } => { run place(graph, store, host, Bytes.asSlice(&virtual), index, &found, allowed) }
         Option.None => { run stopAt("the store has no files for", graph, package) }
       }
       run mark(Bytes.asSlice(&marker), Bytes.asSlice(&links))
       summary.linked = summary.linked + 1
+      if Option.isSome(&rule) == false {
+        run summary.blocked.append(Graph.name(graph, package))
+        run summary.blocked.append(b"@")
+        run summary.blocked.append(Graph.version(graph, package))
+        run summary.blocked.append(b"\n")
+      }
+    }
+    if unbuilt {
+      List<bool>.set(&mut building, index, true)
+      builds = true
     }
     index = index + 1
   }
@@ -830,6 +966,9 @@ pub effect fn install(workspace: &Workspace, graph: &Graph, downloader: Download
     run expose(workspace, graph, host, importer, Bytes.asSlice(&own))
     run pruneCommands(Bytes.asSlice(&own))
     importer = importer + 1
+  }
+  if builds {
+    summary.built = run build(workspace, graph, store, host, Bytes.asSlice(&virtual), List<bool>.asSlice(&building))
   }
   return move summary
 }
