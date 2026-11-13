@@ -231,6 +231,18 @@ function dispatch(session, method, params = {}) {
       cpuOwner = undefined; current.cpu = false;
       return { profile: parse(host.cpuProfileStop(), 'No CPU profile is active') };
     }
+    // V8ProfilerAgentImpl's precise coverage, over internalBinding('profiler')'s counts.
+    case 'Profiler.startPreciseCoverage':
+      if (!current.cpuEnabled) throw protocolError(-32000, 'Profiler is not enabled');
+      coverage().startPreciseCoverage(session, params.callCount === true, params.detailed === true);
+      return { timestamp: coverageTimestamp() };
+    case 'Profiler.takePreciseCoverage': {
+      const result = coverage().takePreciseCoverage(session);
+      if (result === undefined) throw protocolError(-32000, 'Precise coverage has not been started.');
+      return { result, timestamp: coverageTimestamp() };
+    }
+    case 'Profiler.stopPreciseCoverage': coverage().stopPreciseCoverage(session); return {};
+    case 'Profiler.getBestEffortCoverage': return { result: coverage().bestEffortCoverage() };
     case 'HeapProfiler.startSampling': return startAllocation(session, params);
     case 'HeapProfiler.getSamplingProfile': {
       if (allocationOwner !== session || !current.sampling) throw protocolError(-32000, 'No allocation sampling profile is active');
@@ -285,7 +297,11 @@ function dispatch(session, method, params = {}) {
     default: throw unknown(method);
   }
 }
+// V8's monotonic clock in seconds.
+function coverageTimestamp() { return require('perf_hooks').performance.now() / 1000; }
+function coverage() { return require('internal/profiler_binding'); }
 function close(session) {
+  coverage().stopPreciseCoverage(session);
   if (cpuOwner === session) { host.cpuProfileStop(); cpuOwner = undefined; }
   if (allocationOwner === session) { host.allocationProfileStop(); allocationOwner = undefined; }
   const current = states.get(session);
