@@ -11,7 +11,7 @@ import silk.mem.layout { Layout }
 import js_heap_snapshot_graph { Graph, Strength }
 import runtime_memory { AllocationObserver }
 import js_heap { HeapCell, HeapHeader, HeapKind, CellRef }
-import js_core_types { ObjectData, ObjectPayload, ObjectPayloadFamily,
+import js_core_types { ObjectData, ObjectPayload, ObjectPayloadFamily, NativeCapturedValues,
   NativeFunctionId, HeapList, FrameSlots, JobEntry }
 import js_value { ValueBits }
 import js_intl_realm as ops
@@ -164,11 +164,26 @@ fn resolvingPromise<'b>(resolve: ValueRef<'b>) -> ValueRef<'b> {
   drop data
   return unsafe lendFor<'b>(promise)
 }
-/// V8's async stack trace step (CaptureAsyncStackTrace): when the only reaction on
-/// the promise `resolve` settles is an await in another async function, that
-/// function's AsyncFrame; null otherwise. Reads engine records only, no user code.
-pub unsafe fn awaitingFunction<'b>(resolve: ValueRef<'b>) -> ?*mut HeapHeader {
-  let record = match Record<'b>.find(resolvingPromise(resolve)) {
+/// The promise a resolve or reject function of a resolving pair settles, or undefined for
+/// any other value.
+pub fn settledBy<'b>(function: ValueRef<'b>) -> ValueRef<'b> {
+  if !function.view().isObject() { return immediateRef(ValueBits.Undefined) }
+  let anchor = ()
+  let object = ObjectRef.of(function).data(&anchor)
+  let classId = object.classId()
+  if classId != classes.JS_CLASS_PROMISE_RESOLVE_FUNCTION && classId != classes.JS_CLASS_PROMISE_REJECT_FUNCTION { return immediateRef(ValueBits.Undefined) }
+  drop object
+  let reference = match Pointer.nonNullMut<HeapHeader>(storageOf(function)) {
+    Option<*mut HeapHeader>.Some { value } => value _ => { return immediateRef(ValueBits.Undefined) }
+  }
+  let data = unsafe HeapCell.payload<Resolving, ()>(&anchor, reference)
+  let promise = data.promise.view()
+  drop data
+  return unsafe lendFor<'b>(promise)
+}
+/// The one reaction job of a pending promise, or null when it has none or several.
+unsafe fn onlyReaction<'b>(promise: ValueRef<'b>) -> ?*mut HeapHeader {
+  let record = match Record<'b>.find(promise) {
     Option<Record<'b>>.Some { value } => value
     Option<Record<'b>>.None => { return Pointer.null<HeapHeader>() }
   }
@@ -180,16 +195,96 @@ pub unsafe fn awaitingFunction<'b>(resolve: ValueRef<'b>) -> ?*mut HeapHeader {
   }
   drop data
   if !Pointer.isNull<HeapHeader>(unsafe HeapCell.nextLinked(job)) { return Pointer.null<HeapHeader>() }
+  return job
+}
+/// A reaction job's fulfill (0) or reject (1) handler, or undefined.
+unsafe fn reactionHandler(job: *mut HeapHeader, which: usize) -> ValueBits {
+  let anchor = ()
   let entry = unsafe HeapCell.payload<JobEntry, ()>(&anchor, job)
-  if entry.arguments.length() < 3 { return Pointer.null<HeapHeader>() }
-  let handler = entry.arguments.get(2) drop entry
+  if entry.arguments.length() < 4 { return ValueBits.Undefined }
+  return entry.arguments.get(2 + which)
+}
+/// V8's async stack trace step (CaptureAsyncStackTrace): when the only reaction on
+/// `promise` is an await in another async function, that function's AsyncFrame node
+/// (still suspended at that await), else null.
+pub unsafe fn awaitingFunction<'b>(promise: ValueRef<'b>) -> ?*mut HeapHeader {
+  let job = match Pointer.nonNullMut<HeapHeader>(unsafe onlyReaction(promise)) {
+    Option<*mut HeapHeader>.Some { value } => value
+    _ => { return Pointer.null<HeapHeader>() }
+  }
+  let handler = unsafe reactionHandler(job, 0)
   let reference = match handler { ValueBits.Object { reference } => reference _ => { return Pointer.null<HeapHeader>() } }
+  let anchor = ()
   let object = unsafe HeapCell.payload<ObjectData, ()>(&anchor, reference)
   if object.classId() != classes.JS_CLASS_ASYNC_FUNCTION_RESOLVE { return Pointer.null<HeapHeader>() }
   return match &object.payload {
     ObjectPayload.Opaque { reference: node, .. } => node
     _ => Pointer.null<HeapHeader>()
   }
+}
+/// The promise V8's async stack trace moves on to from `promise` when no async function
+/// awaits it and no combinator waits on it: the promise its only reaction's fulfill handler
+/// settles when that handler is a resolve function (as Promise.race passes it), else the
+/// promise that reaction settles (a `then` chain). Undefined when there is none.
+pub unsafe fn chainedPromise<'b>(promise: ValueRef<'b>) -> ValueBits {
+  let job = match Pointer.nonNullMut<HeapHeader>(unsafe onlyReaction(promise)) {
+    Option<*mut HeapHeader>.Some { value } => value
+    _ => { return ValueBits.Undefined }
+  }
+  let anchor = ()
+  let handler = unsafe reactionHandler(job, 0)
+  let settled = settledBy(unsafe lendBits(&anchor, handler)).view()
+  if settled.isObject() { return settled }
+  let entry = unsafe HeapCell.payload<JobEntry, ()>(&anchor, job)
+  if entry.arguments.length() < 1 { return ValueBits.Undefined }
+  let resolve = entry.arguments.get(0) drop entry
+  return settledBy(unsafe lendBits(&anchor, resolve)).view()
+}
+/// Promise.all, Promise.allSettled or Promise.any waiting on a promise: which one
+/// (COMBINATOR_ALL, COMBINATOR_ALL_SETTLED, COMBINATOR_ANY), the element's index, and
+/// the promise the combinator returned.
+pub struct CombinatorStep { pub combinator: i32, pub index: i32, pub combined: ValueBits }
+impl Copy for CombinatorStep {}
+pub const COMBINATOR_ALL: i32 = 0
+pub const COMBINATOR_ALL_SETTLED: i32 = 1
+pub const COMBINATOR_ANY: i32 = 2
+/// V8's async stack trace step through a promise combinator (CaptureAsyncStackTrace's
+/// IsPromiseAllResolveElementFunction and kin): when the only reaction on `promise` is a
+/// Promise.all or Promise.allSettled element function, or a Promise.any reject element,
+/// the combinator step it stands for.
+pub unsafe fn combinatorStep<'b>(promise: ValueRef<'b>) -> Option<CombinatorStep> {
+  let job = match Pointer.nonNullMut<HeapHeader>(unsafe onlyReaction(promise)) {
+    Option<*mut HeapHeader>.Some { value } => value
+    _ => { return Option<CombinatorStep>.none() }
+  }
+  let mut which: usize = 0
+  while which < 2 {
+    let handler = unsafe reactionHandler(job, which)
+    which = which + 1
+    let reference = match handler { ValueBits.Object { reference } => reference _ => { continue } }
+    let anchor = ()
+    let object = unsafe HeapCell.payload<ObjectData, ()>(&anchor, reference)
+    let mut combinator: i32 = -1
+    let mut cell = Pointer.null<HeapHeader>()
+    match &object.payload {
+      ObjectPayload.NativeFunction { function: native } => {
+        let element = match callbacks.method(native.function) { Option<u32>.Some { value } => value == callbacks.ALL_ELEMENT _ => false }
+        // The element's magic: 0 Promise.all, 1 and 5 Promise.allSettled, 2 Promise.any.
+        if element && native.isDataFunction() { combinator = native.magic() & 3 cell = native.captured() }
+      }
+      _ => ()
+    }
+    drop object
+    if combinator < 0 { continue }
+    let captured = match Pointer.nonNullMut<HeapHeader>(cell) { Option<*mut HeapHeader>.Some { value } => value _ => { continue } }
+    let values = unsafe HeapCell.payload<NativeCapturedValues, ()>(&anchor, captured)
+    // [called, index, values, the capability's resolve (reject for Promise.any), remaining]
+    if values.values.length() < 4 { continue }
+    let index = match values.values.get(1) { ValueBits.Int { value } => value _ => { continue } }
+    let combined = settledBy(unsafe lendBits(&anchor, values.values.get(3))).view()
+    return Option<CombinatorStep>.some(CombinatorStep { combinator: combinator, index: index, combined: combined })
+  }
+  return Option<CombinatorStep>.none()
 }
 /// A lent view of a Promise object's settlement record, valid while the promise lives.
 struct Record<'a> { node: CellRef<Data> }
