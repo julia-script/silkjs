@@ -57,13 +57,15 @@ class TLSTransport {
       try { native('feed', this.id, chunk); } catch (err) { this.fail(err); return; }
       this.pump();
     });
-    // As TLSWrap reads its parent's StreamBase, an owned carrier's native handle hands the
+    // As TLSWrap reads its parent's StreamBase, a carrier socket's handle hands the
     // ciphertext to the session directly (the handle's consumer, as an HTTP parser that
-    // consumes a socket): no Readable push and 'data' emit for each record. The end of the
-    // stream and read errors still take the carrier's read path ('end', 'error'), and so
-    // does anything the carrier read before this. A paused carrier stops the handle, which
-    // holds what it reads until it reads again.
-    const handle = owned ? carrier._handle : undefined;
+    // consumes a socket): no Readable push and 'data' emit for each record, and a socket
+    // the program gave (tls.connect({ socket }), a server's 'connection' event) no longer
+    // sees what the session reads, as when Node's _wrapHandle takes its handle. The end of
+    // the stream and read errors still take the carrier's read path ('end', 'error'), and
+    // so does anything the carrier read before this. A paused carrier stops the handle,
+    // which holds what it reads until it reads again.
+    const handle = carrier._handle;
     if (handle && isStreamHandle(handle)) {
       this.consumer = { read: (status, payload) => {
         if (status < 0) return false;
