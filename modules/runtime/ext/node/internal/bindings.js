@@ -23,6 +23,8 @@ function config() {
     fipsMode: false,
     hasNodeOptions: true,
     isDebugBuild: false,
+    // node_config.cc GetDefaultLocale: the locale Intl falls back to (ICU's default there).
+    getDefaultLocale() { return new Intl.DateTimeFormat().resolvedOptions().locale; },
   };
 }
 
@@ -142,11 +144,15 @@ function internalBinding(module) {
 }
 
 // realm.js: the internal bindings process.binding hands out as they are.
-const processBindingAllowList = new Set([
-  'buffer', 'cares_wrap', 'config', 'constants', 'contextify', 'fs', 'fs_event_wrap', 'icu', 'inspector',
-  'js_stream', 'os', 'pipe_wrap', 'process_wrap', 'spawn_sync', 'stream_wrap', 'tcp_wrap', 'tls_wrap',
-  'tty_wrap', 'udp_wrap', 'uv', 'zlib',
-]);
+// Filled by index: this module loads on first use, after user code may have
+// replaced %Array.prototype%[@@iterator], which new Set(array) would call.
+const processBindingAllowList = new Set();
+{
+  const names = ['buffer', 'cares_wrap', 'config', 'constants', 'contextify', 'fs', 'fs_event_wrap', 'icu', 'inspector',
+    'js_stream', 'os', 'pipe_wrap', 'process_wrap', 'spawn_sync', 'stream_wrap', 'tcp_wrap', 'tls_wrap',
+    'tty_wrap', 'udp_wrap', 'uv', 'zlib'];
+  for (let i = 0; i < names.length; i++) processBindingAllowList.add(names[i]);
+}
 const legacyWrapperList = new Set(['natives', 'util']);
 // lib/internal/legacy/processbinding.js: a new object on each call.
 const kUtilTypes = ['isArrayBuffer', 'isArrayBufferView', 'isAsyncFunction', 'isDataView', 'isDate',

@@ -37,10 +37,20 @@ import js_promise_callbacks as callbacks
 import js_invariant { invariant }
 
 pub interface PromiseHooks {
-  /// Both Values and opaque are borrowed. The callback may reenter the engine.
+  /// Both Values and opaque are borrowed. The callback may reenter the engine. `event` is one
+  /// of the PROMISE_* events below (V8's PromiseRejectEvent); for the after-resolved events
+  /// `reason` is the value passed to the resolving function.
   unsafe effect fn promiseRejection<'r, 'v, 'w>(self: &mut Self, realm: Realm<'r>,
-    callback: NativeFunctionId, promise: ValueRef<'v>, reason: ValueRef<'w>, handled: bool, opaque: ?*mut u8) -> () ? &mut Allocator
+    callback: NativeFunctionId, promise: ValueRef<'v>, reason: ValueRef<'w>, event: u32, opaque: ?*mut u8) -> () ? &mut Allocator
 }
+/// A promise was rejected while it had no handler.
+pub const PROMISE_REJECT_WITH_NO_HANDLER: u32 = 0
+/// A handler was added to a promise rejected without one.
+pub const PROMISE_HANDLER_ADDED_AFTER_REJECT: u32 = 1
+/// A resolving function rejected a promise that was already resolved.
+pub const PROMISE_REJECT_AFTER_RESOLVED: u32 = 2
+/// A resolving function resolved a promise that was already resolved.
+pub const PROMISE_RESOLVE_AFTER_RESOLVED: u32 = 3
 pub const PENDING: i32 = 0
 pub const FULFILLED: i32 = 1
 // NativeFunctionHooks supplies captured data as a borrowed writable native range.
@@ -425,18 +435,18 @@ pub unsafe fn finalizeResolving<H: HeapHooks>(hooks: &mut H, rt: *mut HeapHeader
   drop resolved
   unsafe gc.release(&mut hooks, rt, promise.intoBits()) unsafe HeapCell.destroyEmptied<Resolving>(reference)
 }
-effect fn track<'a, 'b, H: PromiseHooks>(hooks: &mut H, realm: Realm<'a>, promise: ValueRef<'b>, reason: ValueRef<'b>, handled: bool) -> () ? &mut Allocator {
+effect fn track<'a, 'b, H: PromiseHooks>(hooks: &mut H, realm: Realm<'a>, promise: ValueRef<'b>, reason: ValueRef<'b>, event: u32) -> () ? &mut Allocator {
   let anchor = () let runtimeData = realm.runtimeState(&anchor)
   let callback = match &runtimeData.promiseRejectionTracker.callback { Option<NativeFunctionId>.Some { value } => value _ => { return } }
   let opaque = runtimeData.promiseRejectionTracker.opaque drop runtimeData
-  run unsafe hooks.promiseRejection(realm, callback, promise, reason, handled, opaque)
+  run unsafe hooks.promiseRejection(realm, callback, promise, reason, event, opaque)
 }
 /// Marks a host-consumed Promise handled without scheduling a reaction.
 pub effect fn markHandled<'a, 'b, H: PromiseHooks>(hooks: &mut H, realm: Realm<'a>, promise: ValueRef<'b>) -> () ? &mut Allocator {
   let record = Record.of(promise)
   let notify = record.state() == REJECTED && !record.handled()
   record.setHandled()
-  if notify { run track(&mut hooks, realm, promise, record.settled(), true) }
+  if notify { run track(&mut hooks, realm, promise, record.settled(), PROMISE_HANDLER_ADDED_AFTER_REJECT) }
 }
 fn terminating<'a>(realm: Realm<'a>) -> bool {
   let anchor = () let state = realm.runtimeState(&anchor)
@@ -488,7 +498,7 @@ pub effect fn settle<'a, 'b, H: HeapHooks + CoercionHooks + PromiseHooks>(hooks:
   let record = match Record.find(promise) { Option<Record<'b>>.Some { value: found } => found _ => { return } }
   if record.state() != PENDING { return }
   record.settle(value.dup(), reject)
-  if reject && !record.handled() { run track(&mut hooks, realm, promise, value, false) }
+  if reject && !record.handled() { run track(&mut hooks, realm, promise, value, PROMISE_REJECT_WITH_NO_HANDLER) }
   while true {
     let reaction = match record.takeReaction() { Option<*mut HeapHeader>.Some { value: selected } => selected _ => { break } }
     unsafe queueReaction(&mut hooks, realm, reaction, reject, value)
@@ -519,11 +529,20 @@ pub effect fn createResolvingFunctions<'a, 'b, H: HeapHooks + CoercionHooks + Ow
   let reject = run createResolvingOne(&mut hooks, memory, realm, promise, &shared, true)
   return Capability { promise: Value.immediate(ValueBits.Undefined), resolve: move resolve, reject: move reject }
 }
+/// V8's kPromiseResolveAfterResolved and kPromiseRejectAfterResolved: a resolving function
+/// called after its promise was already resolved. Kept out of line, so the first call stays lean.
+effect fn resolvedAgain<'a, H: HeapHooks + CoercionHooks + PromiseHooks>(hooks: &mut H, realm: Realm<'a>, functionRef: ValueRef<'a>, promise: ValueBits, argumentsArgs: Arguments<'a>) -> () ? &mut Allocator {
+  let anchor = ()
+  let objectData = ObjectRef.of(functionRef).data(&anchor)
+  let reject = objectData.classId() == classes.JS_CLASS_PROMISE_REJECT_FUNCTION drop objectData
+  let mut event = PROMISE_RESOLVE_AFTER_RESOLVED if reject { event = PROMISE_REJECT_AFTER_RESOLVED }
+  run track(&mut hooks, realm, unsafe lendFor<'a>(promise), argumentsArgs.get(0), event)
+}
 pub effect fn resolvingCall<'a, H: HeapHooks + CoercionHooks + PromiseHooks>(hooks: &mut H, realm: Realm<'a>, functionRef: ValueRef<'a>, argumentsArgs: Arguments<'a>) -> ValueBits ! JsException ? &mut Allocator {
   let reference = match Pointer.nonNullMut<HeapHeader>(storageOf(functionRef)) { Option<*mut HeapHeader>.Some { value } => value _ => { return ValueBits.Undefined } }
   let anchor = () let data = unsafe HeapCell.payload<Resolving, ()>(&anchor, reference)
   let promise = data.promise.view() let first = match &data.resolved { Option<SharedResolved>.Some { value } => value.claim() _ => false } drop data
-  if !first { return ValueBits.Undefined }
+  if !first { run resolvedAgain(&mut hooks, realm, functionRef, promise, argumentsArgs) return ValueBits.Undefined }
   // The resolving function holds `promise` until it is finalized.
   let target = unsafe lendFor<'a>(promise)
   let record = Record.of(target)
@@ -650,7 +669,7 @@ pub effect fn performThen<'a, 'b, H: HeapHooks + CoercionHooks + PromiseHooks>(h
   if settled == PENDING { record.subscribe(reaction) }
   else {
     let value = record.settled()
-    if settled == REJECTED && !record.handled() { run track(&mut hooks, realm, promise, value, true) }
+    if settled == REJECTED && !record.handled() { run track(&mut hooks, realm, promise, value, PROMISE_HANDLER_ADDED_AFTER_REJECT) }
     unsafe queueReaction(&mut hooks, realm, reaction, settled == REJECTED, value)
   }
   record.setHandled()

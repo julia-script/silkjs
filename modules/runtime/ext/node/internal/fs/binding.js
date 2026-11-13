@@ -211,6 +211,10 @@ const binding = {
     };
     return same(req, 'readdir', [path, { encoding, withFileTypes: !!withTypes }], result);
   },
+  // node_file.cc InternalModuleStat, which the module loaders use to probe paths.
+  internalModuleStat(path) {
+    return require('internal/host').internalModuleStat(require('path').toNamespacedPath(`${path}`));
+  },
   // node_file.cc ReadFileUtf8: open (unless given a descriptor), read to the end, close.
   readFileUtf8(path, flags) {
     const isUserFd = typeof path === 'number';

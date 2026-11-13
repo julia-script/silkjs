@@ -52,44 +52,31 @@ let addAbortListener;
 class Interface extends _Interface {
   question(query, options = kEmptyObject) {
     return new Promise((resolve, reject) => {
-      const signal = options?.signal;
-      if (signal) {
-        validateAbortSignal(signal, 'options.signal');
-        if (signal.aborted) {
-          reject(new AbortError(undefined, { cause: signal.reason }));
-          return;
+      let cb = resolve;
+
+      if (options?.signal) {
+        validateAbortSignal(options.signal, 'options.signal');
+        if (options.signal.aborted) {
+          return reject(
+            new AbortError(undefined, { cause: options.signal.reason }));
         }
-      }
-      if (this[kQuestionCallback]) {
-        this.prompt();
-        return;
-      }
-      let disposable;
-      const cleanup = () => {
-        disposable?.[SymbolDispose]();
-        this.removeListener('close', cleanup);
-        this[kQuestionReject] = undefined;
-      };
-      if (signal) {
+
         const onAbort = () => {
-          cleanup();
           this[kQuestionCancel]();
-          reject(new AbortError(undefined, { cause: signal.reason }));
+          reject(new AbortError(undefined, { cause: options.signal.reason }));
         };
         addAbortListener ??= require('internal/path_events/abort_listener').addAbortListener;
-        disposable = addAbortListener(signal, onAbort);
-      }
-      this.once('close', cleanup);
-      this[kQuestionReject] = reject;
-      try {
-        this[kQuestion](query, (answer) => {
-          cleanup();
+        const disposable = addAbortListener(options.signal, onAbort);
+
+        cb = (answer) => {
+          disposable[SymbolDispose]();
           resolve(answer);
-        });
-      } catch (error) {
-        cleanup();
-        reject(error);
+        };
       }
+
+      this[kQuestionReject] = reject;
+
+      this[kQuestion](query, cb);
     });
   }
 }
