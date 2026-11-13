@@ -111,8 +111,87 @@ function canonicalizeIP(ip) {
 
 const finalizers = new FinalizationRegistry(id => host.net('dnsDestroy', [id]));
 
+// ares_sysconfig_files.c: the order ares_gethostbyaddr consults the hosts file ('f')
+// and DNS ('b'). resolv.conf's lookup line, then the hosts entries of nsswitch.conf,
+// netsvc.conf and svc.conf, each replacing what came before; "fb" without any.
+function configLookup(values) {
+  let order = '';
+  for (const value of values) {
+    const name = value.toLowerCase();
+    const ch = ['dns', 'bind', 'bind4', 'bind6', 'resolv', 'resolve'].includes(name) ? 'b' :
+      ['files', 'file', 'local', 'local4', 'local6'].includes(name) ? 'f' : '';
+    if (ch && !order.includes(ch)) order += ch;
+  }
+  return order;
+}
+function configLines(path) {
+  try { return host.readText(path).split('\n'); } catch { return []; }
+}
+function sysconfigLookups() {
+  let lookups = '';
+  for (const line of configLines('/etc/resolv.conf')) {
+    const text = line.trim();
+    if (text[0] === '#' || text[0] === ';') continue;
+    const match = /^(\S+)\s+(.*)$/.exec(text);
+    if (match === null || (match[1] !== 'lookup' && match[1] !== 'hostresorder')) continue;
+    const order = configLookup(match[2].trim().split(/[ \t]+/));
+    if (order) lookups = order;
+  }
+  for (const [path, separator, split] of [['/etc/nsswitch.conf', ':', /[ \t]+/],
+    ['/etc/netsvc.conf', '=', ','], ['/etc/svc.conf', '=', ',']]) {
+    for (const line of configLines(path)) {
+      if (line[0] === '#') continue;
+      const at = line.indexOf(separator);
+      if (at === -1 || line.slice(0, at).trim() !== 'hosts') continue;
+      const order = configLookup(line.slice(at + 1).trim().split(split).map(value => value.trim()));
+      if (order) lookups = order;
+    }
+  }
+  return lookups || 'fb';
+}
+
+// ares_hosts_file.c: the hosts file as c-ares reads it. A line's names join the entry of
+// an address or name already seen, so an entry holds every name of its addresses; a
+// reverse lookup answers the entry's names after the first (its hostent aliases).
+function hostsKey(text) {
+  const family = isIP(text);
+  return family === 0 ? null : canonicalizeIP(text);
+}
+function hostsFileAliases(ip, family) {
+  const key = family === 4 ? canonicalizeIP(ip) : hostsKey(ip);
+  const byAddress = new Map(), byName = new Map();
+  for (const raw of configLines('/etc/hosts')) {
+    const line = raw.trimStart();
+    if (line === '' || line[0] === '#') continue;
+    const fields = line.split(/[ \t\r\f\v]+/).filter(Boolean);
+    const comment = fields.findIndex(field => field[0] === '#');
+    if (comment !== -1) fields.length = comment;
+    const address = hostsKey(fields[0]);
+    if (address === null) continue;
+    const names = fields.slice(1).filter(name => /^[A-Za-z0-9\-._/*]+$/.test(name));
+    if (names.length === 0) continue;
+    let entry = byAddress.get(address);
+    const added = [];
+    if (entry === undefined) {
+      entry = names.map(name => byName.get(name.toLowerCase())).find(found => found !== undefined);
+      if (entry === undefined) entry = { names: [] };
+      byAddress.set(address, entry);
+    }
+    for (const name of names) {
+      const lower = name.toLowerCase();
+      if (byName.has(lower)) continue;
+      entry.names.push(name);
+      added.push(lower);
+    }
+    for (const lower of added) byName.set(lower, entry);
+  }
+  const entry = byAddress.get(key);
+  return entry === undefined ? null : entry.names.slice(1, 101);
+}
+
 class ChannelWrap {
   #id;
+  #lookups;
   #pending = 0;
   constructor(timeout, tries) {
     const id = host.net('dnsCreate', [timeout, tries]);
@@ -185,7 +264,32 @@ class ChannelWrap {
     const family = isIP(ip);
     // GetHostByAddrWrap::Send: an address uv_inet_pton cannot read is UV_EINVAL.
     if (!family) return require('internal/uv_binding').UV_EINVAL;
-    return this._query(req, packet.reverseName(ip, family), 'PTR');
+    // ares_gethostbyaddr's next_lookup: each source in the channel's lookup order in
+    // turn. A DNS failure other than a cancel moves on to the next source; when none
+    // has the address, the query fails with ENOTFOUND.
+    this.#lookups ??= sysconfigLookups();
+    const lookups = this.#lookups;
+    const next = index => {
+      for (; index < lookups.length; index++) {
+        if (lookups[index] === 'f') {
+          const names = hostsFileAliases(ip, family);
+          // A c-ares callback made inside the call is deferred, as QueryWrap does.
+          if (names !== null) { setImmediate(() => req.oncomplete(0, names)); return; }
+          continue;
+        }
+        const at = index + 1;
+        this._query({
+          oncomplete(status, records) {
+            if (status === 0 || status === 'ECANCELLED' || status === 'EDESTRUCTION') req.oncomplete(status, records);
+            else next(at);
+          },
+        }, packet.reverseName(ip, family), 'PTR');
+        return;
+      }
+      setImmediate(() => req.oncomplete('ENOTFOUND'));
+    };
+    next(0);
+    return 0;
   }
 }
 const queries = { queryAny: 'ANY', queryA: 'A', queryAaaa: 'AAAA', queryCaa: 'CAA', queryCname: 'CNAME',
