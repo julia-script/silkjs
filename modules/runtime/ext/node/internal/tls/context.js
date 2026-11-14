@@ -105,6 +105,19 @@ function rootStore() {
   if (process.env.NODE_EXTRA_CA_CERTS) result.push(...extraCACertificates());
   return result;
 }
+// A native context that trusts the root store, kept for the process: every context
+// that takes the roots shares its parsed certificates (Node's root_cert_store).
+let rootsHeld = 0, rootsFor, rootsExtra;
+function rootContext() {
+  const extra = process.env.NODE_EXTRA_CA_CERTS;
+  if (rootsHeld !== 0 && rootsFor === userRoots && rootsExtra === extra) return rootsHeld;
+  const context = native('context');
+  try { for (const cert of rootStore()) native('ca', context, cert); }
+  catch (failure) { native('release', context); throw failure; }
+  if (rootsHeld !== 0) native('release', rootsHeld);
+  rootsFor = userRoots; rootsExtra = extra;
+  return rootsHeld = context;
+}
 function getCACertificates(type = 'default') {
   validateString(type, 'type');
   switch (type) {
@@ -235,7 +248,7 @@ class NativeSecureContext {
   // SecureContext::AddCACert: each certificate found is trusted and named to clients as an
   // acceptable CA; data with no certificate adds nothing and is no error.
   addCACert(cert) { native('clientCa', idOf(this), bytes(cert)); }
-  addRootCerts() { for (const cert of rootStore()) native('ca', idOf(this), cert); }
+  addRootCerts() { native('trustLike', idOf(this), rootContext()); }
   setAllowPartialTrustChain() { native('trustFlags', idOf(this), 0x80000); }
   addCRL(crl) {
     try { native('crl', idOf(this), bytes(crl)); }
