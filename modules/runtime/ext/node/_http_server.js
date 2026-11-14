@@ -1239,9 +1239,12 @@ function parserOnIncoming(server, socket, state, req, keepAlive) {
 
   // When we're finished writing the response, check if this is the last
   // response, if so destroy the socket.
-  res.on('finish',
-         resOnFinish.bind(undefined,
-                          req, res, socket, state, server));
+  // once, not on (Node's): the bound listener holds res, so while it stays on res
+  // the pair is a cycle that only a collection frees. Removed when it runs, the
+  // request's objects are freed by reference counts as the response ends.
+  res.once('finish',
+           resOnFinish.bind(undefined,
+                            req, res, socket, state, server));
 
   let handled = false;
 
