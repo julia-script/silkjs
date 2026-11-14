@@ -414,7 +414,9 @@ OutgoingMessage.prototype._send = function _send(data, encoding, callback, byteL
 OutgoingMessage.prototype._writeRaw = _writeRaw;
 function _writeRaw(data, encoding, callback, size) {
   const conn = this[kSocket];
-  if (conn?.destroyed) {
+  // A net socket's destroyed and writable come from its states in one call.
+  const known = conn != null ? streamHooks.socketState(conn) : -1;
+  if (known === -1 ? conn?.destroyed : known === 0) {
     // The socket was destroyed. If we're still trying to write to it,
     // then we haven't gotten the 'close' event yet.
     return false;
@@ -425,7 +427,7 @@ function _writeRaw(data, encoding, callback, size) {
     encoding = null;
   }
 
-  if (conn && conn._httpMessage === this && conn.writable) {
+  if (conn && conn._httpMessage === this && (known === -1 ? conn.writable : known === 1)) {
     // There might be pending data in the this.output buffer.
     if (this.outputData.length) {
       this._flushOutput(conn);
