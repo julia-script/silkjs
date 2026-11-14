@@ -100,6 +100,32 @@ REPLACEMENTS = {
     'for_await_of_start': ('for_await_of_start', 5, 1, 3, 'label'),
 }
 
+# Final-only opcodes over upstream numbers the final code never holds: the
+# opcode the parser view keeps there (rare: never run by the HTTP workloads or
+# Octane) is written behind OP_extended in final code, and the number holds a
+# fusion. number -> (name, size, pops, pushes, format), and the opcode moved out.
+FINAL_ONLY = {
+    # The prefix of the moved opcodes: extended, then the opcode's own number.
+    20: (('extended', 2, 0, 0, 'u8'), 'dup3'),
+    # `x || y`, `x && y`, `x ?? y`: dup, the short branch, drop, rewritten in
+    # place (js_compiler_label_support.fuseKeepBranches): the old bytes stay as
+    # padding and the displacement keeps its place. Taken, the value stays;
+    # not taken, it is dropped (pops 1, pushes 0 is the fallthrough's effect;
+    # the taken edge keeps the value).
+    26: (('if_true_keep8', 4, 1, 0, 'u16'), 'perm5'),  # dup, if_true8 d, drop
+    28: (('if_false_keep8', 4, 1, 0, 'u16'), 'swap2'),  # dup, if_false8 d, drop
+    31: (('if_not_nullish_keep8', 5, 1, 0, 'u32'), 'rot4l'),  # dup, if_not_nullish8 pad d, drop
+    # obj[k] with k a scope variable (`this[kState]`): get_scope0(_check) k, get_array_el.
+    32: (('get_scope0_el', 3, 1, 1, 'u16'), 'rot5l'),
+    # typeof x === 'string' and friends: the type's index in TYPEOF_NAMES.
+    45: (('typeof_is', 2, 1, 1, 'u8'), 'check_brand'),
+    # x === k and x !== k for an Int k in -128..127.
+    71: (('strict_eq_imm8', 2, 1, 1, 'i8'), 'get_super_value'),
+    72: (('strict_neq_imm8', 2, 1, 1, 'i8'), 'put_super_value'),
+}
+# Moved out without a fusion in their number (yet): free final numbers.
+EXTENDED_ONLY = ['using_dispose_init', 'using_dispose_merge', 'using_dispose_end']
+
 
 def literal(data):
     return 'b"' + ''.join(f'\\x{byte:02x}' for byte in data) + '"'
@@ -181,6 +207,8 @@ def main():
     lines += ['']
     lines += [f'pub const OP_{entry[1]}: u8 = {index}' for index, entry in enumerate(regular)]
     lines += [f'pub const OP_{entry[1]}: u8 = {temporary_start + index}' for index, entry in enumerate(temporary)]
+    final_names = {number: entry[0][0] for number, entry in FINAL_ONLY.items()}
+    lines += [f'pub const OP_{name}: u8 = {number}' for number, name in sorted(final_names.items())]
     lines += [f'pub const OP_COUNT: usize = {len(regular)}',
               f'pub const OP_TEMP_START: u8 = {temporary_start}',
               f'pub const OP_TEMP_END: u8 = {temporary_end}', '',
@@ -199,6 +227,11 @@ def main():
     for opcode in range(256):
         index = opcode + len(temporary) if opcode >= temporary_start else opcode
         size, pops, pushes, fmt = data[index * 4:index * 4 + 4]
+        if opcode in FINAL_ONLY:
+            name, size, pops, pushes, fmt_name = FINAL_ONLY[opcode][0]
+            fmt = format_ids[fmt_name]
+        elif regular_ids.get(entries[opcode][1]) == opcode and entries[opcode][1] in EXTENDED_ONLY:
+            size = pops = pushes = fmt = 0
         short_data.extend((size + FIELD_KEY_BYTES if opcode in keyed else size, pops, pushes, fmt))
     lines += ['/// Bytes of the inline field-cache key that final get_field, get_loc_field8,',
               '/// get_arg_field8, put_field, put_loc_field_loc8 and put_loc_field_arg8 carry',
@@ -224,12 +257,28 @@ def main():
               '}',
               '/// opcodeInfo as metadataIndex and fieldKeyed define it, from OPCODES alone.',
               'pub fn referenceOpcodeInfo(opcode: u8, short: bool) -> OpcodeInfo {',
+              '  if short && (finalOnly(opcode) || freedByExtended(opcode)) { return opcodeInfo(opcode, true) }',
               '  let index = metadataIndex(opcode, short) * 4',
               '  let mut size = OPCODES[index]',
               '  if short && fieldKeyed(opcode) { size = size + FIELD_KEY_BYTES }',
               '  return OpcodeInfo { size: size, pops: OPCODES[index + 1], pushes: OPCODES[index + 2], format: OPCODES[index + 3] }',
               '}', '']
-    emit_names(lines, [entry[1].encode() for entry in entries], 'opcodeName', 'opcode: u8, short: bool', 'metadataIndex(opcode, short)')
+
+    moved = sorted(regular_ids[entry[1]] for entry in FINAL_ONLY.values()) 
+    moved = sorted(set(moved + [regular_ids[name] for name in EXTENDED_ONLY]))
+    finals = sorted(FINAL_ONLY)
+    freed = sorted(regular_ids[name] for name in EXTENDED_ONLY)
+    def member(fn, doc, numbers):
+        return [doc, f'pub fn {fn}(opcode: u8) -> bool {{',
+                '  return ' + ' || '.join(f'opcode == {n}' for n in numbers), '}', '']
+    lines += member('movedToExtended', '/// Parser-view opcodes final code writes as OP_extended, then the opcode.', moved)
+    lines += member('finalOnly', '/// Final numbers that hold a silkjs fusion, not the parser view\'s opcode.', finals)
+    lines += member('freedByExtended', '/// Final numbers no final code holds (their opcode moved behind OP_extended).', freed)
+    emit_names(lines, [entry[1].encode() for entry in entries], 'parserOpcodeName', 'opcode: u8, short: bool', 'metadataIndex(opcode, short)')
+    lines += ['pub fn opcodeName(opcode: u8, short: bool) -> &\'static [u8] {']
+    for number in finals:
+        lines += [f'  if short && opcode == {number} {{ return b"{FINAL_ONLY[number][0][0]}" }}']
+    lines += ['  return parserOpcodeName(opcode, short)', '}', '']
     (ROOT / 'src/js_opcode_data.silk').write_text('\n'.join(lines))
     print(f'Generated {len(atoms)} atoms, {len(regular)} VM opcodes, {len(temporary)} temporary opcodes, {len(formats)} formats')
 

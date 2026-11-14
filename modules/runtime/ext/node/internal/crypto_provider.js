@@ -76,6 +76,10 @@ function finalized() { return error('ERR_CRYPTO_MAC_FINALIZED', 'MAC already fin
 class Mac extends Transform {
   constructor(algorithm, key, options) {
     const args = macArgs(algorithm, key, options);
+    // Node's createMac passes the JS alias cache to the native side, which writes
+    // a newly cached id back into it.
+    const { getCachedMacId, getMacCache } = require('internal/crypto/util');
+    require('internal/crypto/binding').resolveMacCache(algorithm, getCachedMacId(algorithm), getMacCache());
     let id;
     try { id = call('macCreate', args); }
     catch (e) {

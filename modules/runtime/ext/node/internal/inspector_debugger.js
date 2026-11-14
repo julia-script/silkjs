@@ -38,6 +38,13 @@ function locationsOnly(locations) {
 function resourceURL(name) {
   return typeof name === 'string' && name.startsWith('/') ? require('url').pathToFileURL(name).href : name;
 }
+// V8's magic comment: the last `//# sourceURL=` (or `//@`) line comment's value.
+function sourceURLOf(source) {
+  if (typeof source !== 'string' || !source.includes('sourceURL')) return undefined;
+  let found;
+  for (const match of source.matchAll(/\/\/[#@][ \t]sourceURL=[ \t]*([^\s'"]*)[ \t]*$/gm)) found = match[1];
+  return found || undefined;
+}
 function metadata(script) {
   script.url = resourceURL(script.url);
   scriptURLs.set(script.scriptId, script.url);
@@ -49,13 +56,20 @@ function metadata(script) {
     pending.push(script);
     return null;
   }
-  let hash = hashes.get(script.scriptId);
-  if (hash === undefined) {
-    hash = createHash('sha256').update(native(22, script.scriptId)).digest('hex');
-    hashes.set(script.scriptId, hash);
+  let cached = hashes.get(script.scriptId);
+  if (cached === undefined) {
+    const source = native(22, script.scriptId);
+    cached = { hash: createHash('sha256').update(source).digest('hex'), sourceURL: sourceURLOf(source) };
+    hashes.set(script.scriptId, cached);
   }
   const { contextToken, ...properties } = script;
-  return { ...properties, hash, executionContextId: context.id };
+  // V8 names a script with a sourceURL comment by it, and says so (hasSourceURL).
+  if (cached.sourceURL !== undefined) {
+    properties.url = cached.sourceURL;
+    properties.hasSourceURL = true;
+    scriptURLs.set(script.scriptId, cached.sourceURL);
+  }
+  return { ...properties, hash: cached.hash, executionContextId: context.id };
 }
 function matches(breakpoint, script) {
   const url = resourceURL(script.url);
@@ -128,6 +142,13 @@ function frames(session, source) {
 let stepping = false;
 function paused(payload) {
   const source = payload.frames || [];
+  // Node's built-in modules evaluate natively under V8, so the start pause never
+  // lands in one: here it waits for the next statement outside them.
+  if (startupArmed && payload.reason !== 'exception' && source.length && (scriptURLs.get(source[0].location.scriptId) ?? source[0].url ?? '').startsWith('node:') && native(31)) {
+    native(26);
+    native(27, 0);
+    return;
+  }
   const stepped = stepping;
   stepping = false;
   activePause = payload;

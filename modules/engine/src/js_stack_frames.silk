@@ -35,8 +35,6 @@ import js_invariant { present }
 pub struct FrameSnapshot {
   pub functionName: StringOwner,
   pub scriptName: StringOwner,
-  pub typeName: StringOwner,
-  pub methodName: StringOwner,
   pub isToplevel: bool,
   pub scriptId: u64,
   pub scriptMetadata: Value,
@@ -61,8 +59,9 @@ pub struct FrameSnapshot {
   pub isEval: bool,
   /// A frame of the async stack trace: a suspended async function awaiting.
   pub isAsync: bool,
-  /// The receiver and function a method name was found for, even in strict code:
-  /// V8 looks the name up again when the stack is formatted (error_stack.currentMethod).
+  /// The receiver and function of a frame that is not a construct call, even in
+  /// strict code: its type and method names are looked up from them when the stack
+  /// is formatted (presentation). Undefined where a script could not hold the value.
   pub methodReceiver: Value,
   pub methodFunction: Value,
   /// A frame of the async stack trace that stands for a promise combinator waiting on the
@@ -105,7 +104,6 @@ unsafe fn awaitingCaller(settled: ValueBits) -> ?*mut HeapHeader {
 fn combinatorFrame(step: promise.CombinatorStep, empty: ValueBits) -> FrameSnapshot {
   return FrameSnapshot {
     functionName: StringOwner.borrowed(empty), scriptName: StringOwner.borrowed(empty),
-    typeName: StringOwner.borrowed(empty), methodName: StringOwner.borrowed(empty),
     isToplevel: false, scriptId: 0, lineNumber: 0, columnNumber: 0, callLineNumber: 0,
     scriptMetadata: Value.immediate(ValueBits.Undefined),
     callColumnNumber: 0, statementLineNumber: 0, statementColumnNumber: 0, isScript: false, isNative: true, isEval: false, isBuiltin: true,
@@ -261,7 +259,6 @@ pub unsafe effect fn capture(runtime: *mut HeapHeader, limit: usize,
     let mut metadataBits = ValueBits.Undefined
     let mut snapshot = FrameSnapshot {
       functionName: StringOwner.borrowed(name), scriptName: StringOwner.borrowed(empty.get()),
-      typeName: StringOwner.borrowed(empty.get()), methodName: StringOwner.borrowed(empty.get()),
       isToplevel: receiver.tag() == 2 || receiver.tag() == 3,
       scriptId: 0, lineNumber: 0, columnNumber: 0, callLineNumber: 0,
       scriptMetadata: Value.immediate(ValueBits.Undefined),
@@ -291,6 +288,9 @@ pub unsafe effect fn capture(runtime: *mut HeapHeader, limit: usize,
     match move compiled {
       Option<*mut HeapHeader>.Some { value: function } => {
         run unsafe backtrace.ensureLines(function)
+        let mut pc = FUNCTION_DEFINITION_PC
+        if frame.currentPc != NO_PC { pc = u32.wrappingSubtract(usize.toU32(frame.currentPc), 1) }
+        let positions = unsafe backtrace.framePositions(function, pc, includeNative)
         let code = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, function)
         snapshot.scriptId = code.scriptId
         snapshot.isEval = code.scriptIsEval
@@ -322,20 +322,17 @@ pub unsafe effect fn capture(runtime: *mut HeapHeader, limit: usize,
         }
         match &code.debug {
           Option<FunctionDebugInfo>.Some { value: debug } => {
-            let mut pc = FUNCTION_DEFINITION_PC
             if includeNative {
-              let enclosing = unsafe backtrace.callLocation(&debug, FUNCTION_DEFINITION_PC)
-              snapshot.enclosingLineNumber = enclosing.line
-              snapshot.enclosingColumnNumber = enclosing.column
+              snapshot.enclosingLineNumber = positions.enclosing.line
+              snapshot.enclosingColumnNumber = positions.enclosing.column
             }
-            if frame.currentPc != NO_PC { pc = u32.wrappingSubtract(usize.toU32(frame.currentPc), 1) }
-            let position = if debug.nodeVm { unsafe backtrace.callLocation(&debug, pc) } else { unsafe backtrace.lineLocation(&debug, pc) }
+            let position = if debug.nodeVm { positions.call } else { positions.line }
             snapshot.lineNumber = position.line
             snapshot.columnNumber = position.column
-            let statement = if debug.nodeVm { unsafe backtrace.lineLocation(&debug, pc) } else { position }
+            let statement = positions.line
             snapshot.statementLineNumber = statement.line
             snapshot.statementColumnNumber = statement.column
-            let callPosition = unsafe backtrace.callLocation(&debug, pc)
+            let callPosition = positions.call
             snapshot.callLineNumber = callPosition.line
             snapshot.callColumnNumber = callPosition.column
             if includeNative || debug.nodeSourceURL {
@@ -362,12 +359,12 @@ pub unsafe effect fn capture(runtime: *mut HeapHeader, limit: usize,
       }
       Option<*mut HeapHeader>.None => ()
     }
-    if includeNative {
-      run unsafe presentation(runtime, frame.currentFunction, receiverBits, &mut snapshot)
-      if Strings.length(snapshot.methodName.get()) != 0 {
-        snapshot.methodReceiver = unsafe Value.retain(receiverBits)
-        snapshot.methodFunction = unsafe Value.retain(frame.currentFunction)
-      }
+    if includeNative && !snapshot.isConstructor {
+      // Only values a script may hold: an uninitialized `this` and a known local
+      // function (bare bytecode) name nothing.
+      let tag = receiverBits.tag()
+      if tag != 4 && tag != 5 && tag != 6 && tag != -2 && tag != -3 { snapshot.methodReceiver = unsafe Value.retain(receiverBits) }
+      if frame.currentFunction.isObject() { snapshot.methodFunction = unsafe Value.retain(frame.currentFunction) }
     }
     if restricted || native { receiverBits = ValueBits.Undefined }
     if snapshot.isScript { functionBits = ValueBits.Undefined }
@@ -434,8 +431,7 @@ unsafe effect fn foreignFrames(source: &ForeignFrameSource, entered: usize, fram
     let column = i32.wrappingAdd(u32.toI32(out.offset), 1)
     let mut snapshot = FrameSnapshot {
       functionName: StringOwner.borrowed(empty), scriptName: StringOwner.borrowed(empty),
-      typeName: StringOwner.borrowed(empty), methodName: StringOwner.borrowed(empty),
-      isToplevel: false, scriptId: 0, lineNumber: 1, columnNumber: column, callLineNumber: 1,
+        isToplevel: false, scriptId: 0, lineNumber: 1, columnNumber: column, callLineNumber: 1,
       scriptMetadata: Value.immediate(ValueBits.Undefined),
       callColumnNumber: column, statementLineNumber: 1, statementColumnNumber: column, isScript: false, isNative: false, isEval: false, isBuiltin: false,
       sourceLineNumber: 1, sourceColumnNumber: column,
@@ -463,30 +459,40 @@ unsafe fn functionObject(value: ValueBits) -> bool {
   }
   return false
 }
-// Names are read from engine descriptors, never by running user getters/proxies.
-unsafe effect fn presentation(runtime: *mut HeapHeader, function: ValueBits, frameReceiver: ValueBits, snapshot: &mut FrameSnapshot) -> ()
+/// A frame's type and method names as V8's CallSite gives them; the empty string is none.
+pub struct Presentation { pub typeName: StringOwner, pub methodName: StringOwner }
+/// The names of a frame that ran function with receiver (FrameSnapshot.methodFunction
+/// and methodReceiver; Undefined is none). They are looked up when a stack is
+/// formatted, as V8 does, not when it is captured: the lookup walks every property
+/// of the receiver's prototype chain, and most captured stacks are never read.
+/// Names are read from engine descriptors, never by running user getters/proxies.
+pub unsafe effect fn presentation(runtime: *mut HeapHeader, function: ValueBits, frameReceiver: ValueBits, toplevel: bool) -> Presentation
   ! OutOfMemoryError | StringLengthError ? &mut Allocator {
-  if snapshot.isConstructor { return () }
   let anchor = ()
+  let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, runtime)
+  let mut result = Presentation { typeName: StringOwner.adopt(state.atoms.emptyString()), methodName: StringOwner.adopt(state.atoms.emptyString()) }
+  drop state
   let mut receiver = frameReceiver
   if !receiver.isObject() && receiver.tag() != 2 && receiver.tag() != 3 {
     let name: &[u8] = if receiver.isNumber() { b"Number" } else if receiver.isString() { b"String" }
       else if receiver.isBigInt() { b"BigInt" } else if receiver.tag() == 1 { b"Boolean" } else { b"Symbol" }
-    snapshot.typeName = StringOwner.adopt(run Strings.fromLatin1(name))
+    result.typeName = StringOwner.adopt(run Strings.fromLatin1(name))
   }
   let mut methodAtom: u32 = 0
   let mut ambiguous = false
   let mut foundType = false
   // V8's GetTypeName: a function receiver (a static method's class) is named by
   // its own name ("ok.rejects", "Module._load").
-  if !snapshot.isToplevel && unsafe functionObject(receiver) {
+  if !toplevel && unsafe functionObject(receiver) {
     match unsafe backtrace.propertyString(receiver, atoms.JS_ATOM_name) {
       Option<ValueBits>.Some { value: name } => {
-        if Strings.length(name) != 0 { snapshot.typeName = StringOwner.borrowed(name) foundType = true }
+        if Strings.length(name) != 0 { result.typeName = StringOwner.borrowed(name) foundType = true }
       }
       _ => ()
     }
   }
+  // 0 when the frame has no function object, which then matches nothing.
+  let target = match function { ValueBits.Object { reference } => Pointer.address<HeapHeader>(reference) _ => 0 }
   while receiver.isObject() {
     let node = match receiver { ValueBits.Object { reference } => reference _ => Intrinsic.trap("frame receiver") }
     let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, node)
@@ -501,21 +507,17 @@ unsafe effect fn presentation(runtime: *mut HeapHeader, function: ValueBits, fra
           PropertySlot.Value { value } => value
           _ => ValueBits.Undefined
         }
-        if !snapshot.isToplevel && !foundType && atom == atoms.JS_ATOM_constructor {
+        if !toplevel && !foundType && atom == atoms.JS_ATOM_constructor {
           match unsafe backtrace.propertyString(value, atoms.JS_ATOM_name) {
-            Option<ValueBits>.Some { value: name } => { snapshot.typeName = StringOwner.borrowed(name) foundType = true }
+            Option<ValueBits>.Some { value: name } => { result.typeName = StringOwner.borrowed(name) foundType = true }
             _ => ()
           }
         }
-        let mut matches = unsafe equal(value, function, EqualityMode.Strict)
+        // The frame's function is an object, so strict equality is identity.
+        let mut matches = sameObject(value, target)
         match data.slot(index).view(properties[index].flags) {
           PropertySlot.GetterSetter { getter, setter } => {
-            if let Option<*mut HeapHeader>.Some { value: getterNode } = Pointer.nonNullMut<HeapHeader>(getter) {
-              matches = matches || unsafe equal(ValueBits.Object { reference: getterNode }, function, EqualityMode.Strict)
-            }
-            if let Option<*mut HeapHeader>.Some { value: setterNode } = Pointer.nonNullMut<HeapHeader>(setter) {
-              matches = matches || unsafe equal(ValueBits.Object { reference: setterNode }, function, EqualityMode.Strict)
-            }
+            matches = matches || (target != 0 && (Pointer.address<HeapHeader>(getter) == target || Pointer.address<HeapHeader>(setter) == target))
           }
           _ => ()
         }
@@ -533,10 +535,14 @@ unsafe effect fn presentation(runtime: *mut HeapHeader, function: ValueBits, fra
   }
   if methodAtom != 0 && !ambiguous {
     let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, runtime)
-    snapshot.methodName = StringOwner.adopt(run state.atoms.toValue(methodAtom, true))
+    result.methodName = StringOwner.adopt(run state.atoms.toValue(methodAtom, true))
   }
+  return move result
 }
 
+fn sameObject(value: ValueBits, target: usize) -> bool {
+  return match value { ValueBits.Object { reference } => Pointer.address<HeapHeader>(reference) == target _ => false }
+}
 /// Decimal identity conversion without floating-point rounding or user coercion.
 pub effect fn scriptIdString(id: u64) -> Value
   ! OutOfMemoryError | StringLengthError ? &mut Allocator {

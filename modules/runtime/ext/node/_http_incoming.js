@@ -23,6 +23,7 @@
 'use strict';
 
 const { Readable, finished } = require('stream');
+const { Stream } = require('internal/streams/legacy');
 
 
 const kHeaders = Symbol('kHeaders');
@@ -48,6 +49,15 @@ function readStop(socket) {
     socket.pause();
 }
 
+// Lean requests (node:http requests net_native read, see internal/http/native-parser): a
+// request with no body whose stream nobody observes needs no Readable state. Its state is
+// made, and what the stream went through replayed, on the first read of _readableState,
+// which every Readable method and accessor (and every listener added with on) does first.
+// Until then `kLean` holds { highWaterMark, ended, dumped }.
+const kLean = Symbol('kLean');
+let leanNext = false;
+function makeLeanNext(value) { leanNext = value; }
+
 /* Abstract base class for ServerRequest and ClientResponse. */
 function IncomingMessage(socket) {
   let streamOptions;
@@ -58,9 +68,17 @@ function IncomingMessage(socket) {
     };
   }
 
-  Readable.call(this, streamOptions);
-
-  this._readableState.readingMore = true;
+  if (leanNext && new.target === IncomingMessage) {
+    leanNext = false;
+    // Readable's constructor, but its state.
+    this._events = { close: undefined, error: undefined, data: undefined, end: undefined, readable: undefined };
+    Stream.call(this, streamOptions);
+    this[kLean] = { options: streamOptions, ended: false, dumped: false };
+  } else {
+    leanNext = false;
+    Readable.call(this, streamOptions);
+    this._readableState.readingMore = true;
+  }
 
   this.socket = socket;
 
@@ -99,6 +117,37 @@ function IncomingMessage(socket) {
 }
 Object.setPrototypeOf(IncomingMessage.prototype, Readable.prototype);
 Object.setPrototypeOf(IncomingMessage, Readable);
+
+// A lean request's stream state, made when first read (see kLean).
+function leanState(message) {
+  const lean = message[kLean];
+  message[kLean] = undefined;
+  const state = new Readable.ReadableState(lean.options, message, false);
+  Object.defineProperty(message, '_readableState', { __proto__: null, value: state, writable: true, enumerable: true, configurable: true });
+  state.readingMore = true;
+  if (lean.ended) Readable.prototype.push.call(message, null);
+  if (lean.dumped) {
+    // What _dump did on the complete, unread message.
+    message.read(0);
+  }
+  return state;
+}
+Object.defineProperty(IncomingMessage.prototype, '_readableState', {
+  __proto__: null,
+  get() { return this[kLean] ? leanState(this) : undefined; },
+  set(value) { Object.defineProperty(this, '_readableState', { __proto__: null, value, writable: true, enumerable: true, configurable: true }); },
+  configurable: true,
+});
+// parserOnMessageComplete's push(null) on a request.
+function pushEnd(message) {
+  const lean = message[kLean];
+  if (lean) lean.ended = true;
+  else message.push(null);
+}
+// resOnFinish's test of a resume in flight, and whether the message ended.
+function resumeScheduled(message) { return message[kLean] ? false : message._readableState.resumeScheduled; }
+function readableEnded(message) { return message[kLean] ? false : message.readableEnded; }
+function isLean(message) { return message[kLean] !== undefined; }
 
 Object.defineProperty(IncomingMessage.prototype, 'connection', {
   __proto__: null,
@@ -501,6 +550,14 @@ IncomingMessage.prototype._dumpAndCloseReadable = function _dumpAndCloseReadable
 // Call this instead of resume() if we want to just
 // dump all the data to /dev/null
 IncomingMessage.prototype._dump = function _dump() {
+  // A lean message that ended and that nothing listens to: Node's read(0) would only emit
+  // 'end' and 'close' to no one. It stays lean, and replays the read if anything looks.
+  const lean = this[kLean];
+  if (lean && !this._dumped && lean.ended && this.complete && this._eventsCount === 0) {
+    this._dumped = true;
+    lean.dumped = true;
+    return;
+  }
   if (!this._dumped) {
     this._dumped = true;
     // If there is buffered data, it may trigger 'data' events.
@@ -529,6 +586,11 @@ function onError(self, error, cb) {
 
 module.exports = {
   IncomingMessage,
+  makeLeanNext,
+  pushEnd,
+  resumeScheduled,
+  readableEnded,
+  isLean,
   kDetachAbortSignal,
   readStart,
   readStop,

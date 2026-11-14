@@ -1,10 +1,6 @@
 'use strict';
 
 const host = require('internal/host');
-const apply = Reflect.apply;
-const typedArrayTag = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(Uint8Array.prototype), Symbol.toStringTag).get;
-// The getter takes no arguments: one frozen empty list serves every call.
-const noArguments = Object.freeze([]);
 // The engine's own class-ID checks, which nothing replaces later.
 function classCheck(name) {
   if (typeof host.types?.[name] === 'function') return host.types[name];
@@ -23,13 +19,12 @@ function native(name) {
 // getter per failed check made each one cost an error object.
 const types = module.exports = {
   isArrayBufferView: ArrayBuffer.isView,
-  isTypedArray: value => apply(typedArrayTag, value, noArguments) !== undefined,
 };
+// The typed array brands too (isUint8Array guards every Buffer binding call and
+// stream write): one native class check each, not the toStringTag getter.
 for (const name of ['isDate', 'isRegExp', 'isMap', 'isSet', 'isWeakMap', 'isWeakSet', 'isArrayBuffer', 'isDataView',
-  'isBooleanObject', 'isNumberObject', 'isStringObject', 'isSymbolObject', 'isBigIntObject', 'isSharedArrayBuffer']) types[name] = classCheck(name);
-types.isAnyArrayBuffer = value => types.isArrayBuffer(value) || types.isSharedArrayBuffer(value);
+  'isBooleanObject', 'isNumberObject', 'isStringObject', 'isSymbolObject', 'isBigIntObject', 'isSharedArrayBuffer',
+  'isAnyArrayBuffer', 'isTypedArray', 'isUint8Array', 'isUint8ClampedArray', 'isUint16Array', 'isUint32Array', 'isInt8Array',
+  'isInt16Array', 'isInt32Array', 'isFloat16Array', 'isFloat32Array', 'isFloat64Array', 'isBigInt64Array', 'isBigUint64Array']) types[name] = classCheck(name);
 types.isBoxedPrimitive = value => types.isBooleanObject(value) || types.isNumberObject(value) || types.isStringObject(value) || types.isSymbolObject(value) || types.isBigIntObject(value);
-for (const name of ['Uint8Array', 'Uint8ClampedArray', 'Uint16Array', 'Uint32Array', 'Int8Array', 'Int16Array', 'Int32Array', 'Float16Array', 'Float32Array', 'Float64Array', 'BigInt64Array', 'BigUint64Array']) {
-  types['is' + name] = value => apply(typedArrayTag, value, noArguments) === name;
-}
 for (const name of ['isArgumentsObject', 'isAsyncFunction', 'isGeneratorFunction', 'isGeneratorObject', 'isNativeError', 'isPromise', 'isProxy', 'isMapIterator', 'isSetIterator', 'isModuleNamespaceObject', 'isExternal', 'isKeyObject', 'isCryptoKey']) types[name] = native(name);

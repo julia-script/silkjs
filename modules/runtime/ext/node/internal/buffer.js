@@ -1087,20 +1087,22 @@ function addBufferPrototypeMethods(proto) {
   proto.writeDoubleLE = bigEndian ? writeDoubleBackwards : writeDoubleForwards;
   proto.writeDoubleBE = bigEndian ? writeDoubleForwards : writeDoubleBackwards;
 
-  proto.asciiSlice = function(start, end) { return asciiSlice(this, start, end); };
-  proto.base64Slice = function(start, end) { return base64Slice(this, start, end); };
-  proto.base64urlSlice = function(start, end) { return base64urlSlice(this, start, end); };
-  proto.latin1Slice = function(start, end) { return latin1Slice(this, start, end); };
-  proto.hexSlice = function(start, end) { return hexSlice(this, start, end); };
-  proto.ucs2Slice = function(start, end) { return ucs2Slice(this, start, end); };
-  proto.utf8Slice = function(start, end) { return utf8Slice(this, start, end); };
-  proto.asciiWrite = function(string, offset, length) { return asciiWrite(this, string, offset, length); };
+  // Native methods on the receiver (bufferCodec.operation 0..6 and 32..34), as
+  // node_buffer.cc's; each falls back to the binding call for anything unusual.
+  proto.asciiSlice = nativeMethod(2, function(start, end) { return asciiSlice(this, start, end); }, 2);
+  proto.base64Slice = nativeMethod(5, function(start, end) { return base64Slice(this, start, end); }, 2);
+  proto.base64urlSlice = nativeMethod(6, function(start, end) { return base64urlSlice(this, start, end); }, 2);
+  proto.latin1Slice = nativeMethod(1, function(start, end) { return latin1Slice(this, start, end); }, 2);
+  proto.hexSlice = nativeMethod(4, function(start, end) { return hexSlice(this, start, end); }, 2);
+  proto.ucs2Slice = nativeMethod(3, function(start, end) { return ucs2Slice(this, start, end); }, 2);
+  proto.utf8Slice = nativeMethod(0, function(start, end) { return utf8Slice(this, start, end); }, 2);
+  proto.asciiWrite = nativeMethod(34, function(string, offset, length) { return asciiWrite(this, string, offset, length); }, 3);
   proto.base64Write = function(string, offset, length) { return base64Write(this, string, offset, length); };
   proto.base64urlWrite = function(string, offset, length) { return base64urlWrite(this, string, offset, length); };
-  proto.latin1Write = function(string, offset, length) { return latin1Write(this, string, offset, length); };
+  proto.latin1Write = nativeMethod(33, function(string, offset, length) { return latin1Write(this, string, offset, length); }, 3);
   proto.hexWrite = function(string, offset, length) { return hexWrite(this, string, offset, length); };
   proto.ucs2Write = function(string, offset, length) { return ucs2Write(this, string, offset, length); };
-  proto.utf8Write = function(string, offset, length) { return utf8Write(this, string, offset, length); };
+  proto.utf8Write = nativeMethod(32, function(string, offset, length) { return utf8Write(this, string, offset, length); }, 3);
 }
 
 // This would better be placed in internal/worker/clone.js, but that doesn't
@@ -1121,15 +1123,28 @@ function isMarkedAsUntransferable(obj) {
   return untransferable.has(obj);
 }
 
+// Nameless, as node_buffer.cc's methods are.
+function nativeMethod(operation, fallback, length) {
+  return host.bufferOperation(operation, fallback, length);
+}
+
+// new FastBuffer(...) without the derived constructor's frames (bufferCodec.operation 67).
+const makeFastBuffer = host.bufferOperation(67, FastBuffer, 3);
+
 function createUnsafeBuffer(size) {
   if (size <= 64) {
     // Allocated in heap, doesn't call backing store anyway
     // This is the same that the old impl did implicitly, but explicit now
-    return new FastBuffer(size);
+    return makeFastBuffer(size);
   }
 
-  return new FastBuffer(createUnsafeArrayBuffer(size));
+  return makeFastBuffer(createUnsafeArrayBuffer(size));
 }
+
+// internal/buffer's writers as native calls; the functions above answer the rest.
+const nativeAsciiWrite = host.bufferOperation(50, asciiWrite, 4);
+const nativeLatin1Write = host.bufferOperation(49, latin1Write, 4);
+const nativeUtf8Write = host.bufferOperation(48, utf8Write, 4);
 
 module.exports = {
   FastBuffer,
@@ -1137,9 +1152,10 @@ module.exports = {
   markAsUntransferable,
   isMarkedAsUntransferable,
   createUnsafeBuffer,
+  makeFastBuffer,
   readUInt16BE,
   readUInt32BE,
-  asciiWrite,
-  latin1Write,
-  utf8Write,
+  asciiWrite: nativeAsciiWrite,
+  latin1Write: nativeLatin1Write,
+  utf8Write: nativeUtf8Write,
 };
