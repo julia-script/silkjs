@@ -127,7 +127,25 @@ function createLoader(host, builtins) {
   const postgresLoop = '    while (incoming.length > 4) {\n      length = incoming.readUInt32BE(1)\n';
   // On the loop's own line, so the lines after it keep their numbers.
   const postgresFast = '    while (incoming.length > 4) { if (incoming[0] === 68 && query) { const used = __silkPostgresRows(incoming, query, result, rows, transform); if (used > 0) { rows = result.length; incoming = incoming.subarray(used); continue } }\n      length = incoming.readUInt32BE(1)\n';
+  // postgres.js query.js: a Query keeps resolve/reject arrows that capture the
+  // Query itself, so every finished query, its result and all its rows form a
+  // cycle only the cycle collector frees (about a seventh of Bun's 100k-query
+  // benchmark). Once one of them runs the promise is settled and both can only
+  // clear active, so they become a shared method that does that and the cycle
+  // goes: the rows die by reference count when the result is dropped.
+  const postgresQuery = /[\\/]node_modules[\\/]postgres[\\/](?:cjs[\\/])?src[\\/]query\.js$/;
+  const queryResolve = '\n    this.resolve = x => (this.active = false, resolve(x))\n';
+  const queryReject = '\n    this.reject = x => (this.active = false, reject(x))\n';
+  const settledResolve = '\n    this.resolve = x => (this.active = false, this.resolve = this.reject = __silkSettledQuery, resolve(x))\n';
+  const settledReject = '\n    this.reject = x => (this.active = false, this.resolve = this.reject = __silkSettledQuery, reject(x))\n';
+  function onlyOnce(source, text) { const at = source.indexOf(text); return at >= 0 && source.indexOf(text, at + 1) < 0; }
+  function patchQuerySource(source) {
+    if (!onlyOnce(source, queryResolve) || !onlyOnce(source, queryReject) || !source.includes('class Query extends Promise')) return source;
+    // Kept on the first line, so line numbers match the file.
+    return 'function __silkSettledQuery() { this.active = false }' + source.replace(queryResolve, settledResolve).replace(queryReject, settledReject);
+  }
   function patchPackageSource(filename, source, esm) {
+    if (postgresQuery.test(filename)) return patchQuerySource(source);
     if (!postgresConnection.test(filename)) return source;
     const at = source.indexOf(postgresLoop);
     if (at < 0 || source.indexOf(postgresLoop, at + 1) >= 0 || !source.includes('function DataRow(x)')) return source;
@@ -135,7 +153,7 @@ function createLoader(host, builtins) {
     const binding = esm ? 'const __silkPostgresRows = import.meta.silkPostgresRows;' : 'const __silkPostgresRows = module.silkPostgresRows;';
     return binding + source.slice(0, at) + postgresFast + source.slice(at + postgresLoop.length);
   }
-  function isPatchedPackage(filename) { return postgresConnection.test(filename); }
+  function isPatchedPackage(filename) { return postgresConnection.test(filename) || postgresQuery.test(filename); }
 
   function cleanSource(source) {
     if (source.charCodeAt(0) === 0xFEFF) source = source.slice(1);
