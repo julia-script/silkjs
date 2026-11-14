@@ -14,7 +14,10 @@ import runtime_memory { AllocationObserver }
 import js_value { ValueBits }
 import js_intl_realm as ops
 import js_owned_value { Value, ValueRef, immediateRef, lendFor }
-import js_core_types { FrameSlots, PropertyEnum, PropertyDescriptor, JS_PROP_C_W_E, JS_PROP_THROW, JS_PROP_ENUMERABLE, OwnedAtom }
+import js_heap { HeapCell }
+import js_array_storage as arrays
+import js_array_storage { StorageOutcome }
+import js_core_types { ObjectData, ObjectPayload, FrameSlots, PropertyEnum, PropertyDescriptor, JS_PROP_C_W_E, JS_PROP_THROW, JS_PROP_ENUMERABLE, OwnedAtom }
 import js_gc { HeapHooks }
 import js_gc as gc
 import js_runtime as runtime
@@ -52,6 +55,21 @@ pub effect fn newObject<'a, H: HeapHooks + CoercionHooks>(hooks: &mut H, memory:
   return match move allocated { Result<ValueBits, OutOfMemoryError>.Success { value } => unsafe Value.adoptBits(value) Result<ValueBits, OutOfMemoryError>.Failure { error } => run ops.materialize(&mut hooks,realm, move error) }
 }
 effect fn defineIndex<'a, 'b, H: HeapHooks + CoercionHooks + OwnPropertyHooks + PropertyWriteHooks>(hooks: &mut H,realm: Realm<'a>, object: ValueRef<'b>, index: u32, value: Value) -> () ! JsException ? &mut Allocator {
+  // An element a fast array already has is replaced in place; the next one past
+  // its end is appended.
+  let place = unsafe elementPlace(object.view(), u32.toUsize(index))
+  if place == ELEMENT_INSIDE {
+    let previous = unsafe replaceElement(object.view(), u32.toUsize(index), value.intoBits())
+    unsafe gc.release(&mut hooks, realm.runtime(), previous)
+    return
+  }
+  if place == ELEMENT_NEXT {
+    let appended = run Effect.result(unsafe arrays.appendFastElement(&mut hooks, realm, core.reference(object.view()), value.dup().intoBits()))
+    match move appended {
+      Result<StorageOutcome, OutOfMemoryError>.Success { value: outcome } => { if outcome == StorageOutcome.Accepted { return } }
+      Result<StorageOutcome, OutOfMemoryError>.Failure { error } => { let _thrown: ValueBits = run ops.materialize(&mut hooks, realm, move error) }
+    }
+  }
   let interned = run Effect.result(coercions.ownedAtom(&mut hooks, realm, unsafe lendFor(ValueBits.number(u32.toF64(index)))))
   let atom = match move interned {
     Result<OwnedAtom, OutOfMemoryError | StringLengthError | BigIntError | JsException>.Success { value: key } => move key
@@ -76,7 +94,56 @@ effect fn int32<'a, 'b, H: HeapHooks + CoercionHooks>(hooks: &mut H, realm: Real
   match move converted { Result<(), OutOfMemoryError | StringLengthError | JsException>.Success { .. } => () Result<(), OutOfMemoryError | StringLengthError | JsException>.Failure { error } => { return run ops.materialize(&mut hooks,realm, move error) } }
   return number
 }
+/// Adds addend to the one integer of a combinator's own counter array, in place,
+/// and answers whether it reached zero; None when value is not such an array.
+unsafe fn counterAdd(value: ValueBits, addend: i32) -> Option<bool> {
+  let reference = match value { ValueBits.Object { reference } => reference _ => { return Option<bool>.none() } }
+  let mut anchor = ()
+  let data = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut anchor, reference)
+  if !data.fastArray() { return Option<bool>.none() }
+  match &mut data.payload {
+    ObjectPayload.FastArray { array } => {
+      if array.values().length() != 1 { return Option<bool>.none() }
+      let before = match array.values().get(0) { ValueBits.Int { value: count } => count _ => { return Option<bool>.none() } }
+      let after = i32.wrappingAdd(before, addend)
+      array.store(0, ValueBits.Int { value: after })
+      return Option<bool>.some(after == 0)
+    }
+    _ => { return Option<bool>.none() }
+  }
+}
+/// Where index falls in the fast array value.
+const ELEMENT_INSIDE: i32 = 0
+const ELEMENT_NEXT: i32 = 1
+const ELEMENT_OTHER: i32 = 2
+unsafe fn elementPlace(value: ValueBits, index: usize) -> i32 {
+  let reference = match value { ValueBits.Object { reference } => reference _ => { return ELEMENT_OTHER } }
+  let anchor = ()
+  let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, reference)
+  if !data.fastArray() { return ELEMENT_OTHER }
+  return match &data.payload {
+    ObjectPayload.FastArray { array } => {
+      if index < array.values().length() { ELEMENT_INSIDE } else if index == array.values().length() { ELEMENT_NEXT } else { ELEMENT_OTHER }
+    }
+    _ => ELEMENT_OTHER
+  }
+}
+/// Stores incoming at index of the fast array value (elementPlace said
+/// ELEMENT_INSIDE) and returns the element it replaced, for the caller to release.
+unsafe fn replaceElement(value: ValueBits, index: usize, incoming: ValueBits) -> ValueBits {
+  let mut anchor = ()
+  let data = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut anchor, core.reference(value))
+  match &mut data.payload {
+    ObjectPayload.FastArray { array } => {
+      let previous = array.values().get(index)
+      array.store(index, incoming)
+      return previous
+    }
+    _ => { return Intrinsic.trap("fast array invariant") }
+  }
+}
 effect fn remainingAdd<'a, 'b, H: HeapHooks + CoercionHooks + OwnPropertyHooks + GetPropertyHooks + PropertyWriteHooks>(hooks: &mut H,realm: Realm<'a>, env: ValueRef<'b>, addend: i32) -> bool ! JsException ? &mut Allocator {
+  if let Option<bool>.Some { value: zero } = unsafe counterAdd(env.view(), addend) { return zero }
   let count = run getIndex(&mut hooks, realm, env, 0)
   let before = run int32(&mut hooks, realm, count.borrow())
   drop count
@@ -161,10 +228,11 @@ effect fn element<'a, 'b, H: HeapHooks + CoercionHooks + OwnPropertyHooks + GetP
 fn jsTruthy(value: ValueBits) -> bool { return match value { ValueBits.Bool { value: flag } => flag _ => false } }
 fn unsigned(value: i32) -> u32 { if value < 0 { return i32.toU32(-(value + 1)) ^ 0xffffffff } return i32.toU32(value) }
 // The iterator and its close flag live in combinator, which closes it after a failure.
-effect fn iterableLoop<'a, 'b, H: HeapHooks + CoercionHooks + OwnPropertyHooks + GetPropertyHooks + PropertyWriteHooks + CallHooks + NativeFunctionHooks>(hooks: &mut H,
+effect fn iterableLoop<'a, 'b, H: HeapHooks + CoercionHooks + OwnPropertyHooks + GetPropertyHooks + PropertyWriteHooks + CallHooks + NativeFunctionHooks + PromiseHooks>(hooks: &mut H,
   memory: &AllocationObserver, realm: Realm<'a>, ctor: ValueRef<'b>, input: ValueRef<'b>, capability: &Capability, magic: i32, iterator: &mut Value, close: &mut bool) -> () ! JsException ? &mut Allocator {
   let resolver = run promise.get(&mut hooks, realm, ctor, atoms.JS_ATOM_resolve)
   run promise.checkFunction(&mut hooks, realm, resolver.borrow())
+  let direct = core.same(ctor, realm.promiseConstructor()) && promise.intrinsic(realm, resolver.borrow(), callbacks.RESOLVE)
   iterator.* = run iterators.getIterator(&mut hooks, memory, realm, input, false)
   let next = run promise.get(&mut hooks, realm, iterator.borrow(), atoms.JS_ATOM_next)
   let mut values = Value.immediate(ValueBits.Undefined) let mut env = Value.immediate(ValueBits.Undefined)
@@ -179,10 +247,12 @@ effect fn iterableLoop<'a, 'b, H: HeapHooks + CoercionHooks + OwnPropertyHooks +
     let item = run iterators.next(&mut hooks, realm, iterator.borrow(), next.borrow(), &mut done)
     if done { break }
     close.* = true
-    let nextPromise = run promise.call(&mut hooks, realm, resolver.borrow(), ctor, &[item.view()])
+    // The intrinsic resolve of this realm's own Promise needs no call.
+    let nextPromise = if direct { run promise.resolve(&mut hooks, memory, realm, ctor, item.borrow(), false) }
+      else { run promise.call(&mut hooks, realm, resolver.borrow(), ctor, &[item.view()]) }
     drop item
     if magic == 3 {
-      let _returned = run promise.invoke(&mut hooks, realm, nextPromise.borrow(), atoms.JS_ATOM_then, &[capability.resolve.view(), capability.reject.view()])
+      run promise.subscribe(&mut hooks, realm, nextPromise.borrow(), unsafe lendFor(capability.resolve.view()), unsafe lendFor(capability.reject.view()))
     } else {
       let mut handler = capability.resolve.view() if magic == 2 { handler = capability.reject.view() }
       let captures = [ValueBits.Bool { value: false }, ValueBits.Int { value: index }, values.view(), handler, env.view()]
@@ -191,14 +261,14 @@ effect fn iterableLoop<'a, 'b, H: HeapHooks + CoercionHooks + OwnPropertyHooks +
       if magic == 1 {
         let onRejected = run ops.dataFunctionSlots(&mut hooks, memory, realm, callbacks.id(callbacks.ALL_ELEMENT), 1, magic | 4, &captures)
         let _ignored = run remainingAdd(&mut hooks, realm, env.borrow(), 1)
-        let _returned = run promise.invoke(&mut hooks, realm, nextPromise.borrow(), atoms.JS_ATOM_then, &[element.view(), onRejected.view()])
+        run promise.subscribe(&mut hooks, realm, nextPromise.borrow(), unsafe lendFor(element.view()), unsafe lendFor(onRejected.view()))
       } else if magic == 2 {
         run defineIndex(&mut hooks, realm, values.borrow(), unsigned(index), Value.immediate(ValueBits.Undefined))
         let _ignored = run remainingAdd(&mut hooks, realm, env.borrow(), 1)
-        let _returned = run promise.invoke(&mut hooks, realm, nextPromise.borrow(), atoms.JS_ATOM_then, &[capability.resolve.view(), element.view()])
+        run promise.subscribe(&mut hooks, realm, nextPromise.borrow(), unsafe lendFor(capability.resolve.view()), unsafe lendFor(element.view()))
       } else {
         let _ignored = run remainingAdd(&mut hooks, realm, env.borrow(), 1)
-        let _returned = run promise.invoke(&mut hooks, realm, nextPromise.borrow(), atoms.JS_ATOM_then, &[element.view(), capability.reject.view()])
+        run promise.subscribe(&mut hooks, realm, nextPromise.borrow(), unsafe lendFor(element.view()), unsafe lendFor(capability.reject.view()))
       }
     }
     index = i32.wrappingAdd(index, 1)
@@ -285,7 +355,7 @@ effect fn keyedLoop<'a, 'b, H: HeapHooks + CoercionHooks + OwnPropertyHooks + Ge
     let _returned = run promise.call(&mut hooks, realm, capability.resolve.borrow(), immediateRef(ValueBits.Undefined), &[result.view()])
   }
 }
-pub effect fn combinator<'a, 'b, H: HeapHooks + CoercionHooks + OwnPropertyHooks + GetPropertyHooks + OwnKeysHooks + PropertyWriteHooks + CallHooks + NativeFunctionHooks>(hooks: &mut H,
+pub effect fn combinator<'a, 'b, H: HeapHooks + CoercionHooks + OwnPropertyHooks + GetPropertyHooks + OwnKeysHooks + PropertyWriteHooks + CallHooks + NativeFunctionHooks + PromiseHooks>(hooks: &mut H,
   memory: &AllocationObserver, realm: Realm<'a>, ctor: ValueRef<'b>, input: ValueRef<'b>, magic: i32, keyed: bool) -> ValueBits ! JsException ? &mut Allocator {
   if !ctor.view().isObject() { return run ops.error(&mut hooks,realm, b"not an object") }
   let _rt = realm.runtime()
