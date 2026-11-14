@@ -149,6 +149,9 @@ class StreamHandle {
       // The parser link of a node:http connection whose requests net_native reads
       // (internal/http/native-parser consumeNative).
       _httpNative: null,
+      // A TLS socket's handle whose plaintext net_native reads off this carrier (httpAdopt
+      // mode 2): the HTTP events go on to it.
+      _httpTarget: null,
     });
     if (transport !== undefined) this._adopt(transport);
   }
@@ -378,6 +381,12 @@ class StreamHandle {
           }
           return;
         }
+        // Plaintext a TLS session decrypted in JavaScript before net_native took its records
+        // (JSTransportHandle._adoptHttp) belongs ahead of them: the parser reads it with llhttp.
+        if (this._httpNative !== null && status >= 0 && !this._consumers?.length) {
+          if (payload?.byteLength) this._httpNative.stray(payload);
+          return;
+        }
         // An http parser that consumed this stream (parser.consume) reads its bytes instead.
         if (this._consumers?.length) {
           // Reads the transport queued before a readStop wait while the stream is stopped
@@ -459,6 +468,14 @@ class StreamHandle {
     else if (owner && !owner.destroyed && typeof owner.destroy === 'function') owner.destroy();
   }
   _httpEvent(type, status, payload) {
+    const target = this._httpTarget;
+    if (target !== null) {
+      // The ticks of the carrier's event wait, as for a plain connection (HTTP_MORE).
+      if (type === HTTP_REQUEST && (status & 16) !== 0 && this._transport) this._transport.holdTicks = true;
+      if (type === HTTP_FALLBACK) this._httpTarget = null;
+      target._httpEvent(type, status, payload);
+      return;
+    }
     if (type === HTTP_BEGIN) { this._httpNative?.begin(status === 1); return; }
     if (type === HTTP_REQUEST) {
       this._countRead(status >>> 8);
@@ -790,6 +807,25 @@ class JSTransportHandle extends StreamHandle {
     super(transport);
     libuvFields(this);
     internalFields(this, { _pendingWrites: new Set() });
+  }
+  // A TLS socket whose session its carrier runs natively (internal/tls/transport attachNative):
+  // net_native reads the requests of a node:http connection from the plaintext (node mode over
+  // the session) and the events reach this handle through the carrier.
+  _adoptHttp(link, maxHeaderSize) {
+    const transport = this._transport;
+    const carrier = transport?.consumed;
+    if (transport?.native !== true || transport.closing || !carrier || carrier._httpNative || carrier._httpTarget ||
+        carrier._pendingReads.length || this._consumers?.length || this._pendingReads.length || this._userBuffer) return false;
+    const carried = carrier._transport;
+    if (!carried || carried.closing || carried.closed || typeof carried.call !== 'function') return false;
+    if (carried.call('httpAdopt', 2, maxHeaderSize) < 0) return false;
+    this._httpNative = link;
+    carrier._httpTarget = this;
+    return true;
+  }
+  _releaseHttp() {
+    const carried = this._transport?.consumed?._transport;
+    if (this._httpNative && carried && !carried.closed) carried.call('httpRelease');
   }
   // TLSWrap's writes while its session runs natively (internal/tls/transport writeChunks): one
   // call encodes, encrypts and sends them. Like every TLSWrap write they complete

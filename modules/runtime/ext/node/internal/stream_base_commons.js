@@ -44,6 +44,8 @@ const { owner_symbol } = require('internal/async_hooks').symbols;
 const {
   kTimeout,
   reuseOrCreateUnrefTimeout,
+  suspendUnrefTimeout,
+  refreshUnrefTimeout,
   getTimerDuration,
 } = require('internal/timers');
 const { isUint8Array } = require('util').types;
@@ -277,7 +279,15 @@ function setStreamTimeout(msecs, callback) {
   //  even if it will be rescheduled we don't want to leak an existing timer.
   // The cleared Timeout stays referenced in this[kTimeout] so that it can be
   // reused the next time a timeout is set, e.g. on keep-alive connections.
-  clearTimeout(this[kTimeout]);
+  // A keep-alive connection's timer goes 0 and back around every request: it stays in
+  // its list meanwhile when nothing can observe the difference (suspendUnrefTimeout).
+  const timer = this[kTimeout];
+  if (msecs === 0) {
+    if (!suspendUnrefTimeout(timer)) clearTimeout(timer);
+  } else if (!refreshUnrefTimeout(timer, onStreamTimeout, msecs, this)) {
+    clearTimeout(timer);
+    this[kTimeout] = reuseOrCreateUnrefTimeout(timer, onStreamTimeout, msecs, this);
+  }
 
   if (msecs === 0) {
     if (callback !== undefined) {
@@ -285,8 +295,6 @@ function setStreamTimeout(msecs, callback) {
       this.removeListener('timeout', callback);
     }
   } else {
-    this[kTimeout] =
-      reuseOrCreateUnrefTimeout(this[kTimeout], onStreamTimeout, msecs, this);
     if (this[kSession]) this[kSession][kUpdateTimer]();
     if (this[kBoundSession]) this[kBoundSession][kUpdateTimer]();
 

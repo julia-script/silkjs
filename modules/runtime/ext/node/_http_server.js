@@ -36,7 +36,7 @@ const {
   _checkInvalidHeaderChar: checkInvalidHeaderChar,
   prepareError,
 } = require('_http_common');
-const { ConnectionsList, consumeNative } = require('internal/http/native-parser');
+const { ConnectionsList, consumeNative, consumeNativeLater } = require('internal/http/native-parser');
 const {
   kUniqueHeaders,
   parseUniqueHeadersOption,
@@ -842,9 +842,13 @@ function connectionListenerInternal(server, socket) {
       !socket._handle._consumed) {
     parser._consumed = true;
     socket._handle._consumed = true;
-    // Simple requests are read natively; llhttp takes over at the first other one.
-    if (!nativeEligible(server, socket, lenientFlags) || !consumeNative(parser, socket._handle, server.maxHeaderSize || 0))
+    // Simple requests are read natively; llhttp takes over at the first other one. A TLS
+    // connection starts with llhttp and goes native once its session does.
+    const eligible = nativeEligible(server, lenientFlags);
+    if (!eligible || socket.encrypted || !consumeNative(parser, socket._handle, server.maxHeaderSize || 0)) {
       parser.consume(socket._handle);
+      if (eligible && socket.encrypted) consumeNativeLater(parser, socket._handle, server.maxHeaderSize || 0);
+    }
   }
   parser[kOnExecute] =
     onParserExecute.bind(undefined,
@@ -858,10 +862,9 @@ function connectionListenerInternal(server, socket) {
 }
 
 // A connection whose simple requests net_native can read (internal/http/native-parser
-// consumeNative): a plain TCP socket, llhttp's strict mode and no header count limit below
-// what it reads.
-function nativeEligible(server, socket, lenientFlags) {
-  return lenientFlags === 0 && !socket.encrypted &&
+// consumeNative): llhttp's strict mode and no header count limit below what it reads.
+function nativeEligible(server, lenientFlags) {
+  return lenientFlags === 0 &&
     (typeof server.maxHeadersCount !== 'number' || server.maxHeadersCount > 64);
 }
 
