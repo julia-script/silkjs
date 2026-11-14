@@ -528,7 +528,9 @@ export "C" fn napi_release_threadsafe_function(function: ?*mut Function, mode: i
   let a = () let entry = unsafe Pointer.borrow<(), Function>(&a, unsafe nn(function))
   let mut guard = entry.queue.lock()
   let queue = guard.getMut()
-  if queue.threads == 0 || queue.closed { return INVALID_ARG }
+  if queue.threads == 0 { return INVALID_ARG }
+  // An abandoned function only counts its last producers down.
+  if queue.closed { queue.threads = queue.threads - 1 return OK }
   queue.threads = queue.threads - 1
   if mode == TSFN_ABORT { queue.closing = true }
   let signal = queue.threads == 0 || queue.closing
@@ -575,6 +577,34 @@ unsafe fn functionClose(function: *mut Function) -> () {
   unsafe napi.fatalPending(env)
   unsafe napi.leaveCallback(env, handles)
 }
+/// Unlinks and finalizes a closed function that producer threads still hold. Its memory is never
+/// freed, since those threads may still lock its queue.
+unsafe fn functionAbandon(function: *mut Function) -> () {
+  let mut a = () let entry = unsafe Pointer.borrowMut<(), Function>(&mut a, function)
+  let env = entry.env let state = entry.state let next = entry.next let referenced = entry.referenced
+  let finalize = entry.finalize let finalizeData = entry.finalizeData let context = entry.context let resource = entry.resource let callback = entry.callback
+  entry.next = Pointer.null<Function>() entry.referenced = false entry.callback = nil() drop entry
+  let s = unsafe Pointer.borrowMut<(), Async>(&mut a, state)
+  if unsafe same<Function>(s.functions, function) { s.functions = next drop s } else {
+    let mut p = s.functions drop s
+    while !Pointer.isNull<Function>(p) {
+      let other = unsafe Pointer.borrowMut<(), Function>(&mut a, unsafe nn(p))
+      if unsafe same<Function>(other.next, function) { other.next = next break }
+      p = other.next
+    }
+  }
+  if referenced { unsafe holdLoop(state, false) }
+  unsafe bump(state)
+  let handles = unsafe enter(env)
+  if !Intrinsic.pointerIsNull<Finalize>(finalize) {
+    let present = unsafe Intrinsic.pointerRequalify<Finalize, extern "C" fn(?*mut u8, ?*mut u8, ?*mut u8) -> ()>(finalize)
+    unsafe present(env, finalizeData, context)
+  }
+  let _destroyed = unsafe napi_async_destroy(env, resource)
+  if !Pointer.isNull<u8>(callback) { unsafe napi.releaseRoot(env, unsafe nn(callback)) }
+  unsafe napi.fatalPending(env)
+  unsafe napi.leaveCallback(env, handles)
+}
 unsafe fn deliver(function: *mut Function, data: ?*mut u8) -> () {
   let a = () let entry = unsafe Pointer.borrow<(), Function>(&a, function)
   let env = entry.env let call = entry.call let context = entry.context let callback = entry.callback let resource = entry.resource drop entry
@@ -611,10 +641,14 @@ unsafe fn dispatch(function: *mut Function) -> bool {
       let b = () let first = unsafe Pointer.borrow<(), Item>(&b, unsafe nn(item)) queue.head = first.next drop first
       if Pointer.isNull<Item>(queue.head) { queue.tail = Pointer.null<Item>() }
       queue.count = queue.count - 1
-    } else if queue.threads == 0 && !queue.closed { queue.closed = true close = true }
+    } else if !queue.closed && (queue.threads == 0 || closing) { queue.closed = true close = true }
+    // A closing function with producers left is finalized now, as Node does on abort and at
+    // environment teardown; its queue stays allocated for those producers, who get napi_closing.
+    let abandon = close && queue.threads != 0
     drop queue drop guard
     if !Pointer.isNull<Item>(item) { entry.space.notifyOne() }
-    let call = entry.call let context = entry.context drop entry
+    let call = entry.call let context = entry.context let state = entry.state drop entry
+    if abandon { unsafe functionAbandon(function) return false }
     if close { unsafe functionClose(function) return false }
     if Pointer.isNull<Item>(item) { return false }
     let taken = unsafe Pointer.take<Item>(unsafe nn(item)) unsafe free(unsafe raw(unsafe nn(item)))
@@ -625,6 +659,9 @@ unsafe fn dispatch(function: *mut Function) -> bool {
       }
     } else { unsafe deliver(function, taken.data) }
     delivered = delivered + 1
+    // A delivered call ran native code and maybe JavaScript: the poll reports it, so the loop runs
+    // its checkpoint before it waits again.
+    unsafe bump(state)
   }
   return true
 }
