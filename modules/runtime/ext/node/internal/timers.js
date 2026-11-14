@@ -294,6 +294,9 @@ class Timeout {
   }
 
   refresh() {
+    // A suspended socket timeout is cleared as far as anything can tell: refreshing a
+    // cleared timer does nothing.
+    if (this._onTimeout === suspendedTimeout) return this;
     // active() or unrefActive(), by the timer's current state.
     insertGuarded(this, this[kRefed]);
 
@@ -506,6 +509,41 @@ function reuseOrCreateUnrefTimeout(timer, callback, after, arg) {
   return timer;
 }
 
+// A socket timeout set to 0 while it runs (an HTTP request starting on a keep-alive
+// connection) and set again soon after (the response finishing) costs a destroy and a
+// new async resource each time. With no async hook to see them, the timer stays in its
+// list with this callback instead: it fires as a cleared timer would have been destroyed
+// (listOnTimeout), and refreshUnrefTimeout() arms it again in place.
+function suspendedTimeout() {}
+
+function quietUnrefTimer(timer) {
+  return timer !== undefined && timer !== null && hookFields[kTotalHooks] === 0 &&
+    !timer._destroyed && timer._idleNext !== null && !timer[kRefed] &&
+    timer._repeat === null && !timer[kHasPrimitive];
+}
+
+// clearTimeout(timer) for a socket timeout that may run again soon; false when the
+// timer must be cleared for real.
+function suspendUnrefTimeout(timer) {
+  if (!quietUnrefTimer(timer) || timer._onTimeout === null) return false;
+  timer._onTimeout = suspendedTimeout;
+  return true;
+}
+
+// reuseOrCreateUnrefTimeout(timer, ...) for a timer still in its list with the same
+// duration and async context: it restarts where it is. False when it must be replaced.
+function refreshUnrefTimeout(timer, callback, after, arg) {
+  // The timer's callback must run in the context a new timer would capture now.
+  if (!quietUnrefTimer(timer) || timer._idleTimeout !== after || timer._onTimeout === null ||
+      timer[kAsyncResource]?.stores !== host.getAsyncContext()?.stores) return false;
+  const args = timer._timerArgs;
+  if (args === undefined || args.length !== 1) return false;
+  timer._onTimeout = callback;
+  args[0] = arg;
+  insert(timer, after);
+  return true;
+}
+
 // Type checking used by timers.enroll() and Socket#setTimeout()
 function getTimerDuration(msecs, name) {
   validateNumber(msecs, name);
@@ -672,7 +710,7 @@ function getTimerCallbacks(runNextTicks) {
 
       const asyncId = timer[async_id_symbol];
 
-      if (!timer._onTimeout) {
+      if (!timer._onTimeout || timer._onTimeout === suspendedTimeout) {
         if (!timer._destroyed) {
           timer._destroyed = true;
 
@@ -864,6 +902,8 @@ module.exports = {
   initAsyncResource,
   setUnrefTimeout,
   reuseOrCreateUnrefTimeout,
+  suspendUnrefTimeout,
+  refreshUnrefTimeout,
   getTimerDuration,
   immediateQueue,
   getTimerCallbacks,
