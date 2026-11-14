@@ -1,11 +1,13 @@
 'use strict';
 const { native, databases, statements, token, finalizers, release, statement, runnable, notInAuthorizer, notStepping, finalized, stateError, error, argValue, invalid, isObject, bindValue, isBinary, readValue } = require('internal/sqlite/shared');
-function reset(s, checked = true) { if (checked) return native('reset', [s.id]); try { native('reset', [s.id]); } catch {} }
+// s.stepped: the statement may be mid-result, so the next bind resets it first.
+function reset(s, checked = true) { s.stepped = false; if (checked) return native('reset', [s.id]); try { native('reset', [s.id]); } catch {} }
 function bind(s, args) {
   s.resetGeneration++;
-  reset(s);
-  native('clear', [s.id]);
+  if (s.stepped) reset(s);
   const names = s.parameters;
+  // sqlite3_clear_bindings has nothing to clear on a statement without parameters.
+  if (names.length) native('clear', [s.id]);
   let first = 0;
   if (args.length && isObject(args[0]) && !isBinary(args[0])) {
     const named = args[0];
@@ -40,7 +42,12 @@ function bind(s, args) {
 function fetch(s, max) {
   const fix = [0];
   const big = s.options.readBigInts, arrays = s.options.returnArrays;
-  const rows = native('rows', [s.id, +big, +arrays, max, fix]);
+  s.stepped = true;
+  const rows = native('rows', [s.id, +big, +arrays, max, fix, s.template]);
+  // A full read leaves the statement reset.
+  if (max === 0) s.stepped = false;
+  // A private row that carries the result shape into the next read of this statement.
+  if (fix.length > 1) { s.template = fix[1]; fix.length = 1; }
   if (fix[0]) {
     for (const row of rows) {
       if (arrays) { for (let i = 0; i < row.length; i++) row[i] = readValue(row[i], big); }
@@ -65,8 +72,10 @@ function run(s, mode) {
     let resetDone = false;
     try {
       if (mode === 'iterate') { resetDone = true; return new StatementSyncIterator(token, s.self.deref()); }
-      if (mode === 'all') return fetch(s, 0);
+      // A full read resets the statement natively once it is done.
+      if (mode === 'all') { const rows = fetch(s, 0); resetDone = true; return rows; }
       if (mode === 'get') { const rows = fetch(s, 1); return rows.length ? rows[0] : undefined; }
+      s.stepped = true;
       const code = native('step', [s.id]);
       reset(s);
       resetDone = true;
@@ -115,7 +124,7 @@ class StatementSync {
   constructor(secret, db, id, options) {
     if (secret !== token) throw error('ERR_ILLEGAL_CONSTRUCTOR', 'Illegal constructor', TypeError);
     const owner = databases.get(db);
-    const s = { db, id, self: new WeakRef(this), generation: owner.generation, statementGeneration: owner.statementGeneration, options, resetGeneration: 0, busy: false, parameters: native('parameters', [id]) };
+    const s = { db, id, self: new WeakRef(this), generation: owner.generation, statementGeneration: owner.statementGeneration, options, resetGeneration: 0, busy: false, stepped: false, parameters: native('parameters', [id]), template: undefined };
     statements.set(this, s);
     finalizers.register(this, { id }, this);
   }
@@ -154,7 +163,7 @@ function tagExecute(stmt, values, mode) {
   const s = statements.get(stmt);
   notStepping(s);
   s.resetGeneration++;
-  reset(s);
+  if (s.stepped) reset(s);
   native('clear', [s.id]);
   if (s.parameters.length !== values.length) throw argValue('SQLite parameters must be bound using template literal placeholders.');
   for (let i = 0; i < values.length; i++) bindValue(s.id, i + 1, values[i]);
