@@ -70,7 +70,7 @@ class WebSocket extends EventEmitter {
   }
   get binaryType() { return this._binaryType; }
   set binaryType(type) {
-    if (type === 'nodebuffer' || type === 'arraybuffer' || type === 'fragments') this._binaryType = type;
+    if (type === 'nodebuffer' || type === 'arraybuffer' || type === 'fragments' || type === 'blob') this._binaryType = type;
   }
   get bufferedAmount() {
     if (!this._socket) return this._bufferedAmount;
@@ -118,8 +118,11 @@ class WebSocket extends EventEmitter {
     if (type === WS_WRITE_FAILED) { this._socket.destroy(Object.assign(new Error('write failed'), { errno: status })); return; }
     if (status === 1 || status === 2) {
       const binary = status === 2;
+      // ws's Receiver: binaryType shapes binary messages only; a text message is a Buffer.
       let data;
-      if (this._binaryType === 'arraybuffer') data = payload;
+      if (!binary) data = Buffer.from(payload);
+      else if (this._binaryType === 'arraybuffer') data = payload;
+      else if (this._binaryType === 'blob') data = new Blob([payload]);
       else {
         data = Buffer.from(payload);
         if (this._binaryType === 'fragments') data = [data];

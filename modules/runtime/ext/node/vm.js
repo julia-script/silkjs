@@ -54,6 +54,7 @@ function createContext(sandbox = {}, value) {
   const handle = host.vmCreateContext(config.afterEvaluate);
   const global = host.vmGlobal(handle);
   const realmRequire = host.initializeRealmBuiltins(handle, global, config.wasm);
+  if (host.contextExposeGC ?? host.exposeGC) Object.defineProperty(global, 'gc', { value: host.makeGC(), writable: true, enumerable: true });
   let result = global;
   if (sandbox !== DONT_CONTEXTIFY) {
     // The sandbox mirror and the realm's binding record have distinct property
