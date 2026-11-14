@@ -372,6 +372,7 @@ function requestBytes(flags, record) {
   for (let i = 2; i < record.length; i += 2) text += `${record[i]}: ${record[i + 1]}\r\n`;
   return Buffer.from(text + '\r\n', 'latin1');
 }
+let incoming;
 function nativeRequest(parser, state, link, flags, record) {
   if (link.released) { HTTPParser.prototype.execute.call(parser, requestBytes(flags, record)); return; }
   if (!state.id) return;
@@ -382,7 +383,11 @@ function nativeRequest(parser, state, link, flags, record) {
     state.nativeBegun = false;
     // [major, minor, method, statusCode, upgrade, keepAlive, eof, url, fields]
     const head = [1, (flags & 4) !== 0 ? 0 : 1, methodIndex.get(record[0]), 0, false, true, false, record[1], record.slice(2)];
-    event(parser, state, 7, head, 0);
+    // The request's stream starts lean (_http_incoming kLean).
+    incoming ??= require('_http_incoming');
+    incoming.makeLeanNext(true);
+    try { event(parser, state, 7, head, 0); }
+    finally { incoming.makeLeanNext(false); }
     event(parser, state, 9, undefined, 0);
   } finally { state.executing = false; }
   // The last request of a read ends its execute (HTTP_MORE, 16, marks the others).

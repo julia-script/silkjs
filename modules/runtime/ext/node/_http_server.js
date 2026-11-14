@@ -59,6 +59,9 @@ const {
 const {
   IncomingMessage,
   kDetachAbortSignal,
+  resumeScheduled,
+  readableEnded,
+  isLean: isLeanRequest,
 } = require('_http_incoming');
 const {
   ConnResetException,
@@ -1083,7 +1086,8 @@ function clearIncoming(req) {
   const parser = req.socket?.parser;
   // Reset the .incoming property so that the request object can be gc'ed.
   if (parser && parser.incoming === req) {
-    if (req.readableEnded) {
+    // A lean request that _dump left lean ends unseen: nothing waits for its 'end'.
+    if (readableEnded(req) || (req._dumped && isLeanRequest(req))) {
       parser.incoming = null;
     } else {
       req.on('end', clearIncoming);
@@ -1112,7 +1116,7 @@ function resOnFinish(req, res, socket, state, server) {
   // If the user never called req.read(), and didn't pipe() or
   // .resume() or .on('data'), then we call req._dump() so that the
   // bytes will be pulled off the wire.
-  if (!req._consuming && !req._readableState.resumeScheduled)
+  if (!req._consuming && !resumeScheduled(req))
     req._dump();
 
   res.detachSocket(socket);
