@@ -208,6 +208,9 @@ class TLSTransport {
     if (this.closing) return;
     try {
       op2('select', this.id, context ? context._id : 0);
+      // The session runs on the chosen context from here on (TLSWrap's sni_context_):
+      // collecting it would release the native context under the session.
+      if (context) this.selectedContext = context;
       this.selectALPN();
     } catch (failure) { if (!(failure instanceof Failure)) throw failure; this.socket.destroy(failure.cause); return; }
     if (this.closing) return;
