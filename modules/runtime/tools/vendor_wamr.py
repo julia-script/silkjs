@@ -12,6 +12,7 @@ calling native functions as top-level assembly, since Silk compiles C and not as
 """
 from pathlib import Path
 import hashlib
+import re
 import shutil
 import subprocess
 import sys
@@ -123,6 +124,11 @@ def main():
                 text = subprocess.run([compiler, '-E', '-P', '-x', 'assembler-with-cpp', *flags,
                                        str(wamr / 'core/iwasm/common/arch' / assembly)],
                                       check=True, capture_output=True, text=True).stdout
+                if apple:
+                    # Mach-O only lets a conditional branch reach an assembler-local (L-prefixed) label.
+                    for label in re.findall(r'(?m)^\s*(\w+):', text):
+                        if not label.startswith('_'):
+                            text = re.sub(rf'\b{label}\b', 'L' + label, text)
                 lines = ''.join('    "' + line.replace('\\', '\\\\').replace('"', '\\"') + '\\n"\n'
                                 for line in text.splitlines() if line.strip())
                 condition = f'defined({macro}) && ' + ('defined(__APPLE__)' if apple else '!defined(__APPLE__)')
