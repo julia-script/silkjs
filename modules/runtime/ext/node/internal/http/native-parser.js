@@ -33,7 +33,10 @@ const invoke = asyncHooks._invoke;
 const call0 = (fn, self) => fn.call(self);
 const call1 = (fn, self, a) => fn.call(self, a);
 const call2 = (fn, self, a) => fn.call(self, a[0], a[1]);
-const callHead = (fn, self, a) => fn.call(self, a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7], a[8]);
+// The native head ([major, minor, method, statusCode, upgrade, keepAlive, eof, url or status
+// text, fields]) as kOnHeadersComplete's arguments, without an intermediate array.
+const callRequestHead = (fn, self, a) => fn.call(self, a[0], a[1], a[8], a[2], a[7], undefined, undefined, a[4], a[5]);
+const callResponseHead = (fn, self, a) => fn.call(self, a[0], a[1], a[8], undefined, undefined, a[3], a[7], a[4], a[5]);
 // Parser callbacks run in the parser's async scope, with fixed arguments.
 // When the parser consumes its socket, Node calls kOnHeaders, kOnBody and kOnExecute
 // with MakeCallback, so the nextTick and microtask queues drain after them. Message
@@ -72,9 +75,7 @@ function event(parser, state, kind, value, remaining) {
       state.headersComplete = true;
       state.upgrade = value[4];
       state.eof = value[6];
-      const result = callback(parser, state, HTTPParser.kOnHeadersComplete, callHead,
-        [value[0], value[1], value[8], request ? value[2] : undefined, request ? value[7] : undefined,
-          request ? undefined : value[3], request ? undefined : value[7], value[4], value[5]]);
+      const result = callback(parser, state, HTTPParser.kOnHeadersComplete, request ? callRequestHead : callResponseHead, value);
       return state.pauseRequested && !result ? 21 : result | 0;
     }
     case 8: callback(parser, state, HTTPParser.kOnBody, call1, Buffer.from(value)); break;
@@ -122,7 +123,7 @@ function resetAsync(state, owner, id) {
 class HTTPParser {
   constructor() {
     const state = { id: 0, type: HTTPParser.REQUEST, resource: null, connections: null, messageStart: 0, beingFreed: false, topLevel: false, provider: 0, frame: undefined, consuming: null,
-      currentRead: null, executing: false, pauseRequested: false, remaining: 0, remainder: null };
+      currentRead: null, list: null, executing: false, pauseRequested: false, remaining: 0, remainder: null };
     resetMessage(state);
     state.callback = (kind, value, remaining) => event(this, state, kind, value, remaining);
     state.id = native(0, new WeakRef(state.callback));
@@ -150,6 +151,7 @@ class HTTPParser {
     if (connectionsList !== undefined) {
       if (!(connectionsList instanceof ConnectionsList)) throw error('ERR_INVALID_ARG_TYPE', 'connectionsList must be a ConnectionsList');
       state.connections = connectionsList;
+      state.list = listOf(connectionsList);
       // Like Node, a connection that never sends a byte still has a deadline.
       connectionsList._begin(this, state);
     }
@@ -210,7 +212,8 @@ class HTTPParser {
       // the socket's own read path.
       if (status < 0) return false;
       if (!payload?.byteLength) return true;
-      const buffer = Buffer.from(payload);
+      // A plain view: execute only reads it during this event, and getCurrentBuffer copies.
+      const buffer = payload instanceof ArrayBuffer ? new Uint8Array(payload) : payload;
       state.currentRead = buffer;
       state.topLevel = true;
       try { callback(this, state, HTTPParser.kOnExecute, call1, HTTPParser.prototype.execute.call(this, buffer)); }
@@ -235,7 +238,7 @@ class HTTPParser {
     HTTPParser.prototype.unconsume.call(this);
     const state = stateOf(this);
     state.beingFreed = true;
-    if (state.connections) { state.connections._remove(this); state.connections = null; }
+    if (state.connections) { state.connections._remove(this); state.connections = null; state.list = null; }
   }
   free() {
     const state = stateOf(this);
@@ -310,12 +313,12 @@ class ConnectionsList {
     return result;
   }
   _begin(parser, state) {
-    const list = listOf(this);
+    const list = state.list ?? listOf(this);
     state.messageStart = host.now();
     list.all.add(parser); list.active.add(parser);
   }
   _complete(parser, state) {
-    const list = listOf(this);
+    const list = state.list ?? listOf(this);
     list.active.delete(parser);
     state.messageStart = 0;
     list.all.add(parser);
