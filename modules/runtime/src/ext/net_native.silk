@@ -672,8 +672,9 @@ unsafe effect fn collect(state: *mut State) -> () ! OutOfMemoryError ? &mut Allo
       if listening { let accepted = run Effect.result(unsafe acceptReady(handle)) if let Result<(), OutOfMemoryError>.Failure { .. } = move accepted { failed = true } }
       else if udp { unsafe receiveReady(handle) }
       else if !Pointer.isNull<Peer>(unsafe peerOf(handle)) { let read = run Effect.result(unsafe wsReadReady(handle)) if let Result<(), OutOfMemoryError>.Failure { .. } = move read { failed = true } }
-      else if !Pointer.isNull<Exchange>(unsafe exchangeOf(handle)) { let read = run Effect.result(unsafe httpReadReady(handle)) if let Result<(), OutOfMemoryError>.Failure { .. } = move read { failed = true } }
+      // A TLS session's handle reads its records first; their plaintext may go to node mode.
       else if !Pointer.isNull<u8>(unsafe secureOf(handle)) { let read = run Effect.result(unsafe secureReadReady(handle)) if let Result<(), OutOfMemoryError>.Failure { .. } = move read { failed = true } }
+      else if !Pointer.isNull<Exchange>(unsafe exchangeOf(handle)) { let read = run Effect.result(unsafe httpReadReady(handle)) if let Result<(), OutOfMemoryError>.Failure { .. } = move read { failed = true } }
       else { unsafe readReady(handle) }
     }
     unsafe refresh(handle)
@@ -977,7 +978,7 @@ const MAX_BODY: u64 = 134217728
 // its bytes; `body` its payload so far.
 // In node mode (node:http, see Node mode below) `raw` holds the bytes of the head being read,
 // `maxHead` is the server's maxHeaderSize, and `begun` tells that HTTP_BEGIN went out for it.
-struct Exchange { parser: RequestParser, phase: i32, remaining: u64, decoder: Option<Decoder>, record: Bytes, body: Bytes, flags: i32, out: Bytes, scratch: Bytes, pending: Bytes, dateSecond: i64, date: [u8; 29], node: bool, raw: Bytes, maxHead: usize, begun: bool }
+struct Exchange { parser: RequestParser, phase: i32, remaining: u64, decoder: Option<Decoder>, record: Bytes, body: Bytes, flags: i32, out: Bytes, scratch: Bytes, pending: Bytes, dateSecond: i64, date: [u8; 29], node: bool, secure: bool, raw: Bytes, maxHead: usize, begun: bool }
 
 fn httpValueLimits() -> ValueLimits {
   return ValueLimits { maxMethodBytes: 64, maxTargetBytes: 16384, maxNameBytes: 256, maxValueBytes: 16384, maxFields: 256, maxFieldBytes: 65536, maxOwnedBytes: 81920 }
@@ -2358,15 +2359,18 @@ unsafe effect fn operation<'m, S: EngineServices>(engine: &mut Engine<'m, S>, co
   }
   if eq(op, b"httpAdopt") {
     if kind != TCP && kind != PIPE { return ValueBits.Int { value: EINVAL() } }
-    if !Pointer.isNull<Peer>(unsafe peerOf(handle)) || !Pointer.isNull<Exchange>(unsafe exchangeOf(handle)) || !Pointer.isNull<u8>(unsafe secureOf(handle)) { return ValueBits.Int { value: EINVAL() } }
+    // httpAdopt(id, mode, maxHeaderSize): mode 1 reads for node:http (see Node mode), mode 2
+    // reads the plaintext of the TLS session this handle runs natively (secure op 0).
+    let mode = number(args.values[1])
+    let secured = !Pointer.isNull<u8>(unsafe secureOf(handle))
+    if !Pointer.isNull<Peer>(unsafe peerOf(handle)) || !Pointer.isNull<Exchange>(unsafe exchangeOf(handle)) || secured != (mode == 2) { return ValueBits.Int { value: EINVAL() } }
     let made = run RequestParser.make(httpHeadLimits())
     let parser = match move made { Result.Success { value } => move value Result.Failure { .. } => { return ValueBits.Int { value: EINVAL() } } }
     let raw = run allocate(Layout.of<Exchange>().bytes)
     let exchange = unsafe Intrinsic.pointerReinterpret<*mut u8, *mut Exchange>(raw)
-    // httpAdopt(id, mode, maxHeaderSize): mode 1 reads for node:http (see Node mode).
-    let node = number(args.values[1]) == 1
+    let node = mode == 1 || mode == 2
     let maxHead = number(args.values[2])
-    unsafe Pointer.put<Exchange>(exchange, Exchange { parser: move parser, phase: PHASE_HEAD, remaining: 0, decoder: Option<Decoder>.none(), record: Bytes.make(), body: Bytes.make(), flags: 0, out: Bytes.make(), scratch: Bytes.make(), pending: Bytes.make(), dateSecond: -1, date: [0; 29], node: node, raw: Bytes.make(), maxHead: if maxHead > 0 { i32.toUsize(maxHead) } else { 16384 }, begun: false })
+    unsafe Pointer.put<Exchange>(exchange, Exchange { parser: move parser, phase: PHASE_HEAD, remaining: 0, decoder: Option<Decoder>.none(), record: Bytes.make(), body: Bytes.make(), flags: 0, out: Bytes.make(), scratch: Bytes.make(), pending: Bytes.make(), dateSecond: -1, date: [0; 29], node: node, secure: mode == 2, raw: Bytes.make(), maxHead: if maxHead > 0 { i32.toUsize(maxHead) } else { 16384 }, begun: false })
     // A node:http socket reads when JavaScript starts it, as with any socket.
     let entry = unsafe Pointer.borrowMut<(), Handle>(&mut anchor, handle) entry.exchange = exchange if !node { entry.reading = true } drop entry
     unsafe refresh(handle)
@@ -2622,6 +2626,9 @@ const NOT_SECURE: i32 = -100001
 
 unsafe fn secureOf(handle: *mut Handle) -> ?*mut u8 { let a = () let h = unsafe Pointer.borrow<(), Handle>(&a, handle) return h.secure }
 unsafe fn forgetSecure(handle: *mut Handle) -> () {
+  // Node mode over the session hands what it holds to JavaScript's parser first: the
+  // plaintext that follows comes from JavaScript's record pump.
+  if unsafe nodeExchange(handle) { unsafe nodeFallback(handle) }
   let mut anchor = () let h = unsafe Pointer.borrowMut<(), Handle>(&mut anchor, handle)
   let session = h.secure h.secure = Pointer.null<u8>() drop h
   if !Pointer.isNull<u8>(session) { unsafe tls.secureDetach(unsafe nn(session)) }
@@ -2696,7 +2703,11 @@ unsafe effect fn secureReadReady(handle: *mut Handle) -> () ! OutOfMemoryError ?
     let mut bufferAnchor = () let output = unsafe Pointer.borrowManyMut<(), u8>(&mut bufferAnchor, unsafe Pointer.assumeManyMut<u8>(scratch), CHUNK)
     let count = readOnce(&mut h.socket, move output)
     if count == 0 { return () }
-    if count < 0 { h.reading = false drop h unsafe notify(handle, READ, i64.toI32(count), 0) return () }
+    if count < 0 {
+      h.reading = false drop h
+      if unsafe nodeExchange(handle) { unsafe nodeFallback(handle) }
+      unsafe notify(handle, READ, i64.toI32(count), 0) return ()
+    }
     drop h
     let cipher = i64.toUsize(count)
     if !unsafe tls.secureFeed(session, scratch, cipher) { unsafe returnSecure(handle) return () }
@@ -2716,7 +2727,17 @@ unsafe effect fn secureDecrypt(handle: *mut Handle, session: *mut u8, cipher: us
   while true {
     last = unsafe tls.secureRead(session, scratch, CHUNK)
     if last <= 0 { break }
-    let length = i32.toUsize(last) let memory = run allocateRaw(length)
+    let length = i32.toUsize(last)
+    if unsafe nodeExchange(handle) {
+      // Node mode reads the record (httpAdopt mode 2); the ciphertext still counts as read.
+      if counted > 0 { unsafe post(event(handle, READ, counted, PLAINTEXT)) }
+      counted = 0
+      let mut recordAnchor = ()
+      let record = unsafe Pointer.borrowMany<(), u8>(&recordAnchor, unsafe Pointer.assumeMany<u8>(scratch), length)
+      run unsafe nodeReceive(handle, record)
+      continue
+    }
+    let memory = run allocateRaw(length)
     let _copied = unsafe memcpy(memory, scratch, length)
     let mut value = event(handle, READ, counted, PLAINTEXT) value.data = unsafe Intrinsic.pointerRequalify<*mut u8, ?*mut u8>(memory) value.length = length unsafe post(move value)
     counted = 0
