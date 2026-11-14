@@ -92,16 +92,19 @@ def embed_builtin_cache(output, native, environment):
 
 
 def startup_order(arguments):
-    """Linker flags that place the functions a start runs next to each other.
+    """Linker flags that place the functions a start and a server run next to each other.
 
-    A start runs under 3 MB of a 27 MB text section. Left where the compiler put them,
-    its functions touch several times as many pages as they fill, and each page is a
-    fault. tools/startup-order.txt lists them (tools/startup_order.py writes it); a name
-    that no longer exists is skipped. Only lld takes the list.
+    A start runs under 3 MB of a 27 MB text section, and an HTTP or HTTPS server about
+    3 MB more. Left where the compiler put them, these functions touch several times as
+    many pages as they fill: each page is a fault, and the kernel maps file pages 64 KB
+    at a time, so a server's resident text was 22 MB. tools/startup-order.txt lists a
+    start's functions and tools/server-order.txt the rest a server runs (tools/startup_order.py
+    writes both); a name that no longer exists is skipped. Only lld takes the list.
     """
-    order = ROOT / 'tools/startup-order.txt'
     if platform.system() != 'Linux' or not any(a.startswith('--ld-path=') and 'lld' in a for a in arguments):
         return []
+    order = ROOT / 'build/function-order.txt'
+    order.write_text((ROOT / 'tools/startup-order.txt').read_text() + (ROOT / 'tools/server-order.txt').read_text())
     return ['-Wl,--symbol-ordering-file=' + str(order), '-Wl,--no-warn-symbol-ordering']
 
 

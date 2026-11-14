@@ -631,7 +631,13 @@ function _onceWrap(target, type, listener) {
     if (fired) return;
     fired = true;
     target.removeListener(type, wrapper);
-    return ReflectApply(listener, target, args);
+    // wrapper's scope holds wrapper itself and the target: a cycle that only a
+    // collection frees, and with it all the target holds (a whole HTTP request for
+    // resOnFinish). Emptied once fired, the wrapper dies with its last reference.
+    const self = target;
+    const fn = listener;
+    wrapper = target = listener = undefined;
+    return ReflectApply(fn, self, args);
   }
   wrapper.listener = listener;
   return wrapper;
