@@ -110,6 +110,8 @@ const cases = {
   'wrong width': () => [Buffer.concat([dataRow(['1', 'a', 'b', 'c', '1', 't']), dataRow(['1', 'a'])]), query(), none],
   raw: () => [Buffer.concat(rows.map(dataRow)), query({ isRaw: 'values' }), none],
   transform: () => [Buffer.concat(rows.map(dataRow)), query(), { value: { from: v => typeof v }, row: { from: undefined } }],
+  // Same length, same first 16 and last 8 bytes: only the compare tells them apart.
+  repeated: () => [Buffer.concat([0, 1, 2, 1, 0].map(n => dataRow([String(n), `aaaaaaaaaaaaaaaa${n}${n}${n}bbbbbbbb`, 'same', null, '1', 't']))), query(), none],
   forEach: () => { const seen = []; return [Buffer.concat(rows.map(dataRow)), query({ forEachFn: row => seen.push(row.id) }), none]; },
 };
 const output = [];

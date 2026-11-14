@@ -5,6 +5,9 @@ const { createHooks } = require('./hooks');
 const own = (object, key) => Object.prototype.hasOwnProperty.call(object, key);
 const builtinPrefix = Function.prototype.call.bind(String.prototype.startsWith);
 const builtinSlice = Function.prototype.call.bind(String.prototype.slice);
+const functionToString = Function.prototype.call.bind(Function.prototype.toString);
+const defineOwnProperty = Object.defineProperty;
+const prototypeOf = Object.getPrototypeOf;
 // Node's kFirstModuleParent: internal/errors reads it for require stacks.
 const kModuleParent = require('internal/host').kFirstModuleParent;
 const { loaderRequire } = require('internal/modules/helpers');
@@ -127,7 +130,25 @@ function createLoader(host, builtins) {
   const postgresLoop = '    while (incoming.length > 4) {\n      length = incoming.readUInt32BE(1)\n';
   // On the loop's own line, so the lines after it keep their numbers.
   const postgresFast = '    while (incoming.length > 4) { if (incoming[0] === 68 && query) { const used = __silkPostgresRows(incoming, query, result, rows, transform); if (used > 0) { rows = result.length; incoming = incoming.subarray(used); continue } }\n      length = incoming.readUInt32BE(1)\n';
+  // postgres.js query.js: a Query keeps resolve/reject arrows that capture the
+  // Query itself, so every finished query, its result and all its rows form a
+  // cycle only the cycle collector frees (about a seventh of Bun's 100k-query
+  // benchmark). Once one of them runs the promise is settled and both can only
+  // clear active, so they become a shared method that does that and the cycle
+  // goes: the rows die by reference count when the result is dropped.
+  const postgresQuery = /[\\/]node_modules[\\/]postgres[\\/](?:cjs[\\/])?src[\\/]query\.js$/;
+  const queryResolve = '\n    this.resolve = x => (this.active = false, resolve(x))\n';
+  const queryReject = '\n    this.reject = x => (this.active = false, reject(x))\n';
+  const settledResolve = '\n    this.resolve = x => (this.active = false, this.resolve = this.reject = __silkSettledQuery, resolve(x))\n';
+  const settledReject = '\n    this.reject = x => (this.active = false, this.resolve = this.reject = __silkSettledQuery, reject(x))\n';
+  function onlyOnce(source, text) { const at = source.indexOf(text); return at >= 0 && source.indexOf(text, at + 1) < 0; }
+  function patchQuerySource(source) {
+    if (!onlyOnce(source, queryResolve) || !onlyOnce(source, queryReject) || !source.includes('class Query extends Promise')) return source;
+    // Kept on the first line, so line numbers match the file.
+    return 'function __silkSettledQuery() { this.active = false }' + source.replace(queryResolve, settledResolve).replace(queryReject, settledReject);
+  }
   function patchPackageSource(filename, source, esm) {
+    if (postgresQuery.test(filename)) return patchQuerySource(source);
     if (!postgresConnection.test(filename)) return source;
     const at = source.indexOf(postgresLoop);
     if (at < 0 || source.indexOf(postgresLoop, at + 1) >= 0 || !source.includes('function DataRow(x)')) return source;
@@ -135,7 +156,7 @@ function createLoader(host, builtins) {
     const binding = esm ? 'const __silkPostgresRows = import.meta.silkPostgresRows;' : 'const __silkPostgresRows = module.silkPostgresRows;';
     return binding + source.slice(0, at) + postgresFast + source.slice(at + postgresLoop.length);
   }
-  function isPatchedPackage(filename) { return postgresConnection.test(filename); }
+  function isPatchedPackage(filename) { return postgresConnection.test(filename) || postgresQuery.test(filename); }
 
   function cleanSource(source) {
     if (source.charCodeAt(0) === 0xFEFF) source = source.slice(1);
@@ -1205,7 +1226,7 @@ function createLoader(host, builtins) {
       try {
         wrapper = wrapperPatched
           ? host.compileFunction(Module.wrap(compiledSource), filename, undefined, undefined, true)
-          : host.compileFunction(wrapperPrefix + compiledSource + wrapperSuffix, filename, compiledSource, wrapperPrefix.length);
+          : host.compileFunction(wrapperPrefix + compiledSource + wrapperSuffix, filename, undefined, wrapperPrefix.length);
       } catch (error) {
         host.attachArrow(error, filename, compiledSource, wrapperPatched ? Module.wrap(compiledSource).indexOf(compiledSource) : wrapperPrefix.length);
         // CompileFunctionForCJSLoader decorates the stack of a compile error.
@@ -1214,6 +1235,19 @@ function createLoader(host, builtins) {
         throw error;
       }
       const metadata = host.getScriptMetadata(wrapper);
+      // The compiled wrapper already holds the module's text: the script's source is read
+      // back out of it when something asks (an error's source line, the inspector), so a
+      // loaded module keeps one copy of its text, not two.
+      if (metadata && !wrapperPatched) {
+        const compiled = wrapper;
+        // The wrapper's own metadata inherits from the script's, which every function of
+        // the module shares and which owns the source.
+        const script = prototypeOf(metadata) ?? metadata;
+        defineOwnProperty(script, 'source', {
+          __proto__: null, enumerable: true, configurable: true,
+          get() { const text = functionToString(compiled); return builtinSlice(text, wrapperPrefix.length - 1, text.length - 2); },
+        });
+      }
       host.registerSource(filename, compiledSource, {
         owner: this, scriptId: metadata?.scriptId, sourceURL: metadata?.sourceURL ?? null, sourceMapURL: metadata?.sourceMapURL ?? null,
       });
