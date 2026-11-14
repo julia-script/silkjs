@@ -235,7 +235,7 @@ const { emitWarning } = process;
 let shakeWarned = false;
 function warnShake(algorithm) {
   // The name test first: it is cheaper than the option lookup, and most digests are not SHAKE.
-  if (shakeWarned || !/^shake-?(?:128|256)$/i.test(algorithm)) return;
+  if (shakeWarned || !isXof(algorithm)) return;
   if (!require('internal/options').getOptionValue('--pending-deprecation')) return;
   shakeWarned = true; emitWarning('Creating SHAKE128/256 digests without an explicit options.outputLength is deprecated.', 'DeprecationWarning', 'DEP0198');
 }
@@ -249,8 +249,15 @@ function digestSize(algorithm) {
   return size;
 }
 // The native digest has no output length: XOF lengths are applied when the digest is read.
+// Whether a digest name is SHAKE, tested once per name.
+const xofNames = new Map();
+function isXof(algorithm) {
+  let xof = xofNames.get(algorithm);
+  if (xof === undefined) { xof = /^shake-?(?:128|256)$/i.test(algorithm); if (typeof algorithm === 'string') xofNames.set(algorithm, xof); }
+  return xof;
+}
 function hashState(algorithm, xofLen, existing) {
-  const size = digestSize(algorithm), xof = /^shake-?(?:128|256)$/i.test(algorithm);
+  const size = digestSize(algorithm), xof = isXof(algorithm);
   if (xofLen !== undefined && !xof && xofLen !== size) throw error('ERR_OSSL_EVP_NOT_XOF_OR_INVALID_LENGTH', 'Invalid XOF digest length');
   return { algorithm, length: xof ? xofLen ?? (/128$/.test(algorithm) ? 16 : 32) : -1, [kFinalized]: false, existing };
 }
@@ -262,6 +269,12 @@ function hashState(algorithm, xofLen, existing) {
 // (or a copy): a single update then digest, as ETag and checksum code does, is one
 // native one-shot digest of a private copy of the bytes.
 const oneShotDigests = new Set(['md5', 'sha1', 'sha256', 'sha384', 'sha512']);
+// A string the native side may take as is: UTF-8 text without lone surrogates (which
+// Buffer.from turns into U+FFFD).
+const StringPrototypeIsWellFormed = String.prototype.isWellFormed;
+function utf8Text(data, encoding) {
+  return (encoding === undefined || encoding === 'utf8' || encoding === 'utf-8') && Reflect.apply(StringPrototypeIsWellFormed, data, []);
+}
 class HashHandle {
   constructor(algorithm, length, source) {
     this.algorithm = algorithm; this.length = length;
@@ -275,12 +288,18 @@ class HashHandle {
       this.deferred = false;
       attach(this, call('hashCreate', [this.algorithm]));
       const pending = this.pending; this.pending = undefined;
+      // A pending string is well-formed text: the native side encodes it as UTF-8.
       if (pending !== undefined) call('hashUpdate', [handle(this), pending]);
     }
     return this;
   }
   update(data, encoding) {
     try {
+      // ETag code hashes one string: it waits as it is, and the one-shot digest encodes it.
+      if (this.deferred && this.pending === undefined && typeof data === 'string' && utf8Text(data, encoding)) {
+        this.pending = data;
+        return true;
+      }
       const bytes = typeof data === 'string' ? Buffer.from(data, encoding) : data;
       if (this.deferred && this.pending === undefined) {
         this.pending = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
@@ -335,7 +354,9 @@ Hash.prototype._transform = function _transform(chunk, encoding, cb) { if (!this
 Hash.prototype._flush = function _flush(cb) { this.push(this[kHandle].digest()); cb(); };
 Hash.prototype.update = function update(data, encoding) {
   if (this[kState][kFinalized]) throw codes.ERR_CRYPTO_HASH_FINALIZED();
-  if (!this[kHandle].update(hashData(data, encoding))) throw codes.ERR_CRYPTO_HASH_UPDATE_FAILED();
+  // UTF-8 text goes to the handle as it is (hashData would encode it first).
+  const input = typeof data === 'string' && (encoding === undefined || encoding === 'utf8' || encoding === 'utf-8') ? data : hashData(data, encoding);
+  if (!this[kHandle].update(input, encoding)) throw codes.ERR_CRYPTO_HASH_UPDATE_FAILED();
   return this;
 };
 Hash.prototype.digest = function digest(outputEncoding) {
