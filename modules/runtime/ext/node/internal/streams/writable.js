@@ -623,6 +623,8 @@ function writeIdle(stream, chunk, encoding, cb, dispatch) {
   return ret && (state[kState] & (kDestroyed | kErrored)) === 0;
 }
 streamHooks.writeIdle = writeIdle;
+// WritableState's needDrain getter.
+streamHooks.needDrain = function needDrain(state) { return (state[kState] & kNeedDrain) !== 0; };
 // Duplex's destroyed and writable getters for a stream, read in one call (net.js
 // socketState): 0 destroyed, 1 writable, 2 neither.
 streamHooks.duplexState = function duplexState(stream) {

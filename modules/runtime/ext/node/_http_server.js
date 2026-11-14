@@ -22,6 +22,8 @@
 
 'use strict';
 
+const { streamHooks } = require('internal/streams/utils');
+
 const net = require('net');
 const EE = require('events');
 const assert = require('internal/assert');
@@ -1188,9 +1190,12 @@ function parserOnIncoming(server, socket, state, req, keepAlive) {
   // If the writable end isn't consuming, then stop reading
   // so that we don't become overwhelmed by a flood of
   // pipelined requests that may never be resolved.
+  // A net socket's needDrain and writableHighWaterMark come from its state.
+  const netSocket = streamHooks.isNetSocket(socket);
   if (!socket._paused) {
     const ws = socket._writableState;
-    if (ws.needDrain || state.outgoingData >= socket.writableHighWaterMark) {
+    if ((netSocket ? streamHooks.needDrain(ws) : ws.needDrain) ||
+        state.outgoingData >= (netSocket ? ws.highWaterMark : socket.writableHighWaterMark)) {
       socket._paused = true;
       // We also need to pause the parser, but don't do that until after
       // the call to execute, because we may still be processing the last
@@ -1199,9 +1204,10 @@ function parserOnIncoming(server, socket, state, req, keepAlive) {
     }
   }
 
+  const highWaterMark = netSocket ? socket._writableState.highWaterMark : socket.writableHighWaterMark;
   const res = new server[kServerResponse](req,
                                           {
-                                            highWaterMark: socket.writableHighWaterMark,
+                                            highWaterMark,
                                             rejectNonStandardBodyWrites: server.rejectNonStandardBodyWrites,
                                           });
   res._keepAliveTimeout = server.keepAliveTimeout;

@@ -1170,10 +1170,16 @@ function queueEndCallback(msg, callback) {
   msg[kEndCallbacks].push(callback);
 }
 
+// socket?.errored, read from a net socket's state.
+function socketErrored(socket) {
+  if (socket == null) return undefined;
+  return streamHooks.isNetSocket(socket) ? streamHooks.readableErrored(socket) : socket.errored;
+}
+
 function onFinish(outmsg, err) {
   if (err ||
       outmsg[kErrored] ||
-      outmsg[kSocket]?.errored ||
+      socketErrored(outmsg[kSocket]) ||
       outmsg[kSocket]?._hadError) {
     outmsg[kFlushError] = err ?? getEndCallbackError(outmsg);
     flushEndCallbacks(outmsg, outmsg[kFlushError]);
@@ -1322,8 +1328,9 @@ OutgoingMessage.prototype._finish = function _finish() {
 // to attempt to flush any pending messages out to the socket.
 OutgoingMessage.prototype._flush = function _flush() {
   const socket = this[kSocket];
+  const known = socket != null ? streamHooks.socketState(socket) : -1;
 
-  if (socket?.writable) {
+  if (known === -1 ? socket?.writable : known === 1) {
     // There might be remaining data in this.output; write it out
     const ret = this._flushOutput(socket);
 

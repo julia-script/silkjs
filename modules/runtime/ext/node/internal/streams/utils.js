@@ -338,8 +338,12 @@ function isErrored(stream) {
 }
 
 // Fast paths that one stream module lends another without a public property: writable.js
-// sets writeIdle and duplexState, net.js socketWrite and socketState (node:http response writes).
-const streamHooks = { __proto__: null, writeIdle: null, duplexState: null, socketWrite: null, socketState: null };
+// sets writeIdle, duplexState and needDrain, readable.js readableOpen and readableErrored, net.js
+// socketWrite, socketState and isNetSocket (node:http's per-request socket reads).
+const streamHooks = {
+  __proto__: null, writeIdle: null, duplexState: null, needDrain: null, readableOpen: null, readableErrored: null,
+  socketWrite: null, socketState: null, isNetSocket: null,
+};
 
 module.exports = {
   streamHooks,

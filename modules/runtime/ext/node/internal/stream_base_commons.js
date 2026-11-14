@@ -22,6 +22,8 @@
 
 'use strict';
 
+const { streamHooks } = require('internal/streams/utils');
+
 const {
   Array,
   Symbol,
@@ -268,7 +270,8 @@ function onStreamTimeout(stream) {
 }
 
 function setStreamTimeout(msecs, callback) {
-  if (this.destroyed)
+  const known = streamHooks.socketState !== null ? streamHooks.socketState(this) : -1;
+  if (known === -1 ? this.destroyed : known === 0)
     return this;
 
   this.timeout = msecs;

@@ -22,6 +22,8 @@
 
 'use strict';
 
+const { streamHooks } = require('internal/streams/utils');
+
 const { Readable, finished } = require('stream');
 const { Stream } = require('internal/streams/legacy');
 
@@ -40,7 +42,8 @@ const kAttachAbortSignal = Symbol('kAttachAbortSignal');
 const kDetachAbortSignal = Symbol('kDetachAbortSignal');
 
 function readStart(socket) {
-  if (socket && !socket._paused && socket.readable)
+  if (socket && !socket._paused &&
+      (streamHooks.isNetSocket(socket) ? streamHooks.readableOpen(socket) : socket.readable))
     socket.resume();
 }
 
@@ -63,8 +66,10 @@ function IncomingMessage(socket) {
   let streamOptions;
 
   if (socket) {
+    const highWaterMark = streamHooks.isNetSocket(socket) ? socket._readableState.highWaterMark :
+      socket.readableHighWaterMark;
     streamOptions = {
-      highWaterMark: socket.readableHighWaterMark,
+      highWaterMark,
     };
   }
 

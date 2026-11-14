@@ -1372,6 +1372,10 @@ streamHooks.socketState = function socketState(socket) {
   return socket._write === socket_write && socket._writeGeneric === socketWriteGeneric ?
     streamHooks.duplexState(socket) : -1;
 };
+// Whether a stream is a net socket whose state getters are Duplex's own.
+streamHooks.isNetSocket = function isNetSocket(socket) {
+  return socket._write === socket_write && socket._writeGeneric === socketWriteGeneric;
+};
 
 
 // Legacy alias. Having this is probably being overly cautious, but it doesn't

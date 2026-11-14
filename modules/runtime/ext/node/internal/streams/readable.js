@@ -76,6 +76,7 @@ const {
   kErrored,
   kConstructed,
   kOnConstructed,
+  streamHooks,
 } = require('internal/streams/utils');
 
 const {
@@ -1476,6 +1477,17 @@ Readable.prototype.compose = function compose(stream, options) {
 // Making it explicit these properties are not enumerable
 // because otherwise some prototype manipulation in
 // userland will fail.
+// Readable's readable and errored getters, without the state getters below them: node:http
+// reads both on its net sockets per request (streamHooks.isNetSocket).
+streamHooks.readableOpen = function readableOpen(stream) {
+  const r = stream._readableState;
+  return !!r && r.readable !== false && (r[kState] & (kDestroyed | kErrorEmitted | kEndEmitted)) === 0;
+};
+streamHooks.readableErrored = function readableErrored(stream) {
+  const r = stream._readableState;
+  return r ? ((r[kState] & kErrored) !== 0 ? r[kErroredValue] : null) : null;
+};
+
 ObjectDefineProperties(Readable.prototype, {
   readable: {
     __proto__: null,
