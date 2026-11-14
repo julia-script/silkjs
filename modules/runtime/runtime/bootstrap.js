@@ -190,6 +190,31 @@ function disableProto(global) {
     Object.defineProperty(prototype, '__proto__', { get: thrower, set: thrower, enumerable: false, configurable: true });
   }
 }
+// V8's gc extension, which --expose-gc installs in the main context and in each context made
+// while the flag is on (vm contexts after v8.setFlagsFromString('--expose-gc') too).
+host.makeGC = () => {
+  // A collection gc() asks for is a forced one to 'gc' performance entries.
+  const collect = rawStd.gc;
+  // V8's gc(options): type 'minor' collects only the young generation, and
+  // execution 'async' collects in a later task and returns a promise for it.
+  const run = young => {
+    const observer = host.gcObserver;
+    if (observer !== undefined) observer(false);
+    try { if (young) host.collectGarbage(true); else collect(); }
+    finally { if (host.gcObserver !== undefined) host.gcObserver(true); }
+  };
+  const gc = function gc(options) {
+    let young = false;
+    let async = false;
+    if (options !== null && typeof options === 'object') {
+      young = options.type === 'minor';
+      async = options.execution === 'async';
+    }
+    if (!async) return run(young);
+    return new Promise(resolve => setImmediate(() => { run(young); resolve(); }));
+  };
+  return gc;
+};
 host.initializeRealmBuiltins = (handle, global, wasmCodeGeneration, isolated = false) => {
   delete global.InternalError;
   if (host.disableProto !== undefined) disableProto(global);
@@ -1517,29 +1542,7 @@ function installRuntimeOptions(args, entrypoints = [], preloadEntrypoints = true
   host.typeScriptMode = host.stripTypes === false ? false : host.transformTypes ? 'transform' : 'strip';
   host.initialExecArgv = process.execArgv.slice();
   host.workerRuntimeArgs = args.slice();
-  if (host.exposeGC) {
-    // A collection gc() asks for is a forced one to 'gc' performance entries.
-    const collect = rawStd.gc;
-    // V8's gc(options): type 'minor' collects only the young generation, and
-    // execution 'async' collects in a later task and returns a promise for it.
-    const run = young => {
-      const observer = host.gcObserver;
-      if (observer !== undefined) observer(false);
-      try { if (young) host.collectGarbage(true); else collect(); }
-      finally { if (host.gcObserver !== undefined) host.gcObserver(true); }
-    };
-    const gc = function gc(options) {
-      let young = false;
-      let async = false;
-      if (options !== null && typeof options === 'object') {
-        young = options.type === 'minor';
-        async = options.execution === 'async';
-      }
-      if (!async) return run(young);
-      return new Promise(resolve => setImmediate(() => { run(young); resolve(); }));
-    };
-    Object.defineProperty(globalThis, 'gc', { value: gc, writable: true, enumerable: true });
-  }
+  if (host.exposeGC) Object.defineProperty(globalThis, 'gc', { value: host.makeGC(), writable: true, enumerable: true });
   if (host.experimentalEventSource) Object.defineProperty(globalThis, 'EventSource', {
     value: internalRequire('internal/web/eventsource').EventSource, writable: true, configurable: true,
   });

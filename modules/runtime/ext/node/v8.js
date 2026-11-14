@@ -157,9 +157,15 @@ function setFlagsFromString(flags) {
   // keeps its limit and a Worker keeps its resourceLimits stack.
   const tokens = flags.split(/\s+/).filter(Boolean);
   const controls = require('internal/startup_controls');
-  const known = flag => /^--stack[-_]size=\d+$/.test(flag) || controls.applyV8Flag(flag, false);
+  // --expose-gc changes the contexts made from then on (vm contexts), not the running one.
+  const exposeGC = /^--(no-)?expose[-_]gc$/;
+  const known = flag => /^--stack[-_]size=\d+$/.test(flag) || exposeGC.test(flag) || controls.applyV8Flag(flag, false);
   if (tokens.length && tokens.every(known)) {
-    for (let index = 0; index < tokens.length; index++) controls.applyV8Flag(tokens[index], true);
+    for (let index = 0; index < tokens.length; index++) {
+      const match = exposeGC.exec(tokens[index]);
+      if (match) host.contextExposeGC = match[1] === undefined;
+      else controls.applyV8Flag(tokens[index], true);
+    }
     return;
   }
   unsupported('setFlagsFromString', 'V8 execution flags do not control the Silk engine');

@@ -149,7 +149,9 @@ function createNapiAdapter(host) {
       const bits = asUintN(64, word);
       return [Number(bits & 0xffffffffn), Number(bits >> 32n), value === word];
     },
-    asyncInit: (resource, name) => require('async_hooks')._createResource(name, resource),
+    // napi_async_init and napi_create_async_work take any value as the name and convert it
+    // with ToString, as Node's CHECK_TO_STRING does (napi-rs passes undefined).
+    asyncInit: (resource, name) => require('async_hooks')._createResource(typeof name === 'string' ? name : `${name}`, resource),
     asyncBefore: resource => require('async_hooks')._enterResource(resource, true),
     asyncBeforeCallback: resource => require('async_hooks')._enterResource(resource),
     asyncAfter: resource => require('async_hooks')._leaveResource(resource),

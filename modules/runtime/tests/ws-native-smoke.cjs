@@ -67,8 +67,11 @@ function raw(port, frames) {
       assert.strictEqual(new URL(req.url, 'http://x').searchParams.get('name'), 'a');
       assert.strictEqual(ws.readyState, WebSocket.OPEN);
       ws.on('ping', data => { pings++; assert.strictEqual(data.toString(), 'p'); });
+      // binaryType shapes binary messages only: text stays a Buffer, as in ws.
+      ws.binaryType = 'arraybuffer';
       ws.on('message', (data, isBinary) => {
-        assert(Buffer.isBuffer(data));
+        assert(isBinary ? data instanceof ArrayBuffer : Buffer.isBuffer(data));
+        if (isBinary) data = Buffer.from(data);
         serverMessages.push([data, isBinary]);
         if (!isBinary) ws.send(`echo: ${data}`);
         else ws.send(data);

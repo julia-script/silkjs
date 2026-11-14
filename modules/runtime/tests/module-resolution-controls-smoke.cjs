@@ -143,5 +143,12 @@ try {
   assert.deepEqual(run(['--preserve-symlinks', '--preserve-symlinks-main', 'import-main.mjs']), [[path.join(root, 'linked/entry.mjs'), false, pathToFileURL(path.join(root, 'linked/alias.mjs')).href, false, false]]);
   assert.deepEqual(run(['--preserve-symlinks', '--no-preserve-symlinks', 'identity.cjs']), [true]);
   assert.deepEqual(run(['--preserve-symlinks-main', '--no-preserve-symlinks-main', 'linked/entry.cjs']), [[path.join(root, 'real/entry.cjs'), true, path.join(root, 'real/dep.cjs'), true]]);
+  {
+    // A file URL may carry a decoded NUL (vite's virtual \0 modules): createRequire
+    // accepts it as Node's fileURLToPath does, and resolves next to it.
+    file('virtual/dep.cjs', 'module.exports = 7;');
+    const virtualRequire = require('node:module').createRequire(pathToFileURL(path.join(root, 'virtual/helper.js')).href.replace('/helper.js', '/%00helper.js'));
+    assert.equal(virtualRequire('./dep.cjs'), 7);
+  }
   console.log('module resolution controls smoke: passed');
 } finally { fs.rmSync(root, { recursive: true, force: true }); }
