@@ -12,7 +12,6 @@
 //! handle, not RuntimeState; source malloc bookkeeping is provided by runtime_memory.
 
 import silk.mem.allocator { Allocator, OutOfMemoryError }
-import silk.mem.box { Box }
 import silk.mem.layout { Layout }
 import silk.collections.list { List }
 import regexp_types { Captures }
@@ -1173,6 +1172,9 @@ pub struct ContextState {
   pub promiseSpeciesEpoch: u64,
   pub promiseConstructorSlot: u32,
   pub promiseSpeciesSlot: u32,
+  /// Promise.prototype's data slot for `then` at that epoch, or u32's maximum when
+  /// `then` is not an own data property there.
+  pub promiseThenSlot: u32,
   pub spreadIteratorSlot: u32,
   pub spreadNextSlot: u32,
   pub classPrototypes: List<ValueBits>,
@@ -2334,51 +2336,80 @@ pub struct StackFrame {
 /// Before drop, unlink all runtime frame links, detach VarRefs, and release the
 /// frame's JS children. Native destruction then reclaims the frame and owned slots.
 pub struct StableFrame {
-  frame: Box<StackFrame>,
-  /// Heap storage behind the frame's slot ranges: moving these owners never moves it.
-  arguments: ValueSlots, locals: ValueSlots, stack: ValueSlots, references: List<?*mut HeapHeader>
+  /// One block: the frame, then its argument, local and operand slots, then its
+  /// reference table. A resumable call is this one allocation.
+  storage: Intrinsic.RawBuffer<ValueBits>,
+  frame: *mut StackFrame,
+  cells: usize
+}
+/// How many ValueBits cells hold bytes.
+fn frameCells(bytes: usize) -> usize {
+  let cell = Layout.of<ValueBits>().bytes
+  return (bytes + cell - 1) / cell
 }
 impl StableFrame {
   /// A frame whose ranges borrow storage owned elsewhere.
   pub effect fn make(frame: StackFrame) -> Self ! OutOfMemoryError ? &mut Allocator {
-    return Self { frame: run Box<StackFrame>.make(move frame), arguments: run ValueSlots.make(0),
-      locals: run ValueSlots.make(0), stack: run ValueSlots.make(0), references: List<?*mut HeapHeader>.make() }
+    return run StableFrame.block(move frame, 0)
   }
-  /// A frame that owns its slots and reference table; the frame's ranges are pointed at them.
-  /// references must not grow afterwards.
-  pub effect fn owning(frame: StackFrame, arguments: ValueSlots, locals: ValueSlots, stack: ValueSlots,
-    references: List<?*mut HeapHeader>) -> Self ! OutOfMemoryError ? &mut Allocator {
-    let mut owner = Self { frame: run Box<StackFrame>.make(move frame), arguments: move arguments,
-      locals: move locals, stack: move stack, references: move references }
-    let address = owner.address()
-    // Empty ranges point at the boxed frame: aligned, stable, and never dereferenced.
-    let sentinel = unsafe Intrinsic.pointerReinterpret<*mut StackFrame, *mut ValueBits>(address)
-    let arguments = FrameSlots { data: owner.arguments.data(sentinel), count: owner.arguments.length() }
-    let locals = FrameSlots { data: owner.locals.data(sentinel), count: owner.locals.length() }
-    let stack = FrameSlots { data: owner.stack.data(sentinel), count: owner.stack.length() }
-    let count = owner.references.length()
-    let mut table = unsafe Intrinsic.pointerReinterpret<*mut StackFrame, *mut ?*mut HeapHeader>(address)
-    if count != 0 { table = Pointer.fromMutRef<?*mut HeapHeader>(&mut owner.references.asMutSlice()[0]) }
-    let target = &mut owner.frame.getMut()[0]
-    target.arguments = arguments target.locals = locals target.stack = stack
-    target.varRefs = FrameReferences { data: table, count: count }
+  /// The block: the frame in its leading cells and extra cells after it, all Undefined.
+  effect fn block(frame: StackFrame, extra: usize) -> Self ! OutOfMemoryError ? &mut Allocator {
+    let element = Layout.of<ValueBits>()
+    if Layout.of<StackFrame>().alignment > element.alignment || Layout.of<?*mut HeapHeader>().alignment > element.alignment {
+      Intrinsic.trap("frame block alignment")
+    }
+    let head = frameCells(Layout.of<StackFrame>().bytes)
+    if extra > usize.MAX / element.bytes - head { return run Allocator.outOfMemory() }
+    let cells = head + extra
+    let allocation = run Allocator.allocate(Layout { bytes: cells * element.bytes, alignment: element.alignment })
+    let mut storage = unsafe RawBuffer.from<ValueBits>(move allocation, cells)
+    let mut index: usize = 0
+    while index < cells {
+      Slot.write(RawBuffer.slot<ValueBits>(&mut storage, index), ValueBits.Undefined)
+      index = index + 1
+    }
+    let first = Pointer.fromMutRef<ValueBits>(&mut (unsafe RawBuffer.viewMut<ValueBits>(&mut storage, 0, cells))[0])
+    let address = unsafe Intrinsic.pointerReinterpret<*mut ValueBits, *mut StackFrame>(first)
+    unsafe Pointer.put<StackFrame>(address, move frame)
+    return Self { storage: move storage, frame: address, cells: cells }
+  }
+  /// A frame that owns its slots and reference table, all in one allocation; the
+  /// frame's ranges are pointed at them. Slots start Undefined and references null.
+  pub effect fn owning(frame: StackFrame, arguments: usize, locals: usize, stack: usize,
+    references: usize) -> Self ! OutOfMemoryError ? &mut Allocator {
+    let limit = usize.MAX / 64
+    if arguments > limit || locals > limit || stack > limit || references > limit { return run Allocator.outOfMemory() }
+    let table = frameCells(references * Layout.of<?*mut HeapHeader>().bytes)
+    let mut owner = run StableFrame.block(move frame, arguments + locals + stack + table)
+    let address = owner.frame
+    // Empty ranges point at the frame: aligned, stable, and never dereferenced.
+    let base = unsafe Pointer.atMut<ValueBits>(unsafe Pointer.assumeManyMut<ValueBits>(
+      unsafe Intrinsic.pointerReinterpret<*mut StackFrame, *mut ValueBits>(address)), frameCells(Layout.of<StackFrame>().bytes))
+    let many = unsafe Pointer.assumeManyMut<ValueBits>(base)
+    let target = unsafe owner.getMut()
+    target.arguments = FrameSlots { data: base, count: arguments }
+    target.locals = FrameSlots { data: unsafe Pointer.atMut<ValueBits>(many, arguments), count: locals }
+    target.stack = FrameSlots { data: unsafe Pointer.atMut<ValueBits>(many, arguments + locals), count: stack }
+    let entries = unsafe Intrinsic.pointerReinterpret<*mut ValueBits, *mut ?*mut HeapHeader>(
+      unsafe Pointer.atMut<ValueBits>(many, arguments + locals + stack))
+    target.varRefs = FrameReferences { data: entries, count: references }
     drop target
+    let mut index: usize = 0
+    while index < references {
+      unsafe Pointer.write<?*mut HeapHeader>(
+        unsafe Pointer.atMut<?*mut HeapHeader>(unsafe Pointer.assumeManyMut<?*mut HeapHeader>(entries), index), Pointer.null<HeapHeader>())
+      index = index + 1
+    }
     return move owner
   }
-  pub fn get(self: &Self) -> &StackFrame { return &self.frame.get()[0] }
-  pub fn profileBytes(self: &Self) -> usize {
-    return Layout.of<StackFrame>().bytes
-      + (self.arguments.length() + self.locals.length() + self.stack.length()) * Layout.of<ValueBits>().bytes
-      + self.references.capacity() * Layout.of<?*mut HeapHeader>().bytes
-  }
+  pub fn get(self: &Self) -> &StackFrame { return unsafe Pointer.borrow<Self, StackFrame>(self, self.frame) }
+  pub fn profileBytes(self: &Self) -> usize { return self.cells * Layout.of<ValueBits>().bytes }
   /// Requires no conflicting raw frame/slot accesses; do not replace/move published
   /// slots or the frame while attached references can observe them.
-  pub unsafe fn getMut(self: &mut Self) -> &mut StackFrame { return &mut self.frame.getMut()[0] }
+  pub unsafe fn getMut(self: &mut Self) -> &mut StackFrame { let address = self.frame return unsafe Pointer.borrowMut<Self, StackFrame>(move self, address) }
   /// Later dereferences require this owner alive and exclusive/shared access as
   /// appropriate. The returned address does not itself borrow or retain the frame.
-  pub fn address(self: &mut Self) -> *mut StackFrame {
-    return Pointer.fromMutRef<StackFrame>(&mut self.frame.getMut()[0])
-  }
+  pub fn address(self: &mut Self) -> *mut StackFrame { return self.frame }
 }
 /// AsyncFunction payload (HeapKind.AsyncFunction), also used by generators. Its
 /// StableFrame owns the argument/local/operand memory; completed frames must have
@@ -2389,6 +2420,10 @@ pub struct AsyncFrame {
   pub throwFlag: bool,
   pub isCompleted: bool,
   pub resolvingFunctions: [Value; 2],
+  /// The function object the reactions of this body's awaits call (it resumes the
+  /// body), while one is alive; it owns this frame, and the frame does not own it
+  /// (js_async_functions.awaitHandler). Null is none.
+  pub awaitHandler: ?*mut HeapHeader,
   pub frame: StableFrame
 }
 
