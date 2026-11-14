@@ -2,7 +2,6 @@
 """Compile the native Silk engine and embedded Node runtime as one executable."""
 from pathlib import Path
 import argparse
-import filecmp
 import json
 import os
 import platform
@@ -12,17 +11,13 @@ import subprocess
 import sys
 import tempfile
 import tomllib
-from embed import ROOT, generate
-import build_native
+from embed import ROOT, cache_build_identity
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--release', action='store_true')
     parser.add_argument('--output', type=Path, default=ROOT / 'build/silkjsruntime')
-    # What a program that embeds the runtime (src/runtime/embed.silk) needs before it builds:
-    # src/runtime/embedded.silk and the native archives in build/native, without the executable.
-    parser.add_argument('--prepare', action='store_true')
     args = parser.parse_args()
     manifest = tomllib.loads((ROOT / 'silk.toml').read_text())
     version = manifest['package']['silk-version']
@@ -37,37 +32,45 @@ def main():
             raise SystemExit('Set SDKROOT to a macOS SDK supporting the pinned compiler\'s macOS 11 deployment target.')
     if not shutil.which('silk'):
         raise SystemExit('Install the Silk launcher and run silk use in this repository.')
-    generate(debug=not args.release, environment=environment)
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    native = ROOT / 'build/native'
-    native.mkdir(parents=True, exist_ok=True)
-    for package, archive in [
-        ('libuv', 'libuv.a'), ('libssl', 'libssl.a'), ('libcrypto', 'libcrypto.a'),
-        ('libbrotlienc', 'libbrotlienc.a'),
-        ('libbrotlidec', 'libbrotlidec.a'), ('libbrotlicommon', 'libbrotlicommon.a'),
-        ('libzstd', 'libzstd.a'), ('libnghttp2', 'libnghttp2.a'),
-    ]:
-        libdir = Path(subprocess.check_output(['pkg-config', '--variable=libdir', package], env=environment, text=True).strip())
-        source, destination = libdir / archive, native / archive
-        if not source.is_file():
-            raise SystemExit(f'Install the {package} development static archive: {source}')
-        if not destination.exists() or not filecmp.cmp(source, destination, shallow=False):
-            shutil.copyfile(source, destination)
-    build_native.build(native, environment, release=args.release)
-    if args.prepare:
-        return
+    identity = cache_build_identity(not args.release, environment)
+    # tools/clang.py links this object into the executable: the identity the built-ins'
+    # bytecode and the heap image are tied to (src/ext/builtin_cache.c).
+    identified = build_cache_object(environment, identity)
+    named = ROOT / 'build/link-object'
+    named.write_text(str(identified))
     # Source-file compilation keeps the generic engine in one native object.
     command = ['silk', '+' + version, 'build', 'src/main.silk', '-o', str(args.output.resolve()),
                '--debug', str(not args.release).lower(),
                '--clang', str(ROOT / 'tools/clang.py')]
     if args.release:
         command += ['--optimization', 'speed']
-    subprocess.run(command, cwd=ROOT, env=environment, check=True)
-    embed_builtin_cache(args.output.resolve(), native, environment)
+    try:
+        subprocess.run(command, cwd=ROOT, env=environment, check=True)
+    finally:
+        named.unlink(missing_ok=True)
+    embed_builtin_cache(args.output.resolve(), environment, identity, identified)
     embed_heap_image(args.output.resolve())
 
 
-def embed_builtin_cache(output, native, environment):
+def build_cache_object(environment, identity, cache=None):
+    """src/ext/builtin_cache.c with the build identity, and the built-ins' bytecode when given."""
+    directory = ROOT / 'build/builtin-cache'
+    directory.mkdir(parents=True, exist_ok=True)
+    # #embed needs a C23 compiler: the Clang the Silk build itself requires.
+    compiler = [environment.get('SILK_CLANG', 'clang')]
+    flags = ['-std=gnu23', '-fPIC', '-O2', f'-DSILK_BUILD_IDENTITY="{identity}"']
+    if cache is not None:
+        flags.append('-DSILK_BUILTIN_CACHE_FILE="' + str(cache) + '"')
+    if platform.system() == 'Darwin':
+        flags += ['-isysroot', environment['SDKROOT'], '-mmacosx-version-min=11.0']
+    destination = directory / ('builtin_cache.o' if cache is not None else 'identity.o')
+    subprocess.run(compiler + flags + ['-c', str(ROOT / 'src/ext/builtin_cache.c'), '-o', str(destination)],
+                   env=environment, check=True)
+    return destination
+
+
+def embed_builtin_cache(output, environment, identity, identified):
     """Link again with the built-ins' bytecode, which the first link's executable writes.
 
     Without it the runtime still works: built-ins compile from source at startup. That is
@@ -82,26 +85,30 @@ def embed_builtin_cache(output, native, environment):
     except (OSError, subprocess.CalledProcessError) as error:
         print(f'Built-in bytecode not embedded ({error}); built-ins will compile at startup')
         return
-    build_native.build_builtin_cache(native, environment, cache)
+    cached = build_cache_object(environment, identity, cache)
     link = json.loads(record.read_text())
     arguments = link['arguments']
     arguments[arguments.index('-o') + 1] = str(output)
+    arguments[arguments.index(str(identified))] = str(cached)
     arguments += startup_order(arguments)
     subprocess.run([link['compiler'], *arguments], cwd=link['directory'], env=environment, check=True)
     print(f'Embedded {cache.stat().st_size} bytes of built-in bytecode')
 
 
 def startup_order(arguments):
-    """Linker flags that place the functions a start runs next to each other.
+    """Linker flags that place the functions a start and a server run next to each other.
 
-    A start runs under 3 MB of a 27 MB text section. Left where the compiler put them,
-    its functions touch several times as many pages as they fill, and each page is a
-    fault. tools/startup-order.txt lists them (tools/startup_order.py writes it); a name
-    that no longer exists is skipped. Only lld takes the list.
+    A start runs under 3 MB of a 27 MB text section, and an HTTP or HTTPS server about
+    3 MB more. Left where the compiler put them, these functions touch several times as
+    many pages as they fill: each page is a fault, and the kernel maps file pages 64 KB
+    at a time, so a server's resident text was 22 MB. tools/startup-order.txt lists a
+    start's functions and tools/server-order.txt the rest a server runs (tools/startup_order.py
+    writes both); a name that no longer exists is skipped. Only lld takes the list.
     """
-    order = ROOT / 'tools/startup-order.txt'
     if platform.system() != 'Linux' or not any(a.startswith('--ld-path=') and 'lld' in a for a in arguments):
         return []
+    order = ROOT / 'build/function-order.txt'
+    order.write_text((ROOT / 'tools/startup-order.txt').read_text() + (ROOT / 'tools/server-order.txt').read_text())
     return ['-Wl,--symbol-ordering-file=' + str(order), '-Wl,--no-warn-symbol-ordering']
 
 

@@ -2,6 +2,7 @@
 """Clang driver for the runtime's build: final-link flags, and a link that can be repeated."""
 import json
 import os
+import shutil
 import subprocess
 import sys
 
@@ -19,6 +20,14 @@ if arguments and not non_final.intersection(arguments):
         arguments += ['-Wl,-headerpad,0x1000', '-Wl,-export_dynamic']
     else:
         arguments = ['-Wl,--export-dynamic', *arguments, '-ldl']
+        # Link with lld when there is one (beside the compiler, or on PATH): only lld
+        # takes the function order (build.py startup_order) that keeps the code a
+        # start and a server run together, in fewer resident pages.
+        if not any(a.startswith(('--ld-path=', '-fuse-ld=')) for a in arguments):
+            beside = os.path.join(os.path.dirname(shutil.which(compiler) or compiler), 'ld.lld')
+            lld = beside if os.access(beside, os.X_OK) else shutil.which('ld.lld')
+            if lld:
+                arguments = ['--ld-path=' + lld, *arguments]
     # tools/build.py links a second time, with the built-ins' bytecode. Silk hands the
     # program over as LLVM IR in a temporary file, so compile that to an object that
     # stays, link the object, and record the link for build.py to repeat.
@@ -39,6 +48,12 @@ if arguments and not non_final.intersection(arguments):
             # Code generation options have nothing left to apply to.
             while '-mllvm' in arguments:
                 del arguments[arguments.index('-mllvm'):arguments.index('-mllvm') + 2]
+    # tools/build.py's build identity (src/ext/builtin_cache.c), which outranks the weak default.
+    # It names the object in a file: the compiler server that runs this may predate the build.
+    extra = os.path.join(BUILD, 'link-object')
+    if os.path.isfile(extra):
+        with open(extra) as named:
+            arguments.append(named.read().strip())
     # A Silk that compiles the program to an object itself (one kept beside the output)
     # links that object: record every final link, not only one from IR.
     os.makedirs(BUILD, exist_ok=True)

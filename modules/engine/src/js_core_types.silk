@@ -1767,10 +1767,20 @@ impl NativeFunctionData {
 /// releases none. It is only ever set where that is proven and every way to
 /// write an element clears it, except the unsafe plainMut for stores that are
 /// known to keep it true.
+///
+/// clearHead says that no element below it is a heap value, so a search for an
+/// object or a symbol starts there (fastFindCell). It never passes the length;
+/// it only grows in skipClearHead, and every way to write a heap value below it
+/// lowers it: store lowers it to the index, moveWithin to the destination, and
+/// anything through valuesMut (or a new list) resets it. plainMut stores append,
+/// at or past the length. A queue that shifts by overwriting its head with
+/// undefined (postgres.js) then finds its items in time proportional to the
+/// live part instead of to all the holes.
 pub struct FastArrayData {
   /// Native capacity is the source size; length is the initialized element count.
   items: ThinList<ValueBits>,
-  plain: bool
+  plain: bool,
+  clearHead: u32
 }
 /// A build with this on checks FastArrayData.plain against the elements where
 /// the flag is relied on, and traps on a mismatch. Off in every shipped build.
@@ -1778,33 +1788,34 @@ pub const CHECK_PLAIN_ARRAYS: bool = false
 impl FastArrayData {
   /// The payload over values, which may hold anything.
   @inlineAlways
-  pub fn of(values: ThinList<ValueBits>) -> FastArrayData { return FastArrayData { items: move values, plain: false } }
+  pub fn of(values: ThinList<ValueBits>) -> FastArrayData { return FastArrayData { items: move values, plain: false, clearHead: 0 } }
   /// The payload of an array with no elements yet.
   @inlineAlways
-  pub fn empty() -> FastArrayData { return FastArrayData { items: ThinList<ValueBits>.make(), plain: true } }
+  pub fn empty() -> FastArrayData { return FastArrayData { items: ThinList<ValueBits>.make(), plain: true, clearHead: 0 } }
   /// The payload over values that hold no heap value.
   @inlineAlways
-  pub unsafe fn ofPlain(values: ThinList<ValueBits>) -> FastArrayData { return FastArrayData { items: move values, plain: true } }
+  pub unsafe fn ofPlain(values: ThinList<ValueBits>) -> FastArrayData { return FastArrayData { items: move values, plain: true, clearHead: 0 } }
   @inlineAlways
   pub fn values(self: &Self) -> &ThinList<ValueBits> { return &self.items }
   /// The elements, to change in any way: plain is cleared.
   @inlineAlways
-  pub fn valuesMut(self: &mut Self) -> &mut ThinList<ValueBits> { self.plain = false return &mut self.items }
+  pub fn valuesMut(self: &mut Self) -> &mut ThinList<ValueBits> { self.plain = false self.clearHead = 0 return &mut self.items }
   /// The elements, for a change that stores no heap value (or that calls
   /// noteStored for each value it stores): plain is kept.
   @inlineAlways
   pub unsafe fn plainMut(self: &mut Self) -> &mut ThinList<ValueBits> { return &mut self.items }
   /// Takes the elements out, leaving an empty list.
   @inlineAlways
-  pub fn take(self: &mut Self) -> ThinList<ValueBits> { self.plain = true return Intrinsic.replace(self.items, ThinList<ValueBits>.make()) }
+  pub fn take(self: &mut Self) -> ThinList<ValueBits> { self.plain = true self.clearHead = 0 return Intrinsic.replace(self.items, ThinList<ValueBits>.make()) }
   /// Replaces the elements with values, which may hold anything, and returns the old ones.
   @inlineAlways
-  pub fn replace(self: &mut Self, values: ThinList<ValueBits>) -> ThinList<ValueBits> { self.plain = false return Intrinsic.replace(self.items, move values) }
+  pub fn replace(self: &mut Self, values: ThinList<ValueBits>) -> ThinList<ValueBits> { self.plain = false self.clearHead = 0 return Intrinsic.replace(self.items, move values) }
   /// Writes values over elements that were never initialized or were already moved out.
   @inlineAlways
   pub unsafe fn put(self: &mut Self, values: ThinList<ValueBits>) -> () {
     unsafe Pointer.put<ThinList<ValueBits>>(Pointer.fromMutRef<ThinList<ValueBits>>(&mut self.items), move values)
     self.plain = false
+    self.clearHead = 0
   }
   /// The elements of a payload that is going away.
   @inlineAlways
@@ -1822,7 +1833,13 @@ impl FastArrayData {
   }
   /// Stores value at index. The caller owns the count of the value it overwrites.
   @inlineAlways
-  pub fn store(self: &mut Self, index: usize, value: ValueBits) -> () { self.noteStored(&value) self.items.set(index, value) }
+  pub fn store(self: &mut Self, index: usize, value: ValueBits) -> () {
+    match ValueBits.heapReference(&value) {
+      Option<*mut HeapHeader>.Some { .. } => { self.plain = false if index < u32.toUsize(self.clearHead) { self.clearHead = usize.toU32(index) } }
+      Option<*mut HeapHeader>.None => ()
+    }
+    self.items.set(index, value)
+  }
   /// Pushes value into spare capacity.
   @inlineAlways
   pub fn push(self: &mut Self, value: ValueBits) -> () { self.noteStored(&value) self.items.push(value) }
@@ -1830,9 +1847,25 @@ impl FastArrayData {
   @inlineAlways
   pub fn clear(self: &mut Self, index: usize) -> () { self.items.set(index, ValueBits.Undefined) }
   @inlineAlways
-  pub fn truncate(self: &mut Self, length: usize) -> () { self.items.truncate(length) }
+  pub fn truncate(self: &mut Self, length: usize) -> () { if length < u32.toUsize(self.clearHead) { self.clearHead = usize.toU32(length) } self.items.truncate(length) }
   @inlineAlways
-  pub fn moveWithin(self: &mut Self, from: usize, to: usize, count: usize) -> () { self.items.moveWithin(from, to, count) }
+  pub fn moveWithin(self: &mut Self, from: usize, to: usize, count: usize) -> () {
+    self.items.moveWithin(from, to, count)
+    // After the move: a store to the payload before it made the copy loop
+    // reload its bounds every element (PdfJS fastMove 2.2x Ir).
+    if count > 0 && to < u32.toUsize(self.clearHead) { self.clearHead = usize.toU32(to) }
+  }
+  /// Where a search for an object or symbol may start: no element below holds
+  /// a heap value. First moves clearHead past the elements from it that hold
+  /// none, so each element is passed over once until a write lowers it again.
+  pub fn skipClearHead(self: &mut Self) -> usize {
+    let count = self.items.length()
+    if self.plain { return count }
+    let mut index = u32.toUsize(self.clearHead)
+    while index < count && self.items.get(index).tag() >= 0 { index = index + 1 }
+    self.clearHead = usize.toU32(index)
+    return index
+  }
   /// Records the outcome of a scan: the elements hold no heap value.
   @inlineAlways
   pub unsafe fn setPlain(self: &mut Self, plain: bool) -> () { self.plain = plain }

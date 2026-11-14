@@ -623,6 +623,14 @@ function writeIdle(stream, chunk, encoding, cb, dispatch) {
   return ret && (state[kState] & (kDestroyed | kErrored)) === 0;
 }
 streamHooks.writeIdle = writeIdle;
+// Duplex's destroyed and writable getters for a stream, read in one call (net.js
+// socketState): 0 destroyed, 1 writable, 2 neither.
+streamHooks.duplexState = function duplexState(stream) {
+  const r = stream._readableState, w = stream._writableState;
+  if (r !== undefined && w !== undefined && (r[kState] & w[kState] & kDestroyed) !== 0) return 0;
+  return !!w && (w[kState] & (kHasWritable | kWritable)) !== kHasWritable &&
+    (w[kState] & (kEnding | kEnded | kDestroyed | kErrored)) === 0 ? 1 : 2;
+};
 
 function doWrite(stream, state, writev, len, chunk, encoding, cb) {
   state.writelen = len;

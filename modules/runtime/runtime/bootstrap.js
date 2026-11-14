@@ -323,7 +323,7 @@ const hydrations = [];
 host.onHydrate = refresh => { hydrations.push(refresh); };
 const asyncHooks = internalRequire('async_hooks');
 function resource(type, owner) { return asyncHooks._createResource(type, owner); }
-const newAsyncId = asyncHooks._newAsyncId, queueDestroyId = asyncHooks._queueDestroyId;
+const asyncIds = asyncHooks._asyncIds, queueDestroyId = asyncHooks._queueDestroyId;
 const InternalResourceClass = asyncHooks._InternalResource;
 const asyncHookFields = asyncHooks._hookFields;
 const invokeIdFrom = asyncHooks._invokeIdFrom;
@@ -371,18 +371,19 @@ host.nextTick = function nextTick(callback, ...args) {
   if (typeof callback !== 'function') throw new (internalRequire('internal/errors').codes.ERR_INVALID_ARG_TYPE)('callback', 'function', callback);
   // As Node's nextTick: an arguments array only when there are arguments. A rest array
   // costs a fifth of an arguments object, and runs no iterator.
-  ticks.push(callback, args.length === 0 ? undefined : args, tickScope());
+  // A tick's async scope. With no hooks it is the callback context itself, the TickObject
+  // resource: no InternalResource to build and destroy. The run emits before, after and
+  // destroy for it once hooks exist by then, as Node's processTicksAndRejections does.
+  let scope;
+  if (asyncHookFields[5] !== 0) {
+    scope = resource('TickObject');
+  } else {
+    const context = host.getAsyncContext();
+    scope = { stores: context?.stores, id: asyncIds.next++, trigger: context?.id ?? 1, resource: undefined };
+    scope.resource = scope;
+  }
+  ticks.push(callback, args.length === 0 ? undefined : args, scope);
 };
-// A tick's async scope. With no hooks it is the callback context itself, the TickObject
-// resource: no InternalResource to build and destroy. The run emits before, after and
-// destroy for it once hooks exist by then, as Node's processTicksAndRejections does.
-function tickScope() {
-  if (asyncHookFields[5] !== 0) return resource('TickObject');
-  const context = host.getAsyncContext();
-  const scope = { stores: context?.stores, id: newAsyncId(), trigger: context?.id ?? 1, resource: undefined };
-  scope.resource = scope;
-  return scope;
-}
 const noTickArguments = [];
 host.queueMicrotask = function queueMicrotask(callback) {
   checkCallback(callback);
@@ -571,34 +572,43 @@ host.markWorkerActivity = () => { host.workerActivity = true; native.immediateAt
 // Node's tick queue drain (lib/internal/process/task_queues.js), called with process as
 // its receiver: a tick's callback runs straight from it, so its stack shows
 // process.processTicksAndRejections below the callback, as Node's does.
+// Plain ticks switch to their scope one after another: the context the drain started in
+// comes back once, before a tick that needs it or when the drain ends.
 function processTicksAndRejections() {
-  while (tickHead !== ticks.length) {
-    const at = tickHead;
-    const callback = ticks[at], args = ticks[at + 1], scope = ticks[at + 2];
-    ticks[at] = ticks[at + 1] = ticks[at + 2] = undefined;
-    tickHead = at + 3;
-    // A tick queued with no hook enabled has a plain scope (tickScope): switch to it, and
-    // emit before, after and destroy only for hooks enabled since.
-    if (!(scope instanceof InternalResourceClass)) {
-      const previous = host.getAsyncContext();
-      if (asyncHookFields[5] !== 0) {
+  const previous = host.getAsyncContext();
+  let switched = false;
+  try {
+    while (tickHead !== ticks.length) {
+      const at = tickHead;
+      const callback = ticks[at], args = ticks[at + 1], scope = ticks[at + 2];
+      ticks[at] = ticks[at + 1] = ticks[at + 2] = undefined;
+      tickHead = at + 3;
+      // A tick queued with no hook enabled has a plain scope (nextTick): switch to it, and
+      // emit before, after and destroy only for hooks enabled since.
+      const plain = !(scope instanceof InternalResourceClass);
+      if (plain && asyncHookFields[5] === 0) {
+        host.setAsyncContext(scope);
+        switched = true;
+        try { if (args === undefined) callback(); else Reflect.apply(callback, undefined, args); }
+        catch (error) { reportUncaught(error); }
+        continue;
+      }
+      if (switched) { switched = false; host.setAsyncContext(previous); }
+      if (plain) {
         try { invokeIdFrom(previous, scope, scope.id, invokeReporting, callback, undefined, args ?? noTickArguments); }
         finally { queueDestroyId(scope.id); }
         continue;
       }
-      host.setAsyncContext(scope);
-      try { if (args === undefined) callback(); else Reflect.apply(callback, undefined, args); }
+      asyncHooks._enterResource(scope);
+      try { Reflect.apply(callback, undefined, args ?? noTickArguments); }
       catch (error) { reportUncaught(error); }
-      finally { host.setAsyncContext(previous); }
-      continue;
+      finally {
+        try { asyncHooks._leaveResource(scope); }
+        finally { scope.emitDestroy(); }
+      }
     }
-    asyncHooks._enterResource(scope);
-    try { Reflect.apply(callback, undefined, args ?? noTickArguments); }
-    catch (error) { reportUncaught(error); }
-    finally {
-      try { asyncHooks._leaveResource(scope); }
-      finally { scope.emitDestroy(); }
-    }
+  } finally {
+    if (switched) host.setAsyncContext(previous);
   }
 }
 // Node's async_hook_fields: index 5 counts the callbacks of every enabled hook.

@@ -1361,10 +1361,16 @@ function dispatchIdle(socket, data, encoding, cb) {
 }
 streamHooks.socketWrite = function socketWriteIdle(socket, data, encoding, cb) {
   if (socket.write !== socketWrite || typeof data !== 'string' || socket._write !== socket_write ||
-      socket._writeGeneric !== socketWriteGeneric || socket.connecting || !socket._handle) {
+      socket._writeGeneric !== socketWriteGeneric || socket.connecting || !socket[kHandle]) {
     return undefined;
   }
   return streamHooks.writeIdle(socket, data, encoding, cb, dispatchIdle);
+};
+// A net socket's destroyed and writable (streamHooks.duplexState), read without Duplex's
+// getters; -1 for any other stream.
+streamHooks.socketState = function socketState(socket) {
+  return socket._write === socket_write && socket._writeGeneric === socketWriteGeneric ?
+    streamHooks.duplexState(socket) : -1;
 };
 
 

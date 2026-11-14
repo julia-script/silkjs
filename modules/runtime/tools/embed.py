@@ -1,14 +1,31 @@
 #!/usr/bin/env python3
-"""Embed the editable runtime sources; no JS engine is needed at build time."""
+"""Writes the index of the runtime's built-in JavaScript: src/runtime/embedded.silk and
+builtin_sources.c.
+
+The C file embeds each file with #embed, so a build reads the JavaScript itself and an edit to a
+file needs nothing run: only adding, removing or renaming a built-in does (`silk generate`, which
+runs this, or `silk task embed`). No JS engine is needed at build time.
+"""
 from pathlib import Path
-import json
 import hashlib
+import json
 import platform
 import subprocess
 import tomllib
 from prepare_silkjs import prepare
 
 ROOT = Path(__file__).resolve().parents[1]
+# builtin_sources.c sits in the package directory because #embed finds a file by its path from the
+# including file, and the build tracks only embedded files below that file's own directory.
+SOURCES_C = ROOT / 'builtin_sources.c'
+FACTORY_PREFIX = '(function(module, exports, require, process) {\n'
+FACTORY_SUFFIX = '\n})'
+# runtime/bootstrap.js starts with its two host imports. Only they need a module: the three-line
+# entry below. The bootstrap itself is a function like every built-in, the one after the last.
+IMPORTS = ("import * as stdNamespace from 'silk:host/std';\n"
+           "import * as osNamespace from 'silk:host/os';\n")
+# The imports become the two line breaks here, which keeps the line numbers of runtime/bootstrap.js.
+BOOTSTRAP_PREFIX = "(function(stdNamespace, osNamespace) { 'use strict';\n\n"
 
 
 def sources():
@@ -19,11 +36,23 @@ def sources():
                 yield prefix + path.relative_to(directory).with_suffix('').as_posix(), path
 
 
-def cache_build_identity(source, debug, manifest, engine, environment):
+def bootstrap_text():
+    source = (ROOT / 'runtime/bootstrap.js').read_text()
+    if not source.startswith(IMPORTS):
+        raise SystemExit('runtime/bootstrap.js must start with its two host imports')
+    return source
+
+
+def cache_build_identity(debug, environment=None):
+    """What the built-ins' bytecode and a heap image depend on: the compiler, the profile, the
+    JavaScript and every Silk and C source of the runtime and the engine. tools/build.py links
+    it into the executable it builds (silk_build_identity in src/ext/builtin_cache.c)."""
+    manifest = tomllib.loads((ROOT / 'silk.toml').read_text())
+    engine = prepare(manifest)
     compiler = subprocess.check_output(
         ['silk', '+' + manifest['package']['silk-version'], '--version'],
         cwd=ROOT, env=environment, text=True).strip()
-    digest = hashlib.sha256(b'Silk bytecode build identity v1\0')
+    digest = hashlib.sha256(b'Silk bytecode build identity v2\0')
 
     def include(name, contents):
         label = name.encode()
@@ -36,7 +65,9 @@ def cache_build_identity(source, debug, manifest, engine, environment):
         'compiler': compiler, 'debug': debug,
         'system': platform.system(), 'machine': platform.machine(),
     }, sort_keys=True).encode())
-    include('embedded JavaScript', source.encode())
+    for name, path in sources():
+        include('builtin/' + name, path.read_bytes())
+    include('bootstrap', bootstrap_text().encode())
     for namespace, root in (('runtime', ROOT), ('silkjs', engine)):
         paths = set((root / 'src').rglob('*.silk'))
         paths.update((root / 'src').rglob('*.c'))
@@ -44,8 +75,6 @@ def cache_build_identity(source, debug, manifest, engine, environment):
         paths.update(root.glob('*.toml'))
         paths.update((root / 'tools').glob('*.py'))
         for path in sorted(paths):
-            if path == ROOT / 'src/runtime/embedded.silk':
-                continue
             include(namespace + '/' + path.relative_to(root).as_posix(), path.read_bytes())
     return digest.hexdigest()
 
@@ -54,44 +83,59 @@ def silk_bytes(text):
     return 'b"' + ''.join(chr(byte) if 32 <= byte < 127 and byte not in (34, 92) else '\\"' if byte == 34 else '\\\\' if byte == 92 else '\\x%02x' % byte for byte in text.encode()) + '"'
 
 
-def generate(debug=True, environment=None):
-    manifest = tomllib.loads((ROOT / 'silk.toml').read_text())
-    engine = prepare(manifest)
+def c_bytes(text):
+    return ''.join(f'{byte},' for byte in text.encode())
+
+
+def embed_path(path):
+    return path.relative_to(ROOT).as_posix()
+
+
+def generate():
     names = []
-    factories = []
-    for name, path in sources():
+    arrays = []
+    for index, (name, path) in enumerate(sources()):
         names.append(name)
-        factories.append('(function(module, exports, require, process) {\n' + path.read_text() + '\n})')
-    source = (ROOT / 'runtime/bootstrap.js').read_text()
-    # The bootstrap is a function like every built-in, so its bytecode ships in the
-    # same cache: one past the last built-in index. Only its two host imports need a
-    # module, which is the three-line entry below. The imports become blank lines to
-    # keep the line numbers of runtime/bootstrap.js.
-    imports = ("import * as stdNamespace from 'silk:host/std';\n"
-               "import * as osNamespace from 'silk:host/os';\n")
-    if not source.startswith(imports):
-        raise SystemExit('runtime/bootstrap.js must start with its two host imports')
-    bootstrap = "(function(stdNamespace, osNamespace) { 'use strict';\n\n" + source[len(imports):] + '\n})'
-    # Builtin sources stay out of the bootstrap script so that startup does not lex them
-    # as string literals; the bootstrap reads each one from the native table on first use.
-    identity = cache_build_identity(source + ''.join(names) + ''.join(factories), debug, manifest, engine, environment)
-    entry = (imports + f"globalThis.__silkNative.compileBuiltin({len(names)}, 'node:internal/bootstrap/silk')(stdNamespace, osNamespace);\n")
-    output = ROOT / 'src/runtime/embedded.silk'
-    output.parent.mkdir(parents=True, exist_ok=True)
-
-    def table(function, values):
-        arms = ''.join(f'    {index} => {silk_bytes(value)}\n' for index, value in enumerate(values))
-        return (f"pub fn {function}(index: usize) -> &'static [u8] {{\n  return match index {{\n"
-                + arms + '    _ => b""\n  }\n}\n')
-
-    output.write_text('// Generated by tools/embed.py from runtime/, ext/, and libs/node_resolver/.\n'
-                      + f'pub fn debugBuild() -> bool {{ return {str(debug).lower()} }}\n'
-                      + f'pub fn cacheBuildIdentity() -> &\'static [u8] {{ return b"{identity}" }}\n'
-                      + f"pub fn source() -> &'static [u8] {{ return {silk_bytes(entry)} }}\n"
-                      + f"pub fn bootstrapSource() -> &'static [u8] {{ return {silk_bytes(bootstrap)} }}\n"
-                      + f'pub fn builtinCount() -> usize {{ return {len(names)} }}\n'
-                      + table('builtinName', names) + table('builtinSource', factories))
-    print(f'Embedded {len(factories)} modules ({sum(len(f.encode()) for f in factories)} bytes) and a {len(source.encode())} byte bootstrap')
+        arrays.append(f'static const unsigned char b{index}[] = {{{c_bytes(FACTORY_PREFIX)}\n'
+                      f'#embed "{embed_path(path)}" suffix(,)\n{c_bytes(FACTORY_SUFFIX)}}};\n')
+    bootstrap = ROOT / 'runtime/bootstrap.js'
+    bootstrap_text()
+    count = len(names)
+    arrays.append(f'static const unsigned char b{count}[] = {{{c_bytes(BOOTSTRAP_PREFIX)}\n'
+                  f'#embed "{embed_path(bootstrap)}" clang::offset({len(IMPORTS.encode())}) suffix(,)\n'
+                  f'{c_bytes(FACTORY_SUFFIX)}}};\n')
+    table = ''.join(f'  {{ b{index}, sizeof b{index} }},\n' for index in range(count + 1))
+    SOURCES_C.write_text(
+        '/* Generated by tools/embed.py: the built-in modules\' sources, each wrapped in its factory\n'
+        ' * function, then the bootstrap\'s. The build embeds the files themselves (#embed), so editing\n'
+        ' * one needs nothing regenerated. */\n'
+        '#include <stddef.h>\n\n' + ''.join(arrays)
+        + '\nstatic const struct { const unsigned char *data; size_t length; } sources[] = {\n' + table + '};\n\n'
+        + 'const unsigned char *silk_builtin_source(size_t index, size_t *length) {\n'
+        + f'  if (index > {count}) {{ *length = 0; return (const unsigned char *)""; }}\n'
+        + '  *length = sources[index].length;\n  return sources[index].data;\n}\n')
+    entry = (IMPORTS + f"globalThis.__silkNative.compileBuiltin({count}, 'node:internal/bootstrap/silk')(stdNamespace, osNamespace);\n")
+    arms = ''.join(f'    {index} => {silk_bytes(name)}\n' for index, name in enumerate(names))
+    (ROOT / 'src/runtime/embedded.silk').write_text(
+        '// Generated by tools/embed.py from runtime/, ext/, and libs/node_resolver/; the sources\n'
+        '// themselves are in builtin_sources.c.\n'
+        'import silk.core.compilation\n'
+        'import silk.mem.pointer { Pointer }\n\n'
+        'unsafe extern "C" fn silk_builtin_source(index: usize, length: *mut usize) -> *const u8\n'
+        'unsafe extern "C" fn silk_build_identity() -> *const u8\n'
+        'const ANCHOR: u8 = 0\n\n'
+        'pub fn debugBuild() -> bool { return compilation.debug }\n'
+        '/// 64 hexadecimal digits that differ between builds whose bytecode differs.\n'
+        "pub fn cacheBuildIdentity() -> &'static [u8] {\n"
+        '  return unsafe Pointer.borrowMany<u8, u8>(&ANCHOR, unsafe Pointer.assumeMany<u8>(unsafe silk_build_identity()), 64)\n}\n'
+        f"pub fn source() -> &'static [u8] {{ return {silk_bytes(entry)} }}\n"
+        f"pub fn bootstrapSource() -> &'static [u8] {{ return builtinSource({count}) }}\n"
+        f'pub fn builtinCount() -> usize {{ return {count} }}\n'
+        "pub fn builtinName(index: usize) -> &'static [u8] {\n  return match index {\n" + arms + '    _ => b""\n  }\n}\n'
+        "pub fn builtinSource(index: usize) -> &'static [u8] {\n  let mut length: usize = 0\n"
+        '  let data = unsafe silk_builtin_source(index, Pointer.fromMutRef<usize>(&mut length))\n'
+        '  return unsafe Pointer.borrowMany<u8, u8>(&ANCHOR, unsafe Pointer.assumeMany<u8>(data), length)\n}\n')
+    print(f'Indexed {count} built-in modules')
 
 
 if __name__ == '__main__':
