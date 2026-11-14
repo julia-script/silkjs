@@ -36,7 +36,7 @@ const {
   _checkInvalidHeaderChar: checkInvalidHeaderChar,
   prepareError,
 } = require('_http_common');
-const { ConnectionsList } = require('internal/http/native-parser');
+const { ConnectionsList, consumeNative } = require('internal/http/native-parser');
 const {
   kUniqueHeaders,
   parseUniqueHeadersOption,
@@ -839,7 +839,9 @@ function connectionListenerInternal(server, socket) {
       !socket._handle._consumed) {
     parser._consumed = true;
     socket._handle._consumed = true;
-    parser.consume(socket._handle);
+    // Simple requests are read natively; llhttp takes over at the first other one.
+    if (!nativeEligible(server, socket, lenientFlags) || !consumeNative(parser, socket._handle, server.maxHeaderSize || 0))
+      parser.consume(socket._handle);
   }
   parser[kOnExecute] =
     onParserExecute.bind(undefined,
@@ -850,6 +852,14 @@ function connectionListenerInternal(server, socket) {
                          server, socket);
 
   socket._paused = false;
+}
+
+// A connection whose simple requests net_native can read (internal/http/native-parser
+// consumeNative): a plain TCP socket, llhttp's strict mode and no header count limit below
+// what it reads.
+function nativeEligible(server, socket, lenientFlags) {
+  return lenientFlags === 0 && !socket.encrypted &&
+    (typeof server.maxHeadersCount !== 'number' || server.maxHeadersCount > 64);
 }
 
 function socketSetEncoding() {
