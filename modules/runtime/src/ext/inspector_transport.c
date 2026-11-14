@@ -16,8 +16,15 @@
 #include <sys/socket.h>
 #include <time.h>
 #include <unistd.h>
-#include <openssl/evp.h>
-#include <openssl/rand.h>
+/* The OpenSSL functions this file calls, declared here so that it builds without OpenSSL's
+ * headers, which only the silkjs-openssl package names (modules/native/openssl). */
+typedef struct evp_md_st EVP_MD;
+typedef struct engine_st ENGINE;
+#define EVP_MAX_MD_SIZE 64
+int EVP_Digest(const void *data, size_t count, unsigned char *md, unsigned int *size, const EVP_MD *type, ENGINE *impl);
+const EVP_MD *EVP_sha1(void);
+int EVP_EncodeBlock(unsigned char *t, const unsigned char *f, int n);
+int RAND_bytes(unsigned char *buf, int num);
 
 #define MAX_CLIENTS 64
 #define HTTP_LIMIT 8192
