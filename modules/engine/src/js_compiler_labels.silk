@@ -23,10 +23,11 @@ import js_debugger_metadata { Location }
 import js_compiler_state { computePc2Line }
 import js_compiler_emit { updateLabel, MAX_BYTECODE_CAPACITY }
 import js_compiler_code { CodeContext, matchCode, opcode, M2, M3, M4, signedWord, unsignedWord, skipDeadCode, slotCompareShape }
-import js_compiler_label_support { addPosition, pushShortInt, putShortCode, initializeLocals, resolveLabel, emitBranch, emitWith, shrinkJumps, fuseNullishBranches, fuseBackEdges }
+import js_compiler_label_support { addPosition, pushShortInt, putShortCode, initializeLocals, resolveLabel, emitBranch, emitWith, shrinkJumps, fuseNullishBranches, fuseKeepBranches, fuseBackEdges }
 import js_opcode_data as op
+import js_core_types { SCOPE_OPERAND, SCOPE_DEPTH_SHIFT, SCOPE_SLOT_MASK }
 import js_compiler_tdz as tdz
-import js_bytecode { FIELDS_PREFIX_OPERAND, FIELDS_PREFIX_SIZE, FIELDS_INIT_SIZE }
+import js_bytecode { FIELDS_PREFIX_OPERAND, FIELDS_PREFIX_SIZE, FIELDS_INIT_SIZE, typeofIsIndex }
 
 fn matchedLine(cc: &CodeContext, line: &mut i32) -> () {
   if cc.lineNumber >= 0 { line.* = cc.lineNumber }
@@ -38,6 +39,8 @@ effect fn unchanged(fd: &mut FunctionDef, bytes: &[u8], out: &mut ByteBuffer, po
   // resolve reserved the whole output, so the in-capacity copy is the path taken.
   // Most instructions fit one 8-byte load and store instead of a byte loop.
   let at = i32.toUsize(position) let size = i32.toUsize(length)
+  // Cold opcodes whose numbers hold fusions in final code go behind OP_extended.
+  if op.movedToExtended(bytes[at]) { run out.append(op.OP_extended) }
   if bytes.length - at < 8 || !out.appendWordPrefixWithin(readU64(bytes, at), size) {
     let piece = Slice.view<u8>(bytes, at, size)
     if !out.appendSliceWithin(piece) { run out.appendSlice(piece) }
@@ -49,6 +52,18 @@ effect fn unchanged(fd: &mut FunctionDef, bytes: &[u8], out: &mut ByteBuffer, po
     else { run out.writeU64(EMPTY_FIELD_KEY) }
   }
   if code == op.OP_is_undefined_or_null || code == op.OP_is_null { fd.nullishEnd = usize.toI32(out.length()) }
+  if code == op.OP_dup { fd.dupEnd = usize.toI32(out.length()) }
+}
+/// `this[kState]`: a variable of this function's own scope (a depth-0 scope
+/// operand, which specializeOwn would make get_scope0) as the key of an element
+/// read becomes get_scope0_el. The instruction's end in the input, or -1.
+effect fn scopeElement(fd: &mut FunctionDef, bytes: &[u8], out: &mut ByteBuffer, cc: &mut CodeContext, pos: usize, next: i32, line: &mut i32) -> i32
+  ! OutOfMemoryError ? &mut Allocator {
+  let operand = readU16(bytes, pos + 1)
+  if operand < SCOPE_OPERAND || (u16.shiftRight(operand, SCOPE_DEPTH_SHIFT) & 7) != 0 { return -1 }
+  if !matchCode(&mut cc, bytes, next, &[opcode(op.OP_get_array_el), -1]) { return -1 }
+  matchedLine(&cc, &mut line) run addPosition(&mut fd, &out.*, line.*)
+  run out.append(op.OP_get_scope0_el) run out.writeU16(operand & SCOPE_SLOT_MASK) return cc.position
 }
 effect fn constantTest(fd: &mut FunctionDef, table: &mut AtomTable, bytes: &[u8], out: &mut ByteBuffer,
     position: i32, cc: &CodeContext, line: &mut i32, value: bool) -> i32 ! OutOfMemoryError ? &mut Allocator {
@@ -205,6 +220,12 @@ effect fn resolveInstruction(fd: &mut FunctionDef, table: &mut AtomTable, bytes:
           || matchCode(&mut cc, bytes, next, &[M2(op.OP_and, op.OP_or), -1])) {
         matchedLine(&cc, &mut line) run addPosition(&mut fd, &out.*, line.*)
         run out.append(immediateOperator(i32.toU8(cc.opcode))) run out.writeU16(u32.toU16(unsignedWord(value) & 0xffff)) return cc.position
+      }
+      // `x === 0`, `n !== -1`: the comparison takes a small Int inline.
+      if value >= -128 && value <= 127 && matchCode(&mut cc, bytes, next, &[M2(op.OP_strict_eq, op.OP_strict_neq), -1]) {
+        matchedLine(&cc, &mut line) run addPosition(&mut fd, &out.*, line.*)
+        if cc.opcode == opcode(op.OP_strict_eq) { run out.append(op.OP_strict_eq_imm8) } else { run out.append(op.OP_strict_neq_imm8) }
+        run out.append(u32.toU8(unsignedWord(value) & 255)) return cc.position
       }
       run addPosition(&mut fd, &out.*, line.*) run pushShortInt(&mut out, value) return next
     }
@@ -405,6 +426,10 @@ effect fn resolveInstruction(fd: &mut FunctionDef, table: &mut AtomTable, bytes:
       run addPosition(&mut fd, &out.*, line.*) run putShortCode(&mut out, code, index) return next
     }
   } else if code == op.OP_get_arg || code == op.OP_get_var_ref || code == op.OP_get_var {
+    if code == op.OP_get_var_ref {
+      let fused = run scopeElement(&mut fd, bytes, &mut out, &mut cc, pos, next, &mut line)
+      if fused >= 0 { return fused }
+    }
     let index = u16.toI32(readU16(bytes, pos + 1))
     // `heap[(x + k) >> s]` with heap a captured variable or a global and x a
     // local or an argument: the prefix goes first, then every instruction as it
@@ -510,6 +535,8 @@ effect fn resolveInstruction(fd: &mut FunctionDef, table: &mut AtomTable, bytes:
       run out.append(replacement) run out.append(op.OP_put_array_el) return cc.position
     }
   } else if code == op.OP_get_var_ref_check {
+    let fused = run scopeElement(&mut fd, bytes, &mut out, &mut cc, pos, next, &mut line)
+    if fused >= 0 { return fused }
     // A class constructor's field initializer call (parser emitClassFieldInit):
     // the fusion prefix goes first, then the call as it would be without it.
     // The VM skips the call when there are no fields and runs a constant-only
@@ -525,16 +552,24 @@ effect fn resolveInstruction(fd: &mut FunctionDef, table: &mut AtomTable, bytes:
       matchedLine(&cc, &mut line)
       let equal = cc.opcode == opcode(op.OP_strict_eq) || cc.opcode == opcode(op.OP_eq)
       let mut replacement: i32 = -1
+      // typeof_is takes the name's index (`typeof x === 'string'`); undefined and
+      // function keep their own one-byte tests.
+      let index = typeofIsIndex(cc.atom)
       if cc.atom == atoms.JS_ATOM_undefined { replacement = opcode(op.OP_typeof_is_undefined) }
       else if cc.atom == atoms.JS_ATOM_function { replacement = opcode(op.OP_typeof_is_function) }
+      else if index >= 0 { replacement = opcode(op.OP_typeof_is) }
       if replacement >= 0 {
         if equal {
-          run addPosition(&mut fd, &out.*, line.*) run out.append(i32.toU8(replacement)) table.release(cc.atom) return cc.position
+          run addPosition(&mut fd, &out.*, line.*) run out.append(i32.toU8(replacement))
+          if replacement == opcode(op.OP_typeof_is) { run out.append(i32.toU8(index)) }
+          table.release(cc.atom) return cc.position
         }
         let afterComparison = cc.position
         if matchCode(&mut cc, bytes, afterComparison, &[opcode(op.OP_if_false), -1]) {
           matchedLine(&cc, &mut line) run addPosition(&mut fd, &out.*, line.*)
-          run out.append(i32.toU8(replacement)) table.release(cc.atom)
+          run out.append(i32.toU8(replacement))
+          if replacement == opcode(op.OP_typeof_is) { run out.append(i32.toU8(index)) }
+          table.release(cc.atom)
           return run emitBranch(&mut fd, &mut table, bytes, &mut out, position, cc.position, &mut line, op.OP_if_true, cc.label, false)
         }
       }
@@ -656,6 +691,7 @@ effect fn resolve(fd: &mut FunctionDef, table: &mut AtomTable, source: &[u8]) ->
   }
   shrinkJumps(&mut fd, &mut out)
   fuseNullishBranches(&fd, &mut out)
+  fuseKeepBranches(&fd, &mut out)
   fuseBackEdges(&fd, &mut out)
   // Surviving atom operands transfer without retain/release; removed ones were
   // released at their source rewrite. Publish before debug encoding can fail.
