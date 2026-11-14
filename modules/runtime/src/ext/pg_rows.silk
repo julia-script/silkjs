@@ -1,12 +1,15 @@
 //! Postgres DataRow decoding for postgres.js (see internal/postgres_rows.js).
-//! Native host 39: pgRows(buffer, template, result, rows) reads the DataRow
+//! Native host 39: pgRows(buffer, template, result, rows, cache) reads the DataRow
 //! messages at the start of buffer into row objects with template's shape and
 //! appends them to result, which must be a fast Array holding exactly rows
 //! elements. template's slots name the columns in order and say how to read
 //! each one: 0 text, 1 number (decimal integers only), 2 boolean. Returns the
 //! bytes consumed: it stops at the first message that is not a complete
 //! DataRow of that width, or whose numbers are not plain integers, and the
-//! caller handles that message itself.
+//! caller handles that message itself. cache, a fast Array of CACHE_SLOTS
+//! elements the caller keeps for all queries, remembers recent short text
+//! values: a row repeating one shares its string instead of allocating (and
+//! later freeing) a copy.
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.mem.pointer { Pointer }
 import silk.core.effect { Effect }
@@ -23,7 +26,9 @@ import silkjs.js_heap { HeapCell, HeapHeader }
 import silkjs.js_core_types { FrameSlots, ObjectData, ObjectPayload, ShapeData, SlotBits }
 import silkjs.js_value { ValueBits }
 import silkjs.js_exceptions { JsException }
-import silkjs.js_string_types { StringLengthError }
+import silkjs.js_gc { HeapHooks }
+import silkjs.js_string_types { StringLengthError, FlatString }
+import silkjs.js_string_types as stringTypes
 import silkjs.js_strings { Strings }
 import silkjs.js_realm { lendRealm }
 import silkjs.js_buffer_storage { BufferState }
@@ -39,6 +44,9 @@ import libs.core.owners as owners
 import ext.buffer_codec as codec
 
 const MAX_COLUMNS: usize = 64
+/// Cache entries, a power of two, and the longest text cached.
+const CACHE_SLOTS: usize = 4096
+const CACHED_BYTES: usize = 48
 
 /// The bytes of a private buffer from start on, borrowed for the call: nothing
 /// in it runs JavaScript, so the backing stays put.
@@ -87,6 +95,66 @@ fn ascii(bytes: &[u8], start: usize, end: usize) -> bool {
   while i < end { if bytes[i] >= 0x80 { return false } i = i + 1 }
   return true
 }
+@inlineAlways
+unsafe fn word8(bytes: &[u8], offset: usize) -> u64 {
+  return unsafe Pointer.readUnaligned<u64>(unsafe Intrinsic.pointerReinterpret<*const u8, *const align(1) u64>(unsafe at(bytes, offset)))
+}
+@inlineAlways
+fn mix(hash: u64, value: u64) -> u64 { return u64.wrappingMultiply(u64.bitXor(hash, value), 0x9E3779B97F4A7C15) }
+/// The cache slot of bytes[start..end], at most CACHED_BYTES long: its first,
+/// second and last eight bytes, or its bytes when shorter. A collision only
+/// costs a miss.
+@inlineAlways
+fn slotOf(bytes: &[u8], start: usize, end: usize) -> usize {
+  let size = end - start
+  let mut hash = mix(0, usize.toU64(size))
+  if size >= 8 {
+    hash = mix(hash, unsafe word8(bytes, start))
+    hash = mix(hash, unsafe word8(bytes, end - 8))
+    if size > 16 { hash = mix(hash, unsafe word8(bytes, start + 8)) }
+  } else {
+    let mut packed: u64 = 0
+    let mut i = start
+    while i < end { packed = u64.bitOr(u64.shiftLeft(packed, 8), u8.toU64(bytes[i])) i = i + 1 }
+    hash = mix(hash, packed)
+  }
+  return usize.bitAnd(u64.toUsize(u64.shiftRight(hash, 52)), CACHE_SLOTS - 1)
+}
+/// The elements of cache, a fast Array of CACHE_SLOTS. Only remember writes
+/// them while dispatch runs, in place, so they stay put.
+unsafe fn cacheSlots(cache: *mut HeapHeader) -> [*]const ValueBits {
+  let anchor = ()
+  let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, cache)
+  return match &data.payload {
+    ObjectPayload.FastArray { array } => unsafe Intrinsic.pointerRequalify<?[*]const ValueBits, [*]const ValueBits>(Pointer.fromSlice<ValueBits>(array.values().asSlice()))
+    _ => Intrinsic.trap("postgres rows cache is not a fast array")
+  }
+}
+/// The cached string at slot, retained, when its text is bytes[start..end]; else Undefined.
+@inlineAlways
+unsafe fn cached(slots: [*]const ValueBits, slot: usize, bytes: &[u8], start: usize, end: usize) -> ValueBits {
+  let entry = unsafe Pointer.read<ValueBits>(unsafe Pointer.at<ValueBits>(slots, slot))
+  let reference = match entry { ValueBits.String { reference } => reference _ => { return ValueBits.Undefined } }
+  let anchor = ()
+  let flat = unsafe HeapCell.shortPayload<FlatString, ()>(&anchor, reference)
+  if flat.wide || flat.length() != end - start { return ValueBits.Undefined }
+  let text = unsafe stringTypes.latin1Bytes(&anchor, reference)
+  let mut i: usize = 0
+  while start + i + 8 <= end { if unsafe word8(text, i) != unsafe word8(bytes, start + i) { return ValueBits.Undefined } i = i + 8 }
+  while start + i < end { if text[i] != bytes[start + i] { return ValueBits.Undefined } i = i + 1 }
+  return unsafe entry.retained()
+}
+/// Stores value (retained for the cache) at slot, releasing what was there.
+unsafe fn remember<H: HeapHooks>(hooks: &mut H, context: *mut HeapHeader, cache: *mut HeapHeader, slot: usize, value: ValueBits) -> () {
+  let mut anchor = ()
+  let data = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut anchor, cache)
+  let old = match &mut data.payload {
+    ObjectPayload.FastArray { array } => { let was = array.values().get(slot) array.store(slot, unsafe value.retained()) was }
+    _ => { return () }
+  }
+  drop data
+  unsafe owners.release(&mut hooks, context, old)
+}
 unsafe fn fastCount(array: *mut HeapHeader) -> i64 {
   let anchor = () let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, array)
   if data.classId() != classes.JS_CLASS_ARRAY || !data.extensible() { return -1 }
@@ -107,6 +175,7 @@ pub unsafe effect fn dispatch<'m, S: EngineServices>(engine: &mut Engine<'m, S>,
   let resultNode = match result { ValueBits.Object { reference } => reference _ => { return none } }
   let expected = match rowsArgument { ValueBits.Int { value } => i32.toI64(value) _ => { return none } }
   if unsafe fastCount(resultNode) != expected { return none }
+  let cacheNode = match unsafe common.argument(argv, argc, 4) { ValueBits.Object { reference } => reference _ => { return none } }
   // The template's kinds, one per slot.
   let mut kinds: [u8; 64] = [0; 64]
   let anchor = ()
@@ -117,6 +186,8 @@ pub unsafe effect fn dispatch<'m, S: EngineServices>(engine: &mut Engine<'m, S>,
   if !(unsafe HeapCell.payload<ShapeData, ()>(&anchor, shape)).isHashed { return none }
   let width = (unsafe HeapCell.payload<ShapeData, ()>(&anchor, shape)).properties.length()
   if width == 0 || width > MAX_COLUMNS || templateData.slotCount() != width { return none }
+  if unsafe fastCount(cacheNode) != usize.toI64(CACHE_SLOTS) { return none }
+  let slots = unsafe cacheSlots(cacheNode)
   let mut c: usize = 0
   while c < width {
     match (unsafe templateData.slotUnchecked(c)).valueBits() {
@@ -169,13 +240,22 @@ pub unsafe effect fn dispatch<'m, S: EngineServices>(engine: &mut Engine<'m, S>,
       } else if kind == 2 {
         values[i] = ValueBits.Bool { value: size == 1 && bytes[index] == 116 }
       } else {
-        let made = if ascii(bytes, index, stop) {
+        let short = size <= usize.toU64(CACHED_BYTES) && ascii(bytes, index, stop)
+        let slot = if short { slotOf(bytes, index, stop) } else { 0 }
+        if short {
+          let hit = unsafe cached(slots, slot, bytes, index, stop)
+          if hit.tag() < 0 { values[i] = hit index = stop i = i + 1 filled = i continue }
+        }
+        let made = if short || ascii(bytes, index, stop) {
           run Effect.result(Strings.fromLatin1(unsafe bytesAt(&bytesAnchor, state, base + usize.toU64(index), size)))
         } else {
           run Effect.result(unsafe codec.decode(state, base + usize.toU64(index), base + usize.toU64(stop), false))
         }
         match move made {
-          Result<ValueBits, OutOfMemoryError | StringLengthError>.Success { value } => { values[i] = value }
+          Result<ValueBits, OutOfMemoryError | StringLengthError>.Success { value } => {
+            values[i] = value
+            if short { unsafe remember(&mut engine, context, cacheNode, slot, value) }
+          }
           Result<ValueBits, OutOfMemoryError | StringLengthError>.Failure { .. } => { complete = false break }
         }
       }
