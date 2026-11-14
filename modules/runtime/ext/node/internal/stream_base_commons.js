@@ -309,6 +309,7 @@ function setStreamTimeout(msecs, callback) {
 module.exports = {
   writevGeneric,
   writeGeneric,
+  afterWriteDispatched,
   onStreamRead,
   kAfterAsyncWrite,
   kMaybeDestroy,
