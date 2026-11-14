@@ -47,6 +47,7 @@ const {
   suspendUnrefTimeout,
   refreshUnrefTimeout,
   getTimerDuration,
+  TIMEOUT_MAX,
 } = require('internal/timers');
 const { isUint8Array } = require('util').types;
 const { clearTimeout } = require('timers');
@@ -272,8 +273,9 @@ function setStreamTimeout(msecs, callback) {
 
   this.timeout = msecs;
 
-  // Type checking identical to timers.enroll()
-  msecs = getTimerDuration(msecs, 'msecs');
+  // Type checking identical to timers.enroll(); a number that needs no change skips it.
+  if (typeof msecs !== 'number' || !(msecs >= 0 && msecs <= TIMEOUT_MAX))
+    msecs = getTimerDuration(msecs, 'msecs');
 
   // Attempt to clear an existing timer in both cases -
   //  even if it will be rescheduled we don't want to leak an existing timer.
@@ -309,6 +311,7 @@ function setStreamTimeout(msecs, callback) {
 module.exports = {
   writevGeneric,
   writeGeneric,
+  afterWriteDispatched,
   onStreamRead,
   kAfterAsyncWrite,
   kMaybeDestroy,

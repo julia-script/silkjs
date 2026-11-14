@@ -44,6 +44,7 @@ const {
 const EventEmitter = require('events');
 const { addAbortListener } = require('events');
 const stream = require('stream');
+const { streamHooks } = require('internal/streams/utils');
 let debug = require('util').debuglog('net', (fn) => {
   debug = fn;
 });
@@ -93,6 +94,7 @@ const {
 const {
   writevGeneric,
   writeGeneric,
+  afterWriteDispatched,
   onStreamRead,
   kAfterAsyncWrite,
   kHandle,
@@ -1334,6 +1336,35 @@ Socket.prototype._writev = function(chunks, cb) {
 
 Socket.prototype._write = function(data, encoding, cb) {
   this._writeGeneric(false, data, encoding, cb);
+};
+
+// node:http's response writes (_http_outgoing _writeRaw): a latin1 or utf8 string written to
+// an idle, connected socket whose write path is net's own takes the steps of socket.write ->
+// Socket._write -> _writeGeneric -> writeGeneric in one call (streamHooks.writeIdle runs the
+// Writable side). undefined leaves the write to socket.write.
+const socketWrite = Socket.prototype.write;
+const socket_write = Socket.prototype._write;
+const socketWriteGeneric = Socket.prototype._writeGeneric;
+function dispatchIdle(socket, data, encoding, cb) {
+  socket._pendingData = null;
+  socket._pendingEncoding = '';
+  socket._unrefTimer();
+  const handle = socket[kHandle];
+  const ret = encoding === 'latin1' ? handle.writeLatin1String(null, data) : handle.writeUtf8String(null, data);
+  if (ret === 0) {
+    cb();
+    return;
+  }
+  const req = afterWriteDispatched(handle, ret, null, cb);
+  if (req.async)
+    socket[kLastWriteQueueSize] = req.bytes;
+}
+streamHooks.socketWrite = function socketWriteIdle(socket, data, encoding, cb) {
+  if (socket.write !== socketWrite || typeof data !== 'string' || socket._write !== socket_write ||
+      socket._writeGeneric !== socketWriteGeneric || socket.connecting || !socket._handle) {
+    return undefined;
+  }
+  return streamHooks.writeIdle(socket, data, encoding, cb, dispatchIdle);
 };
 
 

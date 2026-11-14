@@ -458,10 +458,14 @@ function writeHead(statusCode, reason, obj) {
     headers = obj;
   }
 
-  if (checkInvalidHeaderChar(this.statusMessage))
-    throw new ERR_INVALID_CHAR('statusMessage');
-
-  const statusLine = `HTTP/1.1 ${statusCode} ${this.statusMessage}\r\n`;
+  let statusLine;
+  if (statusCode === 200 && this.statusMessage === 'OK') {
+    statusLine = 'HTTP/1.1 200 OK\r\n';
+  } else {
+    if (checkInvalidHeaderChar(this.statusMessage))
+      throw new ERR_INVALID_CHAR('statusMessage');
+    statusLine = `HTTP/1.1 ${statusCode} ${this.statusMessage}\r\n`;
+  }
 
   if (statusCode === 204 || statusCode === 304 ||
       (statusCode >= 100 && statusCode <= 199)) {

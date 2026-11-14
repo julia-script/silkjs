@@ -26,6 +26,7 @@ const { getDefaultHighWaterMark } = require('internal/streams/state');
 const assert = require('internal/assert');
 const EE = require('events');
 const Stream = require('stream');
+const { streamHooks } = require('internal/streams/utils');
 const { kOutHeaders, utcDate, kNeedDrain } = require('internal/http');
 const { Buffer } = require('buffer');
 const {
@@ -430,7 +431,8 @@ function _writeRaw(data, encoding, callback, size) {
       this._flushOutput(conn);
     }
     // Directly write to socket.
-    return conn.write(data, encoding, callback);
+    return streamHooks.socketWrite(conn, data, encoding, callback) ??
+      conn.write(data, encoding, callback);
   }
   // Buffer, as long as we're not destroyed.
   this.outputData.push({ data, encoding, callback });
@@ -489,7 +491,7 @@ function _storeHeader(firstLine, headers) {
 
   // Date header
   if (this.sendDate && !state.date) {
-    header += 'Date: ' + utcDate() + '\r\n';
+    header += dateLine();
   }
 
   // Force the connection to close when the response is a 204 No Content or
@@ -529,7 +531,7 @@ function _storeHeader(firstLine, headers) {
         if (~~this._maxRequestsPerSocket > 0) {
           max = `, max=${this._maxRequestsPerSocket}`;
         }
-        header += `Keep-Alive: timeout=${timeoutSeconds}${max}\r\n`;
+        header += keepAliveLine(timeoutSeconds, max);
       }
     } else {
       this._last = true;
@@ -576,6 +578,29 @@ function _storeHeader(firstLine, headers) {
   // Wait until the first body chunk, or close(), is sent to flush,
   // UNLESS we're sending Expect: 100-continue.
   if (state.expect) this._send('');
+}
+
+// The Date and Keep-Alive lines of the last response, rebuilt when their values change.
+let lastUtcDate;
+let lastDateLine = '';
+function dateLine() {
+  const date = utcDate();
+  if (date !== lastUtcDate) {
+    lastUtcDate = date;
+    lastDateLine = 'Date: ' + date + '\r\n';
+  }
+  return lastDateLine;
+}
+let lastKeepAliveSeconds = -1;
+let lastKeepAliveMax = '';
+let lastKeepAliveLine = '';
+function keepAliveLine(timeoutSeconds, max) {
+  if (timeoutSeconds !== lastKeepAliveSeconds || max !== lastKeepAliveMax) {
+    lastKeepAliveSeconds = timeoutSeconds;
+    lastKeepAliveMax = max;
+    lastKeepAliveLine = `Keep-Alive: timeout=${timeoutSeconds}${max}\r\n`;
+  }
+  return lastKeepAliveLine;
 }
 
 function processHeader(self, state, key, value, validate, lenient) {
