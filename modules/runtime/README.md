@@ -6,16 +6,16 @@ Node 24 is the compatibility reference. [Deno](https://github.com/denoland/deno)
 
 ## Build
 
-The verified build target is **macOS arm64**. Linux x64 (Ubuntu 24.04 with libuv, OpenSSL, zstd and nghttp2 built from source) builds and passes the differential suite (72/72, November 2026); other platforms are not claimed as verified.
+The verified build target is **macOS arm64**. Linux x64 builds and passes the differential suite (72/72, November 2026); other platforms are not claimed as verified.
 
 Requirements:
 
 - The Silk launcher; `silk.toml` pins the compiler version.
-- Python 3.12 or newer, Clang 22 or newer, CMake, `patch`, and `pkg-config`.
+- Clang 22 or newer, and Python 3.12 or newer for `silk task build`.
 - A macOS SDK supporting the compiler's macOS 11 deployment target. The build selects the installed macOS 15.5 SDK when `SDKROOT` is unset; otherwise set `SDKROOT` explicitly.
-- Development headers and static archives for libuv 1.50 or newer, OpenSSL 3.2 or newer, Brotli, Zstandard, and nghttp2. They must be discoverable through `pkg-config`. SQLite needs nothing installed: the `db-sqlite` package from [silk-lang/lib-sqlite](https://github.com/silk-lang/lib-sqlite) compiles its pinned amalgamation into the executable.
-- On GNU/Linux, distribution packages are often too old: Ubuntu 24.04 has libuv 1.48 and OpenSSL 3.0.
-- Network access on the first build to retrieve checksum-verified source dependencies.
+- Network access on the first build: Silk downloads the pinned, checksum-verified source releases of the C libraries and compiles them itself.
+
+Nothing needs installing besides. libuv, OpenSSL, nghttp2, zlib, Zstandard and Brotli are packages of [`../native`](../native), each compiled from its pinned release (`[native.archive]` in its `silk.toml`). WAMR, with this runtime's patches, is vendored in [`vendor/wamr`](vendor/wamr). The built-in JavaScript is embedded from its files by [`builtin_sources.c`](builtin_sources.c), so an edit to a built-in needs nothing run first; adding or removing one does (`silk generate`, which runs [`tools/embed.py`](tools/embed.py)). SQLite comes from the `db-sqlite` package of [silk-lang/lib-sqlite](https://github.com/silk-lang/lib-sqlite).
 
 ```sh
 git clone https://github.com/silk-lang/lib-silkjs.git
@@ -25,9 +25,11 @@ silk task build
 ./build/silkjsruntime -p 'process.versions'
 ```
 
-Use `SILK_CLANG` to select a particular Clang executable. `silk task build --release` builds with speed optimization; `--output PATH` selects the output executable. `silk task` lists the other tasks (`embed`, `compat`, `sea`); they run the Python tools in [`tools/`](tools/), which can still be run directly.
+A plain `silk build` builds the executable too, and is how a program that embeds the runtime builds (see [Embed](#embed)). `silk task build` adds what only an executable that can run on the build machine gets: the built-ins' bytecode, compiled by the executable itself and linked into it, and a startup heap image, so a start does not run the bootstrap.
 
-The engine is this repository's [`modules/engine`](../engine), a path dependency in `silk.toml`, so engine and runtime changes land together. The build also prepares the pinned WAMR/uvwasi dependencies, embeds the JavaScript extensions, and links the native executable. An installed Node executable is not required to build or run it.
+Use `SILK_CLANG` to select a particular Clang executable. `silk task build --release` builds with speed optimization; `--output PATH` selects the output executable. `silk task` lists the other tasks (`embed`, `compat`, `sea`); they run the Python tools in [`tools/`](tools/), which can still be run directly. The first build compiles about 1,300 C files once (Silk compiles them one at a time), a few minutes; later builds reuse the objects.
+
+The engine is this repository's [`modules/engine`](../engine), a path dependency in `silk.toml`, so engine and runtime changes land together. An installed Node executable is not required to build or run it.
 
 ## Run
 

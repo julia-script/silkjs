@@ -39,6 +39,9 @@ if arguments and not non_final.intersection(arguments):
             # Code generation options have nothing left to apply to.
             while '-mllvm' in arguments:
                 del arguments[arguments.index('-mllvm'):arguments.index('-mllvm') + 2]
+    # tools/build.py's build identity (src/ext/builtin_cache.c), which outranks the weak default.
+    if os.environ.get('SILKJS_LINK_OBJECT'):
+        arguments.append(os.environ['SILKJS_LINK_OBJECT'])
     # A Silk that compiles the program to an object itself (one kept beside the output)
     # links that object: record every final link, not only one from IR.
     os.makedirs(BUILD, exist_ok=True)
