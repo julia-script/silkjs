@@ -181,7 +181,9 @@ function createLoader(host, builtins) {
     return 'file://' + normalized.split('/').map(encodeURIComponent).join('/');
   }
 
-  function fromFileURL(value) {
+  // nul: Node's fileURLToPath keeps a decoded NUL (createRequire accepts such a URL, as
+  // vite's virtual \0 modules have); only a file system call rejects it.
+  function fromFileURL(value, nul = false) {
     const match = /^file:(?:\/\/([^/?#]*))?([^?#]*)([?#].*)?$/i.exec(value);
     if (!match) throw error('ERR_INVALID_URL', value);
     if (match[1] && match[1].toLowerCase() !== 'localhost') {
@@ -191,14 +193,14 @@ function createLoader(host, builtins) {
     let filename;
     try { filename = decodeURIComponent(match[2]); }
     catch (_) { throw error('ERR_INVALID_URL', value); }
-    if (filename.includes('\0')) throw invalidArgValue('path', value, 'must be a string or Uint8Array without null bytes');
+    if (!nul && filename.includes('\0')) throw invalidArgValue('path', value, 'must be a string or Uint8Array without null bytes');
     if (path.sep !== '\\' && !filename.startsWith('/')) filename = '/' + filename;
     if (path.sep === '\\' && /^\/[A-Za-z]:/.test(filename)) filename = filename.slice(1);
     return { filename: path.resolve(filename), suffix: match[3] || '' };
   }
 
-  function filesystemName(filename) {
-    return filename.startsWith('file:') ? fromFileURL(filename).filename : filename;
+  function filesystemName(filename, nul = false) {
+    return filename.startsWith('file:') ? fromFileURL(filename, nul).filename : filename;
   }
 
   function parentName(parent) {
@@ -207,7 +209,7 @@ function createLoader(host, builtins) {
     parent = String(parent);
     let name = parentNames.get(parent);
     if (name !== undefined) return name;
-    const filename = filesystemName(parent);
+    const filename = filesystemName(parent, true);
     // A file URL ending in a slash names a directory (module.register(specifier, cwd URL)).
     name = parent.startsWith('file:') && /\/(?:[?#].*)?$/.test(parent) ? path.join(path.resolve(filename), '[directory]') : path.resolve(filename);
     // A relative one depends on the working directory.

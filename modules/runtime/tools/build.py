@@ -11,7 +11,7 @@ import subprocess
 import sys
 import tempfile
 import tomllib
-from embed import ROOT, cache_build_identity
+from embed import ROOT, cache_build_identity, sources
 
 
 def main():
@@ -85,6 +85,7 @@ def embed_builtin_cache(output, environment, identity, identified):
     except (OSError, subprocess.CalledProcessError) as error:
         print(f'Built-in bytecode not embedded ({error}); built-ins will compile at startup')
         return
+    order_builtin_cache(cache)
     cached = build_cache_object(environment, identity, cache)
     link = json.loads(record.read_text())
     arguments = link['arguments']
@@ -93,6 +94,39 @@ def embed_builtin_cache(output, environment, identity, identified):
     arguments += startup_order(arguments)
     subprocess.run([link['compiler'], *arguments], cwd=link['directory'], env=environment, check=True)
     print(f'Embedded {cache.stat().st_size} bytes of built-in bytecode')
+
+
+def order_builtin_cache(cache):
+    """Move the built-ins a start or a server reads to the front of the bytecode cache.
+
+    The executable writes the entries in index order, and a server reads under 3 MB of
+    the 22 MB: spread out, those reads kept 7 MB of the cache resident, since the kernel
+    maps the file pages around each one. tools/builtin-order.txt names the modules
+    (tools/builtin_order.py writes it); a name that no longer exists is skipped, and
+    modules it does not name follow in index order. Only the entries move: the table at
+    the front still gives entry i for built-in i (src/ext/builtin_cache.silk).
+    """
+    data = cache.read_bytes()
+    header = 80
+    count = struct.unpack_from('<Q', data, 72)[0]
+    table = [struct.unpack_from('<QQ', data, header + index * 16) for index in range(count)]
+    names = [name for name, _ in sources()] + ['internal/bootstrap/silk']
+    if len(names) != count:
+        raise SystemExit(f'The built-in bytecode has {count} entries for {len(names)} built-ins')
+    index = {name: position for position, name in enumerate(names)}
+    listed = [index[name] for name in (ROOT / 'tools/builtin-order.txt').read_text().split() if name in index]
+    listed = list(dict.fromkeys(listed))
+    first = set(listed)
+    payload = bytearray()
+    placed = [(0, 0)] * count
+    start = header + count * 16
+    for position in listed + [position for position in range(count) if position not in first]:
+        offset, length = table[position]
+        if length == 0:
+            continue
+        placed[position] = (start + len(payload), length)
+        payload += data[offset:offset + length]
+    cache.write_bytes(data[:header] + b''.join(struct.pack('<QQ', *entry) for entry in placed) + bytes(payload))
 
 
 def startup_order(arguments):

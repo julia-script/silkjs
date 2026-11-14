@@ -134,7 +134,14 @@ async function snapshots(root) {
     // Without NODE_V8_COVERAGE there is no coverage to take or stop, as in Node.
     assert.equal(v8.takeCoverage(), undefined);
     assert.equal(v8.stopCoverage(), undefined);
-    assert.throws(() => v8.setFlagsFromString('--expose-gc'), { code: 'ERR_NOT_SUPPORTED' });
+    // As in V8, --expose-gc reaches the contexts made after it, not the running one.
+    const hadGC = typeof globalThis.gc;
+    v8.setFlagsFromString('--expose-gc');
+    assert.equal(typeof globalThis.gc, hadGC);
+    assert.equal(require('node:vm').runInNewContext('typeof gc'), 'function');
+    v8.setFlagsFromString('--no-expose-gc');
+    assert.equal(require('node:vm').runInNewContext('typeof gc'), 'undefined');
+    assert.throws(() => v8.setFlagsFromString('--allow-natives-syntax'), { code: 'ERR_NOT_SUPPORTED' });
     assert.throws(() => v8.startupSnapshot.addSerializeCallback(() => {}), { code: 'ERR_NOT_BUILDING_SNAPSHOT' });
     assert.equal(v8.startupSnapshot.isBuildingSnapshot(), 0);
   }
