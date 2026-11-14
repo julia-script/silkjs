@@ -83,6 +83,7 @@ const {
   kErrored,
   kConstructed,
   kOnConstructed,
+  streamHooks,
 } = require('internal/streams/utils');
 
 const { assignFunctionName } = require('internal/util');
@@ -586,6 +587,42 @@ function writeOrBuffer(stream, state, chunk, encoding, callback) {
   // any synchronous while(stream.write(data)) loops.
   return ret && (state[kState] & (kDestroyed | kErrored)) === 0;
 }
+
+// A string write to an idle stream (nothing buffered, corked, being written or ending) in
+// one call: the steps of write() -> _write() -> writeOrBuffer() with dispatch(stream, chunk,
+// encoding, onwrite) in place of stream._write. net.js uses it for node:http response writes.
+// undefined when the stream is not idle or the encoding is not latin1 or utf8: write() takes it.
+function writeIdle(stream, chunk, encoding, cb, dispatch) {
+  const state = stream._writableState;
+  if ((state[kState] & (kObjectMode | kDecodeStrings | kEnding | kDestroyed | kWriting | kErrored |
+                        kCorked | kConstructed | kBuffered)) !== kConstructed) {
+    return undefined;
+  }
+  if (!encoding) {
+    if ((state[kState] & kDefaultUTF8Encoding) === 0) return undefined;
+    encoding = 'utf8';
+  } else if (encoding !== 'latin1' && encoding !== 'utf8') {
+    return undefined;
+  }
+  if (typeof cb !== 'function') cb = nop;
+  state.pendingcb++;
+  const len = chunk.length;
+  state.length += len;
+  state.writelen = len;
+  if (cb !== nop) {
+    state.writecb = cb;
+  }
+  state[kState] |= kWriting | kSync | kExpectWriteCb;
+  dispatch(stream, chunk, encoding, state.onwrite);
+  state[kState] &= ~kSync;
+
+  const ret = state.length < state.highWaterMark || state.length === 0;
+  if (!ret) {
+    state[kState] |= kNeedDrain;
+  }
+  return ret && (state[kState] & (kDestroyed | kErrored)) === 0;
+}
+streamHooks.writeIdle = writeIdle;
 
 function doWrite(stream, state, writev, len, chunk, encoding, cb) {
   state.writelen = len;

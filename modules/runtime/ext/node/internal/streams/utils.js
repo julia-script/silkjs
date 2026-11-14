@@ -337,7 +337,12 @@ function isErrored(stream) {
   ));
 }
 
+// Fast paths that one stream module lends another without a public property: writable.js
+// sets writeIdle and net.js socketWrite (node:http response writes).
+const streamHooks = { __proto__: null, writeIdle: null, socketWrite: null };
+
 module.exports = {
+  streamHooks,
   kOnConstructed,
   isDestroyed,
   kIsDestroyed,

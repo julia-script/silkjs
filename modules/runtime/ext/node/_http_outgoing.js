@@ -26,6 +26,7 @@ const { getDefaultHighWaterMark } = require('internal/streams/state');
 const assert = require('internal/assert');
 const EE = require('events');
 const Stream = require('stream');
+const { streamHooks } = require('internal/streams/utils');
 const { kOutHeaders, utcDate, kNeedDrain } = require('internal/http');
 const { Buffer } = require('buffer');
 const {
@@ -430,7 +431,8 @@ function _writeRaw(data, encoding, callback, size) {
       this._flushOutput(conn);
     }
     // Directly write to socket.
-    return conn.write(data, encoding, callback);
+    return streamHooks.socketWrite(conn, data, encoding, callback) ??
+      conn.write(data, encoding, callback);
   }
   // Buffer, as long as we're not destroyed.
   this.outputData.push({ data, encoding, callback });
