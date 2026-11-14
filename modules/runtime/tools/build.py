@@ -37,14 +37,18 @@ def main():
     # tools/clang.py links this object into the executable: the identity the built-ins'
     # bytecode and the heap image are tied to (src/ext/builtin_cache.c).
     identified = build_cache_object(environment, identity)
-    environment['SILKJS_LINK_OBJECT'] = str(identified)
+    named = ROOT / 'build/link-object'
+    named.write_text(str(identified))
     # Source-file compilation keeps the generic engine in one native object.
     command = ['silk', '+' + version, 'build', 'src/main.silk', '-o', str(args.output.resolve()),
                '--debug', str(not args.release).lower(),
                '--clang', str(ROOT / 'tools/clang.py')]
     if args.release:
         command += ['--optimization', 'speed']
-    subprocess.run(command, cwd=ROOT, env=environment, check=True)
+    try:
+        subprocess.run(command, cwd=ROOT, env=environment, check=True)
+    finally:
+        named.unlink(missing_ok=True)
     embed_builtin_cache(args.output.resolve(), environment, identity, identified)
     embed_heap_image(args.output.resolve())
 

@@ -40,8 +40,11 @@ if arguments and not non_final.intersection(arguments):
             while '-mllvm' in arguments:
                 del arguments[arguments.index('-mllvm'):arguments.index('-mllvm') + 2]
     # tools/build.py's build identity (src/ext/builtin_cache.c), which outranks the weak default.
-    if os.environ.get('SILKJS_LINK_OBJECT'):
-        arguments.append(os.environ['SILKJS_LINK_OBJECT'])
+    # It names the object in a file: the compiler server that runs this may predate the build.
+    extra = os.path.join(BUILD, 'link-object')
+    if os.path.isfile(extra):
+        with open(extra) as named:
+            arguments.append(named.read().strip())
     # A Silk that compiles the program to an object itself (one kept beside the output)
     # links that object: record every final link, not only one from IR.
     os.makedirs(BUILD, exist_ok=True)
