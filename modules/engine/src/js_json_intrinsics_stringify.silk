@@ -12,9 +12,16 @@ import silk.num.u8
 import silk.num.u16
 import silk.num.usize
 import js_value { ValueBits }
+import js_heap { HeapCell, HeapHeader }
+import js_shapes as shapes
+
+import dtoa { Dtoa }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import js_object_ref { ObjectRef }
 import js_realm { Realm }
 import js_owned_value { Value, lendBits, immediateRef, ValueRef, lendFor }
-import js_core_types { FrameSlots, PropertyEnum, JS_PROP_C_W_E, NativeErrorKind }
+import js_core_types { FrameSlots, PropertyEnum, JS_PROP_C_W_E, NativeErrorKind, ObjectData, ShapeData, JS_PROP_ENUMERABLE }
 import js_gc { HeapHooks }
 import js_coercion_host { CoercionHooks }
 import js_property_host { OwnPropertyHooks, OwnKeysHooks }
@@ -418,8 +425,299 @@ unsafe effect fn initialize<'a, 'b, H: HeapHooks + CoercionHooks + OwnPropertyHo
   let buffer = Intrinsic.replace(state.buffer, StringBuilder.make())
   return run buffer.finish()
 }
+
+// The quick serializer: JSON.stringify(value) with no replacer and no gap, over
+// plain data only. It reads shapes and slots and calls nothing, so nothing it
+// does is observable: when it meets anything else (toJSON anywhere on a
+// chain, an accessor, a proxy, a boxed primitive, a function, a holey or
+// non-fast array, integer-like keys, depth past QUICK_DEPTH) it gives up and
+// the full serializer starts over.
+const QUICK_DEPTH: usize = 24
+const QUICK_WRITTEN: u8 = 0
+/// value is omitted from an object (undefined or a symbol); an array writes null.
+const QUICK_ABSENT: u8 = 1
+const QUICK_GIVE_UP: u8 = 2
+struct QuickStack { objects: [usize; 24], depth: usize }
+/// Where the quick serializer writes. quoted is false when the sink cannot take
+/// text (the Latin-1 sink and wide or rope text); the run then starts over on a
+/// StringBuilder sink.
+interface QuickSink {
+  effect fn unit(self: &mut Self, c: u8) -> () ! OutOfMemoryError | StringLengthError ? &mut Allocator
+  effect fn bytes(self: &mut Self, text: &[u8]) -> () ! OutOfMemoryError | StringLengthError ? &mut Allocator
+  effect fn quoted(self: &mut Self, text: ValueBits, open: &[u8], close: &[u8]) -> bool ! OutOfMemoryError | StringLengthError ? &mut Allocator
+}
+struct BuilderSink { buffer: StringBuilder }
+impl QuickSink for BuilderSink {
+  effect fn unit(self: &mut Self, c: u8) -> () ! OutOfMemoryError | StringLengthError ? &mut Allocator { run self.buffer.appendUnit(u8.toU16(c)) }
+  effect fn bytes(self: &mut Self, text: &[u8]) -> () ! OutOfMemoryError | StringLengthError ? &mut Allocator { run self.buffer.appendLatin1(text) }
+  effect fn quoted(self: &mut Self, text: ValueBits, open: &[u8], close: &[u8]) -> bool ! OutOfMemoryError | StringLengthError ? &mut Allocator {
+    run quote(&mut self.buffer, text, open, close) return true
+  }
+}
+const NARROW_ROOM: usize = 512
+/// Latin-1 output in a fixed buffer, spilling into a list past NARROW_ROOM bytes:
+/// most results are made with the one allocation of the final string.
+struct NarrowSink { room: [u8; 512], length: usize, spill: List<u8>, spilled: bool, wide: bool }
+impl NarrowSink {
+  effect fn spillOut(self: &mut Self, additional: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+    run self.spill.reserve(self.length + additional)
+    run self.spill.appendBytes(Slice.view<u8>(&self.room, 0, self.length))
+    self.spilled = true
+  }
+  effect fn finish(self: &mut Self) -> ValueBits ! OutOfMemoryError | StringLengthError ? &mut Allocator {
+    if self.spilled { return run Strings.fromLatin1(self.spill.asSlice()) }
+    return run Strings.fromLatin1(Slice.view<u8>(&self.room, 0, self.length))
+  }
+  // Escapes one byte below 32, a quote or a backslash.
+  effect fn escape(self: &mut Self, c: u8) -> () ! OutOfMemoryError | StringLengthError ? &mut Allocator {
+    let mut short: u8 = 0
+    if c == 9 { short = 116 } else if c == 13 { short = 114 } else if c == 10 { short = 110 }
+    else if c == 8 { short = 98 } else if c == 12 { short = 102 } else if c == 34 || c == 92 { short = c }
+    if short != 0 { run self.unit(92) run self.unit(short) return () }
+    let hex = b"0123456789abcdef"
+    run self.bytes(b"\\u00")
+    run self.unit(hex[u8.toUsize(u8.shiftRight(c, 4))])
+    run self.unit(hex[u8.toUsize(c & 15)])
+  }
+}
+/// Copies source to target (count bytes, room checked by the caller).
+@inlineAlways
+unsafe fn copyRaw(target: [*]mut u8, source: &[u8]) -> () {
+  let input = unsafe Intrinsic.pointerRequalify<?[*]const u8, [*]const u8>(Pointer.fromSlice<u8>(source))
+  let mut i: usize = 0
+  while i < source.length { unsafe Pointer.write<u8>(unsafe Pointer.atMut<u8>(target, i), unsafe Pointer.read<u8>(unsafe Pointer.at<u8>(input, i))) i = i + 1 }
+}
+impl QuickSink for NarrowSink {
+  effect fn unit(self: &mut Self, c: u8) -> () ! OutOfMemoryError | StringLengthError ? &mut Allocator {
+    if !self.spilled {
+      if self.length < NARROW_ROOM { self.room[self.length] = c self.length = self.length + 1 return () }
+      run self.spillOut(1)
+    }
+    run self.spill.append(c)
+  }
+  effect fn bytes(self: &mut Self, text: &[u8]) -> () ! OutOfMemoryError | StringLengthError ? &mut Allocator {
+    if !self.spilled {
+      if text.length <= NARROW_ROOM - self.length {
+        let room = unsafe Intrinsic.pointerRequalify<?[*]mut u8, [*]mut u8>(Pointer.fromMutSlice<u8>(&mut self.room))
+        unsafe copyRaw(unsafe Pointer.assumeManyMut<u8>(unsafe Pointer.atMut<u8>(room, self.length)), text)
+        self.length = self.length + text.length
+        return ()
+      }
+      run self.spillOut(text.length)
+    }
+    run self.spill.appendBytes(text)
+  }
+  effect fn quoted(self: &mut Self, text: ValueBits, open: &[u8], close: &[u8]) -> bool ! OutOfMemoryError | StringLengthError ? &mut Allocator {
+    if text.tag() != -7 || Strings.isWide(text) { self.wide = true return false }
+    let length = Strings.length(text)
+    let bytes = unsafe latin1Bytes(&text, stringReference(text))
+    let start = self.length
+    if !self.spilled && open.length + length + close.length <= NARROW_ROOM - start {
+      // One pass copies the text until a byte needs escaping.
+      let room = unsafe Intrinsic.pointerRequalify<?[*]mut u8, [*]mut u8>(Pointer.fromMutSlice<u8>(&mut self.room))
+      let at = unsafe Pointer.assumeManyMut<u8>(unsafe Pointer.atMut<u8>(room, start))
+      unsafe copyRaw(at, open)
+      let body = unsafe Pointer.assumeManyMut<u8>(unsafe Pointer.atMut<u8>(at, open.length))
+      let input = unsafe Intrinsic.pointerRequalify<?[*]const u8, [*]const u8>(Pointer.fromSlice<u8>(bytes))
+      let mut i: usize = 0
+      while i < length {
+        let c = unsafe Pointer.read<u8>(unsafe Pointer.at<u8>(input, i))
+        if c < 32 || c == 34 || c == 92 { break }
+        unsafe Pointer.write<u8>(unsafe Pointer.atMut<u8>(body, i), c)
+        i = i + 1
+      }
+      if i == length {
+        unsafe copyRaw(unsafe Pointer.assumeManyMut<u8>(unsafe Pointer.atMut<u8>(body, length)), close)
+        self.length = start + open.length + length + close.length
+        return true
+      }
+      self.length = start + open.length + i
+      run self.escapedTail(bytes, i, length, close)
+      return true
+    }
+    run self.bytes(open)
+    run self.escapedTail(bytes, 0, length, close)
+    return true
+  }
+}
+impl NarrowSink {
+  effect fn escapedTail(self: &mut Self, bytes: &[u8], from: usize, length: usize, close: &[u8]) -> () ! OutOfMemoryError | StringLengthError ? &mut Allocator {
+    let mut at = from
+    while at < length {
+      let c = bytes[at]
+      if c < 32 || c == 34 || c == 92 { run self.escape(c) } else { run self.unit(c) }
+      at = at + 1
+    }
+    run self.bytes(close)
+  }
+}
+/// Whether no object on the chain from prototype has a toJSON property. Only
+/// ordinary objects and Arrays are looked through.
+unsafe fn noToJson(prototype: ?*mut HeapHeader) -> bool {
+  let mut cursor = prototype
+  let mut depth: usize = 0
+  while true {
+    let node = match Pointer.nonNullMut<HeapHeader>(cursor) { Option<*mut HeapHeader>.Some { value } => value Option<*mut HeapHeader>.None => { return true } }
+    depth = depth + 1
+    if depth > 8 { return false }
+    let anchor = () let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, node)
+    let class = data.classId()
+    if class != classes.JS_CLASS_OBJECT && class != classes.JS_CLASS_ARRAY { return false }
+    if let Option<usize>.Some { .. } = unsafe shapes.lookup(data.shape, atoms.JS_ATOM_toJSON) { return false }
+    cursor = (unsafe HeapCell.payload<ShapeData, ()>(&anchor, data.shape)).prototype
+  }
+  return true
+}
+unsafe effect fn quickValue<'a, S: QuickSink>(realm: Realm<'a>, buffer: &mut S, stack: &mut QuickStack, value: ValueBits) -> u8
+  ! OutOfMemoryError | StringLengthError ? &mut Allocator {
+  match value {
+    ValueBits.String { .. } => { if run buffer.quoted(value, b"\"", b"\"") { return QUICK_WRITTEN } return QUICK_GIVE_UP }
+    ValueBits.Rope { .. } => { if run buffer.quoted(value, b"\"", b"\"") { return QUICK_WRITTEN } return QUICK_GIVE_UP }
+    ValueBits.Int { value: integer } => {
+      let mut digits: [u8; 12] = [0; 12]
+      let length = Dtoa.i32toa(&mut digits, integer)
+      run buffer.bytes(Slice.view<u8>(&digits, 0, length))
+      return QUICK_WRITTEN
+    }
+    ValueBits.Float64 { value: number } => {
+      if !f64.isFinite(number) { run buffer.bytes(b"null") return QUICK_WRITTEN }
+      // ToString(-0) is "0".
+      if number == 0.0 { run buffer.unit(48) return QUICK_WRITTEN }
+      let mut bytes: [u8; 32] = [0; 32]
+      let length = Dtoa.shortest(&mut bytes, number)
+      run buffer.bytes(Slice.view<u8>(&bytes, 0, length))
+      return QUICK_WRITTEN
+    }
+    ValueBits.Bool { value: flag } => {
+      if flag { run buffer.bytes(b"true") } else { run buffer.bytes(b"false") }
+      return QUICK_WRITTEN
+    }
+    ValueBits.Null => { run buffer.bytes(b"null") return QUICK_WRITTEN }
+    ValueBits.Undefined => { return QUICK_ABSENT }
+    ValueBits.Symbol { .. } => { return QUICK_ABSENT }
+    ValueBits.Object { reference } => { return run unsafe quickObject(realm, &mut buffer, &mut stack, reference) }
+    _ => { return QUICK_GIVE_UP }
+  }
+}
+/// Whether neither shapeNode nor its prototype chain has toJSON, remembered on
+/// the shape for the current RuntimeState.shapeEpoch.
+unsafe fn shapeLacksToJson<'a>(realm: Realm<'a>, shapeNode: *mut HeapHeader) -> bool {
+  let anchor = ()
+  let epoch = realm.runtimeState(&anchor).shapeEpoch
+  let mut shapeAnchor = ()
+  let shape = unsafe HeapCell.payloadMut<ShapeData, ()>(&mut shapeAnchor, shapeNode)
+  if shape.jsonEpoch == epoch && shape.enumVersion == shape.version { return true }
+  if let Option<usize>.Some { .. } = unsafe shapes.lookup(shapeNode, atoms.JS_ATOM_toJSON) { return false }
+  if !unsafe noToJson(shape.prototype) { return false }
+  // Only valid with the enumeration cache's version: enumKeys clears it on a rebuild.
+  if shape.enumVersion == shape.version { shape.jsonEpoch = epoch }
+  return true
+}
+unsafe effect fn quickObject<'a, S: QuickSink>(realm: Realm<'a>, buffer: &mut S, stack: &mut QuickStack, node: *mut HeapHeader) -> u8
+  ! OutOfMemoryError | StringLengthError ? &mut Allocator {
+  let address = Pointer.address<HeapHeader>(node)
+  let depth = stack.depth
+  if depth >= QUICK_DEPTH { return QUICK_GIVE_UP }
+  let mut i: usize = 0
+  while i < depth { if stack.objects[i] == address { return QUICK_GIVE_UP } i = i + 1 }
+  let anchor = () let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, node)
+  let class = data.classId()
+  let shapeNode = data.shape
+  if class == classes.JS_CLASS_ARRAY {
+    if !data.fastArray() { return QUICK_GIVE_UP }
+    let length = match data.slot(0).valueBits() { ValueBits.Int { value: n } => n _ => { return QUICK_GIVE_UP } }
+    let count = arrays.fastCount((unsafe ObjectRef.lend(&anchor, node)).value())
+    if count != i32.toI64(length) { return QUICK_GIVE_UP }
+    drop data
+    let kind = run unsafe shapes.enumKeys(realm.runtime(), shapeNode)
+    if kind == shapes.ENUM_UNSUPPORTED || !unsafe shapeLacksToJson(realm, shapeNode) { return QUICK_GIVE_UP }
+    stack.objects[depth] = address stack.depth = depth + 1
+    run buffer.unit(91)
+    let mut index: i64 = 0
+    while index < count {
+      if index != 0 { run buffer.unit(44) }
+      let element = arrays.fastBorrow((unsafe ObjectRef.lend(&anchor, node)).value(), index).view()
+      let written = run unsafe quickValue(realm, &mut buffer, &mut stack, element)
+      if written == QUICK_GIVE_UP { return QUICK_GIVE_UP }
+      if written == QUICK_ABSENT { run buffer.bytes(b"null") }
+      index = index + 1
+    }
+    run buffer.unit(93)
+    stack.depth = depth
+    return QUICK_WRITTEN
+  }
+  if class != classes.JS_CLASS_OBJECT || data.isExotic() || data.fastArray() { return QUICK_GIVE_UP }
+  let records = (unsafe HeapCell.payload<ShapeData, ()>(&anchor, shapeNode)).properties.length()
+  if data.slotCount() != records { return QUICK_GIVE_UP }
+  drop data
+  let kind = run unsafe shapes.enumKeys(realm.runtime(), shapeNode)
+  if (kind & shapes.ENUM_PLAIN) == 0 || !unsafe shapeLacksToJson(realm, shapeNode) { return QUICK_GIVE_UP }
+  stack.objects[depth] = address stack.depth = depth + 1
+  let source = unsafe HeapCell.payload<ObjectData, ()>(&anchor, node)
+  let shape = unsafe HeapCell.payload<ShapeData, ()>(&anchor, shapeNode)
+  let state = realm.runtimeState(&anchor)
+  let dense = (kind & shapes.ENUM_DENSE) != 0
+  let listed = shape.enumKeys.length()
+  let mut open: &[u8] = b"{\""
+  let mut wrote = false
+  let mut record: usize = 0
+  i = 0
+  while i < listed {
+    let name = shape.enumKeys.get(i)
+    let mut index = i
+    i = i + 1
+    if !dense {
+      // The next enumerable string-keyed record: the cache lists them in order.
+      while true {
+        let property = unsafe shape.properties.getUnchecked(record)
+        record = record + 1
+        if property.atom != 0 && (u8.toU32(property.flags) & JS_PROP_ENUMERABLE) != 0 && state.atoms.borrowedString(property.atom).isString() { break }
+      }
+      index = record - 1
+    }
+    let element = (unsafe source.slotUnchecked(index)).valueBits()
+    match element {
+      ValueBits.Undefined => { continue }
+      ValueBits.Symbol { .. } => { continue }
+      _ => ()
+    }
+    if !run buffer.quoted(name, open, b"\":") { return QUICK_GIVE_UP }
+    open = b",\""
+    wrote = true
+    let written = run unsafe quickValue(realm, &mut buffer, &mut stack, element)
+    if written != QUICK_WRITTEN { return QUICK_GIVE_UP }
+  }
+  if !wrote { run buffer.unit(123) }
+  run buffer.unit(125)
+  stack.depth = depth
+  return QUICK_WRITTEN
+}
+effect fn quickBody<'a>(realm: Realm<'a>, input: ValueBits) -> ValueBits ! OutOfMemoryError | StringLengthError ? &mut Allocator {
+  let mut narrow = NarrowSink { room: [0; 512], length: 0, spill: List<u8>.make(), spilled: false, wide: false }
+  let mut stack = QuickStack { objects: [0; 24], depth: 0 }
+  let written = run unsafe quickValue(realm, &mut narrow, &mut stack, input)
+  if written == QUICK_WRITTEN { return run narrow.finish() }
+  if !narrow.wide { return ValueBits.Uninitialized }
+  let mut sink = BuilderSink { buffer: StringBuilder.make() }
+  stack.depth = 0
+  let again = run unsafe quickValue(realm, &mut sink, &mut stack, input)
+  if again != QUICK_WRITTEN { return ValueBits.Uninitialized }
+  return run sink.buffer.finish()
+}
+/// The quick serializer's string for input, or Uninitialized when the full one must run.
+effect fn quickStringify<'a>(realm: Realm<'a>, input: ValueBits) -> ValueBits ? &mut Allocator {
+  let result = run Effect.result(quickBody(realm, input))
+  return match move result {
+    Result<ValueBits, OutOfMemoryError | StringLengthError>.Success { value } => value
+    Result<ValueBits, OutOfMemoryError | StringLengthError>.Failure { error: _error } => ValueBits.Uninitialized
+  }
+}
 pub effect fn stringify<'a, 'b, H: HeapHooks + CoercionHooks + OwnPropertyHooks + OwnKeysHooks + PropertyWriteHooks + CallHooks + ErrorHooks>(hooks: &mut H,
   memory: &AllocationObserver, realm: Realm<'a>, input: ValueRef<'b>, replacer: ValueRef<'b>, space: ValueRef<'b>) -> ValueBits ! JsException ? &mut Allocator {
+  if shared.undefined(replacer.view()) && shared.undefined(space.view()) {
+    let quick = run quickStringify(realm, input.view())
+    if quick.tag() != 4 { return quick }
+  }
   let mut state = State.make()
   let result = run Intrinsic.catchFailure<OutOfMemoryError | StringLengthError | BigIntError | JsException>(unsafe initialize(&mut hooks, memory, realm, input, replacer, space, &mut state), failed)
   let output = match move result {

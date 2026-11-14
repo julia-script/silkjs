@@ -14,7 +14,8 @@ import silk.num.usize
 import silk.num.i64
 import silk.num.f64
 import runtime_memory { AllocationObserver }
-import js_heap { HeapCell }
+import js_heap { HeapCell, HeapHeader }
+import silk.num.u8
 import js_object_ref { ObjectRef }
 import js_value { ValueBits }
 import js_intl_realm as ops
@@ -22,8 +23,13 @@ import js_owned_value { Value, ValueList, ValueRef, lendBits, immediateRef }
 import js_core_types { ObjectData, ObjectPayload, SlotBits, StackFrame, PropertyDescriptor,
   NativeErrorKind, JS_PROP_C_W_E, JS_PROP_THROW, JS_PROP_GETSET, JS_PROP_ENUMERABLE,
   JS_PROP_CONFIGURABLE, JS_PROP_WRITABLE, JS_PROP_HAS_CONFIGURABLE,
-  JS_PROP_HAS_WRITABLE, JS_PROP_HAS_ENUMERABLE, JS_PROP_HAS_GET, JS_PROP_HAS_SET, OwnedAtom }
+  JS_PROP_HAS_WRITABLE, JS_PROP_HAS_ENUMERABLE, JS_PROP_HAS_GET, JS_PROP_HAS_SET, OwnedAtom,
+  ShapeData, SlotBits }
+
 import js_gc { HeapHooks }
+import js_gc as gc
+import js_shapes as shapes
+import js_array_intrinsics_support as arraySupport
 import js_runtime as runtime
 import js_class_data as classes
 import js_atom_data as atoms
@@ -219,7 +225,86 @@ effect fn definePropertiesBody<'a, 'b, H: HeapHooks + OwnPropertyHooks + HasProp
     i = i + 1
   }
 }
+/// Object.keys, values or entries of an ordinary object whose own properties
+/// all live in its shape, from the shape's enumeration cache (js_shapes.enumKeys):
+/// keys copies the cached names into an array made at its final size; values
+/// and entries read the slots too when every listed record is plain data.
+/// Nothing it does can run JS, so the object cannot change in between.
+/// Uninitialized when it does not apply.
+unsafe effect fn quickEnumerate<'a, H: HeapHooks>(hooks: &mut H, memory: &AllocationObserver, realm: Realm<'a>,
+  input: ValueBits, method: u32) -> ValueBits ! OutOfMemoryError ? &mut Allocator {
+  let node = match input { ValueBits.Object { reference } => reference _ => { return ValueBits.Uninitialized } }
+  let anchor = ()
+  let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, node)
+  if data.isExotic() || data.fastArray() { return ValueBits.Uninitialized }
+  let shapeNode = data.shape
+  let records = (unsafe HeapCell.payload<ShapeData, ()>(&anchor, shapeNode)).properties.length()
+  if data.slotCount() != records { return ValueBits.Uninitialized }
+  drop data
+  let kind = run unsafe shapes.enumKeys(realm.runtime(), shapeNode)
+  if kind == shapes.ENUM_UNSUPPORTED { return ValueBits.Uninitialized }
+  let shape = unsafe HeapCell.payload<ShapeData, ()>(&anchor, shapeNode)
+  let listed = shape.enumKeys.length()
+  if method == KEYS {
+    if listed == 0 { return run objects.arrayWithCapacity(&mut hooks, memory, realm, 0) }
+    let first = unsafe Intrinsic.pointerRequalify<?[*]const ValueBits, [*]const ValueBits>(Pointer.fromSlice<ValueBits>(shape.enumKeys.asSlice()))
+    return run unsafe objects.copiedArray(&mut hooks, memory, realm, unsafe Pointer.at<ValueBits>(first, 0), listed)
+  }
+  if (kind & shapes.ENUM_PLAIN) == 0 { return ValueBits.Uninitialized }
+  drop shape
+  let array = run objects.arrayWithCapacity(&mut hooks, memory, realm, listed)
+  if listed == 0 { return array }
+  let target = match array { ValueBits.Object { reference } => reference _ => invariant() }
+  let source = unsafe HeapCell.payload<ObjectData, ()>(&anchor, node)
+  let cache = unsafe HeapCell.payload<ShapeData, ()>(&anchor, shapeNode)
+  let dense = (kind & shapes.ENUM_DENSE) != 0
+  let mut i: usize = 0
+  let mut filled: usize = 0
+  while filled < listed {
+    let name = cache.enumKeys.get(filled)
+    let mut index = filled
+    if !dense {
+      // The next enumerable string-keyed record: the cache lists them in order.
+      while true {
+        let property = unsafe cache.properties.getUnchecked(i)
+        i = i + 1
+        if property.atom != 0 && (u8.toU32(property.flags) & JS_PROP_ENUMERABLE) != 0 && realm.runtimeState(&anchor).atoms.borrowedString(property.atom).isString() { break }
+      }
+      index = i - 1
+    }
+    let mut item = ValueBits.Undefined
+    if method == VALUES { item = unsafe (unsafe source.slotUnchecked(index)).valueBits().retained() }
+    else {
+      // copiedArray retains, so the pair holds borrowed values (not literalArray:
+      // a second caller stops it inlining into arrayFrom, Splay +1.9% Ir)
+      let mut pair = [name, (unsafe source.slotUnchecked(index)).valueBits()]
+      let first = unsafe Intrinsic.pointerRequalify<*mut ValueBits, *const ValueBits>(Pointer.fromMutRef<ValueBits>(&mut pair[0]))
+      let made = run Effect.result(unsafe objects.copiedArray(&mut hooks, memory, realm, first, 2))
+      match move made {
+        Result<ValueBits, OutOfMemoryError>.Success { value } => { item = value }
+        Result<ValueBits, OutOfMemoryError>.Failure { error } => {
+          unsafe publishFilled(target, filled)
+          unsafe gc.release(&mut hooks, realm.runtime(), array)
+          fail move error
+        }
+      }
+    }
+    run arraySupport.appendReserved(unsafe lendBits(&array, array), unsafe Value.adoptBits(item))
+    filled = filled + 1
+  }
+  unsafe publishFilled(target, filled)
+  return array
+}
+unsafe fn publishFilled(target: *mut HeapHeader, count: usize) -> () {
+  let mut anchor = ()
+  let made = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut anchor, target)
+  made.setSlot(0, SlotBits.value(ValueBits.Int { value: usize.toI32(count) }))
+}
 effect fn enumerate<'a, 'b, H: HeapHooks + OwnPropertyHooks + HasPropertyHooks + GetPropertyHooks + OwnKeysHooks + CoercionHooks + PropertyWriteHooks + PrototypeHooks + CallHooks + NativeFunctionHooks + InterruptHooks>(hooks: &mut H, memory: &AllocationObserver,realm: Realm<'a>, input: ValueRef<'b>, method: u32) -> ValueBits ! OutOfMemoryError | StringLengthError | BigIntError | OwnKeysError | PrototypeError | JsException ? &mut Allocator {
+  if method == KEYS || method == VALUES || method == ENTRIES {
+    let quick = run unsafe quickEnumerate(&mut hooks, memory, realm, input.view(), method)
+    if quick.tag() != 4 { return quick }
+  }
   let object = run boxing.toObjectValue(&mut hooks, memory, realm, input)
   let mut flags: u32 = 1
   if method == GET_OWN_PROPERTY_SYMBOLS { flags = 2 }
