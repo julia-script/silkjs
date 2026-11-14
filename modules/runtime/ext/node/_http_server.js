@@ -104,6 +104,7 @@ const kServerResponse = Symbol('ServerResponse');
 const kServerResponseStatistics = Symbol('ServerResponseStatistics');
 
 const kOptimizeEmptyRequests = Symbol('OptimizeEmptyRequestsOption');
+const kResOnFinish = Symbol('kResOnFinish');
 
 const {
   hasObserver,
@@ -1103,6 +1104,11 @@ function clearIncoming(req) {
 }
 
 function resOnFinish(req, res, socket, state, server) {
+  const listener = res[kResOnFinish];
+  if (listener !== undefined) {
+    res[kResOnFinish] = undefined;
+    res.removeListener('finish', listener);
+  }
   if (onResponseFinishChannel.hasSubscribers) {
     onResponseFinishChannel.publish({
       request: req,
@@ -1243,12 +1249,14 @@ function parserOnIncoming(server, socket, state, req, keepAlive) {
 
   // When we're finished writing the response, check if this is the last
   // response, if so destroy the socket.
-  // once, not on (Node's): the bound listener holds res, so while it stays on res
-  // the pair is a cycle that only a collection frees. Removed when it runs, the
-  // request's objects are freed by reference counts as the response ends.
-  res.once('finish',
-           resOnFinish.bind(undefined,
-                            req, res, socket, state, server));
+  // The bound listener holds res, so while it stays on res the pair is a cycle that
+  // only a collection frees: resOnFinish removes it (kResOnFinish), and the request's
+  // objects are freed by reference counts as the response ends. Not once: its wrapper
+  // costs a closure with a property, a rest call and a Reflect.apply per request.
+  const onResFinish = resOnFinish.bind(undefined,
+                                       req, res, socket, state, server);
+  res[kResOnFinish] = onResFinish;
+  res.on('finish', onResFinish);
 
   let handled = false;
 
