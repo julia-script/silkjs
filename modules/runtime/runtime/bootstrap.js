@@ -1441,7 +1441,7 @@ function runtimeFlag(arg) {
   // V8 flags that turn on source phase imports and import attributes, which this
   // engine always implements.
   if (arg === '--js-source-phase-imports' || arg === '--harmony-import-attributes') return true;
-  // Buffer.allocUnsafe memory is always zeroed here, which is what this flag asks for.
+  // Buffer's unsafe allocations zero their bytes under it (createUnsafeArrayBuffer).
   if (arg === '--zero-fill-buffers') { host.zeroFillBuffers = true; return true; }
   if (arg === '--experimental-webstorage' || arg === '--no-experimental-webstorage') {
     host.experimentalWebStorage = arg === '--experimental-webstorage'; return true;

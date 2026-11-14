@@ -459,8 +459,11 @@ function atob(input) {
   return bufferCodec(6, out, 0, count);
 }
 
+// Bytes the caller overwrites before anyone reads them skip the zeroing that new ArrayBuffer
+// does (bufferCodec.operation 79), unless --zero-fill-buffers asks for it, as in Node.
+const uninitializedArrayBuffer = host.bufferOperation(79, size => new ArrayBuffer(size), 1);
 function createUnsafeArrayBuffer(size) {
-  return new ArrayBuffer(size);
+  return host.zeroFillBuffers ? new ArrayBuffer(size) : uninitializedArrayBuffer(size);
 }
 
 // Objects that structured clone and postMessage must not transfer
