@@ -10,6 +10,10 @@ const { pgRows } = require('internal/host');
 
 // Columns arrays (one per RowDescription) to their row template or null.
 const templates = new WeakMap();
+// Recent short text values (pg_rows.silk CACHE_SLOTS), which rows repeating a
+// value share instead of each holding a copy. Pushed, so it stays a fast array.
+const cache = [];
+for (let i = 0; i < 4096; i++) cache.push(undefined);
 const TEXT = 0, INTEGER = 1, BOOLEAN = 2;
 const integerTypes = [21, 23, 26];
 const MAX_COLUMNS = 16;
@@ -49,7 +53,7 @@ function rows(incoming, query, result, count, transform) {
     template = makeTemplate(columns);
     templates.set(columns, template);
   }
-  return template === null ? 0 : pgRows(incoming, template, result, count);
+  return template === null ? 0 : pgRows(incoming, template, result, count, cache);
 }
 
 module.exports = rows;
