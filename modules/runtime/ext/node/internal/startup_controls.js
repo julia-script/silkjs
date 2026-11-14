@@ -56,6 +56,8 @@ function initialize() {
     if (state[name]) process[name] = true;
   }
   if (!state.deprecation) process.noDeprecation = true;
+  // createUnsafeArrayBuffer and getOptionValue read it from the host.
+  if (state.zeroFillBuffers) host.zeroFillBuffers = true;
   host.pendingDeprecation = state.pendingDeprecation ?? process.env.NODE_PENDING_DEPRECATION === '1';
   // pre_execution.js initializeDeprecations.
   if (host.pendingDeprecation) {
