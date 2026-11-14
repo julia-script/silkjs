@@ -1178,7 +1178,13 @@ OutgoingMessage.prototype.end = function end(chunk, encoding, callback) {
       return this;
     }
 
-    if (this[kSocket]) {
+    // A string body that goes out with the implicit header is one socket write (_send
+    // joins them), which corking cannot merge with anything: the socket is corked only
+    // when more than one write may follow.
+    const single = typeof chunk === 'string' && !this._header &&
+      this.outputData.length === 0 && this[kChunkedBuffer].length === 0 &&
+      (encoding === 'utf8' || encoding === 'latin1' || !encoding);
+    if (this[kSocket] && !single) {
       this[kSocket].cork();
     }
 
@@ -1191,6 +1197,8 @@ OutgoingMessage.prototype.end = function end(chunk, encoding, callback) {
         callback = undefined;
       }
       finishCallback = onFinish.bind(undefined, this);
+    } else if (single) {
+      this[kSocket]?.cork();
     }
 
     write_(this, chunk, encoding, finishCallback, true);
