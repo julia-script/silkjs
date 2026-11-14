@@ -116,6 +116,27 @@ file('syntax-only.mjs', 'import "./missing.mjs";console.log("must-not-execute");
 file('syntax-invalid.cjs', 'const value = ;\n');
 add('cli-syntax-only-boundaries', `const {spawnSync}=require('node:child_process');const cases=[[['--check','syntax-only.cjs']], [['--check','syntax-only.mjs']], [['--check','syntax-invalid.cjs']], [['--check','--input-type=module'],'import "./missing.mjs";console.log("must-not-execute")'],[['--check','--eval=console.log("must-not-execute")']], [['--input-type=module','syntax-only.cjs']]];console.log(JSON.stringify(cases.map(([args,input])=>{const child=spawnSync(process.execPath,args,{input,encoding:'utf8',env:{...process.env,NODE_OPTIONS:''}});if(child.error)throw child.error;return [child.status,child.stdout]})));`);
 add('cli-automatic-module-input', `const {spawnSync}=require('node:child_process');const source='await Promise.resolve();console.log(typeof require,42)';console.log(JSON.stringify([[['--eval='+source]], [[],source], [['--input-type=commonjs','--eval='+source]]].map(([args,input])=>{const child=spawnSync(process.execPath,args,{input,encoding:'utf8',env:{...process.env,NODE_OPTIONS:''}});if(child.error)throw child.error;return [child.status,child.stdout]})));`);
+// One long function whose call sites are asked for in mixed order, twice in a row
+// and going backwards, through the stack string and through call sites.
+file('stack-sites.cjs', `'use strict';
+function mk(n) { return new Error('e' + n); }
+function big(k) {
+${Array.from({ length: 400 }, (_, i) => `  if (k === ${i}) { const pad${i} = "${'x'.repeat(i % 50)}"; return mk(pad${i}.length); }`).join('\n')}
+  return mk(-1);
+}
+function small(k) { if (k & 1) return mk(1);
+  return mk(2); }
+const where = (e, d) => e.stack.split('\\n')[d].replace(/^.*[\\\\/]/, '');
+const out = [];
+for (const k of [5, 300, 5, 399, 0, 150, 150, 151, 20, 399, 398, 1, 250, 250, 3]) out.push(k + ' ' + where(big(k), 2));
+for (let k = 0; k < 6; k++) out.push('s' + k + ' ' + where(small(k), 2));
+for (let k = 399; k >= 0; k -= 37) out.push(k + ' ' + where(big(k), 2));
+function sites(k) { Error.prepareStackTrace = (e, s) => s.slice(0, 3).map(c => c.getLineNumber() + ':' + c.getColumnNumber() + ':' + c.getFunctionName()).join(','); const r = big(k).stack; Error.prepareStackTrace = undefined; return r; }
+for (const k of [7, 380, 7, 200]) out.push('cs' + k + ' ' + sites(k));
+out.push('top ' + where(new Error('t'), 1)); out.push('top ' + where(new Error('t'), 1));
+console.log(out.join('\\n'));
+`);
+cases.push({ name: 'error-stack-repeated-sites', args: [join(directory, 'stack-sites.cjs')] });
 let passed = 0, failed = 0;
 try {
   if (!cases.some(item => filter.test(item.name))) throw new Error('No compatibility scenarios match ' + filter);
