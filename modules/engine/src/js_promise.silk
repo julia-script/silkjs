@@ -67,7 +67,7 @@ struct Data { state: i32, handled: bool, result: Value, reactions: HeapList, asy
 /// What a promise's two resolving functions share: the promise, and whether one
 /// of them was called. Each function holds a count on the cell and its own count
 /// on the promise (so each traces its own edge); the last one frees the cell.
-struct Resolving { promise: ValueBits, already: bool }
+struct Resolving { promise: ValueBits, already: bool, gated: bool }
 /// A promise with its resolving functions. Each field owns its count, so dropping a
 /// capability releases all three; move a field out to keep it.
 
@@ -247,6 +247,18 @@ impl Copy for CombinatorStep {}
 pub const COMBINATOR_ALL: i32 = 0
 pub const COMBINATOR_ALL_SETTLED: i32 = 1
 pub const COMBINATOR_ANY: i32 = 2
+/// The combinator step of an element subscribed without functions (subscribeElement):
+/// its job is [result, index, record, record, _], the record being
+/// [remaining, values, the combinator's magic].
+unsafe fn elementStep(job: *mut HeapHeader) -> Option<CombinatorStep> {
+  let anchor = ()
+  let entry = unsafe HeapCell.payload<JobEntry, ()>(&anchor, job)
+  let element = match callbacks.method(entry.function) { Option<u32>.Some { value } => value == callbacks.ELEMENT_JOB _ => false }
+  if !element || entry.arguments.length() < 3 { return Option<CombinatorStep>.none() }
+  let index = match entry.arguments.get(1) { ValueBits.Int { value } => value _ => 0 }
+  let combinator = match unsafe recordField(entry.arguments.get(2), 2) { ValueBits.Int { value } => value _ => 0 }
+  return Option<CombinatorStep>.some(CombinatorStep { combinator: combinator, index: index, combined: entry.arguments.get(0) })
+}
 /// V8's async stack trace step through a promise combinator (CaptureAsyncStackTrace's
 /// IsPromiseAllResolveElementFunction and kin): when the only reaction on `promise` is a
 /// Promise.all or Promise.allSettled element function, or a Promise.any reject element,
@@ -256,6 +268,7 @@ pub unsafe fn combinatorStep<'b>(promise: ValueRef<'b>) -> Option<CombinatorStep
     Option<*mut HeapHeader>.Some { value } => value
     _ => { return Option<CombinatorStep>.none() }
   }
+  if let Option<CombinatorStep>.Some { value: step } = unsafe elementStep(job) { return Option<CombinatorStep>.some(step) }
   let mut which: usize = 0
   while which < 2 {
     let handler = unsafe reactionHandler(job, which)
@@ -325,6 +338,9 @@ impl<'a> Record<'a> {
     let mut anchor = () let data = self.node.getMut(&mut anchor)
     let first = !data.resolveNotified data.resolveNotified = true return first
   }
+  /// Whether resolveDirect already ran for this promise: a direct capability's
+  /// [[AlreadyResolved]].
+  fn resolveStarted(self: Record<'a>) -> bool { let anchor = () let data = self.node.get(&anchor) return data.resolveNotified }
   fn takeReaction(self: Record<'a>) -> Option<*mut HeapHeader> {
     let mut anchor = () let data = self.node.getMut(&mut anchor) return unsafe data.reactions.popFront()
   }
@@ -515,9 +531,12 @@ effect fn createResolvingOne<'a, 'b, H: HeapHooks + CoercionHooks + OwnPropertyH
   run functions.setFunctionProperties(&mut hooks, realm, object.borrow(), atoms.JS_ATOM_empty_string, 1)
   return move object
 }
+/// The resolve and reject functions of `promise` (CreateResolvingFunctions). A gated
+/// pair shares the promise with a direct capability (a combinator's result), so it
+/// also counts as already resolved once anything has resolved the promise.
 pub effect fn createResolvingFunctions<'a, 'b, H: HeapHooks + CoercionHooks + OwnPropertyHooks + PropertyWriteHooks>(hooks: &mut H,
-  memory: &AllocationObserver, realm: Realm<'a>, promise: ValueRef<'b>) -> Capability ! JsException ? &mut Allocator {
-  let allocated = run Effect.result(HeapCell.allocate(HeapKind.Auxiliary, Resolving { promise: promise.view(), already: false }))
+  memory: &AllocationObserver, realm: Realm<'a>, promise: ValueRef<'b>, gated: bool) -> Capability ! JsException ? &mut Allocator {
+  let allocated = run Effect.result(HeapCell.allocate(HeapKind.Auxiliary, Resolving { promise: promise.view(), already: false, gated: gated }))
   let reference = match move allocated { Result<*mut HeapHeader, OutOfMemoryError>.Success { value } => value Result<*mut HeapHeader, OutOfMemoryError>.Failure { error } => run ops.materialize(&mut hooks,realm, move error) }
   // One hold per function: the cell's first count and a second, a promise count each.
   unsafe HeapCell.retain(reference)
@@ -542,7 +561,8 @@ effect fn resolvedAgain<'a, H: HeapHooks + CoercionHooks + PromiseHooks>(hooks: 
 pub effect fn resolvingCall<'a, H: HeapHooks + CoercionHooks + PromiseHooks>(hooks: &mut H, realm: Realm<'a>, functionRef: ValueRef<'a>, argumentsArgs: Arguments<'a>) -> ValueBits ! JsException ? &mut Allocator {
   let reference = match Pointer.nonNullMut<HeapHeader>(storageOf(functionRef)) { Option<*mut HeapHeader>.Some { value } => value _ => { return ValueBits.Undefined } }
   let anchor = () let data = unsafe HeapCell.payload<Resolving, ()>(&anchor, reference)
-  let promise = data.promise let first = !data.already drop data
+  let promise = data.promise let mut first = !data.already let gated = data.gated drop data
+  if first && gated { first = !Record.of(unsafe lendFor<'a>(promise)).resolveStarted() }
   if first { let mut claim = () let shared = unsafe HeapCell.payloadMut<Resolving, ()>(&mut claim, reference) shared.already = true }
   if !first { run resolvedAgain(&mut hooks, realm, functionRef, promise, argumentsArgs) return ValueBits.Undefined }
   // The resolving function holds `promise` until it is finalized.
@@ -551,6 +571,22 @@ pub effect fn resolvingCall<'a, H: HeapHooks + CoercionHooks + PromiseHooks>(hoo
   let reject = objectData.classId() == classes.JS_CLASS_PROMISE_REJECT_FUNCTION drop objectData
   run resolveDirect(&mut hooks, realm, target, argumentsArgs.get(0), reject)
   return ValueBits.Undefined
+}
+/// Calls a capability's resolve (or, with reject, its reject) function with value.
+/// A direct capability is the promise itself: its first settlement wins, and a later
+/// one is only reported, as a resolving function called again is.
+pub effect fn settleCapability<'a, 'b, H: HeapHooks + CoercionHooks + CallHooks + PromiseHooks>(hooks: &mut H, realm: Realm<'a>,
+  function: ValueRef<'b>, value: ValueRef<'b>, reject: bool) -> () ! JsException ? &mut Allocator {
+  if stateOf(function) >= 0 {
+    if Record.of(function).resolveStarted() {
+      let mut event = PROMISE_RESOLVE_AFTER_RESOLVED if reject { event = PROMISE_REJECT_AFTER_RESOLVED }
+      run track(&mut hooks, realm, function, value, event)
+      return ()
+    }
+    run resolveDirect(&mut hooks, realm, function, value, reject)
+    return ()
+  }
+  let _returned = run call(&mut hooks, realm, function, immediateRef(ValueBits.Undefined), &[value.view()])
 }
 /// What a resolving function does once it has claimed its pair (ES2023 27.2.1.3.1 and
 /// .2 past [[AlreadyResolved]]): settles `target` with `resolution`, or adopts a
@@ -625,7 +661,7 @@ pub effect fn createPending<'a, H: HeapHooks + CoercionHooks>(hooks: &mut H, mem
 effect fn constructBody<'a, 'b, H: HeapHooks + CoercionHooks + OwnPropertyHooks + PropertyWriteHooks + CallHooks>(hooks: &mut H,
   memory: &AllocationObserver, realm: Realm<'a>, object: ValueRef<'b>, executor: ValueRef<'b>) -> () ! JsException ? &mut Allocator {
   run initialize(&mut hooks, realm, object)
-  let capability = run createResolvingFunctions(&mut hooks, memory, realm, object)
+  let capability = run createResolvingFunctions(&mut hooks, memory, realm, object, false)
   let returned = run Effect.catch<JsException>(call(&mut hooks, realm, executor, immediateRef(ValueBits.Undefined), &[capability.resolve.view(), capability.reject.view()]), exceptionValue)
   if returned.view().isException() {
     let error = realm.takeException()
@@ -695,8 +731,28 @@ pub effect fn queueFulfilled<'a, 'b, H: HeapHooks + CoercionHooks>(hooks: &mut H
 }
 pub effect fn performThen<'a, 'b, H: HeapHooks + CoercionHooks + PromiseHooks>(hooks: &mut H, realm: Realm<'a>,
   promise: ValueRef<'b>, onFulfilled: ValueRef<'b>, onRejected: ValueRef<'b>, resolve: ValueRef<'b>, reject: ValueRef<'b>) -> () ! JsException ? &mut Allocator {
-  let record = Record.of(promise)
   let reaction = run allocateReaction(&mut hooks, realm, onFulfilled, onRejected, resolve, reject)
+  run attach(&mut hooks, realm, promise, reaction)
+}
+/// A combinator's reaction to its element `target` (Promise.all, allSettled, any):
+/// an ELEMENT_JOB carrying the combinator's result promise, the element's index and
+/// the combinator's record, where the specification makes element functions and
+/// `then` a derived promise. For a target whose `then` is plain (thenIsPlain) and a
+/// result that is a direct capability, nothing can tell the two apart.
+pub effect fn subscribeElement<'a, 'b, H: HeapHooks + CoercionHooks + PromiseHooks>(hooks: &mut H, realm: Realm<'a>,
+  target: ValueRef<'b>, result: ValueRef<'b>, index: i32, record: ValueRef<'b>) -> () ! JsException ? &mut Allocator {
+  let allocated = run Effect.result(unsafe jobs.prepareJob(realm.runtime(), callbacks.id(callbacks.ELEMENT_JOB),
+    &[result.view(), ValueBits.Int { value: index }, record.view(), record.view(), ValueBits.Undefined]))
+  let reaction = match move allocated {
+    Result<*mut HeapHeader, OutOfMemoryError>.Success { value } => value
+    Result<*mut HeapHeader, OutOfMemoryError>.Failure { error } => run ops.materialize(&mut hooks, realm, move error)
+  }
+  run attach(&mut hooks, realm, target, reaction)
+}
+/// Subscribes a prepared reaction job to promise, or queues it when promise is settled.
+effect fn attach<'a, 'b, H: HeapHooks + CoercionHooks + PromiseHooks>(hooks: &mut H, realm: Realm<'a>,
+  promise: ValueRef<'b>, reaction: *mut HeapHeader) -> () ! JsException ? &mut Allocator {
+  let record = Record.of(promise)
   let mut jobAnchor = ()
   let job = unsafe HeapCell.payloadMut<JobEntry, ()>(&mut jobAnchor, reaction)
   if !job.asyncResource.view().isObject() {
@@ -854,19 +910,23 @@ pub fn intrinsic<'a, 'b>(realm: Realm<'a>, value: ValueRef<'b>, method: u32) -> 
     _ => false
   }
 }
-/// `promise.then(onFulfilled, onRejected)` for a caller that drops what `then`
-/// returns (a combinator's element): `then` is read as the specification reads it,
-/// and when it is the intrinsic on one of this realm's untouched promises, the
-/// reaction is subscribed without the derived promise nothing would ever see.
-pub effect fn subscribe<'a, 'b, H: HeapHooks + CoercionHooks + CallHooks + PromiseHooks>(hooks: &mut H, realm: Realm<'a>,
-  target: ValueRef<'b>, onFulfilled: ValueRef<'b>, onRejected: ValueRef<'b>) -> () ! JsException ? &mut Allocator {
-  let method = run get(&mut hooks, realm, target, atoms.JS_ATOM_then)
-  if stateOf(target) >= 0 && intrinsic(realm, method.borrow(), callbacks.THEN) && speciesIsDefault(realm, target) &&
-    !unsafe runtime.asyncHooksEnabled(realm.runtime()) {
-    run performThen(&mut hooks, realm, target, onFulfilled, onRejected, immediateRef(ValueBits.Undefined), immediateRef(ValueBits.Undefined))
-    return
+/// Whether calling `method`, read as target's `then`, with handlers a combinator made
+/// can be replaced by subscribing the reaction: target is one of this realm's
+/// untouched promises and method the intrinsic, so the derived promise `then` would
+/// return is one nothing could ever see (async hooks would see it being made).
+pub fn thenIsPlain<'a, 'b>(realm: Realm<'a>, target: ValueRef<'b>, method: ValueRef<'b>) -> bool {
+  return stateOf(target) >= 0 && intrinsic(realm, method, callbacks.THEN) && speciesIsDefault(realm, target) &&
+    !unsafe runtime.asyncHooksEnabled(realm.runtime())
+}
+/// Element `index` of the fast array `record` (a combinator's record), lent.
+pub unsafe fn recordField(record: ValueBits, index: usize) -> ValueBits {
+  let reference = match record { ValueBits.Object { reference } => reference _ => { return ValueBits.Undefined } }
+  let anchor = ()
+  let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, reference)
+  return match &data.payload {
+    ObjectPayload.FastArray { array } => { if index < array.values().length() { array.values().get(index) } else { ValueBits.Undefined } }
+    _ => ValueBits.Undefined
   }
-  let _returned = run call(&mut hooks, realm, method.borrow(), target, &[onFulfilled.view(), onRejected.view()])
 }
 /// Whether handler is the function that resumes an async body at its await.
 fn awaitHandler<'b>(handler: ValueRef<'b>) -> bool {
@@ -908,7 +968,7 @@ pub effect fn dispatchJob<'a, 's, H: HeapHooks + CoercionHooks + OwnPropertyHook
     }
     let mut function = arguments.get(0) if rejected { function = arguments.get(1) }
     if stateOf(function) >= 0 {
-      run resolveDirect(&mut hooks, realm, function, returned.borrow(), rejected)
+      run settleCapability(&mut hooks, realm, function, returned.borrow(), rejected)
       return ValueBits.Undefined
     }
     let mut output = ValueBits.Undefined
@@ -916,7 +976,7 @@ pub effect fn dispatchJob<'a, 's, H: HeapHooks + CoercionHooks + OwnPropertyHook
     if output.isException() { fail JsException {} } return output
   }
   if method == callbacks.THENABLE_JOB {
-    let capability = run createResolvingFunctions(&mut hooks, memory, realm, arguments.get(0))
+    let capability = run createResolvingFunctions(&mut hooks, memory, realm, arguments.get(0), false)
     let mut output = (run Effect.catch<JsException>(call(&mut hooks, realm, arguments.get(2), arguments.get(1), &[capability.resolve.view(), capability.reject.view()]), exceptionValue)).intoBits()
     if output.isException() {
       if terminating(realm) { fail JsException {} }
