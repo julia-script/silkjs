@@ -37,9 +37,13 @@ class Transport {
     this.sequence = 0;
     this.provider = kind === 5 ? 'TTYWRAP' : kind === 2 ? 'PIPEWRAP' : 'TCPWRAP';
     this.resource = createResource(this.provider);
+    // holdTicks: the event is not the last of a read (net_native's HTTP_MORE), and the task
+    // queues drain after the read, as Node's parser drains them after an execute.
+    this.holdTicks = false;
     const callback = (type, status, payload, extra) => {
       invokeDispatch(this.resource, this, type, status, payload, extra);
-      host.checkpoint();
+      if (this.holdTicks) this.holdTicks = false;
+      else host.checkpoint();
     };
     this.id = id === undefined ? host.net('create', [kind, callback, fd]) : id;
     if (this.id < 0) {

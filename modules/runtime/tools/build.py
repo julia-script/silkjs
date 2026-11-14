@@ -20,6 +20,9 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--release', action='store_true')
     parser.add_argument('--output', type=Path, default=ROOT / 'build/silkjsruntime')
+    # What a program that embeds the runtime (src/runtime/embed.silk) needs before it builds:
+    # src/runtime/embedded.silk and the native archives in build/native, without the executable.
+    parser.add_argument('--prepare', action='store_true')
     args = parser.parse_args()
     manifest = tomllib.loads((ROOT / 'silk.toml').read_text())
     version = manifest['package']['silk-version']
@@ -51,6 +54,8 @@ def main():
         if not destination.exists() or not filecmp.cmp(source, destination, shallow=False):
             shutil.copyfile(source, destination)
     build_native.build(native, environment, release=args.release)
+    if args.prepare:
+        return
     # Source-file compilation keeps the generic engine in one native object.
     command = ['silk', '+' + version, 'build', 'src/main.silk', '-o', str(args.output.resolve()),
                '--debug', str(not args.release).lower(),

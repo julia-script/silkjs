@@ -947,9 +947,19 @@ pub unsafe effect fn wsSend<'m, S: EngineServices>(engine: &mut Engine<'m, S>, c
 // httpChunk writes one chunk of a streamed response. A malformed request gets a bare 400 (413 for a
 // body over the limit), and the connection reads no more: a READ event with END follows.
 const HTTP_REQUEST: i32 = 9
+// Node mode: the connection goes back to JavaScript's own HTTP parser, which reads the bytes
+// in the payload first (see Node mode below).
+const HTTP_FALLBACK: i32 = 10
+// Node mode: the first bytes of a request arrived, and its head is not complete yet (llhttp's
+// message begin, which starts the server's headersTimeout).
+const HTTP_BEGIN: i32 = 11
 // Request flags.
 const HTTP_KEEP_ALIVE: i32 = 1
 const HTTP_HAS_BODY: i32 = 2
+const HTTP_V10: i32 = 4
+// Node mode: more events of the same read follow this request (JavaScript drains its task
+// queues after a read, as Node's parser does after an execute).
+const HTTP_MORE: i32 = 16
 // Response flags.
 const HTTP_CLOSE: i32 = 1
 const HTTP_NO_BODY: i32 = 2
@@ -965,7 +975,9 @@ const PHASE_STOPPED: i32 = 3
 const MAX_BODY: u64 = 134217728
 // `record` holds the strings of the request being read, each as a 4-byte little-endian length and
 // its bytes; `body` its payload so far.
-struct Exchange { parser: RequestParser, phase: i32, remaining: u64, decoder: Option<Decoder>, record: Bytes, body: Bytes, flags: i32, out: Bytes, scratch: Bytes, pending: Bytes, dateSecond: i64, date: [u8; 29] }
+// In node mode (node:http, see Node mode below) `raw` holds the bytes of the head being read,
+// `maxHead` is the server's maxHeaderSize, and `begun` tells that HTTP_BEGIN went out for it.
+struct Exchange { parser: RequestParser, phase: i32, remaining: u64, decoder: Option<Decoder>, record: Bytes, body: Bytes, flags: i32, out: Bytes, scratch: Bytes, pending: Bytes, dateSecond: i64, date: [u8; 29], node: bool, raw: Bytes, maxHead: usize, begun: bool }
 
 fn httpValueLimits() -> ValueLimits {
   return ValueLimits { maxMethodBytes: 64, maxTargetBytes: 16384, maxNameBytes: 256, maxValueBytes: 16384, maxFields: 256, maxFieldBytes: 65536, maxOwnedBytes: 81920 }
@@ -1207,12 +1219,207 @@ unsafe effect fn httpReadReady(handle: *mut Handle) -> () ! OutOfMemoryError ? &
     let mut bufferAnchor = () let output = unsafe Pointer.borrowManyMut<(), u8>(&mut bufferAnchor, unsafe Pointer.assumeManyMut<u8>(scratch), CHUNK)
     let count = readOnce(&mut h.socket, move output)
     if count == 0 { return () }
-    if count < 0 { h.reading = false drop h unsafe notify(handle, READ, i64.toI32(count), 0) return () }
+    if count < 0 {
+      h.reading = false drop h
+      // llhttp sees the start of a head the peer never finished, and reports it at the end.
+      if unsafe nodeExchange(handle) { unsafe nodeFallback(handle) }
+      unsafe notify(handle, READ, i64.toI32(count), 0) return ()
+    }
     drop h
     let viewAnchor = ()
     let view = unsafe Pointer.borrowMany<(), u8>(&viewAnchor, unsafe Pointer.assumeMany<u8>(scratch), i64.toUsize(count))
-    run unsafe httpReceive(handle, view)
+    if unsafe nodeExchange(handle) { run unsafe nodeReceive(handle, view) } else { run unsafe httpReceive(handle, view) }
+    // A node mode connection that went back to JavaScript's parser reads as any socket.
+    if Pointer.isNull<Exchange>(unsafe exchangeOf(handle)) { unsafe readReady(handle) return () }
     if i64.toUsize(count) < CHUNK { return () }
+  }
+}
+// ---- Node mode ----
+// node:http servers hand a connection to this module with httpAdopt mode 1. Simple requests are
+// read here: a head of plain bytes (a GET-like request line, HTTP/1.0 or 1.1, CRLF line ends,
+// token names, printable values) with no body, no Expect, no Upgrade and a kept-alive
+// connection. Each is one HTTP_REQUEST event whose payload is [method, url, name, value, ...]
+// with the names as sent, and whose status holds HTTP_KEEP_ALIVE and HTTP_V10. Every request
+// accepted here is one llhttp reads the same way, so JavaScript runs Node's parser callbacks
+// for it. Anything else, and httpRelease, posts one HTTP_FALLBACK event with the bytes of the
+// head read so far: the connection then reads as a plain socket, and JavaScript's parser (Node's
+// llhttp) goes on from those bytes, so it answers what this module does not read exactly.
+unsafe fn nodeExchange(handle: *mut Handle) -> bool {
+  let found = unsafe exchangeOf(handle) if Pointer.isNull<Exchange>(found) { return false }
+  let a = () let ex = unsafe Pointer.borrow<(), Exchange>(&a, unsafe nn(found)) return ex.node
+}
+fn tokenChar(c: u8) -> bool {
+  if (c >= 97 && c <= 122) || (c >= 65 && c <= 90) || (c >= 48 && c <= 57) { return true }
+  return c == 33 || c == 35 || c == 36 || c == 37 || c == 38 || c == 39 || c == 42 || c == 43 || c == 45 || c == 46 || c == 94 || c == 95 || c == 96 || c == 124 || c == 126
+}
+// A request-target byte: unreserved, sub-delims, gen-delims and '%'.
+fn targetChar(c: u8) -> bool {
+  if (c >= 97 && c <= 122) || (c >= 65 && c <= 90) || (c >= 48 && c <= 57) { return true }
+  return c == 45 || c == 46 || c == 95 || c == 126 || c == 58 || c == 47 || c == 63 || c == 35 || c == 91 || c == 93 || c == 64 || c == 33 || c == 36 || c == 38 || c == 39 || c == 40 || c == 41 || c == 42 || c == 43 || c == 44 || c == 59 || c == 61 || c == 37
+}
+fn simpleMethod(m: &[u8]) -> bool {
+  return eq(m, b"GET") || eq(m, b"HEAD") || eq(m, b"POST") || eq(m, b"PUT") || eq(m, b"DELETE") || eq(m, b"OPTIONS") || eq(m, b"PATCH")
+}
+// Whether `m` starts one of the methods simpleMethod takes.
+fn methodPrefix(m: &[u8]) -> bool {
+  let names: [&[u8]; 7] = [b"GET", b"HEAD", b"POST", b"PUT", b"DELETE", b"OPTIONS", b"PATCH"]
+  let mut k: usize = 0
+  while k < 7 {
+    let name = names[k]
+    if m.length <= name.length && eq(m, Slice.view<u8>(name, 0, m.length)) { return true }
+    k = k + 1
+  }
+  return false
+}
+// Reads the simple head at the start of `all` into `record` and `flags`. Returns its length, 0
+// when the head is not complete yet, or -1 for a head this module leaves to JavaScript. Bytes
+// are checked as they arrive, so that llhttp sees a bad request as soon as it would.
+effect fn nodeHead(all: &[u8], record: &mut Bytes, maxHead: usize, flags: &mut i32) -> isize ! OutOfMemoryError ? &mut Allocator {
+  let n = if all.length > maxHead { maxHead } else { all.length }
+  // An incomplete head: 0, or -1 when it can no longer fit.
+  let more: isize = if all.length >= maxHead { -1 } else { 0 }
+  let mut i: usize = 0
+  while i < n && all[i] >= 65 && all[i] <= 90 { i = i + 1 }
+  if !methodPrefix(Slice.view<u8>(all, 0, i)) { return -1 }
+  if i == n { return more }
+  if i == 0 || all[i] != 32 || !simpleMethod(Slice.view<u8>(all, 0, i)) { return -1 }
+  let mut j = i + 1
+  while j < n && targetChar(all[j]) { j = j + 1 }
+  if j == n { return more }
+  if j == i + 1 || all[j] != 32 { return -1 }
+  // "HTTP/1.1\r\n" or "HTTP/1.0\r\n", checked as far as it has arrived.
+  let line = b"HTTP/1.1\r\n"
+  let mut k: usize = 0 let mut v10 = false
+  while k < 10 {
+    if j + 1 + k == n { return more }
+    let c = all[j + 1 + k]
+    if k == 7 { if c == 48 { v10 = true } else if c != 49 { return -1 } }
+    else if c != line[k] { return -1 }
+    k = k + 1
+  }
+  record.clear()
+  run pushText(&mut record, Slice.view<u8>(all, 0, i))
+  run pushText(&mut record, Slice.view<u8>(all, i + 1, j - i - 1))
+  let mut p = j + 11 let mut fields: usize = 0
+  let mut close = false let mut keep = false let mut connection = false
+  while true {
+    if p == n { return more }
+    if all[p] == 13 {
+      if p + 1 == n { return more }
+      if all[p + 1] != 10 { return -1 }
+      p = p + 2
+      break
+    }
+    let mut q = p
+    while q < n && tokenChar(all[q]) { q = q + 1 }
+    if q == n { return more }
+    if q == p || all[q] != 58 { return -1 }
+    let mut v = q + 1
+    while v < n && all[v] == 32 { v = v + 1 }
+    let start = v
+    while v < n && all[v] >= 32 && all[v] <= 126 { v = v + 1 }
+    if v == n { return more }
+    if all[v] != 13 { return -1 }
+    if v + 1 == n { return more }
+    if all[v + 1] != 10 || v == start || all[v - 1] == 32 { return -1 }
+    let name = Slice.view<u8>(all, p, q - p) let value = Slice.view<u8>(all, start, v - start)
+    if asciiEqualFold(name, b"content-length") { if !eq(value, b"0") { return -1 } }
+    else if asciiEqualFold(name, b"transfer-encoding") || asciiEqualFold(name, b"expect") || asciiEqualFold(name, b"upgrade") { return -1 }
+    else if asciiEqualFold(name, b"connection") {
+      if connection { return -1 }
+      connection = true
+      if asciiEqualFold(value, b"close") { close = true } else if asciiEqualFold(value, b"keep-alive") { keep = true } else { return -1 }
+    }
+    fields = fields + 1
+    if fields > 64 { return -1 }
+    run pushText(&mut record, name) run pushText(&mut record, value)
+    p = v + 2
+  }
+  // Node closes the connection after a request that does not keep it alive: llhttp reads that.
+  if close || (v10 && !keep) { return -1 }
+  flags.* = HTTP_KEEP_ALIVE | (if v10 { HTTP_V10 } else { 0 })
+  return usize.toIsize(p)
+}
+// Queues the request in `ex.record`, as httpPost does. The status holds the flags, and the
+// length of the head above its low 8 bits (the socket's bytesRead).
+unsafe fn nodePost(handle: *mut Handle, exchange: *mut Exchange, used: usize) -> () {
+  let mut anchor = () let ex = unsafe Pointer.borrowMut<(), Exchange>(&mut anchor, exchange)
+  let recordLength = ex.record.length()
+  let total = 4 + recordLength
+  let memory = unsafe calloc(1, total)
+  if Pointer.isNull<u8>(memory) { drop ex let mut b = () let s = unsafe Pointer.borrowMut<(), State>(&mut b, unsafe stateOf(handle)) s.oom = true return () }
+  let base = unsafe Pointer.assumeManyMut<u8>(unsafe nn(memory))
+  let n = usize.toU32(recordLength)
+  unsafe Pointer.put<u8>(unsafe Pointer.atMut<u8>(base, 0), u32.toU8(n & 255))
+  unsafe Pointer.put<u8>(unsafe Pointer.atMut<u8>(base, 1), u32.toU8((n / 256) & 255))
+  unsafe Pointer.put<u8>(unsafe Pointer.atMut<u8>(base, 2), u32.toU8((n / 65536) & 255))
+  unsafe Pointer.put<u8>(unsafe Pointer.atMut<u8>(base, 3), u32.toU8(n / 16777216))
+  if recordLength != 0 { let _a = unsafe memcpy(unsafe Pointer.atMut<u8>(base, 4), unsafe sliceAt(ex.record.asSlice(), 0), recordLength) }
+  let flags = ex.flags | (if used < 8388608 { usize.toI32(used) * 256 } else { 0 })
+  ex.record.clear()
+  drop ex
+  let mut value = event(handle, HTTP_REQUEST, flags, 0) value.data = memory value.length = total
+  unsafe post(move value)
+}
+// Hands the connection back to JavaScript's parser: one HTTP_FALLBACK event with the bytes of
+// the head read so far, and no exchange from now on.
+unsafe fn nodeFallback(handle: *mut Handle) -> () {
+  let found = unsafe exchangeOf(handle) if Pointer.isNull<Exchange>(found) { return () }
+  let mut anchor = () let ex = unsafe Pointer.borrowMut<(), Exchange>(&mut anchor, unsafe nn(found))
+  let count = ex.raw.length()
+  let memory = unsafe calloc(1, if count == 0 { 1 } else { count })
+  if Pointer.isNull<u8>(memory) { drop ex let mut b = () let s = unsafe Pointer.borrowMut<(), State>(&mut b, unsafe stateOf(handle)) s.oom = true unsafe forgetExchange(handle) return () }
+  if count != 0 { let _c = unsafe memcpy(unsafe nn(memory), unsafe sliceAt(ex.raw.asSlice(), 0), count) }
+  drop ex
+  unsafe forgetExchange(handle)
+  let mut value = event(handle, HTTP_FALLBACK, 0, 0) value.data = memory value.length = count
+  unsafe post(move value)
+}
+// The request event this read posted last gets HTTP_MORE: another event of the read follows.
+unsafe fn markMore(handle: *mut Handle) -> () {
+  let mut anchor = () let s = unsafe Pointer.borrowMut<(), State>(&mut anchor, unsafe stateOf(handle))
+  let last = s.last drop s
+  if Pointer.isNull<Event>(last) { return () }
+  let e = unsafe Pointer.borrowMut<(), Event>(&mut anchor, unsafe nn(last))
+  if Pointer.address<Handle>(e.handle) == Pointer.address<Handle>(handle) && e.kind == HTTP_REQUEST { e.status = e.status | HTTP_MORE }
+}
+// Reads the simple requests in `input`; the first other one hands the connection back. A read
+// that leaves a head incomplete ends with HTTP_BEGIN (status 1 for the head's first bytes).
+
+unsafe effect fn nodeReceive(handle: *mut Handle, input: &[u8]) -> () ! OutOfMemoryError ? &mut Allocator {
+  let found = unsafe exchangeOf(handle) if Pointer.isNull<Exchange>(found) { return () }
+  let exchange = unsafe nn(found)
+  let mut anchor = ()
+  let ex = unsafe Pointer.borrowMut<(), Exchange>(&mut anchor, exchange)
+  run ex.raw.append(input) drop ex
+  let mut posted = false
+  while true {
+    let entry = unsafe Pointer.borrowMut<(), Exchange>(&mut anchor, exchange)
+    if entry.raw.length() == 0 { return () }
+    let mut record = Intrinsic.replace(entry.record, Bytes.make())
+    let mut flags: i32 = 0 let maxHead = entry.maxHead
+    let read = run nodeHead(entry.raw.asSlice(), &mut record, maxHead, &mut flags)
+    entry.record = move record entry.flags = flags
+    if read == 0 {
+      let first = !entry.begun entry.begun = true drop entry
+      if posted { unsafe markMore(handle) }
+      unsafe notify(handle, HTTP_BEGIN, if first { 1 } else { 0 }, 0)
+      return ()
+    }
+    if read < 0 { drop entry if posted { unsafe markMore(handle) } unsafe nodeFallback(handle) return () }
+    entry.begun = false
+    // The head is read: the rest of `raw` starts the next request.
+    let used = isize.toUsize(read) let total = entry.raw.length()
+    if used == total { entry.raw.clear() }
+    else {
+      let bytes = entry.raw.asMutSlice() let mut k: usize = 0
+      while k < total - used { bytes[k] = bytes[used + k] k = k + 1 }
+      entry.raw.truncate(total - used)
+    }
+    drop entry
+    if posted { unsafe markMore(handle) }
+    unsafe nodePost(handle, exchange, used)
+    posted = true
   }
 }
 // Reads the string at `offset` of a request record: its bytes, and the offset after it.
@@ -2151,17 +2358,28 @@ unsafe effect fn operation<'m, S: EngineServices>(engine: &mut Engine<'m, S>, co
   }
   if eq(op, b"httpAdopt") {
     if kind != TCP && kind != PIPE { return ValueBits.Int { value: EINVAL() } }
-    if !Pointer.isNull<Peer>(unsafe peerOf(handle)) || !Pointer.isNull<Exchange>(unsafe exchangeOf(handle)) { return ValueBits.Int { value: EINVAL() } }
+    if !Pointer.isNull<Peer>(unsafe peerOf(handle)) || !Pointer.isNull<Exchange>(unsafe exchangeOf(handle)) || !Pointer.isNull<u8>(unsafe secureOf(handle)) { return ValueBits.Int { value: EINVAL() } }
     let made = run RequestParser.make(httpHeadLimits())
     let parser = match move made { Result.Success { value } => move value Result.Failure { .. } => { return ValueBits.Int { value: EINVAL() } } }
     let raw = run allocate(Layout.of<Exchange>().bytes)
     let exchange = unsafe Intrinsic.pointerReinterpret<*mut u8, *mut Exchange>(raw)
-    unsafe Pointer.put<Exchange>(exchange, Exchange { parser: move parser, phase: PHASE_HEAD, remaining: 0, decoder: Option<Decoder>.none(), record: Bytes.make(), body: Bytes.make(), flags: 0, out: Bytes.make(), scratch: Bytes.make(), pending: Bytes.make(), dateSecond: -1, date: [0; 29] })
-    let entry = unsafe Pointer.borrowMut<(), Handle>(&mut anchor, handle) entry.exchange = exchange entry.reading = true drop entry
+    // httpAdopt(id, mode, maxHeaderSize): mode 1 reads for node:http (see Node mode).
+    let node = number(args.values[1]) == 1
+    let maxHead = number(args.values[2])
+    unsafe Pointer.put<Exchange>(exchange, Exchange { parser: move parser, phase: PHASE_HEAD, remaining: 0, decoder: Option<Decoder>.none(), record: Bytes.make(), body: Bytes.make(), flags: 0, out: Bytes.make(), scratch: Bytes.make(), pending: Bytes.make(), dateSecond: -1, date: [0; 29], node: node, raw: Bytes.make(), maxHead: if maxHead > 0 { i32.toUsize(maxHead) } else { 16384 }, begun: false })
+    // A node:http socket reads when JavaScript starts it, as with any socket.
+    let entry = unsafe Pointer.borrowMut<(), Handle>(&mut anchor, handle) entry.exchange = exchange if !node { entry.reading = true } drop entry
     unsafe refresh(handle)
     return ValueBits.Int { value: 0 }
   }
   if eq(op, b"pendingRead") { return ValueBits.Int { value: if unsafe hasPendingRead(handle, fd) { 1 } else { 0 } } }
+  // httpRelease(id): a node mode connection goes back to JavaScript's parser (HTTP_FALLBACK).
+  if eq(op, b"httpRelease") {
+    if !unsafe nodeExchange(handle) { return ValueBits.Int { value: EINVAL() } }
+    unsafe nodeFallback(handle)
+    unsafe refresh(handle)
+    return ValueBits.Int { value: 0 }
+  }
   if eq(op, b"httpPending") { return ValueBits.number(unsafe pendingBytes(handle)) }
   if eq(op, b"wsFeed") {
     if Pointer.isNull<Peer>(unsafe peerOf(handle)) { return ValueBits.Int { value: EBADF() } }
@@ -2661,6 +2879,9 @@ unsafe effect fn deliver<'m, S: EngineServices>(engine: &mut Engine<'m, S>, cont
   if silent { return () }
   scope.values[1] = ValueBits.Int { value: token }
   if kind == WS_FRAME {
+    let memory = engine.memory scope.values[1] = run unsafe buffers.newArrayBufferCopy(&mut engine, memory, unsafe lendRealm(&context, context), data, usize.toU64(length))
+  }
+  if kind == HTTP_FALLBACK {
     let memory = engine.memory scope.values[1] = run unsafe buffers.newArrayBufferCopy(&mut engine, memory, unsafe lendRealm(&context, context), data, usize.toU64(length))
   }
   if kind == HTTP_REQUEST { scope.values[1] = ValueBits.Undefined run unsafe httpRequestValues(&mut engine, context, unsafe stateOf(handle), unsafe nn(data), length, code, &mut scope) }

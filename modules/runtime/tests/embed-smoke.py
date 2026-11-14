@@ -17,11 +17,13 @@ ROOT = Path(__file__).resolve().parents[1]
 BUILD = ROOT / 'build/embed-smoke'
 EXECUTABLE = BUILD / 'embed-smoke'
 EXPECTED = [
+    'add 5',
     'fs function',
     'tick 1',
     'tick 2',
     'tick 3',
     'exit 3',
+    'host: callback returned 42 after its microtask',
     'host: finished with 3',
 ]
 
