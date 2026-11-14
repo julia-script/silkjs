@@ -44,6 +44,10 @@ const CONNECT = 3;
 const CLOSED = 6;
 const WS_CLOSE = 7;
 const WS_FRAME = 8;
+// The native HTTP/1 reader of a node:http connection (net_native's node mode).
+const HTTP_REQUEST = 9;
+const HTTP_FALLBACK = 10;
+const HTTP_BEGIN = 11;
 
 // src/stream_base.h StreamBaseStateFields.
 const kReadBytesOrError = 0;
@@ -142,6 +146,12 @@ class StreamHandle {
       _flushScheduled: false,
       _connectRequest: null,
       _consumers: null,
+      // The parser link of a node:http connection whose requests net_native reads
+      // (internal/http/native-parser consumeNative).
+      _httpNative: null,
+      // A TLS socket's handle whose plaintext net_native reads off this carrier (httpAdopt
+      // mode 2): the HTTP events go on to it.
+      _httpTarget: null,
     });
     if (transport !== undefined) this._adopt(transport);
   }
@@ -156,7 +166,7 @@ class StreamHandle {
   get isStreamBase() { return true; }
   _adopt(transport) {
     this._transport = transport;
-    transport.onEvent = (type, status, payload) => this._dispatch(type, status, payload);
+    transport.onEvent = (type, status, payload, extra) => this._dispatch(type, status, payload, extra);
     if (this.#owner !== undefined) transport.owner = this.#owner;
   }
   get [owner_symbol]() { return this.#owner; }
@@ -296,6 +306,19 @@ class StreamHandle {
       for (let i = 0; i < buffers.length; i++) { joined.set(buffers[i], offset); offset += buffers[i].byteLength; }
       target = [joined];
     }
+    // One buffer the kernel takes at once (the usual HTTP response): no WriteWrap, no
+    // completion closures and no request entry.
+    const transport = this._transport;
+    let token = 0;
+    if (target.length === 1 && typeof transport.writeNow === 'function') {
+      const chunk = target[0];
+      token = transport.writeNow(chunk instanceof Uint8Array ? chunk : new Uint8Array(chunk.buffer, chunk.byteOffset, chunk.byteLength));
+      if (token <= 0) {
+        this._countWritten(bytes);
+        streamBaseState[kLastWriteWasAsync] = 0;
+        return token;
+      }
+    }
     let pending = target.length;
     let failure = 0;
     let sync = true;
@@ -316,9 +339,10 @@ class StreamHandle {
       if (!this._transport) { completed = true; this._pendingWrites?.delete(complete); return; }
       complete(failure);
     };
-    for (let i = 0; i < target.length; i++) {
+    if (token > 0) transport.expect(token, done, target[0]);
+    else for (let i = 0; i < target.length; i++) {
       const chunk = target[i];
-      this._transport.write(chunk instanceof Uint8Array ? chunk : new Uint8Array(chunk.buffer, chunk.byteOffset, chunk.byteLength), done);
+      transport.write(chunk instanceof Uint8Array ? chunk : new Uint8Array(chunk.buffer, chunk.byteOffset, chunk.byteLength), done);
     }
     sync = false;
     this._countWritten(bytes);
@@ -334,9 +358,20 @@ class StreamHandle {
     wrap.async = true;
     return req ? 0 : wrap;
   }
-  _dispatch(type, status, payload) {
+  // `extra` marks a read of a TLS session the native handle runs (internal/tls/transport):
+  // 1 plaintext, 2 the session is back with JavaScript. Only the session's consumer takes them.
+  _dispatch(type, status, payload, extra) {
     switch (type) {
       case READ: {
+        if (extra !== undefined && typeof extra === 'number') {
+          if (!this._consumers?.length) return;
+          if (!this.reading || this._pendingReads.length) {
+            this._pendingReads.push([payload ? payload.slice(0) : payload, status, true, extra]);
+            return;
+          }
+          this._readForConsumer(status, payload, extra);
+          return;
+        }
         const owner = this.#owner;
         // A WebSocket peer (internal/ws) owns the frames of this socket after its upgrade.
         if (owner?._wsPeer && status >= 0) {
@@ -344,6 +379,12 @@ class StreamHandle {
             this._countRead(payload.byteLength);
             host.net('wsFeed', [this._transport.id, payload, 0, payload.byteLength]);
           }
+          return;
+        }
+        // Plaintext a TLS session decrypted in JavaScript before net_native took its records
+        // (JSTransportHandle._adoptHttp) belongs ahead of them: the parser reads it with llhttp.
+        if (this._httpNative !== null && status >= 0 && !this._consumers?.length) {
+          if (payload?.byteLength) this._httpNative.stray(payload);
           return;
         }
         // An http parser that consumed this stream (parser.consume) reads its bytes instead.
@@ -387,11 +428,35 @@ class StreamHandle {
         this._closed();
         return;
       }
+      case HTTP_BEGIN:
+      case HTTP_REQUEST:
+      case HTTP_FALLBACK:
+        // What one read held is parsed whole, as llhttp executes a read even when a request in
+        // it pauses the socket; only reads held before it make it wait.
+        if (this._pendingReads.length) { this._pendingReads.push([payload, status, 'http', type]); return; }
+        this._httpEvent(type, status, payload);
+        return;
       case WS_CLOSE:
       case WS_FRAME:
         this.#owner?._wsPeer?._frame(type, status, payload);
         return;
     }
+  }
+  // A node:http connection's requests read by net_native (HTTP_REQUEST events) instead of
+  // bytes for its parser; false when this handle cannot.
+  _adoptHttp(link, maxHeaderSize) {
+    const transport = this._transport;
+    if (!transport || transport.closing || transport.closed || typeof transport.call !== 'function' ||
+        this._consumers?.length || this._pendingReads.length || this._userBuffer || this.#owner?._wsPeer) return false;
+    if (transport.call('httpAdopt', 1, maxHeaderSize) < 0) return false;
+    this._httpNative = link;
+    return true;
+  }
+  // Ends native reading: an HTTP_FALLBACK event with the head read so far follows the
+  // requests already queued.
+  _releaseHttp() {
+    const transport = this._transport;
+    if (this._httpNative && transport && !transport.closed) transport.call('httpRelease');
   }
   _closed() {
     this._endConnectTrace?.();
@@ -402,11 +467,34 @@ class StreamHandle {
     if (callback) { this._closeReported = true; callback.call(this); }
     else if (owner && !owner.destroyed && typeof owner.destroy === 'function') owner.destroy();
   }
+  _httpEvent(type, status, payload) {
+    const target = this._httpTarget;
+    if (target !== null) {
+      // The ticks of the carrier's event wait, as for a plain connection (HTTP_MORE).
+      if (type === HTTP_REQUEST && (status & 16) !== 0 && this._transport) this._transport.holdTicks = true;
+      if (type === HTTP_FALLBACK) this._httpTarget = null;
+      target._httpEvent(type, status, payload);
+      return;
+    }
+    if (type === HTTP_BEGIN) { this._httpNative?.begin(status === 1); return; }
+    if (type === HTTP_REQUEST) {
+      this._countRead(status >>> 8);
+      // HTTP_MORE (16): another event of the same read follows.
+      if ((status & 16) !== 0 && this._transport) this._transport.holdTicks = true;
+      this._httpNative?.request(status & 255, payload);
+      return;
+    }
+    const link = this._httpNative;
+    this._httpNative = null;
+    if (payload?.byteLength) this._countRead(payload.byteLength);
+    link?.fallback(payload);
+  }
   // A read for the stream's consumer, which hands read errors and the end of the stream
   // back to onread (returns false).
-  _readForConsumer(status, payload) {
+  _readForConsumer(status, payload, extra) {
     const consumer = this._consumers?.[this._consumers.length - 1];
-    if (consumer && consumer.read(status, payload) !== false) return;
+    if (consumer && consumer.read(status, payload, extra) !== false) return;
+    if (extra !== undefined) return;
     if (status < 0) {
       this.reading = false;
       this._deliver(null, status);
@@ -422,12 +510,13 @@ class StreamHandle {
     for (let i = 0; i < pending.length; i++) {
       // A read stopped again: the rest waits, after anything it held back.
       // So does one that came while the stream was stopped (net clears handle.reading).
-      if (this._pendingReads.length || (pending[i][2] && !this.reading)) {
+      if (this._pendingReads.length || (pending[i][2] && pending[i][2] !== 'http' && !this.reading)) {
         this._pendingReads.push(...pending.slice(i));
         return;
       }
-      const [payload, nread, consumed] = pending[i];
-      if (consumed) this._readForConsumer(nread, payload);
+      const [payload, nread, consumed, extra] = pending[i];
+      if (consumed === 'http') this._httpEvent(extra, nread, payload);
+      else if (consumed) this._readForConsumer(nread, payload, extra);
       else this._deliver(payload, nread);
     }
   }
@@ -494,6 +583,65 @@ class NativeStreamHandle extends StreamHandle {
     out.family = result.family;
     out.port = result.port;
     return 0;
+  }
+  // A writev with strings, or of several buffers, is encoded and written by one native call
+  // (host.secure op 4) instead of a join here and a write per buffer.
+  writev(req, chunks, allBuffers) {
+    if (chunks.length > (allBuffers ? 1 : 2)) {
+      const status = this._writeChunks(req, chunks, allBuffers);
+      if (status !== undefined) return status;
+    }
+    return super.writev(req, chunks, allBuffers);
+  }
+  writeUtf8String(req, string) { return this._writeChunks(req, [string, 'utf8'], false) ?? super.writeUtf8String(req, string); }
+  writeLatin1String(req, string) { return this._writeChunks(req, [string, 'latin1'], false) ?? super.writeLatin1String(req, string); }
+  writeAsciiString(req, string) { return this._writeChunks(req, [string, 'latin1'], false) ?? super.writeAsciiString(req, string); }
+  // StreamBase::Write over host.secure op 4: undefined leaves the write to StreamHandle._write.
+  _writeChunks(req, chunks, allBuffers) {
+    const transport = this._transport;
+    if (!transport || transport.closing || transport.closed) return undefined;
+    if (!allBuffers) {
+      for (let i = 0; i < chunks.length; i += 2) {
+        if (typeof chunks[i] !== 'string') continue;
+        const encoding = chunks[i + 1];
+        if (encoding !== 'latin1' && encoding !== 'utf8' && encoding !== 'ascii' && encoding !== 'utf-8' && encoding !== 'binary') return undefined;
+      }
+    }
+    const token = ++transport.sequence;
+    const result = host.secure(4, transport.id, chunks, chunks.length, allBuffers ? 1 : 0, token);
+    if (result <= -100000) return undefined;
+    streamBaseState[kLastWriteErr] = 0;
+    if (result < 0) {
+      streamBaseState[kBytesWritten] = 0;
+      streamBaseState[kLastWriteWasAsync] = 0;
+      return result;
+    }
+    const bytes = Math.floor(result / 2);
+    streamBaseState[kBytesWritten] = bytes;
+    this._countWritten(bytes);
+    if (result % 2 === 1) {
+      streamBaseState[kLastWriteWasAsync] = 0;
+      return 0;
+    }
+    streamBaseState[kLastWriteWasAsync] = 1;
+    const wrap = req ?? new WriteWrap();
+    this.writeQueueSize += bytes;
+    let completed = false;
+    const complete = status => {
+      if (completed) return;
+      completed = true;
+      this._pendingWrites?.delete(complete);
+      this.writeQueueSize -= bytes;
+      if (typeof wrap.oncomplete === 'function') wrap.oncomplete(status, this, undefined);
+      else wrap.writeStatus = status;
+    };
+    transport.requests.set(token, { callback: error => {
+      if (!this._transport) { completed = true; this._pendingWrites?.delete(complete); return; }
+      complete(statusOf(error));
+    } });
+    this._pendingWrites?.add(complete);
+    wrap.async = true;
+    return req ? 0 : wrap;
   }
   _accept(id) { return new this.constructor(this.constructor.SOCKET, id); }
   // ConnectWrap: a node.net.native "connect" span lasts from the native connect to its result.
@@ -659,6 +807,89 @@ class JSTransportHandle extends StreamHandle {
     super(transport);
     libuvFields(this);
     internalFields(this, { _pendingWrites: new Set() });
+  }
+  // A TLS socket whose session its carrier runs natively (internal/tls/transport attachNative):
+  // net_native reads the requests of a node:http connection from the plaintext (node mode over
+  // the session) and the events reach this handle through the carrier.
+  _adoptHttp(link, maxHeaderSize) {
+    const transport = this._transport;
+    const carrier = transport?.consumed;
+    if (transport?.native !== true || transport.closing || !carrier || carrier._httpNative || carrier._httpTarget ||
+        carrier._pendingReads.length || this._consumers?.length || this._pendingReads.length || this._userBuffer) return false;
+    const carried = carrier._transport;
+    if (!carried || carried.closing || carried.closed || typeof carried.call !== 'function') return false;
+    if (carried.call('httpAdopt', 2, maxHeaderSize) < 0) return false;
+    this._httpNative = link;
+    carrier._httpTarget = this;
+    return true;
+  }
+  _releaseHttp() {
+    const carried = this._transport?.consumed?._transport;
+    if (this._httpNative && carried && !carried.closed) carried.call('httpRelease');
+  }
+  // TLSWrap's writes while its session runs natively (internal/tls/transport writeChunks): one
+  // call encodes, encrypts and sends them. Like every TLSWrap write they complete
+  // asynchronously, after the tick that made them or when the carrier wrote them.
+  writev(req, chunks, allBuffers) {
+    if (this._transport?.native === true) {
+      const status = this._secureWrite(req, chunks, allBuffers);
+      if (status !== undefined) return status;
+    }
+    return super.writev(req, chunks, allBuffers);
+  }
+  writeBuffer(req, buffer) {
+    if (this._transport?.native === true) {
+      const status = this._secureWrite(req, [buffer], true);
+      if (status !== undefined) return status;
+    }
+    return super.writeBuffer(req, buffer);
+  }
+  writeUtf8String(req, string) {
+    if (this._transport?.native === true) {
+      const status = this._secureWrite(req, [string, 'utf8'], false);
+      if (status !== undefined) return status;
+    }
+    return super.writeUtf8String(req, string);
+  }
+  writeLatin1String(req, string) {
+    if (this._transport?.native === true) {
+      const status = this._secureWrite(req, [string, 'latin1'], false);
+      if (status !== undefined) return status;
+    }
+    return super.writeLatin1String(req, string);
+  }
+  writeAsciiString(req, string) {
+    if (this._transport?.native === true) {
+      const status = this._secureWrite(req, [string, 'latin1'], false);
+      if (status !== undefined) return status;
+    }
+    return super.writeAsciiString(req, string);
+  }
+  _secureWrite(req, chunks, allBuffers) {
+    if (this._transport.closing || this._transport.closed) return undefined;
+    let complete = null;
+    const result = this._transport.writeChunks(chunks, allBuffers, status => complete(status));
+    if (result === undefined) return undefined;
+    const bytes = Math.floor(result / 2);
+    streamBaseState[kBytesWritten] = bytes;
+    streamBaseState[kLastWriteErr] = 0;
+    streamBaseState[kLastWriteWasAsync] = 1;
+    this._countWritten(bytes);
+    const wrap = req ?? new WriteWrap();
+    wrap.async = true;
+    this.writeQueueSize += bytes;
+    let completed = false;
+    complete = status => {
+      if (completed) return;
+      completed = true;
+      this._pendingWrites.delete(complete);
+      this.writeQueueSize -= bytes;
+      if (typeof wrap.oncomplete === 'function') wrap.oncomplete(status, this, undefined);
+      else wrap.writeStatus = status;
+    };
+    this._pendingWrites.add(complete);
+    if (result % 2 === 1) process.nextTick(complete, 0);
+    return req ? 0 : wrap;
   }
   // TLSWrap cancels its queued writes as it closes (InvokeQueued(UV_ECANCELED)), before
   // the close or any error of its owner surfaces.

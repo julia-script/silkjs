@@ -116,6 +116,275 @@ file('syntax-only.mjs', 'import "./missing.mjs";console.log("must-not-execute");
 file('syntax-invalid.cjs', 'const value = ;\n');
 add('cli-syntax-only-boundaries', `const {spawnSync}=require('node:child_process');const cases=[[['--check','syntax-only.cjs']], [['--check','syntax-only.mjs']], [['--check','syntax-invalid.cjs']], [['--check','--input-type=module'],'import "./missing.mjs";console.log("must-not-execute")'],[['--check','--eval=console.log("must-not-execute")']], [['--input-type=module','syntax-only.cjs']]];console.log(JSON.stringify(cases.map(([args,input])=>{const child=spawnSync(process.execPath,args,{input,encoding:'utf8',env:{...process.env,NODE_OPTIONS:''}});if(child.error)throw child.error;return [child.status,child.stdout]})));`);
 add('cli-automatic-module-input', `const {spawnSync}=require('node:child_process');const source='await Promise.resolve();console.log(typeof require,42)';console.log(JSON.stringify([[['--eval='+source]], [[],source], [['--input-type=commonjs','--eval='+source]]].map(([args,input])=>{const child=spawnSync(process.execPath,args,{input,encoding:'utf8',env:{...process.env,NODE_OPTIONS:''}});if(child.error)throw child.error;return [child.status,child.stdout]})));`);
+// One long function whose call sites are asked for in mixed order, twice in a row
+// and going backwards, through the stack string and through call sites.
+file('stack-sites.cjs', `'use strict';
+function mk(n) { return new Error('e' + n); }
+function big(k) {
+${Array.from({ length: 400 }, (_, i) => `  if (k === ${i}) { const pad${i} = "${'x'.repeat(i % 50)}"; return mk(pad${i}.length); }`).join('\n')}
+  return mk(-1);
+}
+function small(k) { if (k & 1) return mk(1);
+  return mk(2); }
+const where = (e, d) => e.stack.split('\\n')[d].replace(/^.*[\\\\/]/, '');
+const out = [];
+for (const k of [5, 300, 5, 399, 0, 150, 150, 151, 20, 399, 398, 1, 250, 250, 3]) out.push(k + ' ' + where(big(k), 2));
+for (let k = 0; k < 6; k++) out.push('s' + k + ' ' + where(small(k), 2));
+for (let k = 399; k >= 0; k -= 37) out.push(k + ' ' + where(big(k), 2));
+function sites(k) { Error.prepareStackTrace = (e, s) => s.slice(0, 3).map(c => c.getLineNumber() + ':' + c.getColumnNumber() + ':' + c.getFunctionName()).join(','); const r = big(k).stack; Error.prepareStackTrace = undefined; return r; }
+for (const k of [7, 380, 7, 200]) out.push('cs' + k + ' ' + sites(k));
+out.push('top ' + where(new Error('t'), 1)); out.push('top ' + where(new Error('t'), 1));
+console.log(out.join('\\n'));
+`);
+cases.push({ name: 'error-stack-repeated-sites', args: [join(directory, 'stack-sites.cjs')] });
+// Promise.all, allSettled, any and race against Node: settlement order, tick order,
+// patched and inherited `then`, subclasses, thenables, iterator closing, rejection
+// tracking, async stacks through combinators, and await over every kind of value.
+file('promise-combinators.mjs', String.raw`import { AsyncLocalStorage, createHook } from 'node:async_hooks';
+const log = [];
+const out = (...a) => log.push(a.map(x => typeof x === 'string' ? x : JSON.stringify(x)).join(' '));
+const tick = () => new Promise(r => setTimeout(r, 0));
+
+// 1. basic + order
+out('all', await Promise.all([1, Promise.resolve(2), new Promise(r => setTimeout(r, 1, 3)), { then(r) { r(4); } }]));
+out('allSettled', await Promise.allSettled([1, Promise.reject(new Error('x')).catch(e => { throw e.message; }), Promise.reject(5)]));
+out('any', await Promise.any([Promise.reject(1), Promise.resolve(2), 3]));
+out('race', await Promise.race([new Promise(r => setTimeout(r, 5, 'slow')), Promise.resolve('fast')]));
+try { await Promise.any([Promise.reject(1), Promise.reject(2)]); } catch (e) { out('agg', e.constructor.name, e.errors); }
+try { await Promise.all([1, Promise.reject('r'), 3]); } catch (e) { out('all rej', e); }
+out('empty', await Promise.all([]), await Promise.allSettled([]));
+// out-of-order settlement
+{
+  const rs = []; const ps = [0, 1, 2, 3, 4].map(i => new Promise(r => rs[i] = r));
+  const all = Promise.all(ps); [3, 0, 4, 2, 1].forEach(i => rs[i]('v' + i)); out('ooo', await all);
+}
+// sparse-ish: large arrays
+out('big', (await Promise.all(Array.from({ length: 1000 }, (_, i) => i % 3 ? i : Promise.resolve(i)))).reduce((a, b) => a + b, 0));
+// tick ordering
+{
+  const order = [];
+  Promise.all([Promise.resolve(1)]).then(() => order.push('all'));
+  Promise.resolve().then(() => order.push('t1')).then(() => order.push('t2')).then(() => order.push('t3')).then(() => order.push('t4'));
+  await tick(); out('ticks', order);
+}
+{
+  const order = [];
+  Promise.all([1, 2]).then(() => order.push('all'));
+  Promise.allSettled([1]).then(() => order.push('settled'));
+  Promise.race([1]).then(() => order.push('race'));
+  Promise.any([1]).then(() => order.push('any'));
+  Promise.resolve().then(() => order.push('t1')).then(() => order.push('t2')).then(() => order.push('t3')).then(() => order.push('t4'));
+  await tick(); out('ticks2', order);
+}
+// overridden then on instance
+{
+  const p = Promise.resolve(7); let called = 0;
+  p.then = function (a, b) { called++; return Promise.prototype.then.call(this, a, b); };
+  out('own then', await Promise.all([p]), called);
+}
+// then getter that throws
+{
+  const p = Promise.resolve(1); Object.defineProperty(p, 'then', { get() { throw new Error('getter'); } });
+  try { await Promise.all([p]); } catch (e) { out('then getter', e.message); }
+}
+// patched prototype then
+{
+  const orig = Promise.prototype.then; let n = 0;
+  Promise.prototype.then = function (a, b) { n++; return orig.call(this, a, b); };
+  const v = await Promise.all([Promise.resolve(1), Promise.resolve(2)]);
+  Promise.prototype.then = orig; out('proto then', v, n > 0);
+}
+// patched Promise.resolve
+{
+  const orig = Promise.resolve; let n = 0;
+  Promise.resolve = function (v) { n++; return orig.call(this, v); };
+  const v = await Promise.all([1, 2, 3]); Promise.resolve = orig; out('patched resolve', v, n);
+}
+// subclass
+{
+  class P extends Promise { static calls = 0; then(a, b) { P.calls++; return super.then(a, b); } }
+  const r = P.all([P.resolve(1), 2]); out('subclass', r instanceof P, await r, P.calls > 0);
+  const q = Promise.all([P.resolve(9)]); out('sub in base', q instanceof P, await q);
+}
+// species / constructor override on element
+{
+  const p = Promise.resolve(3); let made = 0;
+  p.constructor = { [Symbol.species]: function (ex) { made++; return new Promise(ex); } };
+  out('ctor override', await Promise.all([p]), made);
+}
+// non-callable resolve
+try { await Promise.all.call(function () {}, []); } catch (e) { out('bad ctor', e.constructor.name); }
+// iterator closing on resolve throw
+{
+  let closed = 0; const it = { [Symbol.iterator]() { return { next() { return { value: 1, done: false }; }, return() { closed++; return {}; } }; } };
+  const orig = Promise.resolve; Promise.resolve = () => { throw new Error('boom'); };
+  let p; try { p = Promise.all(it); } finally { Promise.resolve = orig; }
+  try { await p; } catch (e) { out('iter close', e.message, closed); }
+}
+// result array identity / mutation after
+{
+  const a = await Promise.all([1, 2]); a.push(3); out('arr', a, Array.isArray(a), Object.getPrototypeOf(a) === Array.prototype, a.length);
+}
+// resolve element function called twice / thenable calling twice
+{
+  const th = { then(r, j) { r('a'); r('b'); j('c'); } };
+  out('twice', await Promise.all([th, th]), await Promise.allSettled([th]));
+}
+// thenable resolving later than others, with holes mid-flight
+{
+  let late; const th = { then(r) { late = r; } };
+  const all = Promise.all([th, 1, 2]); await tick(); late('L'); out('late thenable', await all);
+}
+// reject then later fulfil does not disturb
+{
+  let r1; const p1 = new Promise(r => r1 = r);
+  const all = Promise.all([p1, Promise.reject('E')]).catch(e => 'caught ' + e); r1(1); out('rej first', await all);
+}
+// unhandled rejection semantics: elements rejected are handled by all
+{
+  let unhandled = 0; const h = () => unhandled++; process.on('unhandledRejection', h);
+  await Promise.allSettled([Promise.reject(1), Promise.reject(2)]);
+  await Promise.all([Promise.reject(1), Promise.reject(2)]).catch(() => {});
+  await tick(); await tick(); process.off('unhandledRejection', h); out('unhandled', unhandled);
+}
+// async stack
+{
+  async function leaf() { await null; throw new Error('deep'); }
+  async function mid() { return Promise.all([1, leaf()]); }
+  try { await mid(); } catch (e) { out('stack', e.stack.split('\n').slice(0, 4).map(s => s.replace(/\(.*[\\/]/, '(').replace(/file:.*[\\/]/, '')).join(' | ')); }
+}
+// AsyncLocalStorage
+{
+  const als = new AsyncLocalStorage();
+  out('als', await als.run('ctx', async () => { const [a] = await Promise.all([Promise.resolve(1).then(() => als.getStore())]); await Promise.all([1, 2]); return [a, als.getStore()]; }));
+}
+// async hooks
+{
+  let inits = 0; const hook = createHook({ init(id, type) { if (type === 'PROMISE') inits++; } }).enable();
+  await Promise.all([Promise.resolve(1), 2]); hook.disable(); out('hooks', inits);
+}
+// await in loops of various values
+{
+  async function f(x) { return x; } async function g() { throw new Error('g'); }
+  let s = 0; for (let i = 0; i < 100; i++) { s += await i; s += await f(i); s += await Promise.resolve(i); s += await { then(r) { r(i); } }; }
+  try { await g(); } catch (e) { s += e.message; } try { await Promise.reject('z'); } catch (e) { s += e; } try { await { then(_, j) { j('t'); } }; } catch (e) { s += e; }
+  out('awaits', s);
+}
+// new Promise resolve/reject functions
+{
+  let res, rej; const p = new Promise((a, b) => { res = a; rej = b; });
+  out('fn props', res.length, rej.length, res.name, rej.name, typeof res, res !== rej);
+  res(1); rej(2); res(3); out('first wins', await p);
+  let r2; const p2 = new Promise((a, b) => { r2 = b; a(p); }); r2('no'); out('locked', await p2);
+  let keep; new Promise(r => keep = r); const p3 = new Promise((_, j) => j('x')); out('rejfn', await p3.catch(e => e), keep.name);
+  try { new Promise(r => { r(1); throw new Error('after'); }); out('throw after resolve ok'); } catch (e) { out('bad'); }
+  const self = new Promise(r => setTimeout(() => r(self), 0)); out('self', await self.catch(e => e.constructor.name));
+}
+console.log(log.join('\n'));
+`);
+cases.push({ name: 'promise-combinators', args: [join(directory, 'promise-combinators.mjs')] });
+// Elements that mix untouched promises with patched ones, late thenables that lock
+// a race in, a thenable result array, and combinators nested or abandoned.
+file('promise-combinators-mixed.mjs', String.raw`const log = []; const out = (...a) => log.push(a.map(x => typeof x === 'string' ? x : JSON.stringify(x)).join(' '));
+const tick = () => new Promise(r => setTimeout(r, 0));
+// race: first fulfils with a late thenable, second with plain value: first wins (locked in)
+{
+  const o = {}; const p1 = Promise.resolve(o); o.then = (r) => setTimeout(r, 5, 'from thenable');
+  out('race locked', await Promise.race([p1, Promise.resolve('second')]));
+}
+// same but the second element goes through a patched then (function pair path)
+{
+  const o = {}; const p1 = Promise.resolve(o); o.then = (r) => setTimeout(r, 5, 'from thenable');
+  const p2 = Promise.resolve('second'); p2.then = function (a, b) { return Promise.prototype.then.call(this, a, b); };
+  out('race locked mixed', await Promise.race([p1, p2]));
+  const q1 = Promise.resolve('q1'); q1.then = function (a, b) { return Promise.prototype.then.call(this, a, b); };
+  const o2 = {}; const q2 = Promise.resolve(o2); o2.then = (r) => setTimeout(r, 5, 'thenable2');
+  out('race mixed 2', await Promise.race([q1, q2]));
+}
+// all with Array.prototype.then making the values array a thenable
+{
+  let seen = 0; Array.prototype.then = function (r) { seen++; delete Array.prototype.then; r('hijacked'); };
+  out('array thenable', await Promise.all([1, Promise.resolve(2)]), seen); delete Array.prototype.then;
+}
+// all: mixed plain + patched elements, out of order, reject after
+{
+  const mk = (v, ms, patched, rej) => { const p = new Promise((r, j) => setTimeout(rej ? j : r, ms * 8, v)); if (patched) p.then = function (a, b) { return Promise.prototype.then.call(this, a, b); }; return p; };
+  out('mixed all', await Promise.all([mk(1, 6), mk(2, 2, true), 3, mk(4, 4, true), mk(5, 1)]));
+  out('mixed settled', await Promise.allSettled([mk(1, 6), mk(2, 2, true, true), 3, mk(4, 4, true), mk(5, 1, false, true)]));
+  out('mixed any', await Promise.any([mk(1, 6, false, true), mk(2, 2, true, true), mk(4, 4, true), mk(5, 5)]));
+  out('mixed any rej', await Promise.any([mk(1, 6, false, true), mk(2, 2, true, true), mk(5, 1, false, true)]).catch(e => e.errors));
+  out('mixed all rej', await Promise.all([mk(1, 6), mk(2, 2, true, true), mk(4, 1, false, true), mk(5, 3, true, true)]).catch(e => 'rej ' + e));
+  out('mixed race', await Promise.race([mk(1, 60), mk(2, 5, true), mk(4, 30), mk(5, 50, true)]));
+  await new Promise(r => setTimeout(r, 500));
+}
+// thenable element invoking handlers repeatedly and synchronously
+{
+  const th = { then(r, j) { r(1); r(2); j(3); } };
+  out('thenables', await Promise.all([th, Promise.resolve(5), th]), await Promise.any([{ then(r, j) { j('a'); r('b'); } }, Promise.reject('c')]).catch(e => e.errors));
+}
+// element then called synchronously re-entrantly during iteration
+{
+  const p = Promise.resolve(1); let handlers;
+  p.then = function (a, b) { handlers = [a, b]; a('sync'); a('again'); };
+  out('sync then', await Promise.all([p, 2]), typeof handlers[0], handlers[0].length, handlers[0].name, typeof handlers[1], handlers[1].name);
+}
+// iterator throws midway after subscriptions
+{
+  function* gen() { yield Promise.resolve(1); yield new Promise(r => setTimeout(r, 2, 2)); throw new Error('iter'); }
+  out('iter throw', await Promise.all(gen()).catch(e => e.message)); await tick();
+  out('iter throw settled', await Promise.allSettled(gen()).catch(e => e.message));
+}
+// many rejections, all handled, events
+{
+  let unhandled = 0; const h = () => unhandled++; process.on('unhandledRejection', h);
+  await Promise.all([Promise.reject(new Error('a')), Promise.reject(new Error('b')), new Promise((_, j) => setTimeout(j, 1, 'c'))]).catch(() => {});
+  await Promise.race([Promise.reject('r1'), Promise.reject('r2'), Promise.resolve('r3')]).catch(() => {});
+  await Promise.any([Promise.resolve('a1'), Promise.resolve('a2'), Promise.reject('a3')]);
+  await new Promise(r => setTimeout(r, 5)); process.off('unhandledRejection', h); out('unhandled', unhandled);
+}
+// result identity and types
+{
+  const r = Promise.all([]); out('ident', r instanceof Promise, r.constructor === Promise, Object.getPrototypeOf(r) === Promise.prototype);
+  const s = await Promise.allSettled([Promise.reject(1)]); out('settled obj', Object.keys(s[0]), Object.getPrototypeOf(s[0]) === Object.prototype);
+}
+// nested combinators and async stack through them
+{
+  async function leaf(n) { await null; if (n === 2) throw new Error('deep' + n); return n; }
+  async function mid() { return await Promise.all([leaf(0), Promise.allSettled([leaf(1)]), Promise.any([leaf(2), leaf(3)])]); }
+  out('nested', await mid());
+  async function f1() { await Promise.allSettled([leaf(1)]); await Promise.all([leaf(0), leaf(2)]); }
+  try { await f1(); } catch (e) { out('stack all', e.stack.split('\n').slice(1).map(s => s.trim().replace(/\(.*[\\/]/, '(').replace(/file:.*[\\/]/, '')).join(' | ')); }
+  async function thrower() { await null; throw new Error('t'); }
+  async function f2() { await Promise.any([thrower()]); }
+  try { await f2(); } catch (e) { out('stack any', e.constructor.name, e.errors[0].stack.split('\n').slice(1).map(s => s.trim().replace(/\(.*[\\/]/, '(').replace(/file:.*[\\/]/, '')).join(' | ')); }
+  async function f3() { return (await Promise.allSettled([thrower()]))[0].reason; }
+  out('stack settled', (await f3()).stack.split('\n').slice(1).map(s => s.trim().replace(/\(.*[\\/]/, '(').replace(/file:.*[\\/]/, '')).join(' | '));
+  async function f4() { await Promise.race([thrower()]); }
+  try { await f4(); } catch (e) { out('stack race', e.stack.split('\n').slice(1).map(s => s.trim().replace(/\(.*[\\/]/, '(').replace(/file:.*[\\/]/, '')).join(' | ')); }
+}
+// ordering across many microtasks
+{
+  const order = []; const mark = (s) => () => order.push(s);
+  const a = Promise.resolve('a'), b = Promise.reject('b');
+  Promise.all([a, b]).then(mark('all ok'), mark('all rej'));
+  Promise.allSettled([a, b]).then(mark('settled'));
+  Promise.any([b, a]).then(mark('any'));
+  Promise.race([b, a]).then(mark('race ok'), mark('race rej'));
+  let p = Promise.resolve(); for (let i = 0; i < 6; i++) p = p.then(mark('t' + i));
+  await tick(); out('order', order);
+}
+// large + GC churn
+{
+  let total = 0; for (let k = 0; k < 200; k++) { const r = await Promise.all(Array.from({ length: 50 }, (_, i) => i % 2 ? Promise.resolve(i) : new Promise(r => queueMicrotask(() => r(i))))); total += r.length + r[49]; }
+  out('churn', total);
+  // abandoned combinators (never settle)
+  for (let k = 0; k < 2000; k++) { Promise.all([new Promise(() => {}), 1]); Promise.any([new Promise(() => {})]); Promise.race([new Promise(() => {})]); }
+  if (globalThis.gc) gc(); out('abandoned ok');
+}
+await tick(); await tick();
+console.log(log.join('\n'));
+`);
+cases.push({ name: 'promise-combinators-mixed', args: [join(directory, 'promise-combinators-mixed.mjs')] });
 let passed = 0, failed = 0;
 try {
   if (!cases.some(item => filter.test(item.name))) throw new Error('No compatibility scenarios match ' + filter);

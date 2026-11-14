@@ -43,6 +43,8 @@ class TLSTransport {
     this.handshakeStarts = 0; this.handshakeCompletions = 0;
     this.keylog = false; this.sessionCallbacks = false; this.helloWaiting = false;
     this.awaitingSession = false; this.flushWaiters = []; this.currentSession = null;
+    // Native mode: the carrier's native handle runs the session's records (see attachNative).
+    this.native = false;
     // TLSWrap::DoShutdown inside an OpenSSL callback waits for the handshake
     // and any 'newSession' answer (FlushPendingShutdown).
     this.holdShutdown = false;
@@ -67,11 +69,25 @@ class TLSTransport {
     // which holds what it reads until it reads again.
     const handle = carrier._handle;
     if (handle && isStreamHandle(handle)) {
-      this.consumer = { read: (status, payload) => {
+      this.consumer = { read: (status, payload, extra) => {
         if (status < 0) return false;
+        // Native mode: plaintext the handle decrypted (status counts its ciphertext), or the
+        // session back with JavaScript, behind everything it decrypted.
+        if (extra === 1) {
+          handle._countRead(status);
+          if (!this.closing && this.id && payload?.byteLength) this.onEvent?.(1, payload.byteLength, payload);
+          return true;
+        }
+        if (extra === 2) {
+          this.native = false;
+          if (!this.closing && this.id) this.pump();
+          return true;
+        }
         if (!payload?.byteLength) return true;
         handle._countRead(payload.byteLength);
         if (this.closing || !this.id) return true;
+        // Ciphertext read before native mode began goes through the record pump.
+        if (this.native) this.detachNative();
         const bytes = payload instanceof ArrayBuffer ? new Uint8Array(payload) : payload;
         try { native('feed', this.id, bytes); } catch (err) { this.fail(err); return true; }
         this.pump();
@@ -312,7 +328,39 @@ class TLSTransport {
     }
     return true;
   }
+  // Native mode, as TLSWrap: once the handshake is done and nothing waits in JavaScript, the
+  // carrier's native handle reads, decrypts, encrypts and writes the records itself, and this
+  // transport only sees plaintext. Anything else (a shutdown, renegotiation, a close_notify,
+  // a failure, a new session or keylog line) brings the session back to the record pump.
+  attachNative() {
+    if (this.native || !this.ready || this.closing || !this.id || this.pumping || this.selecting || this.helloWaiting ||
+        this.renegotiating || this.awaitingSession || this.writes.length || this.pendingShutdown || this.eof || this.alert) return;
+    const handle = this.consumed, carrier = this.carrier;
+    if (!handle || carrier._handle !== handle || handle._pendingReads.length || carrier.connecting || carrier.destroyed ||
+        carrier.writableLength !== 0 || carrier.writableEnded || !carrier.writable) return;
+    const transport = handle._transport;
+    if (!transport || transport.closing || transport.closed || typeof transport.secureWrite !== 'function') return;
+    const status = host.secure(0, transport.id, this.id);
+    // 1: records that came with the handshake already sent it back (a RETURNED read follows).
+    if (status === 0 || status === 1) this.native = true;
+  }
+  detachNative() {
+    if (!this.native) return;
+    this.native = false;
+    const transport = this.consumed?._transport;
+    if (transport && !transport.closed) host.secure(1, transport.id);
+  }
   pump() {
+    if (this.native) {
+      // Only work the record pump does detaches: a write while native mode runs goes straight
+      // to the handle, and reads arrive as plaintext.
+      if (!this.renegotiating && !this.pendingShutdown && !this.writes.length) return;
+      this.detachNative();
+    }
+    this.pumpRecords();
+    if (!this.native) this.attachNative();
+  }
+  pumpRecords() {
     if (this.pumping || this.closing || !this.started || this.selecting || this.helloWaiting || !this.id) return;
     this.pumping = true;
     try {
@@ -405,12 +453,64 @@ class TLSTransport {
   // Node's TLSWrap::DestroySSL: the session goes away before the socket does.
   destroySSL() {
     if (!this.id) return;
+    this.detachNative();
     answering.delete(this.id); op('release', this.id); this.id = 0;
     for (const item of this.writes.splice(0)) item.callback(canceled());
   }
   write(data, callback) {
     if (this.closing || !this.id) { process.nextTick(() => callback(canceled())); return; }
+    if (this.native && !this.writes.length && data.length) {
+      const carrier = this.carrier;
+      const status = this.consumed._transport.secureWrite(data, err => {
+        if (err) { carrier.destroy(err); return; }
+        callback();
+      });
+      if (status === 1 || status === 0) {
+        this.socket._refreshTimeout();
+        this.consumed._countWritten(data.length);
+        if (status === 1) process.nextTick(callback);
+        return;
+      }
+      if (status < 0 && status > -100000) {
+        // As a failed write to the carrier's handle (writeDirect).
+        carrier.destroy(new ErrnoException(status, 'write'));
+        return;
+      }
+      // The handle let go of the session: the record pump takes the write (and reports
+      // a failure the session met).
+      this.native = false;
+    }
     this.writes.push({ data, offset: 0, callback, inflight: false }); this.pump();
+  }
+  // A StreamBase write of the TLS socket while native mode runs (internal/net/binding): the
+  // chunks (Buffers, or [chunk, encoding] pairs) are encoded, encrypted and sent by the carrier's
+  // handle in one call. Returns bytes * 2 + 1 when sent now, bytes * 2 when onWritten() follows,
+  // or undefined when the record pump must take the write.
+  writeChunks(chunks, allBuffers, onWritten) {
+    if (!this.native || this.writes.length || this.closing || !this.id) return undefined;
+    if (!allBuffers) {
+      for (let i = 0; i < chunks.length; i += 2) {
+        if (typeof chunks[i] !== 'string') continue;
+        const encoding = chunks[i + 1];
+        if (encoding !== 'latin1' && encoding !== 'utf8' && encoding !== 'ascii' && encoding !== 'utf-8' && encoding !== 'binary') return undefined;
+      }
+    }
+    const transport = this.consumed._transport, carrier = this.carrier;
+    const token = ++transport.sequence;
+    const result = host.secure(3, transport.id, chunks, chunks.length, allBuffers ? 1 : 0, token);
+    if (result >= 0) {
+      this.socket._refreshTimeout();
+      this.consumed._countWritten(Math.floor(result / 2));
+      if (result % 2 === 0) transport.requests.set(token, { callback: err => { if (err) carrier.destroy(err); else onWritten(0); } });
+      return result;
+    }
+    if (result > -100000) {
+      // As a failed write to the carrier's handle (writeDirect): the write never completes.
+      carrier.destroy(new ErrnoException(result, 'write'));
+      return 0;
+    }
+    this.native = false;
+    return undefined;
   }
   writev(chunks, callback) {
     let pending = chunks.length, failure;
@@ -427,6 +527,7 @@ class TLSTransport {
   unconsume() {
     const handle = this.consumed;
     if (!handle) return;
+    this.detachNative();
     this.consumed = null;
     const at = handle._consumers ? handle._consumers.indexOf(this.consumer) : -1;
     if (at !== -1) handle._consumers.splice(at, 1);

@@ -34,6 +34,7 @@ const {
   IncomingMessage,
   readStart,
   readStop,
+  pushEnd,
 } = incoming;
 
 const kIncomingMessage = Symbol('IncomingMessage');
@@ -151,7 +152,7 @@ function parserOnMessageComplete() {
     }
 
     // For emit end event
-    stream.push(null);
+    pushEnd(stream);
   }
 
   // Force to read the next incoming message

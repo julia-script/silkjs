@@ -36,7 +36,7 @@ const {
   _checkInvalidHeaderChar: checkInvalidHeaderChar,
   prepareError,
 } = require('_http_common');
-const { ConnectionsList } = require('internal/http/native-parser');
+const { ConnectionsList, consumeNative, consumeNativeLater } = require('internal/http/native-parser');
 const {
   kUniqueHeaders,
   parseUniqueHeadersOption,
@@ -59,6 +59,9 @@ const {
 const {
   IncomingMessage,
   kDetachAbortSignal,
+  resumeScheduled,
+  readableEnded,
+  isLean: isLeanRequest,
 } = require('_http_incoming');
 const {
   ConnResetException,
@@ -839,7 +842,13 @@ function connectionListenerInternal(server, socket) {
       !socket._handle._consumed) {
     parser._consumed = true;
     socket._handle._consumed = true;
-    parser.consume(socket._handle);
+    // Simple requests are read natively; llhttp takes over at the first other one. A TLS
+    // connection starts with llhttp and goes native once its session does.
+    const eligible = nativeEligible(server, lenientFlags);
+    if (!eligible || socket.encrypted || !consumeNative(parser, socket._handle, server.maxHeaderSize || 0)) {
+      parser.consume(socket._handle);
+      if (eligible && socket.encrypted) consumeNativeLater(parser, socket._handle, server.maxHeaderSize || 0);
+    }
   }
   parser[kOnExecute] =
     onParserExecute.bind(undefined,
@@ -850,6 +859,13 @@ function connectionListenerInternal(server, socket) {
                          server, socket);
 
   socket._paused = false;
+}
+
+// A connection whose simple requests net_native can read (internal/http/native-parser
+// consumeNative): llhttp's strict mode and no header count limit below what it reads.
+function nativeEligible(server, lenientFlags) {
+  return lenientFlags === 0 &&
+    (typeof server.maxHeadersCount !== 'number' || server.maxHeadersCount > 64);
 }
 
 function socketSetEncoding() {
@@ -1073,7 +1089,8 @@ function clearIncoming(req) {
   const parser = req.socket?.parser;
   // Reset the .incoming property so that the request object can be gc'ed.
   if (parser && parser.incoming === req) {
-    if (req.readableEnded) {
+    // A lean request that _dump left lean ends unseen: nothing waits for its 'end'.
+    if (readableEnded(req) || (req._dumped && isLeanRequest(req))) {
       parser.incoming = null;
     } else {
       req.on('end', clearIncoming);
@@ -1102,7 +1119,7 @@ function resOnFinish(req, res, socket, state, server) {
   // If the user never called req.read(), and didn't pipe() or
   // .resume() or .on('data'), then we call req._dump() so that the
   // bytes will be pulled off the wire.
-  if (!req._consuming && !req._readableState.resumeScheduled)
+  if (!req._consuming && !resumeScheduled(req))
     req._dump();
 
   res.detachSocket(socket);

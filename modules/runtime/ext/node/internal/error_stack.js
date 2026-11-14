@@ -254,6 +254,8 @@ function install(global, isolated = false) {
   function format(error, raw) {
     if (raw === undefined) return undefined;
     const frames = [];
+    // The type and method names, which a capture leaves until now.
+    host.captureCallSites(-8, raw);
     for (let index = 0; index < raw.length; index++) frames[index] = fromNative(raw[index]);
     if ((typeof error === 'object' && error !== null) || typeof error === 'function') state.frames.set(error, frames);
     if (state.formatting) return defaultFormat(error, frames);

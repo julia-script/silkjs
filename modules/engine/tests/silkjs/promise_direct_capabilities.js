@@ -16,6 +16,11 @@ const expected = [
   "ctor getter",
   "proto swap true",
   "identity true false",
+  "resolve ctor getter",
+  "resolve identity true",
+  "resolve ctor getter",
+  "sub identity false",
+  "reproto identity false true",
   "a 1",
   "b 2",
   "c1",
@@ -26,6 +31,7 @@ const expected = [
   "thenable.then",
   "await caught aw",
   "afin",
+  "awaited own ctor",
   "c2",
   "thenable.then",
   "async thenable T",
@@ -40,6 +46,7 @@ const expected = [
   "async promise AP",
   "all 1,2,T",
   "async ret rej rr",
+  "awaited sub 2",
   "adoptedP P",
   "patched species",
   "patched derived true",
@@ -86,6 +93,9 @@ Promise.race([new Promise(() => {}), Promise.resolve('r')]).then(v => L('race', 
 Promise.any([Promise.reject(1), Promise.resolve('any')]).then(v => L('any', v));
 (async () => { try { await Promise.reject(new Error('aw')); } catch (e) { L('await caught', e.message); } finally { L('afin'); } return 5; })().then(v => L('ret', v));
 (async () => Promise.reject(new Error('rr')))().catch(e => L('async ret rej', e.message));
+{ const p = Promise.resolve(1); Object.defineProperty(p, 'constructor', { get() { L('resolve ctor getter'); return Promise; } }); L('resolve identity', Promise.resolve(p) === p); (async () => { await p; L('awaited own ctor'); })(); }
+{ const p = Sub.resolve(2); L('sub identity', Promise.resolve(p) === p); (async () => { L('awaited sub', await p); })(); }
+{ const p = Promise.resolve(3); Object.setPrototypeOf(p, Sub.prototype); L('reproto identity', Promise.resolve(p) === p, Sub.resolve(p) === p); }
 // Second phase, after the first drains: the species and constructor are replaced
 // and restored on the intrinsics themselves, which the remembered slots must see.
 let ticks = 0;

@@ -423,6 +423,8 @@ TLSSocket.prototype.renegotiate = function(options, callback) {
     native('verifyMode', this._tls.id, requestCert, rejectUnauthorized);
     this._requestCert = requestCert; this._rejectUnauthorized = rejectUnauthorized;
   }
+  // The record pump runs the renegotiation: the session leaves native mode first.
+  this._tls.detachNative();
   try { native('renegotiate', this._tls.id); }
   catch (err) { if (callback) process.nextTick(callback, err); return false; }
   this._tls.renegotiating = true;

@@ -467,17 +467,29 @@ function createUnsafeArrayBuffer(size) {
 // (util_object_private_symbol untransferable_object_private_symbol in Node).
 const untransferable = new WeakSet();
 
+// The hot entry points are native (host.bufferOperation): a Buffer with number
+// or absent offsets in range is answered in one native call, and anything else
+// (other views, coercions, errors) runs the JavaScript above with the same
+// receiver and arguments. The operation numbers are bufferCodec.operation's.
+const native = host.bufferOperation;
+const sliceKinds = { utf8Slice, latin1Slice, asciiSlice, ucs2Slice, hexSlice, base64Slice, base64urlSlice };
+const nativeSlices = {};
+{
+  let kind = 0;
+  for (const name in sliceKinds) nativeSlices[name] = native(16 + kind++, sliceKinds[name], 3);
+}
+
 module.exports = {
   kMaxLength,
   kStringMaxLength,
   ERR_STRING_TOO_LONG,
-  asciiSlice,
-  base64Slice,
-  base64urlSlice,
-  latin1Slice,
-  hexSlice,
-  ucs2Slice,
-  utf8Slice,
+  asciiSlice: nativeSlices.asciiSlice,
+  base64Slice: nativeSlices.base64Slice,
+  base64urlSlice: nativeSlices.base64urlSlice,
+  latin1Slice: nativeSlices.latin1Slice,
+  hexSlice: nativeSlices.hexSlice,
+  ucs2Slice: nativeSlices.ucs2Slice,
+  utf8Slice: nativeSlices.utf8Slice,
   asciiWriteStatic,
   base64Write,
   base64urlWrite,
@@ -485,10 +497,10 @@ module.exports = {
   hexWrite,
   ucs2Write,
   utf8WriteStatic,
-  byteLengthUtf8,
-  compare,
+  byteLengthUtf8: native(64, byteLengthUtf8, 1),
+  compare: native(66, compare, 2),
   compareOffset,
-  copy,
+  copy: native(65, copy, 5),
   fill,
   isAscii,
   isUtf8,

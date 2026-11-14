@@ -10,6 +10,7 @@ const states = new WeakMap();
 const finalizers = new FinalizationRegistry(id => native(1, id));
 const allMethods = native(8);
 const methods = allMethods.filter((name, index) => index < 34 || index === 46);
+const methodIndex = new Map(allMethods.map((name, index) => [name, index]));
 
 // node_http_parser.cc: a parser given 0 takes the process's --max-http-header-size.
 // Read at each initialize: the heap image may hold this module from before the options are set.
@@ -33,7 +34,10 @@ const invoke = asyncHooks._invoke;
 const call0 = (fn, self) => fn.call(self);
 const call1 = (fn, self, a) => fn.call(self, a);
 const call2 = (fn, self, a) => fn.call(self, a[0], a[1]);
-const callHead = (fn, self, a) => fn.call(self, a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7], a[8]);
+// The native head ([major, minor, method, statusCode, upgrade, keepAlive, eof, url or status
+// text, fields]) as kOnHeadersComplete's arguments, without an intermediate array.
+const callRequestHead = (fn, self, a) => fn.call(self, a[0], a[1], a[8], a[2], a[7], undefined, undefined, a[4], a[5]);
+const callResponseHead = (fn, self, a) => fn.call(self, a[0], a[1], a[8], undefined, undefined, a[3], a[7], a[4], a[5]);
 // Parser callbacks run in the parser's async scope, with fixed arguments.
 // When the parser consumes its socket, Node calls kOnHeaders, kOnBody and kOnExecute
 // with MakeCallback, so the nextTick and microtask queues drain after them. Message
@@ -63,6 +67,7 @@ function event(parser, state, kind, value, remaining) {
   if (state.beingFreed) return 0;
   switch (kind) {
     case 0:
+      state.inMessage = true;
       resetMessage(state);
       if (state.connections) state.connections._begin(parser, state);
       callback(parser, state, HTTPParser.kOnMessageBegin, call0);
@@ -72,9 +77,7 @@ function event(parser, state, kind, value, remaining) {
       state.headersComplete = true;
       state.upgrade = value[4];
       state.eof = value[6];
-      const result = callback(parser, state, HTTPParser.kOnHeadersComplete, callHead,
-        [value[0], value[1], value[8], request ? value[2] : undefined, request ? value[7] : undefined,
-          request ? undefined : value[3], request ? undefined : value[7], value[4], value[5]]);
+      const result = callback(parser, state, HTTPParser.kOnHeadersComplete, request ? callRequestHead : callResponseHead, value);
       return state.pauseRequested && !result ? 21 : result | 0;
     }
     case 8: callback(parser, state, HTTPParser.kOnBody, call1, Buffer.from(value)); break;
@@ -86,6 +89,7 @@ function event(parser, state, kind, value, remaining) {
       return Math.min(Math.max(1, Math.floor(limit)), 0x7fffffff);
     }
     case 9:
+      state.inMessage = false;
       if (value !== undefined) callback(parser, state, HTTPParser.kOnHeaders, call2, [value, '']);
       state.headersComplete = false;
       if (state.connections) state.connections._complete(parser, state);
@@ -122,7 +126,8 @@ function resetAsync(state, owner, id) {
 class HTTPParser {
   constructor() {
     const state = { id: 0, type: HTTPParser.REQUEST, resource: null, connections: null, messageStart: 0, beingFreed: false, topLevel: false, provider: 0, frame: undefined, consuming: null,
-      currentRead: null, executing: false, pauseRequested: false, remaining: 0, remainder: null };
+      currentRead: null, list: null, executing: false, pauseRequested: false, remaining: 0, remainder: null,
+      native: null, nativeBegun: false, inMessage: false, nativeLater: 0 };
     resetMessage(state);
     state.callback = (kind, value, remaining) => event(this, state, kind, value, remaining);
     state.id = native(0, new WeakRef(state.callback));
@@ -143,6 +148,8 @@ class HTTPParser {
     state.remaining = 0;
     state.remainder = null;
     state.pauseRequested = false;
+    state.inMessage = false;
+    state.nativeLater = 0;
     resetMessage(state);
     native(2, state.id, type, maxHeaderSize || defaultMaxHeaderSize(), lenientFlags >>> 0);
     state.provider = type === HTTPParser.REQUEST ? HTTPINCOMINGMESSAGE : HTTPCLIENTREQUEST;
@@ -150,6 +157,7 @@ class HTTPParser {
     if (connectionsList !== undefined) {
       if (!(connectionsList instanceof ConnectionsList)) throw error('ERR_INVALID_ARG_TYPE', 'connectionsList must be a ConnectionsList');
       state.connections = connectionsList;
+      state.list = listOf(connectionsList);
       // Like Node, a connection that never sends a byte still has a deadline.
       connectionsList._begin(this, state);
     }
@@ -210,11 +218,13 @@ class HTTPParser {
       // the socket's own read path.
       if (status < 0) return false;
       if (!payload?.byteLength) return true;
-      const buffer = Buffer.from(payload);
+      // A plain view: execute only reads it during this event, and getCurrentBuffer copies.
+      const buffer = payload instanceof ArrayBuffer ? new Uint8Array(payload) : payload;
       state.currentRead = buffer;
       state.topLevel = true;
       try { callback(this, state, HTTPParser.kOnExecute, call1, HTTPParser.prototype.execute.call(this, buffer)); }
       finally { state.currentRead = null; state.topLevel = false; }
+      if (state.nativeLater !== 0) maybeNative(this, state, handle);
       return true;
     } };
     (handle._consumers ||= []).push(consumer);
@@ -223,6 +233,8 @@ class HTTPParser {
   }
   unconsume() {
     const state = stateOf(this);
+    // Requests net_native already read still come; then the head it holds, for execute().
+    if (state.native) { state.native.released = true; state.native.handle._releaseHttp(); state.native = null; }
     if (state.consuming) {
       const { handle, consumer } = state.consuming;
       const at = handle._consumers.indexOf(consumer);
@@ -232,10 +244,12 @@ class HTTPParser {
     this._consumed = false;
   }
   remove() {
+    // A freed parser hears nothing more from net_native: the link is dead.
+    if (stateOf(this).native) stateOf(this).native.dead = true;
     HTTPParser.prototype.unconsume.call(this);
     const state = stateOf(this);
     state.beingFreed = true;
-    if (state.connections) { state.connections._remove(this); state.connections = null; }
+    if (state.connections) { state.connections._remove(this); state.connections = null; state.list = null; }
   }
   free() {
     const state = stateOf(this);
@@ -310,12 +324,12 @@ class ConnectionsList {
     return result;
   }
   _begin(parser, state) {
-    const list = listOf(this);
+    const list = state.list ?? listOf(this);
     state.messageStart = host.now();
     list.all.add(parser); list.active.add(parser);
   }
   _complete(parser, state) {
-    const list = listOf(this);
+    const list = state.list ?? listOf(this);
     list.active.delete(parser);
     state.messageStart = 0;
     list.all.add(parser);
@@ -326,9 +340,120 @@ class ConnectionsList {
   }
 }
 
+// node:http connections whose requests net_native reads (its node mode): simple heads arrive as
+// [method, url, name, value, ...] and run the callbacks llhttp would run for them, in the same
+// order and async scope as parser.consume; any other head comes back as bytes for llhttp
+// (fallback), which then consumes the socket as usual. A parser that unconsumed its socket
+// still gets the requests already read, then executes the bytes of the head held natively.
+function consumeNative(parser, handle, maxHeaderSize) {
+  const state = live(parser);
+  if (state.type !== HTTPParser.REQUEST || state.consuming || typeof handle?._adoptHttp !== 'function') return false;
+  const link = { handle, dead: false, released: false, begin: null, request: null, fallback: null };
+  link.begin = first => { if (!link.dead && !link.released) nativeBegin(parser, state, first); };
+  link.request = (flags, record) => { if (!link.dead) nativeRequest(parser, state, link, flags, record); };
+  link.fallback = bytes => { if (!link.dead) nativeFallback(parser, state, link, bytes); };
+  link.stray = bytes => { if (!link.dead) nativeStray(parser, state, link, bytes); };
+  if (!handle._adoptHttp(link, maxHeaderSize || defaultMaxHeaderSize())) return false;
+  state.native = link;
+  state.nativeBegun = false;
+  parser._consumed = true;
+  return true;
+}
+// A read that ends inside a head: message begin for its first bytes, and kOnExecute for the
+// read, as llhttp's execute of it would.
+function nativeBegin(parser, state, first) {
+  if (!state.id) return;
+  if (first && !state.nativeBegun) {
+    state.nativeBegun = true;
+    event(parser, state, 0, undefined, 0);
+  }
+  state.topLevel = true;
+  try { callback(parser, state, HTTPParser.kOnExecute, call1, 0); }
+  finally { state.topLevel = false; }
+}
+// The bytes of a request net_native read: llhttp gets them when the parser no longer takes
+// net_native's requests.
+function requestBytes(flags, record) {
+  let text = `${record[0]} ${record[1]} HTTP/1.${(flags & 4) !== 0 ? 0 : 1}\r\n`;
+  for (let i = 2; i < record.length; i += 2) text += `${record[i]}: ${record[i + 1]}\r\n`;
+  return Buffer.from(text + '\r\n', 'latin1');
+}
+let incoming;
+function nativeRequest(parser, state, link, flags, record) {
+  if (link.released) { HTTPParser.prototype.execute.call(parser, requestBytes(flags, record)); return; }
+  if (!state.id) return;
+  state.topLevel = true;
+  state.executing = true;
+  try {
+    if (!state.nativeBegun) event(parser, state, 0, undefined, 0);
+    state.nativeBegun = false;
+    // [major, minor, method, statusCode, upgrade, keepAlive, eof, url, fields]
+    const head = [1, (flags & 4) !== 0 ? 0 : 1, methodIndex.get(record[0]), 0, false, true, false, record[1], record.slice(2)];
+    // The request's stream starts lean (_http_incoming kLean).
+    incoming ??= require('_http_incoming');
+    incoming.makeLeanNext(true);
+    try { event(parser, state, 7, head, 0); }
+    finally { incoming.makeLeanNext(false); }
+    event(parser, state, 9, undefined, 0);
+  } finally { state.executing = false; }
+  // The last request of a read ends its execute (HTTP_MORE, 16, marks the others).
+  try { if ((flags & 16) === 0) callback(parser, state, HTTPParser.kOnExecute, call1, 0); }
+  finally { state.topLevel = false; }
+}
+function nativeFallback(parser, state, link, bytes) {
+  if (state.native === link) state.native = null;
+  const buffer = bytes?.byteLength ? new Uint8Array(bytes) : null;
+  if (link.released) {
+    if (buffer && state.id) HTTPParser.prototype.execute.call(parser, buffer);
+    return;
+  }
+  // A head net_native does not read: llhttp reads the connection from its first byte on.
+  // The bytes came with this read, which llhttp executes whole even when an earlier request
+  // in it paused the socket.
+  HTTPParser.prototype.consume.call(parser, link.handle);
+  if (buffer) {
+    if (link.handle._pendingReads.length) link.handle._dispatch(1, buffer.byteLength, bytes);
+    else link.handle._readForConsumer(buffer.byteLength, bytes);
+  }
+}
+// Bytes the handle got around net_native (a TLS session's plaintext from JavaScript's record
+// pump, from before net_native took its records): they come first, so llhttp reads them and
+// the connection, as after a fallback.
+function nativeStray(parser, state, link, bytes) {
+  if (!link.released) {
+    link.released = true;
+    if (state.native === link) state.native = null;
+    link.handle._releaseHttp();
+    HTTPParser.prototype.consume.call(parser, link.handle);
+  }
+  if (state.consuming) link.handle._readForConsumer(bytes.byteLength, bytes);
+  else if (state.id) HTTPParser.prototype.execute.call(parser, new Uint8Array(bytes));
+}
+// A TLS connection of a node:http server starts with llhttp: its session goes native after the
+// handshake, when the first request is read already (internal/tls/transport attachNative). Once
+// llhttp is between messages and the session runs natively, net_native reads the requests.
+function consumeNativeLater(parser, handle, maxHeaderSize) {
+  const state = live(parser);
+  if (state.type !== HTTPParser.REQUEST || typeof handle?._adoptHttp !== 'function') return;
+  state.nativeLater = maxHeaderSize || defaultMaxHeaderSize();
+}
+function maybeNative(parser, state, handle) {
+  if (state.inMessage || state.executing || state.pauseRequested || state.upgrade || state.remainder !== null ||
+      !state.id || state.beingFreed || state.consuming?.handle !== handle || handle._transport?.native !== true) return;
+  const maxHeaderSize = state.nativeLater;
+  const { consumer } = state.consuming;
+  const at = handle._consumers.indexOf(consumer);
+  if (at !== -1) handle._consumers.splice(at, 1);
+  state.consuming = null;
+  if (consumeNative(parser, handle, maxHeaderSize)) { state.nativeLater = 0; return; }
+  // Not now (the carrier holds reads, the session went back): llhttp goes on reading.
+  (handle._consumers ||= []).push(consumer);
+  state.consuming = { handle, consumer };
+  parser._consumed = true;
+}
 function takeRemainder(parser) { const state = stateOf(parser), value = state.remainder; state.remainder = null; return value; }
 function remainingBytes(parser) { const state = stateOf(parser); return state.executing ? state.remaining : 0; }
 function setUpgrade(parser, value) { const state = live(parser); state.upgrade = !!value; native(10, state.id, Number(!!value)); }
 function needsEOF(parser) { return stateOf(parser).eof; }
 function isExecuting(parser) { return stateOf(parser).executing; }
-module.exports = { HTTPParser, ConnectionsList, methods, allMethods, takeRemainder, remainingBytes, setUpgrade, needsEOF, isExecuting };
+module.exports = { HTTPParser, ConnectionsList, methods, allMethods, consumeNative, consumeNativeLater, takeRemainder, remainingBytes, setUpgrade, needsEOF, isExecuting };
