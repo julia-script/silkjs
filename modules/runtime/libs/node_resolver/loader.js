@@ -5,6 +5,9 @@ const { createHooks } = require('./hooks');
 const own = (object, key) => Object.prototype.hasOwnProperty.call(object, key);
 const builtinPrefix = Function.prototype.call.bind(String.prototype.startsWith);
 const builtinSlice = Function.prototype.call.bind(String.prototype.slice);
+const functionToString = Function.prototype.call.bind(Function.prototype.toString);
+const defineOwnProperty = Object.defineProperty;
+const prototypeOf = Object.getPrototypeOf;
 // Node's kFirstModuleParent: internal/errors reads it for require stacks.
 const kModuleParent = require('internal/host').kFirstModuleParent;
 const { loaderRequire } = require('internal/modules/helpers');
@@ -1225,7 +1228,7 @@ function createLoader(host, builtins) {
       try {
         wrapper = wrapperPatched
           ? host.compileFunction(Module.wrap(compiledSource), filename, undefined, undefined, true)
-          : host.compileFunction(wrapperPrefix + compiledSource + wrapperSuffix, filename, compiledSource, wrapperPrefix.length);
+          : host.compileFunction(wrapperPrefix + compiledSource + wrapperSuffix, filename, undefined, wrapperPrefix.length);
       } catch (error) {
         host.attachArrow(error, filename, compiledSource, wrapperPatched ? Module.wrap(compiledSource).indexOf(compiledSource) : wrapperPrefix.length);
         // CompileFunctionForCJSLoader decorates the stack of a compile error.
@@ -1234,6 +1237,19 @@ function createLoader(host, builtins) {
         throw error;
       }
       const metadata = host.getScriptMetadata(wrapper);
+      // The compiled wrapper already holds the module's text: the script's source is read
+      // back out of it when something asks (an error's source line, the inspector), so a
+      // loaded module keeps one copy of its text, not two.
+      if (metadata && !wrapperPatched) {
+        const compiled = wrapper;
+        // The wrapper's own metadata inherits from the script's, which every function of
+        // the module shares and which owns the source.
+        const script = prototypeOf(metadata) ?? metadata;
+        defineOwnProperty(script, 'source', {
+          __proto__: null, enumerable: true, configurable: true,
+          get() { const text = functionToString(compiled); return builtinSlice(text, wrapperPrefix.length - 1, text.length - 2); },
+        });
+      }
       host.registerSource(filename, compiledSource, {
         owner: this, scriptId: metadata?.scriptId, sourceURL: metadata?.sourceURL ?? null, sourceMapURL: metadata?.sourceMapURL ?? null,
       });
