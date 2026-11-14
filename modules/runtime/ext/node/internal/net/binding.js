@@ -296,6 +296,19 @@ class StreamHandle {
       for (let i = 0; i < buffers.length; i++) { joined.set(buffers[i], offset); offset += buffers[i].byteLength; }
       target = [joined];
     }
+    // One buffer the kernel takes at once (the usual HTTP response): no WriteWrap, no
+    // completion closures and no request entry.
+    const transport = this._transport;
+    let token = 0;
+    if (target.length === 1 && typeof transport.writeNow === 'function') {
+      const chunk = target[0];
+      token = transport.writeNow(chunk instanceof Uint8Array ? chunk : new Uint8Array(chunk.buffer, chunk.byteOffset, chunk.byteLength));
+      if (token <= 0) {
+        this._countWritten(bytes);
+        streamBaseState[kLastWriteWasAsync] = 0;
+        return token;
+      }
+    }
     let pending = target.length;
     let failure = 0;
     let sync = true;
@@ -316,9 +329,10 @@ class StreamHandle {
       if (!this._transport) { completed = true; this._pendingWrites?.delete(complete); return; }
       complete(failure);
     };
-    for (let i = 0; i < target.length; i++) {
+    if (token > 0) transport.expect(token, done, target[0]);
+    else for (let i = 0; i < target.length; i++) {
       const chunk = target[i];
-      this._transport.write(chunk instanceof Uint8Array ? chunk : new Uint8Array(chunk.buffer, chunk.byteOffset, chunk.byteLength), done);
+      transport.write(chunk instanceof Uint8Array ? chunk : new Uint8Array(chunk.buffer, chunk.byteOffset, chunk.byteLength), done);
     }
     sync = false;
     this._countWritten(bytes);
