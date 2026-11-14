@@ -44,6 +44,10 @@ const CONNECT = 3;
 const CLOSED = 6;
 const WS_CLOSE = 7;
 const WS_FRAME = 8;
+// The native HTTP/1 reader of a node:http connection (net_native's node mode).
+const HTTP_REQUEST = 9;
+const HTTP_FALLBACK = 10;
+const HTTP_BEGIN = 11;
 
 // src/stream_base.h StreamBaseStateFields.
 const kReadBytesOrError = 0;
@@ -142,6 +146,9 @@ class StreamHandle {
       _flushScheduled: false,
       _connectRequest: null,
       _consumers: null,
+      // The parser link of a node:http connection whose requests net_native reads
+      // (internal/http/native-parser consumeNative).
+      _httpNative: null,
     });
     if (transport !== undefined) this._adopt(transport);
   }
@@ -412,11 +419,35 @@ class StreamHandle {
         this._closed();
         return;
       }
+      case HTTP_BEGIN:
+      case HTTP_REQUEST:
+      case HTTP_FALLBACK:
+        // What one read held is parsed whole, as llhttp executes a read even when a request in
+        // it pauses the socket; only reads held before it make it wait.
+        if (this._pendingReads.length) { this._pendingReads.push([payload, status, 'http', type]); return; }
+        this._httpEvent(type, status, payload);
+        return;
       case WS_CLOSE:
       case WS_FRAME:
         this.#owner?._wsPeer?._frame(type, status, payload);
         return;
     }
+  }
+  // A node:http connection's requests read by net_native (HTTP_REQUEST events) instead of
+  // bytes for its parser; false when this handle cannot.
+  _adoptHttp(link, maxHeaderSize) {
+    const transport = this._transport;
+    if (!transport || transport.closing || transport.closed || typeof transport.call !== 'function' ||
+        this._consumers?.length || this._pendingReads.length || this._userBuffer || this.#owner?._wsPeer) return false;
+    if (transport.call('httpAdopt', 1, maxHeaderSize) < 0) return false;
+    this._httpNative = link;
+    return true;
+  }
+  // Ends native reading: an HTTP_FALLBACK event with the head read so far follows the
+  // requests already queued.
+  _releaseHttp() {
+    const transport = this._transport;
+    if (this._httpNative && transport && !transport.closed) transport.call('httpRelease');
   }
   _closed() {
     this._endConnectTrace?.();
@@ -426,6 +457,20 @@ class StreamHandle {
     this._transport = null;
     if (callback) { this._closeReported = true; callback.call(this); }
     else if (owner && !owner.destroyed && typeof owner.destroy === 'function') owner.destroy();
+  }
+  _httpEvent(type, status, payload) {
+    if (type === HTTP_BEGIN) { this._httpNative?.begin(status === 1); return; }
+    if (type === HTTP_REQUEST) {
+      this._countRead(status >>> 8);
+      // HTTP_MORE (16): another event of the same read follows.
+      if ((status & 16) !== 0 && this._transport) this._transport.holdTicks = true;
+      this._httpNative?.request(status & 255, payload);
+      return;
+    }
+    const link = this._httpNative;
+    this._httpNative = null;
+    if (payload?.byteLength) this._countRead(payload.byteLength);
+    link?.fallback(payload);
   }
   // A read for the stream's consumer, which hands read errors and the end of the stream
   // back to onread (returns false).
@@ -448,12 +493,13 @@ class StreamHandle {
     for (let i = 0; i < pending.length; i++) {
       // A read stopped again: the rest waits, after anything it held back.
       // So does one that came while the stream was stopped (net clears handle.reading).
-      if (this._pendingReads.length || (pending[i][2] && !this.reading)) {
+      if (this._pendingReads.length || (pending[i][2] && pending[i][2] !== 'http' && !this.reading)) {
         this._pendingReads.push(...pending.slice(i));
         return;
       }
       const [payload, nread, consumed, extra] = pending[i];
-      if (consumed) this._readForConsumer(nread, payload, extra);
+      if (consumed === 'http') this._httpEvent(extra, nread, payload);
+      else if (consumed) this._readForConsumer(nread, payload, extra);
       else this._deliver(payload, nread);
     }
   }
