@@ -8,8 +8,7 @@ const booleanOptions = new Map([
   ['--warnings', 'warnings'], ['--deprecation', 'deprecation'],
   ['--trace-warnings', 'traceProcessWarnings'], ['--trace-deprecation', 'traceDeprecation'],
   ['--throw-deprecation', 'throwDeprecation'], ['--pending-deprecation', 'pendingDeprecation'],
-  // Every ArrayBuffer the engine allocates is zero-filled, so Buffer's unsafe
-  // allocations already meet --zero-fill-buffers.
+  // Buffer's unsafe allocations (createUnsafeArrayBuffer) zero their bytes under it.
   ['--zero-fill-buffers', 'zeroFillBuffers'],
   ['--abort-on-uncaught-exception', 'abortOnUncaughtException'], ['--trace-exit', 'traceExit'],
   ['--trace-uncaught', 'traceUncaught'],
@@ -57,6 +56,8 @@ function initialize() {
     if (state[name]) process[name] = true;
   }
   if (!state.deprecation) process.noDeprecation = true;
+  // createUnsafeArrayBuffer and getOptionValue read it from the host.
+  if (state.zeroFillBuffers) host.zeroFillBuffers = true;
   host.pendingDeprecation = state.pendingDeprecation ?? process.env.NODE_PENDING_DEPRECATION === '1';
   // pre_execution.js initializeDeprecations.
   if (host.pendingDeprecation) {
