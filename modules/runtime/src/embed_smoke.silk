@@ -1,5 +1,7 @@
 //! The embedding API's smoke test: a host that runs its own module in an embedded runtime,
-//! turns the loop with a bounded wait, and ends it with process.exit. Built and run by
+//! turns the loop with a bounded wait, and ends it with process.exit. The module calls a
+//! native function of the host's (`hostAdd`), and the host calls a function of the module's
+//! as a callback, whose microtask runs before the call returns. Built and run by
 //! tests/embed-smoke.py; it prints what the module logged and the status the turn reported.
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.core.effect { Effect }
@@ -11,18 +13,60 @@ import silkjs.js_libc_platform as platform
 import runtime.embed { Host, Options }
 import runtime.embed
 import runtime.session { Runtime, Turn }
+import silk.mem.pointer { Pointer }
+import silkjs.js_value { ValueBits }
+import silkjs.js_realm { Arguments, lendRealm }
+import silkjs.js_owned_value { Value }
+import silkjs.js_core_types { NativeFunctionId, NativeCallProtocol }
+import silkjs.js_native_functions as functions
+import silkjs.js_intl_common as common
+import libs.core.embedder { Embedder, EmbedderCall }
+import libs.core.embedder as embedder
 
-const SOURCE: &[u8] = b"let ticks = 0;\nconst timer = setInterval(() => {\n  ticks++;\n  console.log('tick', ticks);\n  if (ticks === 3) {\n    clearInterval(timer);\n    // Nothing referenced is left: a kept-alive runtime keeps turning until the host or\n    // process.exit ends it.\n    setTimeout(() => { process.exitCode = 3; process.exit(); }, 5).unref();\n  }\n}, 5);\nprocess.on('exit', code => console.log('exit', code));\nconst { readFileSync } = await import('node:fs');\nconsole.log('fs', typeof readFileSync);\n"
+const SOURCE: &[u8] = b"console.log('add', hostAdd(2, 3));\nglobalThis.onHost = x => { queueMicrotask(() => hostAdd(x, 100)); return x * 2; };\nlet ticks = 0;\nconst timer = setInterval(() => {\n  ticks++;\n  console.log('tick', ticks);\n  if (ticks === 3) {\n    clearInterval(timer);\n    // Nothing referenced is left: a kept-alive runtime keeps turning until the host or\n    // process.exit ends it.\n    setTimeout(() => { process.exitCode = 3; process.exit(); }, 5).unref();\n  }\n}, 5);\nprocess.on('exit', code => console.log('exit', code));\nconst { readFileSync } = await import('node:fs');\nconsole.log('fs', typeof readFileSync);\n"
 
-struct Smoke { turns: u64 }
+/// What the host's native function saw: its last sum.
+struct Added { last: i32 }
+
+/// `hostAdd(a, b)`: returns `a + b`, and keeps it.
+export "C" fn hostNative(state: ?*mut u8, raw: ?*mut u8) -> u32 as "embed_smoke_host_native" {
+  let mut stateAnchor: u8 = 0
+  let mut callAnchor: u8 = 0
+  let added = unsafe Pointer.borrowMut<u8, Added>(&mut stateAnchor, unsafe embedder.typed<Added>(state))
+  let call = unsafe Pointer.borrowMut<u8, EmbedderCall>(&mut callAnchor, unsafe embedder.typed<EmbedderCall>(raw))
+  let mut argumentsAnchor: u8 = 0
+  let arguments = unsafe Pointer.borrowMut<u8, Arguments<'static>>(&mut argumentsAnchor, unsafe embedder.typed<Arguments<'static>>(call.arguments))
+  let sum = integer(arguments.get(0).view()) + integer(arguments.get(1).view())
+  added.last = sum
+  call.result = ValueBits.Int { value: sum }
+  return embedder.STATUS_RETURNED
+}
+
+fn integer(value: ValueBits) -> i32 { return match value { ValueBits.Int { value: number } => number _ => 0 } }
+
+/// Defines `hostAdd` on the global object.
+effect fn install<'e, 'm>(runtime: &mut Runtime<'e, 'm>) -> () ! JsException ? &mut Allocator {
+  let context = runtime.rawContext()
+  let engine = runtime.rawEngine()
+  let memory = engine.memory
+  let realm = unsafe lendRealm(&context, context)
+  let function = run functions.newFunction(&mut engine.*, memory, realm, NativeFunctionId.Host { id: embedder.FIRST }, b"hostAdd", 2, NativeCallProtocol.Generic, 0)
+  run common.define(&mut engine.*, realm, realm.globalObject(), b"hostAdd", unsafe Value.adoptBits(function), 7)
+}
+
+struct Smoke { turns: u64, added: Added, doubled: i32, afterMicrotask: i32 }
 impl Host for Smoke {
   effect fn drive<'e, 'm>(self: &mut Self, runtime: &mut Runtime<'e, 'm>) -> i32 ! OutOfMemoryError | JsException ? &mut Allocator {
+    runtime.setEmbedder(Embedder { state: embedder.erase<Added>(&mut self.added), native: hostNative })
+    run install(&mut runtime.*)
     run runtime.evaluateModule(b"/embed-smoke/main.mjs", SOURCE)
+    run self.callHost(&mut runtime.*)
     while self.turns < 10000 {
       self.turns = self.turns + 1
       match run runtime.turn(50.0) {
         Turn.Running => ()
         Turn.Finished { status } => {
+          let _called = platform.writeAll(1, if self.doubled == 42 && self.afterMicrotask == 121 { b"host: callback returned 42 after its microtask\n" } else { b"host: callback went wrong\n" })
           let _written = platform.writeAll(1, if status == 3 { b"host: finished with 3\n" } else { b"host: finished with another status\n" })
           return status
         }
@@ -33,9 +77,24 @@ impl Host for Smoke {
   }
 }
 
+impl Smoke {
+  /// Calls the module's `onHost(21)` as a callback: it returns 42, and its microtask has run
+  /// `hostAdd(21, 100)` by the time the call returns.
+  effect fn callHost<'e, 'm>(self: &mut Self, runtime: &mut Runtime<'e, 'm>) -> () ! OutOfMemoryError | JsException ? &mut Allocator {
+    let context = runtime.rawContext()
+    let realm = unsafe lendRealm(&context, context)
+    let function = run common.get(&mut runtime.rawEngine().*, realm, realm.globalObject(), b"onHost")
+    let returned = run runtime.callback(function.borrow().view(), ValueBits.Undefined, &[ValueBits.Int { value: 21 }])
+    self.doubled = integer(returned)
+    realm.release(&mut runtime.rawEngine().*, unsafe Value.adoptBits(returned))
+    self.afterMicrotask = self.added.last
+    realm.release(&mut runtime.rawEngine().*, move function)
+  }
+}
+
 effect fn program() -> i32 ! OutOfMemoryError | SynchronizationError ? &mut Allocator {
   let options = run Options.make(b"embed-smoke")
-  let mut host = Smoke { turns: 0 }
+  let mut host = Smoke { turns: 0, added: Added { last: 0 }, doubled: 0, afterMicrotask: 0 }
   return run embed.start(move options, &mut host)
 }
 pub effect fn main() -> i32 ? &mut HostInput {
